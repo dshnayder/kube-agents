@@ -507,11 +507,29 @@ class GateFailure(Exception):
     project."""
 
 
-def output_digest(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+class SlugReads:
+    """The reads that backed one check: their commands, their summed time, and
+    a running digest of their output. Each body is hashed as it arrives and not
+    kept: a console read can be most of a megabyte, and holding every one a
+    project returns until the project is done grows with its instance count,
+    times the projects collected at once. Hashing in order equals hashing the
+    concatenation, so `output_sha256` is what it was."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.duration_s = 0.0
+        self._digest = hashlib.sha256()
+
+    def add(self, command: str, result: Run) -> None:
+        self.commands.append(command)
+        self.duration_s += result.duration_s
+        self._digest.update((result.stdout or "").encode("utf-8"))
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
-def _joined_record(reads: list[tuple[str, Run]]) -> dict:
+def _joined_record(reads: SlugReads) -> dict:
     """One `commands` entry covering every read that backed one check.
 
     Most of the four checks take more than one read — an enumeration plus a
@@ -525,7 +543,7 @@ def _joined_record(reads: list[tuple[str, Run]]) -> dict:
     `GateFailure` before reaching this, and a serial, `project-info` or
     `list-nodes` read that failed is never recorded.
     """
-    parts = [command for command, _ in reads]
+    parts = list(reads.commands)
     joined = " && ".join(parts)
     if len(joined) > MAX_COMMAND_CHARS:
         # Clipped at a join boundary, and the tail is counted rather than
@@ -543,8 +561,8 @@ def _joined_record(reads: list[tuple[str, Run]]) -> dict:
     return {
         "command": joined[:MAX_COMMAND_CHARS],
         "rc": 0,
-        "duration_s": round(sum(result.duration_s for _, result in reads), 2),
-        "output_sha256": output_digest("".join(result.stdout for _, result in reads)),
+        "duration_s": round(reads.duration_s, 2),
+        "output_sha256": reads.hexdigest(),
     }
 
 
@@ -1100,7 +1118,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     """
     name = f"{PROJECT_TARGET_PREFIX}{project}"
     # Every read that backed each slug, in the order it ran.
-    reads: dict[str, list[tuple[str, Run]]] = {}
+    reads: dict[str, SlugReads] = {}
     candidates: list[dict] = []
     not_applicable: list[dict] = []
     unevaluated: list[dict] = []
@@ -1128,7 +1146,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 f"{slug}: {' '.join(argv)} returned "
                 f"{type(parsed).__name__}, not a JSON array"
             )
-        reads.setdefault(slug, []).append((" ".join(argv), result))
+        reads.setdefault(slug, SlugReads()).add(" ".join(argv), result)
         return parsed
 
     try:
@@ -1154,9 +1172,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         ]
         info_parsed, info_result = run_and_gate(info_argv, run=run)
         if isinstance(info_parsed, dict):
-            reads.setdefault(STARTUP_SLUG, []).append(
-                (" ".join(info_argv), info_result)
-            )
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(info_argv), info_result)
         project_wide = (
             True
             if not isinstance(info_parsed, dict)
@@ -1179,7 +1195,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 unread.append(f"{instance_name} ({zone})")
                 continue
             hit = check_startup_script(instance_name, zone, result.stdout)
-            reads.setdefault(STARTUP_SLUG, []).append((" ".join(argv), result))
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(argv), result)
             if hit:
                 candidates.append(_emit(STARTUP_SLUG, hit, " ".join(argv)))
 
@@ -1280,9 +1296,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 if not isinstance(parsed, list):
                     unmeasured.append(f"{group_name} ({_scope_of(group)})")
                     continue
-                reads.setdefault(SOLE_TENANT_SLUG, []).append(
-                    (" ".join(nodes_argv), result)
-                )
+                reads.setdefault(SOLE_TENANT_SLUG, SlugReads()).add(" ".join(nodes_argv), result)
                 hit, measured = check_sole_tenant_headroom(group, parsed)
                 measured_any = measured_any or measured
                 if not measured:
@@ -1456,6 +1470,10 @@ def collect_fleet(
                     entries[index] = crashed_entry(projects[index], exc)
     else:
         entries = [unresolved_entry()]
+    # `collect_project` returns None only for a project whose own Compute API
+    # is off. It contributes no target, but the reason is kept: when nothing
+    # else was read, it is the cause the top-level `error` has to name.
+    api_off = [project for project, entry in zip(projects, entries) if entry is None]
     entries = [entry for entry in entries if entry is not None]
     if notes:
         entries.append(unenumerated_entry(notes))
@@ -1473,6 +1491,12 @@ def collect_fleet(
     # `finish` would refuse it on shape rather than on this reason.
     if not any(entry.get("outcome") == OUTCOME_COLLECTED for entry in entries):
         reasons = [str(entry.get("error", "")) for entry in entries if entry.get("error")]
+        if api_off:
+            reasons.insert(
+                0,
+                f"the Compute Engine API is off in {', '.join(sorted(api_off))}, "
+                "which holds nothing for this audit to read",
+            )
         manifest["error"] = (
             f"no project could be read: {len(entries)} target(s), none collected"
             + (f"; {reasons[0]}" if reasons else "")

@@ -12947,6 +12947,8 @@ class TestChecksRun(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError) as exc:
             audit_report.validate_findings(doc, stream)
         self.assertIn("checks_run: empty", str(exc.exception))
+        self.assertIn("runs no collector", str(exc.exception))
+        self.assertNotIn("needs nothing more", str(exc.exception))
 
     def test_a_target_with_some_checks_inapplicable_and_none_run_is_rejected(self):
         roster = audit_report.audit_target_checks(AUDIT, "prod-us-east")
@@ -16051,6 +16053,24 @@ class TestCrossCheckManifest(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.cross_check_manifest(doc, self.manifest())
         self.assertIn("does not name it", str(ctx.exception))
+
+    def test_an_out_of_scope_target_is_refused_as_out_of_scope(self):
+        doc = self.doc(["no-requests"])
+        roster = audit_report.audit_target_checks(doc["audit"], "prod-eu-west")
+        doc["scope"]["clusters"].append(
+            {
+                "name": "prod-eu-west",
+                "checks_run": [],
+                "checks_not_applicable": [
+                    {"check": c, "reason": "nothing of this kind exists on this target"} for c in roster
+                ],
+            }
+        )
+        manifest = self.unreadable("out-of-scope", error="not this audit's cluster")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, manifest)
+        self.assertIn("out of scope", str(ctx.exception))
+        self.assertNotIn("does not name it", str(ctx.exception))
 
     def test_scope_clusters_with_limitations_also_accounts_for_it(self):
         doc = self.doc(["no-requests"])

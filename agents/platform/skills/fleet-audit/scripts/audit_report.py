@@ -3542,8 +3542,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "ran, or — if nothing could run there — say why in that cluster's "
                 "limitations, or move it to scope.skipped with a reason. A check "
                 "that cannot apply to this cluster goes in checks_not_applicable "
-                "with its reason; a cluster where every check is listed there "
-                f"needs nothing more. {_sop_pointer(audit_id)}"
+                "with its reason"
+                + (
+                    "; a cluster where every check is listed there needs nothing more"
+                    if audit_id in COLLECTOR_AUDITS
+                    else "; this stream runs no collector to corroborate that, so a "
+                    "cluster where every check is listed there still owes a "
+                    "limitations note or a scope.skipped entry"
+                )
+                + f". {_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
         for j, entry in enumerate(checks_run):
@@ -5022,6 +5029,16 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 and roster <= set(checks_na(cluster))
                 and not str(cluster.get("limitations", "")).strip()
             ):
+                named = next(
+                    (c for c in _manifest_clusters(manifest) if str(c.get("name", "")) == name),
+                    None,
+                )
+                if named and named.get("outcome") == MANIFEST_OUTCOME_OUT_OF_SCOPE:
+                    raise ValidationError(
+                        f"scope.clusters: {name!r} is out of scope for {audit_id} in the "
+                        f"collector manifest{_collector_error(named)}. It need not be "
+                        "listed at all; leave it out of both scope lists."
+                    )
                 raise ValidationError(
                     f"scope.clusters: {name!r} declares every check inapplicable, but "
                     f"the collector manifest for {audit_id} does not name it, so "

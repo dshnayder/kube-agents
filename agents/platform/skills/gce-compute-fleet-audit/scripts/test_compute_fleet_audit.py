@@ -1789,6 +1789,17 @@ class AutoscalingNodeGroupReadTest(unittest.TestCase):
         self.assertNotIn("sole-tenant-headroom", entry.get("limitations", ""))
 
 
+class SlugReadsTest(unittest.TestCase):
+    def test_the_digest_is_the_concatenations_and_no_body_is_kept(self):
+        reads = cf.SlugReads()
+        bodies = ["a" * 5000, "b" * 7000]
+        for i, body in enumerate(bodies):
+            reads.add(f"cmd-{i}", cf.Run(["gcloud"], 0, body, "", 0.5))
+        self.assertEqual(reads.hexdigest(), hashlib.sha256("".join(bodies).encode()).hexdigest())
+        self.assertEqual(reads.commands, ["cmd-0", "cmd-1"])
+        self.assertNotIn("a" * 5000, repr(vars(reads)))
+
+
 class ExcludedNodeGroupCountTest(unittest.TestCase):
     def test_an_excluded_group_is_not_counted_as_measured(self):
         groups = json.dumps([
@@ -1833,6 +1844,15 @@ class NothingCollectedTest(unittest.TestCase):
         with patch.dict(os.environ, {**NO_PROJECT_ENV, "MONITORED_PROJECT_IDS": "p-a"}):
             manifest = cf.collect_fleet(run=run)
         self.assertNotIn("error", manifest)
+
+    def test_an_api_off_only_project_is_named_as_the_cause(self):
+        refusal = (
+            "ERROR: Compute Engine API has not been used in project p-off before or it "
+            "is disabled. SERVICE_DISABLED"
+        )
+        with patch.dict(os.environ, {**NO_PROJECT_ENV, "MONITORED_PROJECT_IDS": "p-off"}):
+            manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(1, "", refusal))
+        self.assertIn("Compute Engine API is off in p-off", manifest["error"])
 
     def test_main_exits_non_zero_when_nothing_was_collected(self):
         with patch.object(cf, "collect_fleet", return_value={"clusters": [], "error": "no project could be read"}):
