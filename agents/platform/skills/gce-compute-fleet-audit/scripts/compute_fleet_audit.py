@@ -195,6 +195,8 @@ STARTUP_SLUG = "gce-startup-script-status"
 MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
+# The four checks this stream's roster holds.
+ROSTER_SLUGS = (STARTUP_SLUG, MIG_SLUG, SOLE_TENANT_SLUG, SNAPSHOT_SLUG)
 
 # §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
 # guest agent current images ship logs `Script "startup-script" failed with
@@ -346,14 +348,14 @@ NO_NODE_GROUPS_REASON = (
     "has no reservation to measure. Structural, not a missed read."
 )
 # The `checks_unevaluated` case for §2.4: the groups exist and were enumerated,
-# the per-node read ran, and not one node carried the resource figures the
-# condition needs. Nobody looked, so a stale headroom finding must not be
-# called fixed on the strength of this run.
+# and for every one of them the per-node read failed or no node carried the
+# resource figures the condition needs. Nobody looked, so a stale headroom
+# finding must not be called fixed on the strength of this run.
 UNMEASURED_NODE_GROUPS_REASON = (
     "§2.4's headroom condition needs each node's `totalResources` and "
     "`consumedResources`, and `compute sole-tenancy node-groups list-nodes` "
-    "returned neither for any node of the {groups} node group(s) on this "
-    "project. They were enumerated, not measured."
+    "failed or returned neither for every one of the {groups} node group(s) on "
+    "this project. They were enumerated, not measured."
 )
 UNMEASURED_NODE_GROUPS_LIMITATION = (
     "sole-tenant-headroom could not be evaluated on this project: "
@@ -370,7 +372,7 @@ PARTIAL_NODE_GROUPS_LIMITATION = (
     "cleared: {names}."
 )
 UNREAD_SERIAL_REASON = (
-    "Every RUNNING instance on this project refused "
+    "Every RUNNING instance whose console §2.1 reads on this project refused "
     "`compute instances get-serial-port-output`, so no serial console text was "
     "read and §2.1's markers were matched against nothing."
 )
@@ -380,8 +382,8 @@ UNREAD_SERIAL_REASON = (
 # the ones it passed over rather than cleared, which is what turns the
 # shortfall into a coverage gap instead of a silent clean pass.
 PARTIAL_SERIAL_LIMITATION = (
-    "gce-startup-script-status read serial console output from {read} of "
-    "{total} RUNNING instance(s) on this project. "
+    "gce-startup-script-status read serial console output from {read} of the "
+    "{total} RUNNING instance(s) on this project that run a startup script. "
     "`compute instances get-serial-port-output` failed for the rest, which "
     "the check passed over rather than cleared: {names}."
 )
@@ -391,7 +393,7 @@ PARTIAL_SERIAL_LIMITATION = (
 UNREAD_SERIAL_LIMITATION = (
     "gce-startup-script-status could not be evaluated on this project: "
     "`compute instances get-serial-port-output` failed for all {total} "
-    "RUNNING instance(s), so no serial console output was read. They were "
+    "RUNNING instance(s) that run a startup script, so no serial console output was read. They were "
     "enumerated, not examined."
 )
 
@@ -460,13 +462,19 @@ class Run(NamedTuple):
 RunFn = Callable[..., Run]
 
 
+def _text(value: object) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
+
+
 def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
     t0 = time.monotonic()
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        # On Linux the partial buffers come back as bytes whatever `text=` says,
+        # as the fleet-audit collectors' `_text()` helpers note.
+        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:  # gcloud missing, permission denied on exec, etc.
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
@@ -949,6 +957,25 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     if not name:
         return None, False
 
+    # §2.4's Do-NOT-flag limb: a node group that grows itself is not short of
+    # headroom, it is between sizes. Applied here rather than handed back as
+    # triage because the mode is a field on the group, not a judgment, and
+    # before the nodes are read, since such a group may have scaled to none.
+    #
+    # Named positively rather than as "anything but OFF". The Compute v1
+    # discovery document gives `mode` four values — MODE_UNSPECIFIED, OFF, ON,
+    # ONLY_SCALE_OUT — and only the last two actually add nodes. Excluding on
+    # "not OFF" would drop a MODE_UNSPECIFIED group out of the check silently,
+    # reporting headroom it never measured as headroom it found adequate.
+    policy = group.get("autoscalingPolicy")
+    mode = str((policy or {}).get("mode", "")).strip().upper()
+    if mode in AUTOSCALING_MODES:
+        return None, True
+    # A group holding no nodes has no host to lose: the read established that,
+    # which is a verdict rather than a missing one.
+    if not nodes:
+        return None, True
+
     total_cpus = consumed_cpus = 0
     total_mem = consumed_mem = 0
     measured_nodes = 0
@@ -979,20 +1006,6 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
 
     if not measured_nodes or total_cpus <= 0:
         return None, False
-
-    # §2.4's Do-NOT-flag limb: a node group that grows itself is not short of
-    # headroom, it is between sizes. Applied here rather than handed back as
-    # triage because the mode is a field on the group, not a judgment.
-    #
-    # Named positively rather than as "anything but OFF". The Compute v1
-    # discovery document gives `mode` four values — MODE_UNSPECIFIED, OFF, ON,
-    # ONLY_SCALE_OUT — and only the last two actually add nodes. Excluding on
-    # "not OFF" would drop a MODE_UNSPECIFIED group out of the check silently,
-    # reporting headroom it never measured as headroom it found adequate.
-    policy = group.get("autoscalingPolicy")
-    mode = str((policy or {}).get("mode", "")).strip().upper()
-    if mode in AUTOSCALING_MODES:
-        return None, True
 
     cpu_pct = 100.0 * consumed_cpus / total_cpus
     mem_pct = 100.0 * consumed_mem / total_mem if total_mem > 0 else 0.0
@@ -1319,6 +1332,15 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             "outcome": OUTCOME_GATE_FAILED,
             "error": str(exc)[:ERROR_CLIP_CHARS],
         }
+
+    # A project where every check is structurally inapplicable -- no instance,
+    # MIG, node group or snapshot -- holds nothing to audit, like one whose
+    # Compute API is off, and is left out the same way. Listed, it would carry
+    # no `checks_run` and owe `finish` a limitations note, and that note would
+    # hold every run partial for as long as the project exists.
+    if not candidates and not unevaluated and {e["check"] for e in not_applicable} >= set(ROSTER_SLUGS):
+        log(f"{project}: no instance, MIG, node group or snapshot; nothing to audit, left out")
+        return None
 
     # Neither kind of declaration records a command: one that ran corroborates
     # exactly the `checks_run` claim each exists to refuse.

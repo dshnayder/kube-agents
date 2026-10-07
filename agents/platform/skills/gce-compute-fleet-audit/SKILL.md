@@ -9,9 +9,9 @@ Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial co
 
 # Workflow
 
-## 1. Execute Compute Inspection
+## 1. Open the Run, Then Execute Compute Inspection
 
-Run the profile-relative compute fleet collector to sweep target projects. It writes a collector manifest to stdout:
+Open the run first with the `fleet-audit` harness's `start` (SOP §0). `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then run the profile-relative compute fleet collector to sweep target projects. It writes a collector manifest to stdout:
 
 ```bash
 python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
@@ -32,4 +32,4 @@ All four roster checks are collector-verified; none is yours to hand-run.
 
 ## 3. Hand Findings to Fleet Audit
 
-Emit findings using the `fleet-audit` harness lifecycle (`start` ... `finish`), passing `--manifest-file` to `finish` as the SOP's §5 directs, so it cross-checks `checks_run` against what the collector ran.
+Finish the run you opened in step 1 with the `fleet-audit` harness's `finish`, passing `--manifest-file` as the SOP's §5 directs, so it cross-checks `checks_run` against what the collector ran. This stream's `finish` requires that flag, or `--no-collector-manifest` with a reason.

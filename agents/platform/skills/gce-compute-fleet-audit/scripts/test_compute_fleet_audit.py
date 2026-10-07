@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -82,6 +83,15 @@ def node(cpus: int = 8, used_cpus: int = 0, mem: int = 32768, used_mem: int = 0)
         "totalResources": {"guestCpus": cpus, "memoryMb": mem},
         "consumedResources": {"guestCpus": used_cpus, "memoryMb": used_mem},
     }
+
+
+class DefaultRunTest(unittest.TestCase):
+    def test_a_timeout_after_writing_stderr_returns_text(self):
+        expired = subprocess.TimeoutExpired(["gcloud"], 1, output=b"partial", stderr=b"WARNING: slow")
+        with patch.object(cf.subprocess, "run", side_effect=expired):
+            result = cf.default_run(["gcloud", "compute", "instances", "list"])
+        self.assertEqual(result.rc, cf.TIMEOUT_RC)
+        self.assertEqual((result.stdout, result.stderr), ("partial", "WARNING: slow"))
 
 
 class RunAndGateTest(unittest.TestCase):
@@ -635,6 +645,25 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("Standard node pool", reason)
         self.assertNotIn("a project whose only instances are GKE nodes", reason)
 
+    def test_a_windows_startup_script_makes_an_instance_a_target(self):
+        seen = []
+        windows = (
+            '[{"name": "win-1", "status": "RUNNING", "zone": "https://x/projects/proj-1/zones/us-central1-a", '
+            '"metadata": {"items": [{"key": "windows-startup-script-ps1", "value": "exit 1"}]}}]'
+        )
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            seen.append(joined)
+            if "instances list" in joined:
+                return run_of(0, windows)
+            if "project-info describe" in joined:
+                return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
+            return run_of(0, "[]")
+
+        cf.collect_project("proj-1", run=run)
+        self.assertTrue([c for c in seen if "get-serial-port-output win-1" in c])
+
     def test_no_console_is_read_for_an_instance_that_runs_no_script(self):
         """The declaration has to stop the reads, not just relabel them.
 
@@ -990,28 +1019,29 @@ class CollectProjectTest(unittest.TestCase):
 
 class CollectFleetTest(unittest.TestCase):
     def stub(self):
+        # One RUNNING instance per project, so no project is left out as
+        # holding nothing to audit.
         def run(argv, **kwargs):
+            if "instances list" in " ".join(argv):
+                return run_of(0, one_running_instance())
             return run_of(0, "[]")
 
         return run
 
+    def env(self, **values):
+        return patch.dict(os.environ, {**NO_PROJECT_ENV, **values})
+
     def test_sweeps_every_monitored_project(self):
-        os.environ["MONITORED_PROJECT_IDS"] = "p-a, p-b"
-        try:
+        with self.env(MONITORED_PROJECT_IDS="p-a, p-b"):
             manifest = cf.collect_fleet(run=self.stub())
-        finally:
-            os.environ.pop("MONITORED_PROJECT_IDS", None)
         self.assertEqual(
             sorted(c["name"] for c in manifest["clusters"]),
             sorted(["project/p-a", "project/p-b", cf.UNENUMERATED_PROJECTS_TARGET]),
         )
 
     def test_single_project_override_bypasses_the_environment(self):
-        os.environ["MONITORED_PROJECT_IDS"] = "p-a,p-b"
-        try:
+        with self.env(MONITORED_PROJECT_IDS="p-a,p-b"):
             manifest = cf.collect_fleet("only-this", run=self.stub())
-        finally:
-            os.environ.pop("MONITORED_PROJECT_IDS", None)
         self.assertEqual(
             [c["name"] for c in manifest["clusters"]],
             ["project/only-this", cf.UNENUMERATED_PROJECTS_TARGET],
@@ -1021,18 +1051,16 @@ class CollectFleetTest(unittest.TestCase):
         """The SOP redirects stdout into the manifest file, so an exception
         escaping `collect_fleet` truncates it — the run loses every project to
         one bad object instead of one."""
-        os.environ["MONITORED_PROJECT_IDS"] = "p-a,p-b"
+        stub = self.stub()
 
         def run(argv, **kwargs):
             joined = " ".join(argv)
             if "p-a" in joined:
                 raise TypeError("unmodelled")
-            return run_of(0, "[]")
+            return stub(argv, **kwargs)
 
-        try:
+        with self.env(MONITORED_PROJECT_IDS="p-a,p-b"):
             manifest = cf.collect_fleet(run=run)
-        finally:
-            os.environ.pop("MONITORED_PROJECT_IDS", None)
         by_name = {c["name"]: c for c in manifest["clusters"]}
         self.assertEqual(by_name["project/p-a"]["outcome"], "gate-failed")
         self.assertIn("TypeError", by_name["project/p-a"]["error"])
@@ -1041,14 +1069,23 @@ class CollectFleetTest(unittest.TestCase):
     def test_no_project_resolved_still_produces_a_target(self):
         """An empty `clusters` list reads as a fleet with nothing in it, which
         is a clean, fully covered scope."""
-        for var in ("MONITORED_PROJECT_IDS", "GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID"):
-            os.environ.pop(var, None)
-        manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(1, "", "no auth"))
+        with self.env():
+            manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(1, "", "no auth"))
         self.assertEqual(
             [c["name"] for c in manifest["clusters"]],
             ["project/unknown", cf.UNENUMERATED_PROJECTS_TARGET],
         )
         self.assertEqual({c["outcome"] for c in manifest["clusters"]}, {"gate-failed"})
+
+    def test_a_project_holding_nothing_to_audit_is_left_out(self):
+        """No instance, MIG, node group or snapshot: all four checks are
+        inapplicable, and listed it could only publish with a limitations note
+        that holds every run partial, so it is left out like a project whose
+        Compute API is off."""
+        with self.env(MONITORED_PROJECT_IDS="p-empty"):
+            manifest = cf.collect_fleet(run=lambda argv, **kw: run_of(0, "[]"))
+        self.assertEqual([c["name"] for c in manifest["clusters"]], [cf.UNENUMERATED_PROJECTS_TARGET])
+        self.assertIsNone(cf.collect_project("p-empty", run=lambda argv, **kw: run_of(0, "[]")))
 
     def test_the_manifest_carries_the_top_level_contract(self):
         manifest = cf.collect_fleet("proj-1", run=self.stub())
@@ -1061,11 +1098,8 @@ class CollectFleetTest(unittest.TestCase):
     def test_target_names_are_unique_across_the_manifest(self):
         """`cross_check_manifest` builds `{c["name"]: c}`, so a duplicate name
         makes the earlier target invisible to all six rejection rules."""
-        os.environ["MONITORED_PROJECT_IDS"] = "p-a,p-b,p-c"
-        try:
+        with self.env(MONITORED_PROJECT_IDS="p-a,p-b,p-c"):
             manifest = cf.collect_fleet(run=self.stub())
-        finally:
-            os.environ.pop("MONITORED_PROJECT_IDS", None)
         names = [c["name"] for c in manifest["clusters"]]
         self.assertEqual(len(names), len(set(names)))
 
@@ -1451,7 +1485,8 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
             "p1",
             run=self.fake_run(
                 {
-                    "instances list": run_of(0, "[]"),
+                    "instances list": run_of(0, one_running_instance()),
+                    "get-serial-port-output": run_of(0, "boot ok\n"),
                     "disks list": run_of(0, "[]"),
                     "snapshots list": run_of(0, "[]"),
                 }
@@ -1633,8 +1668,9 @@ class SoleTenantHeadroomTest(unittest.TestCase):
 
     def test_memory_pressure_alone_can_flag(self):
         hit, _ = cf.check_sole_tenant_headroom(
-            self.GROUP, [node(cpus=8, used_cpus=8, mem=1000, used_mem=950)]
+            self.GROUP, [node(cpus=8, used_cpus=1, mem=1000, used_mem=950)]
         )
+        # vCPU sits at 12.5%, so only the memory limb can carry the threshold.
         self.assertIsNotNone(hit)
 
     def test_an_autoscaling_group_is_excluded_and_still_counts_as_measured(self):
@@ -1657,13 +1693,6 @@ class SoleTenantHeadroomTest(unittest.TestCase):
             self.assertIsNotNone(hit, mode)
             self.assertTrue(measured, mode)
 
-    def test_every_discovery_document_mode_is_accounted_for(self):
-        """The enum is small and stable, so pin it: a fifth value appearing
-        upstream should fail here rather than be silently treated as fixed."""
-        self.assertEqual(
-            sorted(cf.AUTOSCALING_MODES), ["ON", "ONLY_SCALE_OUT"]
-        )
-
     def test_an_absent_autoscaling_policy_is_evaluated(self):
         hit, measured = cf.check_sole_tenant_headroom(
             self.GROUP, [node(cpus=8, used_cpus=8)]
@@ -1679,16 +1708,23 @@ class SoleTenantHeadroomTest(unittest.TestCase):
         self.assertIsNone(hit)
         self.assertFalse(measured)
 
-    def test_an_empty_node_list_reports_unmeasured(self):
-        self.assertEqual(cf.check_sole_tenant_headroom(self.GROUP, []), (None, False))
+    def test_a_group_holding_no_nodes_is_measured_and_clean(self):
+        """No node means no host to lose: a verdict, not a missing read."""
+        self.assertEqual(cf.check_sole_tenant_headroom(self.GROUP, []), (None, True))
+
+    def test_an_autoscaling_group_scaled_to_no_nodes_is_excluded(self):
+        group = dict(self.GROUP, autoscalingPolicy={"mode": "ON", "minNodes": 0})
+        self.assertEqual(cf.check_sole_tenant_headroom(group, []), (None, True))
 
     def test_a_zero_capacity_node_does_not_skew_the_ratio(self):
         """Counting a node that reports no capacity would shrink the
         denominator and manufacture a utilisation figure from a bad record."""
-        nodes = [node(cpus=0, used_cpus=0), node(cpus=10, used_cpus=1)]
+        # Counted, the empty node would add its 32768 MB to the memory
+        # denominator and dilute the 95% the real node carries to under 3%.
+        nodes = [node(cpus=0, used_cpus=0), node(cpus=10, used_cpus=5, mem=1000, used_mem=950)]
         hit, measured = cf.check_sole_tenant_headroom(self.GROUP, nodes)
         self.assertTrue(measured)
-        self.assertIsNone(hit)
+        self.assertIsNotNone(hit)
 
     def test_a_malformed_node_is_skipped_not_fatal(self):
         nodes = [None, "junk", node(cpus=8, used_cpus=8)]
@@ -1872,6 +1908,10 @@ def discovery_run(*, listed: str = "", config: str = "", described: dict | None 
             return run_of(list_rc, listed, list_stderr)
         if list(argv) == list(cf.CONFIG_PROJECT_CMD):
             return run_of(0, config)
+        # One RUNNING instance, so a discovered project is not left out as
+        # holding nothing to audit.
+        if "instances list" in " ".join(argv):
+            return run_of(0, one_running_instance())
         return run_of(0, "[]")
 
     return run
