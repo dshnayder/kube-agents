@@ -458,7 +458,8 @@ roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes
 `<project>/<region>/<subnet>` path, or a bare cluster name). A stream declares the partition in
 `AuditSpec.scopes`; an empty `scopes` measures every target against the whole roster, and a kind
 the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
-and stockout streams declare a `cluster` and a `project` kind. A fleet that holds no cluster is not
+and stockout streams declare a `cluster` and a `project` kind; the GCE compute stream, whose targets
+are all projects, declares `project` alone. A fleet that holds no cluster is not
 a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs
