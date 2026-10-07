@@ -17541,6 +17541,10 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertFalse(audit_report.decline_names_a_pull_request(
             "see https://gitlab.com/acme/fleet/-/work_items/12"
         ))
+        # Review (#2549): GitLab still answers the legacy form without `/-/`.
+        self.assertTrue(audit_report.decline_names_a_pull_request(
+            "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
+        ))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names

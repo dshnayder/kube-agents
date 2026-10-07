@@ -25,6 +25,7 @@ printed one.
 from __future__ import annotations
 
 import base64
+import repo_ref
 import functools
 import json
 import os
@@ -153,8 +154,12 @@ def _registered_urls() -> dict[str, str]:
             if slug and "://" in url:
                 github.setdefault(slug.lower(), url)
         else:
-            path = url.split("://", 1)[-1].split("/", 1)[-1].removesuffix(".git").strip("/")
-            other.add(path.lower())
+            # The one repository parser, not a split by hand: an scp remote
+            # (`git@host:group/name.git`) has no `/` after the host, and a
+            # hand split read it as `name` and missed the collision.
+            ref = repo_ref.try_parse(url)
+            if ref is not None:
+                other.add("/".join(ref.segments).lower())
     return {slug: url for slug, url in github.items() if slug not in other}
 
 

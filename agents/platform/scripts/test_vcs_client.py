@@ -66,6 +66,9 @@ class ForgeCallTest(unittest.TestCase):
             {"type": "github", "url": "https://github.com/acme/fleet"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/both"},
             {"type": "github", "url": "https://github.com/acme/both"},
+            # Review (#2549): an scp remote on another forge collides too.
+            {"type": "gitlab", "url": "git@gitlab.com:acme/scp.git"},
+            {"type": "github", "url": "https://github.com/acme/scp"},
         ]
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), \
                 mock.patch.object(vcs_client.credential_proxy_client, "vcs_call",
@@ -74,11 +77,11 @@ class ForgeCallTest(unittest.TestCase):
                            side_effect=lambda key: entries if key == "managed_repos" else []):
             vcs_client._registered_urls.cache_clear()
             for name in ("acme/fleet", "Acme/Fleet", "acme/both", "acme/unregistered",
-                         "gitlab.com/acme/both", "https://github.com/acme/fleet"):
+                         "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"):
                 vcs_client.call("issue-list", {"repository": name})
         self.assertEqual(
             ["https://github.com/acme/fleet", "https://github.com/acme/fleet", "acme/both",
-             "acme/unregistered", "gitlab.com/acme/both", "https://github.com/acme/fleet"],
+             "acme/unregistered", "gitlab.com/acme/both", "https://github.com/acme/fleet", "acme/scp"],
             sent,
         )
 
