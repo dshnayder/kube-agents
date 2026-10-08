@@ -168,14 +168,14 @@ NAT_CHECK_SLUG = "cloud-nat-exhaustion"
 MTU_CHECK_SLUG = "mtu-packet-fragmentation"
 ARMOR_CHECK_SLUG = "cloud-armor-false-positive"
 FIREWALL_CHECK_SLUG = "firewall-world-open-ingress"
-# The project target's limitation for a target-scoped rule that opens a
-# management port to the internet and reaches no instance the audit can see.
 # The project target's limitation when the fleet pass measured its rules
 # without the instances of other projects whose `instances list` failed.
 FLEET_INSTANCES_UNREAD_LIMITATION = (
     "firewall-world-open-ingress measured these rules without the instances of "
     "{count} other project(s), because their `instances list` read failed: {names}"
 )
+# The project target's limitation for a target-scoped rule that opens a
+# management port to the internet and reaches no instance the audit can see.
 UNDECIDED_FIREWALL_LIMITATION = (
     "firewall-world-open-ingress could not decide {count} target-scoped rule(s) "
     "that open a management port to the internet and reach no instance visible "
@@ -1179,10 +1179,11 @@ def _world_families(rule: dict) -> set[str]:
 
 def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
     """Ports an unconditional DENY of higher or equal priority already blocks on
-    this rule: same network, no target restriction, and a world source range
-    for every address family the rule opens to the world. GCP lets a deny win
-    at equal priority. A target-scoped DENY may or may not cover the instances
-    found reachable, so it is not subtracted."""
+    this rule: same network, no target restriction, no destination ranges, and
+    a world source range for every address family the rule opens to the world.
+    GCP lets a deny win at equal priority. A DENY with a target or with
+    destination ranges applies only to some instances, so
+    `_denied_on_instance` subtracts it for each instance."""
     network = _network_key(rule.get("network", ""), project)
     priority = rule.get("priority", DEFAULT_FIREWALL_PRIORITY)
     families = _world_families(rule)
@@ -1192,7 +1193,7 @@ def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
             continue
         if other.get("disabled") or (other.get("direction") or INGRESS).upper() != INGRESS:
             continue
-        if other.get("targetTags") or other.get("targetServiceAccounts"):
+        if other.get("targetTags") or other.get("targetServiceAccounts") or other.get("destinationRanges"):
             continue
         if _network_key(other.get("network", ""), project) != network:
             continue
@@ -1204,11 +1205,66 @@ def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
     return blocked
 
 
-def _matches_target(rule: dict, inst: dict, project: str) -> bool:
-    """Whether `inst` is a RUNNING instance on the rule's network inside the
-    rule's target scope. The external address is not part of this test."""
-    if inst.get("status", INSTANCE_RUNNING) != INSTANCE_RUNNING:
-        return False
+def _instance_ips(inst: dict) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Every internal and external address of `inst` that parses."""
+    found = []
+    for nic in inst.get("networkInterfaces") or []:
+        raw = [nic.get("networkIP"), nic.get("ipv6Address")]
+        raw += [a.get("natIP") for a in nic.get("accessConfigs") or []]
+        raw += [a.get("externalIpv6") for a in nic.get("ipv6AccessConfigs") or []]
+        for value in raw:
+            try:
+                found.append(ipaddress.ip_address(str(value)))
+            except ValueError:
+                continue
+    return found
+
+
+def _covers_instance(rule: dict, inst: dict) -> bool:
+    """Whether the `destinationRanges` of `rule`, if it has any, contain an
+    address of `inst`. A rule without destination ranges covers every
+    instance."""
+    ranges = rule.get("destinationRanges") or []
+    if not ranges:
+        return True
+    networks = []
+    for value in ranges:
+        try:
+            networks.append(ipaddress.ip_network(str(value), strict=False))
+        except ValueError:
+            continue
+    return any(ip in net for ip in _instance_ips(inst) for net in networks if ip.version == net.version)
+
+
+def _denied_on_instance(rule: dict, inst: dict, firewalls: list, project: str) -> set[int]:
+    """Ports a DENY of higher or equal priority blocks on `inst` for this
+    allow: same network, a world source range for every address family the
+    allow opens, a target that includes `inst`, and destination ranges, if
+    any, that contain an address of `inst`."""
+    network = _network_key(rule.get("network", ""), project)
+    priority = rule.get("priority", DEFAULT_FIREWALL_PRIORITY)
+    families = _world_families(rule)
+    blocked: set[int] = set()
+    for other in firewalls or []:
+        if not isinstance(other, dict) or not other.get("denied"):
+            continue
+        if other.get("disabled") or (other.get("direction") or INGRESS).upper() != INGRESS:
+            continue
+        if _network_key(other.get("network", ""), project) != network:
+            continue
+        if other.get("priority", DEFAULT_FIREWALL_PRIORITY) > priority:
+            continue
+        if not families or not families <= _world_families(other):
+            continue
+        if not _in_target(other, inst, project) or not _covers_instance(other, inst):
+            continue
+        blocked |= _tcp_management_ports(other.get("denied") or [])
+    return blocked
+
+
+def _in_target(rule: dict, inst: dict, project: str) -> bool:
+    """Whether `inst` is on the rule's network and inside the rule's target
+    scope. The status and the external address are not part of this test."""
     wanted = _network_key(rule.get("network", ""), project)
     if not any(_network_key(nic.get("network", ""), project) == wanted for nic in inst.get("networkInterfaces") or []):
         return False
@@ -1221,7 +1277,9 @@ def _matches_target(rule: dict, inst: dict, project: str) -> bool:
     return True
 
 
-def _reachable_instances(rule: dict, instances: list, project: str) -> list[tuple[str, str]]:
+def _reachable_instances(
+    rule: dict, instances: list, project: str, ports: list[int] | None = None, firewalls: list | None = None
+) -> list[tuple[str, str]]:
     """The instances this rule admits internet traffic to: on its network,
     holding an external IP, inside its target scope. An instance with no
     external address is not dialable from the internet, so a rule reaching only
@@ -1258,6 +1316,10 @@ def _reachable_instances(rule: dict, instances: list, project: str) -> list[tupl
         if accounts and not accounts & {
             (sa.get("email") or "").lower() for sa in inst.get("serviceAccounts") or []
         }:
+            continue
+        # A DENY that applies to this instance can block every port the allow
+        # opens. Then the allow does not reach the instance.
+        if ports is not None and not set(ports) - _denied_on_instance(rule, inst, firewalls or [], project):
             continue
         exposed.append((f"{inst.get('name', '')} ({addresses[0]})", inst.get(ORIGIN_PROJECT_KEY, project)))
     return sorted(exposed)
@@ -1296,15 +1358,15 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
         ports = sorted(_tcp_management_ports(rule.get("allowed") or []) - _shadowed_ports(rule, firewalls, project))
         if not ports:
             continue
-        reachable = _reachable_instances(rule, instances, project)
+        reachable = _reachable_instances(rule, instances, project, ports, firewalls)
         exposed = [label for label, _origin in reachable]
         if not exposed:
             # Undecided only when no visible instance carries the target. A
-            # target whose instances all have no external IP is clear: nothing
-            # on the internet can dial them.
+            # target whose instances have no external IP, are stopped, or are
+            # behind a DENY is clear: nothing on the internet can dial them.
             target_scoped = rule.get("targetTags") or rule.get("targetServiceAccounts")
             if target_scoped and not any(
-                isinstance(inst, dict) and _matches_target(rule, inst, project) for inst in instances or []
+                isinstance(inst, dict) and _in_target(rule, inst, project) for inst in instances or []
             ):
                 undecided.append(str(rule.get("name", "")))
             continue

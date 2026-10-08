@@ -1657,6 +1657,48 @@ class WorldOpenPrecedenceAndFamilyTest(unittest.TestCase):
         self.assertEqual(len(na.check_world_open_ingress([rule], [node], "p1")), 1)
 
 
+class WorldOpenDenyScopeTest(unittest.TestCase):
+    """A DENY applies only to the instances it covers: its target and its
+    destination ranges decide which ones."""
+
+    def deny(self, ports=("22",), priority=100, **extra):
+        return {
+            "name": "deny-some",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": priority,
+            "sourceRanges": ["0.0.0.0/0"],
+            "denied": [{"IPProtocol": "tcp", "ports": list(ports)}],
+            **extra,
+        }
+
+    def test_a_deny_for_one_destination_does_not_cancel_the_allow_for_all(self):
+        rules = [world_open(), self.deny(destinationRanges=["10.99.0.5/32"])]
+        self.assertEqual(len(na.check_world_open_ingress(rules, [public_node()], "p1")), 1)
+
+    def test_a_deny_for_the_instance_address_blocks_that_instance(self):
+        rules = [world_open(), self.deny(destinationRanges=["203.0.113.7/32"])]
+        self.assertEqual(na.check_world_open_ingress(rules, [public_node()], "p1"), [])
+
+    def test_a_target_scoped_deny_blocks_only_the_instances_it_targets(self):
+        """The fixture's shape: a stock `default-allow-ssh` and a DENY on the
+        tag of the planted VM."""
+        allow = world_open(name="default-allow-ssh", ports=("22",), priority=65534)
+        deny = self.deny(ports=("22", "3389"), priority=900, targetTags=["x"])
+        tagged = public_node(name="node-1", tags={"items": ["x"]})
+        self.assertEqual(na.check_world_open_ingress([allow, deny], [tagged], "p1"), [])
+        other = public_node(name="node-2", ip="203.0.113.8")
+        hits = na.check_world_open_ingress([allow, deny], [tagged, other], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("node-2", hits[0]["excerpt"])
+        self.assertNotIn("node-1", hits[0]["excerpt"])
+
+    def test_a_stopped_target_is_decided_and_clear(self):
+        rule = world_open(name="scoped", targetTags=["x"])
+        stopped = public_node(name="old-1", status="TERMINATED", tags={"items": ["x"]})
+        self.assertEqual(na.world_open_ingress([rule], [stopped], "p1"), ([], []))
+
+
 class WorldOpenUndecidedTest(unittest.TestCase):
     def test_a_target_scoped_rule_reaching_no_visible_instance_is_undecided(self):
         rule = world_open(name="allow-ssh-autopilot", targetTags=["gk3-pool"])
