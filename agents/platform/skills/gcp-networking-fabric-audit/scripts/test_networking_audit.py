@@ -883,7 +883,7 @@ class SharedVpcTest(unittest.TestCase):
         with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc"]), \
                 patch.object(networking_audit, "run_gcloud_json", side_effect=fake_subnet_reads), \
                 patch.object(networking_audit, "collect_project_target",
-                             side_effect=lambda p: {"name": f"project/{p}", "project": p, "location": "global",
+                             side_effect=lambda p, *_: {"name": f"project/{p}", "project": p, "location": "global",
                                                     "outcome": "collected", "commands": [], "candidates": [],
                                                     "checks_not_applicable": []}), \
                 patch("sys.stderr", new_callable=io.StringIO):
@@ -934,11 +934,11 @@ class SharedVpcTest(unittest.TestCase):
 
 
 class SubnetCommandsTest(unittest.TestCase):
-    def test_instances_read_is_projected_to_the_fields_counted(self):
+    def test_instances_read_is_the_project_check_s_read(self):
+        # One read serves the subnet sweep and the firewall check.
         self.assertEqual(
             networking_audit.subnet_commands("p1")["instances"],
-            ["gcloud", "compute", "instances", "list", "--project=p1",
-             "--format=json(networkInterfaces[].networkIP,networkInterfaces[].subnetwork)"],
+            networking_audit.project_commands("p1")["instances"],
         )
 
     def test_reads_pass_command_policy_and_fit_checks_run(self):
@@ -972,7 +972,12 @@ class CheckRoutingTest(unittest.TestCase):
         self.output = os.path.join(self._tmp.name, "manifest.json")
 
     def run_main(self, *extra):
+        def no_gcloud(cmd, *args, **kwargs):
+            raise AssertionError(f"the test ran gcloud: {cmd}")
+
         with patch.object(networking_audit, "get_target_projects", return_value=["p1"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=no_gcloud), \
+                patch.object(networking_audit, "read_subnet_usage", return_value={}), \
                 patch.object(networking_audit, "collect_project_target", return_value=None) as project, \
                 patch.object(networking_audit, "subnet_targets", return_value=[]) as subnets, \
                 patch("sys.stdout", new_callable=io.StringIO), \
@@ -1845,6 +1850,99 @@ class FleetInstancesUnreadTest(unittest.TestCase):
         self.assertIn("without the instances of 1 other project(s)", host["limitations"])
         self.assertIn("svc", host["limitations"])
 
+    def test_a_failed_firewall_read_in_another_project_is_named_with_the_right_cause(self):
+        rule = dict(world_open(name="host-allow-ssh"), network=HOST_NETWORK)
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [rule]}),
+            "svc": project_answers(**{"firewall-rules list": (1, "ERROR: PERMISSION_DENIED")}),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        host = {e["name"]: e for e in manifest["clusters"]}["project/host"]
+        self.assertIn("whose firewall or instance reads failed: svc", host["limitations"])
+        self.assertNotIn("because their `instances list` read failed", host["limitations"])
+
+    def test_one_run_lists_each_project_s_instances_once(self):
+        calls = []
+        per_project = {"p1": project_answers(), "p2": project_answers()}
+        with patch.object(networking_audit, "get_target_projects", return_value=["p1", "p2"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project, calls)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            networking_audit.collect_fleet()
+        for project in ("p1", "p2"):
+            reads = [c for c in calls if c[2:4] == ["instances", "list"] and f"--project={project}" in c]
+            self.assertEqual(len(reads), 1, project)
+
+
+class ForwardingRulesUnreadTest(unittest.TestCase):
+    """The firewall check uses the `forwarding-rules list` read for its
+    load-balancer path. When that read fails, the check says so."""
+
+    def setUp(self):
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+        self.addCleanup(networking_audit.FIREWALL_READS.clear)
+
+    def manifest(self, per_project, projects):
+        with patch.object(networking_audit, "get_target_projects", return_value=projects), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            return {e["name"]: e for e in networking_audit.collect_fleet()["clusters"]}
+
+    def test_a_failed_forwarding_read_names_the_unmeasured_load_balancer_path(self):
+        per_project = {
+            "p1": project_answers(**{
+                "firewall-rules list": [gke_lb_rule()],
+                "forwarding-rules list": (1, "ERROR: deadline exceeded"),
+            }),
+        }
+        target = self.manifest(per_project, ["p1"])["project/p1"]
+        self.assertIn(networking_audit.FORWARDING_UNREAD_LIMITATION, target["limitations"])
+        self.assertIn("firewall-world-open-ingress", [c["check"] for c in target["commands"]])
+
+    def test_a_passed_forwarding_read_is_part_of_the_firewall_record(self):
+        target = self.manifest({"p1": project_answers()}, ["p1"])["project/p1"]
+        record = next(c for c in target["commands"] if c["check"] == "firewall-world-open-ingress")
+        self.assertIn("gcloud compute forwarding-rules list --project=p1 --format=json", record["command"])
+        self.assertNotIn("limitations", target)
+
+    def test_a_load_balancer_hit_names_the_forwarding_read(self):
+        node = dict(private_node(), selfLink="https://x/projects/p1/zones/us-central1-a/instances/node-1")
+        per_project = {
+            "p1": project_answers(**{
+                "firewall-rules list": [gke_lb_rule()],
+                "instances list": [node],
+                "forwarding-rules list": [passthrough()],
+            }),
+        }
+        target = self.manifest(per_project, ["p1"])["project/p1"]
+        hit = next(c for c in target["candidates"] if c["check"] == "firewall-world-open-ingress")
+        self.assertIn("gcloud compute forwarding-rules list --project=p1 --format=json", hit["command"])
+
+    def test_another_project_s_failed_forwarding_read_is_named_on_the_host(self):
+        rule = dict(world_open(name="host-allow-ssh"), network=HOST_NETWORK)
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [rule]}),
+            "svc": project_answers(**{
+                "forwarding-rules list": (1, "ERROR: deadline exceeded"),
+            }),
+        }
+        host = self.manifest(per_project, ["host", "svc"])["project/host"]
+        self.assertIn("without the forwarding rules of 1 other project(s)", host["limitations"])
+        self.assertIn("svc", host["limitations"])
+
+
+class NonProductionTokenTest(unittest.TestCase):
+    def test_a_token_match_not_a_substring_match(self):
+        for name in ("device-gateway", "payments-latest", "backstage-portal", "qatar-checkout", "contest-api"):
+            with self.subTest(name):
+                self.assertFalse(na._looks_non_production(name))
+        for name in ("api-dev", "test-web", "staging-db", "web_qa", "api-dev2", "Sandbox.svc"):
+            with self.subTest(name):
+                self.assertTrue(na._looks_non_production(name))
+
 
 LB_IP = "34.1.2.3"
 
@@ -1858,14 +1956,16 @@ def gke_lb_rule(ports=("5432",), **extra):
 
 
 def passthrough(scheme="EXTERNAL", ports=("5432",), **extra):
-    return {
+    fields = {
         "name": "a1b2c3",
         "IPAddress": LB_IP,
         "loadBalancingScheme": scheme,
         "IPProtocol": "TCP",
         "ports": list(ports),
-        **extra,
+        "target": "https://www.googleapis.com/compute/v1/projects/p1/regions/us-central1/targetPools/a1b2c3",
     }
+    fields.update(extra)
+    return fields
 
 
 def private_node(name="node-1"):
@@ -1884,8 +1984,25 @@ class WorldOpenLoadBalancerTest(unittest.TestCase):
     def test_a_private_backend_behind_a_passthrough_load_balancer_is_reachable(self):
         hits = na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [passthrough()])
         self.assertEqual(len(hits), 1)
-        self.assertIn(f"through a1b2c3 {LB_IP}", hits[0]["excerpt"])
+        self.assertIn(f"through load balancer a1b2c3 {LB_IP}", hits[0]["excerpt"])
         self.assertIn("5432 (PostgreSQL)", hits[0]["excerpt"])
+
+    def test_the_excerpt_does_not_say_a_private_backend_holds_an_external_ip(self):
+        excerpt = na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [passthrough()])[0]["excerpt"]
+        self.assertNotIn("hold an external IP", excerpt)
+        self.assertIn(na.LOAD_BALANCER_PATH_NOTE, excerpt)
+
+    def test_a_wide_destination_range_names_no_load_balancer(self):
+        wide = {**gke_lb_rule(), "destinationRanges": ["34.0.0.0/8"]}
+        self.assertEqual(na.check_world_open_ingress([wide], [private_node()], "p1", [passthrough()]), [])
+
+    def test_a_tcp_proxy_forwarding_rule_is_not_a_passthrough_path(self):
+        proxy = passthrough(target="https://www.googleapis.com/compute/v1/projects/p1/global/targetTcpProxies/x")
+        self.assertEqual(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [proxy]), [])
+
+    def test_a_backend_service_forwarding_rule_is_a_passthrough_path(self):
+        regional = passthrough(target="", backendService="projects/p1/regions/us-central1/backendServices/b")
+        self.assertEqual(len(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [regional])), 1)
 
     def test_without_the_forwarding_rule_the_private_backend_is_not_reachable(self):
         self.assertEqual(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", []), [])
@@ -1917,6 +2034,19 @@ class WorldOpenAutopilotNetworkTest(unittest.TestCase):
         hits, undecided = na.world_open_ingress([rule], [], "p1", [], self.AUTOPILOT)
         self.assertEqual(hits, [])
         self.assertEqual(undecided, ["allow-kubelet (Autopilot cluster(s) p1/us-central1/ap-1)"])
+
+    def test_an_untargeted_rule_where_the_clusters_read_failed_is_undecided(self):
+        rule = world_open(name="allow-kubelet", ports=("10250",))
+        hits, undecided = na.world_open_ingress([rule], [], "p1", [], {}, ["p1"])
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["allow-kubelet (clusters read failed in p1)"])
+
+    def test_a_failed_clusters_read_is_reported_by_the_subnet_sweep(self):
+        per_project = {"p1": project_answers(**{"clusters list": (1, "PERMISSION_DENIED")})}
+        with patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            usage = networking_audit.read_subnet_usage(["p1"])
+        self.assertEqual(usage["clusters_unread"], ["p1"])
 
     def test_an_untargeted_rule_without_an_autopilot_cluster_is_clear(self):
         rule = world_open(name="allow-kubelet", ports=("10250",))

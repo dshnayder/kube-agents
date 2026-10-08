@@ -686,6 +686,8 @@ resource "google_compute_disk" "orphan_pd" {
 # nothing on this VM listens on it: the rule is a real finding with no service
 # behind it. No service account, project SSH keys blocked, OS Login on. The
 # `world_open_deny_remote` rule below blocks tcp:22 and tcp:3389.
+# The external IP is the fixture: the check fires only on an instance with one.
+#trivy:ignore:AVD-GCP-0031
 resource "google_compute_instance" "world_open" {
   name         = "world-open-${var.cluster_prefix}"
   machine_type = "e2-micro"
@@ -719,6 +721,8 @@ resource "google_compute_instance" "world_open" {
 
 # The name leads with `world-open-2379-` so the case can grade
 # `FirewallRule/world-open-2379-`, which only the finding's object carries.
+# The world-open allow is the fixture: nothing listens on tcp:2379.
+#trivy:ignore:AVD-GCP-0027
 resource "google_compute_firewall" "world_open" {
   name          = "world-open-2379-${var.cluster_prefix}"
   network       = "default"

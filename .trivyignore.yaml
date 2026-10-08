@@ -131,20 +131,6 @@ misconfigurations:
   # drift scenario's outlier and the declared 2.10 background findings in
   # bench/tf/fleet/README.md's accepted-background section. Do not "fix"
   # them; the scenarios assert on them.
-  # Ignore GCP-0031 on the seeded fleet only: `world-open-<prefix>` holds an
-  # external IP on purpose, because the networking audit's
-  # firewall-world-open-ingress check fires only on a rule that reaches an
-  # instance with one. Nothing listens on tcp:2379, and a deny rule blocks
-  # tcp:22 and tcp:3389.
-  - id: GCP-0031
-    paths:
-      - "bench/tf/fleet/**"
-  # Ignore GCP-0027 on the seeded fleet only: `world-open-2379-<prefix>` opens
-  # tcp:2379 to the internet on purpose, for the same check. Nothing listens
-  # on tcp:2379, and a deny rule blocks tcp:22 and tcp:3389.
-  - id: GCP-0027
-    paths:
-      - "bench/tf/fleet/**"
   - id: GCP-0053
     paths:
       - "bench/tf/fleet/**"
