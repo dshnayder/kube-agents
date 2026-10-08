@@ -1693,8 +1693,9 @@ class TestForgeNeutralNames(unittest.TestCase):
     def entries(*pairs):
         return [{"type": kind, "url": url} for kind, url in pairs]
 
-    def names(self, *pairs):
-        with patch("gitops_workspace.get_managed_repo_entries", return_value=self.entries(*pairs)):
+    def names(self, *pairs, context=()):
+        with patch("gitops_workspace.get_managed_repo_entries", return_value=self.entries(*pairs)), \
+                patch("gitops_workspace.mounted_repo_entries", return_value=self.entries(*context)):
             return gitops_workspace.get_managed_repos()
 
     def test_a_github_only_list_is_the_bare_slugs_it_always_was(self):
@@ -1743,6 +1744,38 @@ class TestForgeNeutralNames(unittest.TestCase):
             ),
         )
         self.assertEqual(["acme/hand"], self.names(("github", "acme/hand")))
+
+    def test_a_slug_a_context_entry_on_another_forge_spells_is_named_with_its_host(self):
+        # Fresh-context review (#2437): the client also reads the context
+        # list. A GitLab context repository with the path of a managed GitHub
+        # repository (for example, the upstream of a mirror) left the name
+        # bare in this list. The client then sent it without a host. Context
+        # entries now also count as entries of another forge.
+        self.assertEqual(
+            ["github.com/acme/infra", "acme/fleet"],
+            self.names(
+                ("github", "https://github.com/acme/infra"),
+                ("github", "https://github.com/acme/fleet"),
+                context=(("gitlab", "https://gitlab.com/acme/infra"),),
+            ),
+        )
+
+    def test_a_slug_a_skipped_entry_spells_is_named_with_its_host(self):
+        # Fresh-context review (#2437): the list skips some entries, for
+        # example a host with a port or a type that no forge here serves. The
+        # client still refuses to select a forge for that slug. Thus the list
+        # also adds the host to the slug.
+        with self.assertLogs("gitops_workspace", level="WARNING"):
+            self.assertEqual(
+                ["github.com/acme/fleet", "github.com/acme/gitea", "acme/infra"],
+                self.names(
+                    ("github", "https://github.com/acme/fleet"),
+                    ("github", "https://github.com/acme/gitea"),
+                    ("github", "https://github.com/acme/infra"),
+                    ("gitlab", "https://gitlab.example.com:8443/acme/fleet"),
+                    ("gitea", "https://gitea.example.com/acme/gitea"),
+                ),
+            )
 
     def test_an_entry_with_no_host_or_no_provider_is_skipped_and_says_why(self):
         with self.assertLogs("gitops_workspace", level="WARNING") as logs:

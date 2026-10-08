@@ -647,7 +647,7 @@ def render_report(report: dict) -> str:
             [
                 NO_REPOS_HEADING,
                 "",
-                "No GitHub repository is registered under managed_repos, so there are no "
+                "No repository on any forge is registered under managed_repos, so there are no "
                 "manifests to scan. Name one with --repo, or a local tree with --manifests-dir.",
                 "",
             ]

@@ -97,13 +97,23 @@ class ForgeCallTest(unittest.TestCase):
             {"type": "github", "url": "acme/hand"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/both"},
             {"type": "gitlab", "url": "git@gitlab.com:group/sub/proj.git"},
+            # Fresh-context review (#2437): the list skips these entries, but
+            # they still collide on the client. They are a host with a port
+            # and an unserved type.
+            {"type": "github", "url": "https://github.com/acme/ported"},
+            {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/ported"},
+            {"type": "github", "url": "https://github.com/acme/gitea"},
+            {"type": "gitea", "url": "https://gitea.example.com/acme/gitea"},
+            {"type": "github", "url": "https://github.com/acme/mirror"},
         ]
+        # A context entry on another forge also collides.
+        context = [{"type": "gitlab", "url": "https://gitlab.com/acme/mirror"}]
+        lists = {"managed_repos": entries, "context_repos": context}
         sent = []
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), \
                 mock.patch.object(vcs_client.credential_proxy_client, "vcs_call",
                                   lambda endpoint, verb, payload: sent.append(payload["repository"]) or {}), \
-                mock.patch("gitops_workspace.mounted_repo_entries",
-                           side_effect=lambda key: entries if key == "managed_repos" else []), \
+                mock.patch("gitops_workspace.mounted_repo_entries", side_effect=lambda key: lists.get(key, [])), \
                 mock.patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
             vcs_client._registered_urls.cache_clear()
             names = gitops_workspace.get_managed_repos()
@@ -111,7 +121,8 @@ class ForgeCallTest(unittest.TestCase):
                 vcs_client.call("issue-list", {"repository": name})
         vcs_client._registered_urls.cache_clear()
         self.assertEqual(
-            ["acme/fleet", "github.com/acme/both", "github.com/acme/hand",
+            ["acme/fleet", "github.com/acme/both", "github.com/acme/hand", "github.com/acme/ported",
+             "github.com/acme/gitea", "github.com/acme/mirror",
              "gitlab.com/acme/both", "gitlab.com/group/sub/proj"],
             names,
         )
