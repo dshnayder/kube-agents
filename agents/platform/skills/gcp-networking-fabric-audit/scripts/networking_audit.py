@@ -92,7 +92,7 @@ PROJECT_NUMBERS: dict[str, tuple[int, str, str]] = {}
 # Each project target's firewall and instance reads, kept for the run so
 # `collect_fleet` can measure a Shared VPC host's rules against its service
 # projects' instances: `{project: (firewalls, instances, command)}`.
-FIREWALL_READS: dict[str, tuple[list, list, str]] = {}
+FIREWALL_READS: dict[str, dict] = {}
 PROJECT_NUMBER_FORMAT = "--format=value(projectNumber)"
 PROJECT_FLAG = "--project"
 JSON_INDENT = 2
@@ -175,6 +175,18 @@ UNDECIDED_FIREWALL_LIMITATION = (
     "to the audit identity, which does not see GKE Autopilot nodes; confirm by "
     "hand that no instance carries their target: {names}"
 )
+# The instance fields that the firewall check reads. The projection keeps each
+# stored instance small for the fleet pass.
+FIREWALL_INSTANCES_FORMAT = "--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)"
+# An instance in any other state does not accept connections.
+INSTANCE_RUNNING = "RUNNING"
+# The key that records the project of each stored instance. Only this module
+# reads it.
+ORIGIN_PROJECT_KEY = "_origin_project"
+# The excerpt clause that names what the firewall check does not read.
+FIREWALL_POLICY_BLIND_SPOT = "network firewall rules only; firewall policies were not read"
+# The project target's limitation for one check whose read failed.
+UNREAD_CHECK_LIMITATION = "{check} could not be evaluated on this project: {error}"
 # The `--check` value that runs the project-level checks. `psc-routing-deadlock`
 # was this flag's value when PSC was the only project-level check here, and the
 # value is kept so a caller that passes it still runs PSC, now beside the rest.
@@ -1185,7 +1197,7 @@ def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
     return blocked
 
 
-def _reachable_instances(rule: dict, instances: list, project: str) -> list[str]:
+def _reachable_instances(rule: dict, instances: list, project: str) -> list[tuple[str, str]]:
     """The instances this rule admits internet traffic to: on its network,
     holding an external IP, inside its target scope. An instance with no
     external address is not dialable from the internet, so a rule reaching only
@@ -1198,6 +1210,10 @@ def _reachable_instances(rule: dict, instances: list, project: str) -> list[str]
     exposed = []
     for inst in instances or []:
         if not isinstance(inst, dict):
+            continue
+        # A stopped instance can keep a static external IP, but it accepts no
+        # connection.
+        if inst.get("status", INSTANCE_RUNNING) != INSTANCE_RUNNING:
             continue
         # Only an address in a family the rule opens to the world is dialable
         # through it: an IPv6-only world allow does not reach an IPv4 natIP.
@@ -1219,7 +1235,7 @@ def _reachable_instances(rule: dict, instances: list, project: str) -> list[str]
             (sa.get("email") or "").lower() for sa in inst.get("serviceAccounts") or []
         }:
             continue
-        exposed.append(f"{inst.get('name', '')} ({addresses[0]})")
+        exposed.append((f"{inst.get('name', '')} ({addresses[0]})", inst.get(ORIGIN_PROJECT_KEY, project)))
     return sorted(exposed)
 
 
@@ -1256,7 +1272,8 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
         ports = sorted(_tcp_management_ports(rule.get("allowed") or []) - _shadowed_ports(rule, firewalls, project))
         if not ports:
             continue
-        exposed = _reachable_instances(rule, instances, project)
+        reachable = _reachable_instances(rule, instances, project)
+        exposed = [label for label, _origin in reachable]
         if not exposed:
             if rule.get("targetTags") or rule.get("targetServiceAccounts"):
                 undecided.append(str(rule.get("name", "")))
@@ -1271,7 +1288,9 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
                 f"identity hold an external IP and are reachable today: "
                 f"{', '.join(exposed[:MAX_NAMED_EXPOSED_INSTANCES])}"
                 + (f", +{remainder} more" if remainder > 0 else "")
+                + f"; {FIREWALL_POLICY_BLIND_SPOT}"
             ),
+            "projects": sorted({origin for _label, origin in reachable}),
         })
     return hits, sorted(undecided)
 
@@ -1295,24 +1314,35 @@ def instance_union(groups: list[list]) -> list[dict]:
     return list(seen.values())
 
 
+def firewall_command(project: str, hit: dict) -> str:
+    """The evidence command for one §2.6 hit: the project's firewall read and
+    the `instances list` read of each project that holds a reachable instance."""
+    reads = FIREWALL_READS[project]
+    parts = [reads["firewalls_command"], reads["instances_command"]]
+    for origin in hit.get("projects") or []:
+        if origin != project and origin in FIREWALL_READS:
+            parts.append(FIREWALL_READS[origin]["instances_command"])
+    return joined_command(parts)
+
+
 def apply_fleet_firewall_reads(entries: list[dict]) -> None:
-    """Re-measure each collected project target's §2.6 against every project's
-    instances, not its own alone. A Shared VPC host holds the firewall rules and
-    its service projects hold the VMs, so a host-only measurement misses every
-    exposure the shared network carries."""
-    fleet_instances = instance_union([reads[1] for reads in FIREWALL_READS.values()])
+    """Measure again the §2.6 rules of each collected project target against the
+    instances of every project, not its own only. A Shared VPC host holds the
+    firewall rules, and its service projects hold the VMs."""
+    fleet_instances = instance_union([reads["instances"] for reads in FIREWALL_READS.values()])
     for entry in entries:
         project = entry.get("project", "")
         if entry.get("outcome") != OUTCOME_COLLECTED or project not in FIREWALL_READS:
             continue
-        firewalls, _own, command = FIREWALL_READS[project]
-        hits, undecided = world_open_ingress(firewalls, fleet_instances, project)
+        reads = FIREWALL_READS[project]
+        hits, undecided = world_open_ingress(reads["firewalls"], fleet_instances, project)
         entry["candidates"] = [c for c in entry["candidates"] if c["check"] != FIREWALL_CHECK_SLUG] + [
-            emit(FIREWALL_CHECK_SLUG, hit, command) for hit in hits
+            emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits
         ]
-        limitation = undecided_limitation(undecided)
-        if limitation:
-            entry["limitations"] = limitation
+        limitations = [*reads["limitations"], undecided_limitation(undecided)]
+        limitations = [text for text in limitations if text]
+        if limitations:
+            entry["limitations"] = LIMITATION_JOINER.join(limitations)
         else:
             entry.pop("limitations", None)
 
@@ -1370,7 +1400,8 @@ def joined_record(reads: SlugReads) -> dict:
 
 
 class GateFailure(Exception):
-    """One of a project target's reads failed; that target fails closed."""
+    """A read failed. The project target records the checks that use this read
+    as unevaluated, and the other checks keep their verdicts."""
 
 
 class ComputeApiDisabled(Exception):
@@ -1401,7 +1432,7 @@ def project_commands(project: str) -> dict[str, list[str]]:
         "security_policies": [GCLOUD, "compute", "security-policies", "list", flag, fmt],
         "backend_services": [GCLOUD, "compute", "backend-services", "list", flag, fmt],
         "firewall_rules": [GCLOUD, "compute", "firewall-rules", "list", flag, fmt],
-        "instances": [GCLOUD, "compute", "instances", "list", flag, fmt],
+        "instances": [GCLOUD, "compute", "instances", "list", flag, FIREWALL_INSTANCES_FORMAT],
     }
 
 
@@ -1415,22 +1446,39 @@ def router_commands(project: str, router: str, region: str, nat: str | None = No
 
 def collect_project_target(project: str) -> dict | None:
     """The `project/<project>` entry for the five project-level checks, or None
-    for a project whose own Compute Engine API is off."""
+    for a project whose own Compute Engine API is off.
+
+    A failed read costs only the checks that use it. Each such check goes in
+    `checks_unevaluated` with a `limitations` sentence, and the other checks
+    keep their verdicts. The target is `gate-failed` only when no check has a
+    read that passed.
+    """
     name = f"{PROJECT_TARGET_PREFIX}{project}"
     reads: dict[str, SlugReads] = {}
     candidates: list[dict] = []
+    unevaluated: list[dict] = []
+    limitations: list[str] = []
+    errors: list[str] = []
     cmds = project_commands(project)
 
-    def gated(cmd: list[str], slug: str, shape: type | tuple[type, ...] = list):
+    def gated(cmd: list[str], slug: str, shape: type = list):
         parsed, error, stdout, seconds = read_gcloud_json(cmd)
         if parsed == API_DISABLED:
             raise ComputeApiDisabled()
         if error is not None or not isinstance(parsed, shape):
-            raise GateFailure(f"{slug}: {error or f'`{shlex.join(cmd)}` returned {type(parsed).__name__}'}")
+            raise GateFailure(error or f"`{shlex.join(cmd)}` returned {type(parsed).__name__}")
         reads.setdefault(slug, SlugReads()).add(shlex.join(cmd), stdout, seconds)
         return parsed
 
-    try:
+    def unread(slug: str, exc: GateFailure) -> None:
+        reads.pop(slug, None)
+        candidates[:] = [c for c in candidates if c["check"] != slug]
+        errors.append(f"{slug}: {exc}")
+        reason = str(exc)[:ERROR_EXCERPT_CHARS]
+        unevaluated.append({"check": slug, "reason": reason})
+        limitations.append(UNREAD_CHECK_LIMITATION.format(check=slug, error=reason))
+
+    def nat() -> None:
         routers = gated(cmds["routers"], NAT_CHECK_SLUG)
         for router in routers:
             if not isinstance(router, dict) or not router.get("nats"):
@@ -1440,45 +1488,80 @@ def collect_project_target(project: str) -> dict | None:
             router_reads = [cmds["routers"], router_commands(project, router_name, region)]
             status = gated(router_reads[-1], NAT_CHECK_SLUG, dict)
             mappings = {}
-            for nat in router["nats"]:
-                if not nat.get("enableDynamicPortAllocation"):
+            for gateway in router["nats"]:
+                if not gateway.get("enableDynamicPortAllocation"):
                     continue
-                nat_name = nat.get("name", "")
+                nat_name = gateway.get("name", "")
                 router_reads.append(router_commands(project, router_name, region, nat_name))
-                mappings[nat_name] = gated(router_reads[-1], NAT_CHECK_SLUG, (list, dict))
+                mappings[nat_name] = gated(router_reads[-1], NAT_CHECK_SLUG)
             hit = check_router_nat(router, status, mappings)
             if hit:
                 candidates.append(emit(NAT_CHECK_SLUG, hit, joined_command([shlex.join(c) for c in router_reads])))
 
+    def psc() -> None:
         forwarding_rules = gated(cmds["forwarding_rules"], PSC_CHECK_SLUG)
-        candidates += [
+        candidates.extend(
             emit(PSC_CHECK_SLUG, hit, shlex.join(cmds["forwarding_rules"]))
             for hit in check_psc_routing(forwarding_rules)
-        ]
+        )
+
+    def mtu() -> None:
         networks = gated(cmds["networks"], MTU_CHECK_SLUG)
-        candidates += [
+        candidates.extend(
             emit(MTU_CHECK_SLUG, hit, shlex.join(cmds["networks"])) for hit in check_mtu_mismatch(networks, project)
-        ]
+        )
+
+    def armor() -> None:
         policies = gated(cmds["security_policies"], ARMOR_CHECK_SLUG)
         backends = gated(cmds["backend_services"], ARMOR_CHECK_SLUG)
         armor_command = command_text(cmds["security_policies"], cmds["backend_services"])
-        candidates += [emit(ARMOR_CHECK_SLUG, hit, armor_command) for hit in check_cloud_armor(policies, backends)]
+        candidates.extend(emit(ARMOR_CHECK_SLUG, hit, armor_command) for hit in check_cloud_armor(policies, backends))
+
+    undecided: list[str] = []
+
+    def firewall() -> None:
         firewalls = gated(cmds["firewall_rules"], FIREWALL_CHECK_SLUG)
-        instances = gated(cmds["instances"], FIREWALL_CHECK_SLUG)
-        firewall_command = command_text(cmds["firewall_rules"], cmds["instances"])
-        firewall_hits, undecided = world_open_ingress(firewalls, instances, project)
-        candidates += [emit(FIREWALL_CHECK_SLUG, hit, firewall_command) for hit in firewall_hits]
-        FIREWALL_READS[project] = (firewalls, instances, firewall_command)
+        instances = [
+            {**inst, ORIGIN_PROJECT_KEY: project}
+            for inst in gated(cmds["instances"], FIREWALL_CHECK_SLUG)
+            if isinstance(inst, dict)
+        ]
+        FIREWALL_READS[project] = {
+            "firewalls": firewalls,
+            "instances": instances,
+            "firewalls_command": shlex.join(cmds["firewall_rules"]),
+            "instances_command": shlex.join(cmds["instances"]),
+            "limitations": limitations,
+        }
+        hits, rules = world_open_ingress(firewalls, instances, project)
+        candidates.extend(emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits)
+        undecided.extend(rules)
+
+    try:
+        for slug, check in (
+            (NAT_CHECK_SLUG, nat),
+            (PSC_CHECK_SLUG, psc),
+            (MTU_CHECK_SLUG, mtu),
+            (ARMOR_CHECK_SLUG, armor),
+            (FIREWALL_CHECK_SLUG, firewall),
+        ):
+            try:
+                check()
+            except GateFailure as exc:
+                unread(slug, exc)
     except ComputeApiDisabled:
+        FIREWALL_READS.pop(project, None)
         sys.stderr.write(f"{project}: Compute Engine API is not enabled; nothing here to audit\n")
         return None
-    except GateFailure as exc:
+    if not reads:
         return {
             "name": name,
             "project": project,
             "location": GLOBAL_LOCATION,
             "outcome": OUTCOME_GATE_FAILED,
-            "error": str(exc),
+            # The first failure in full: it names the read that every later
+            # read then also failed.
+            "error": errors[0],
         }
     entry = {
         "name": name,
@@ -1489,9 +1572,12 @@ def collect_project_target(project: str) -> dict | None:
         "candidates": candidates,
         "checks_not_applicable": [],
     }
-    limitation = undecided_limitation(undecided)
-    if limitation:
-        entry["limitations"] = limitation
+    if unevaluated:
+        entry["checks_unevaluated"] = unevaluated
+    all_limitations = [*limitations, undecided_limitation(undecided)]
+    all_limitations = [text for text in all_limitations if text]
+    if all_limitations:
+        entry["limitations"] = LIMITATION_JOINER.join(all_limitations)
     return entry
 
 

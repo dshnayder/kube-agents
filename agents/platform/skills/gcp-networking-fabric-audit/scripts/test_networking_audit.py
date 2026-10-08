@@ -1703,6 +1703,9 @@ class SharedVpcFirewallTest(unittest.TestCase):
         objects = [c["object"] for c in by_name["project/host"]["candidates"]]
         self.assertEqual(objects, ["FirewallRule/host-allow-ssh"])
         self.assertIn("svc-vm", by_name["project/host"]["candidates"][0]["excerpt"])
+        command = by_name["project/host"]["candidates"][0]["command"]
+        self.assertIn("gcloud compute firewall-rules list --project=host", command)
+        self.assertIn("gcloud compute instances list --project=svc", command)
 
 
 class ManagementPortsPinTest(unittest.TestCase):
@@ -1769,17 +1772,61 @@ class ProjectTargetTest(unittest.TestCase):
         self.collect(calls, **{"routers list": [{"name": "bgp-only", "region": "regions/us-central1"}]})
         self.assertFalse([c for c in calls if "get-status" in c])
 
-    def test_a_failed_read_gates_the_whole_project_target(self):
+    def test_a_failed_read_costs_only_its_own_check(self):
         entry = self.collect(**{"networks list": (1, "PERMISSION_DENIED compute.networks.list")})
-        self.assertEqual(entry["outcome"], "gate-failed")
-        self.assertIn("mtu-packet-fragmentation", entry["error"])
-        self.assertIn("PERMISSION_DENIED", entry["error"])
-        self.assertNotIn("commands", entry)
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(unevaluated_slugs(entry), ["mtu-packet-fragmentation"])
+        self.assertIn("PERMISSION_DENIED", entry["checks_unevaluated"][0]["reason"])
+        self.assertIn("mtu-packet-fragmentation could not be evaluated", entry["limitations"])
+        self.assertNotIn("mtu-packet-fragmentation", [c["check"] for c in entry["commands"]])
 
-    def test_a_get_status_that_is_not_an_object_gates_the_target(self):
+    def test_a_nat_read_failure_keeps_the_other_checks_and_their_findings(self):
+        entry = self.collect(**{
+            "routers list": [dynamic_router()],
+            "get-status": (1, "DEADLINE_EXCEEDED"),
+            "firewall-rules list": [world_open()],
+            "instances list": [public_node()],
+            "forwarding-rules list": [{
+                "name": "psc-ep-1",
+                "target": "projects/p1/regions/us-central1/serviceAttachments/sa-1",
+                "pscConnectionStatus": "REJECTED",
+            }],
+        })
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(unevaluated_slugs(entry), ["cloud-nat-exhaustion"])
+        self.assertEqual(
+            [c["check"] for c in entry["commands"]],
+            ["psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
+             "firewall-world-open-ingress"],
+        )
+        self.assertEqual(
+            sorted(c["check"] for c in entry["candidates"]),
+            ["firewall-world-open-ingress", "psc-routing-deadlock"],
+        )
+
+    def test_a_firewall_read_failure_lists_only_the_firewall_check(self):
+        entry = self.collect(**{"firewall-rules list": (1, "PERMISSION_DENIED compute.firewalls.list")})
+        self.assertEqual(unevaluated_slugs(entry), ["firewall-world-open-ingress"])
+        self.assertEqual(len(entry["commands"]), 4)
+
+    def test_a_get_status_that_is_not_an_object_costs_the_nat_check(self):
         entry = self.collect(**{"routers list": [dynamic_router()], "get-status": []})
+        self.assertEqual(unevaluated_slugs(entry), ["cloud-nat-exhaustion"])
+        self.assertIn("returned list", entry["checks_unevaluated"][0]["reason"])
+
+    def test_a_nat_mapping_that_is_not_a_list_costs_the_nat_check(self):
+        mapping = {"n": {"result": [{"instanceName": "busy-vm", "interfaceNatMappings": [{"numTotalNatPorts": 4000}]}]}}
+        entry = self.collect(**{"routers list": [dynamic_router()], "get-nat-mapping-info": mapping})
+        self.assertEqual(unevaluated_slugs(entry), ["cloud-nat-exhaustion"])
+        self.assertIn("returned dict", entry["checks_unevaluated"][0]["reason"])
+
+    def test_every_read_failing_gates_the_target(self):
+        entry = self.collect(**{phrase: (1, "PERMISSION_DENIED") for phrase in (
+            "routers list", "forwarding-rules list", "networks list", "security-policies list",
+            "firewall-rules list")})
         self.assertEqual(entry["outcome"], "gate-failed")
-        self.assertIn("returned list", entry["error"])
+        self.assertIn("cloud-nat-exhaustion", entry["error"])
+        self.assertNotIn("commands", entry)
 
     def test_each_candidate_names_the_reads_that_produced_it(self):
         entry = self.collect(**{
@@ -1797,9 +1844,33 @@ class ProjectTargetTest(unittest.TestCase):
         self.assertEqual(
             by_check["firewall-world-open-ingress"]["command"],
             "gcloud compute firewall-rules list --project=p1 --format=json && "
-            "gcloud compute instances list --project=p1 --format=json",
+            "gcloud compute instances list --project=p1 "
+            "'--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)'",
         )
         self.assertEqual(by_check["firewall-world-open-ingress"]["severity"], "critical")
+
+
+def unevaluated_slugs(entry):
+    return [e["check"] for e in entry.get("checks_unevaluated") or []]
+
+
+class FirewallReadNarrowingTest(unittest.TestCase):
+    def test_a_stopped_instance_with_a_static_ip_is_not_reachable(self):
+        stopped = public_node(name="stopped-vm", status="TERMINATED")
+        running = public_node(name="running-vm", ip="203.0.113.8", status="RUNNING")
+        hits = na.check_world_open_ingress([world_open()], [stopped, running], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("running-vm", hits[0]["excerpt"])
+        self.assertNotIn("stopped-vm", hits[0]["excerpt"])
+        self.assertEqual(na.check_world_open_ingress([world_open()], [stopped], "p1"), [])
+
+    def test_the_excerpt_names_the_policy_blind_spot(self):
+        hit = na.check_world_open_ingress([world_open()], [public_node()], "p1")[0]
+        self.assertIn("network firewall rules only; firewall policies were not read", hit["excerpt"])
+
+    def test_the_instance_read_is_narrowed_to_the_fields_used(self):
+        argv = networking_audit.project_commands("p1")["instances"]
+        self.assertEqual(argv[-1], "--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)")
 
 
 class SlugReadsTest(unittest.TestCase):
