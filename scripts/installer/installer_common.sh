@@ -3240,7 +3240,7 @@ write_tfvars_from_state() {
       echo "gitops_forge              = \"gitlab\""
       echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
       echo "gitlab_repo               = $(hcl_str "${GITOPS_REPO:-}")"
-      echo "gitlab_credentials_secret = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}")"
+      echo "gitlab_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}")"
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
     fi

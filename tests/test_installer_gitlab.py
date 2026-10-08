@@ -108,13 +108,13 @@ class GitLabTfvarsTest(unittest.TestCase):
         self.assertIn('gitops_forge              = "gitlab"', content)
         self.assertIn('gitops_host               = "gitlab.example.com"', content)
         self.assertIn('gitlab_repo               = "platform/infra/gitops"', content)
-        self.assertIn('gitlab_credentials_secret = "gl-token"', content)
+        self.assertIn('gitlab_token_secret_name  = "gl-token"', content)
         self.assertNotIn("github_repo", content)
         self.assertRegex(content, r"enable_github_minter\s*=\s*false")
 
     def test_gitlab_secret_name_defaults(self):
         content = self._tfvars({"GITOPS_FORGE": "gitlab", "GITOPS_REPO": "g/p"})
-        self.assertIn('gitlab_credentials_secret = "gitlab-forge-token"', content)
+        self.assertIn('gitlab_token_secret_name  = "gitlab-forge-token"', content)
         self.assertIn('gitops_host               = ""', content)
 
     # GitHub installs this change must leave byte-identical. The goldens were
@@ -143,7 +143,7 @@ class GitLabTfvarsTest(unittest.TestCase):
         explicit = self._tfvars({**github, "GITOPS_FORGE": "github"})
         self.assertEqual(unset, explicit)
         self.assertIn('github_repo = "acme/infra"', unset)
-        for key in ("gitops_forge", "gitops_host", "gitlab_repo", "gitlab_credentials_secret"):
+        for key in ("gitops_forge", "gitops_host", "gitlab_repo", "gitlab_token_secret_name"):
             self.assertNotIn(key, unset)
 
 
@@ -216,7 +216,7 @@ class GitLabFlagsTest(unittest.TestCase):
     def test_validator_refuses(self):
         for case in (
             {"PARAM_GITOPS_FORGE": "bitbucket"},
-            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_HOST": "gitlab.com"},
+            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_HOST": "gitlab.com", "PARAM_GITOPS_HOST_FROM_FLAG": "true"},
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITLAB_TOKEN_FILE": "/etc/hostname"},
             self._gitlab(PARAM_GITOPS_HOST="https://gitlab.com"),
             self._gitlab(PARAM_GITOPS_HOST="gitlab.com:8443"),
@@ -229,7 +229,12 @@ class GitLabFlagsTest(unittest.TestCase):
             self._gitlab(PARAM_GITOPS_REPO="a/*"),
             self._gitlab(PARAM_GITOPS_REPO="git@gitlab.com:a/b.git"),
             self._gitlab(PARAM_GITOPS_REPO="https://evil.example/a/b"),
-            self._gitlab(PARAM_GITHUB_APP_ID="123"),
+            self._gitlab(PARAM_GITHUB_APP_ID="123", PARAM_GITHUB_APP_FROM_FLAG="true"),
+            self._gitlab(PARAM_GITOPS_REPO="g/p\nX"),
+            self._gitlab(PARAM_GITOPS_REPO="g/p x"),
+            self._gitlab(PARAM_GITOPS_REPO="Platform.GIT/infra"),
+            self._gitlab(PARAM_GITOPS_REPO="grp.Atom/proj"),
+            self._gitlab(PARAM_GITOPS_REPO="grp/proj.ATOM"),
             self._gitlab(PARAM_GITLAB_TOKEN_SECRET="Bad_Name"),
             self._gitlab(PARAM_GITLAB_TOKEN_FILE=str(self._tmp / "missing")),
             self._gitlab(PARAM_GITOPS_REPO="", PARAM_NON_INTERACTIVE="true"),
@@ -373,7 +378,12 @@ class GitLabTokenNeverLeaksTest(unittest.TestCase):
                 seen = out.index(pending[0][0], seen) + len(pending[0][0])
                 time.sleep(0.2)
                 os.write(fd, pending.pop(0)[1])
+        else:
+            # Out of time with the child still parked on a prompt: kill it, or
+            # waitpid would hang the suite instead of failing the test.
+            os.kill(pid, 9)
         os.waitpid(pid, 0)
+        os.close(fd)
         return out.decode(errors="replace"), pending
 
     def _apply_calls(self):
@@ -587,7 +597,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         dest.write_text("PROJECT_ID=p\nGITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=123\nMEMORY=file\n")
         proc = self._bash(
             "export GITOPS_FORGE=gitlab GITOPS_HOST=gitlab.corp.example GITOPS_REPO=g/sub/p GITLAB_TOKEN_SECRET=gl GITOPS_ORG= GITHUB_APP_ID=\n"
-            f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+            f'record_gitops_forge_keys "{dest}"\n'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         text = dest.read_text()
@@ -609,7 +619,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         dest.write_text("PROJECT_ID=p\nGITOPS_FORGE=gitlab\nGITOPS_HOST=\nGITLAB_TOKEN_SECRET=gl\nGITOPS_REPO=g/p\n")
         proc = self._bash(
             "unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET; export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=9\n"
-            f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+            f'record_gitops_forge_keys "{dest}"\n'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         text = dest.read_text()
@@ -618,11 +628,92 @@ class GitLabInstallEnvTest(unittest.TestCase):
         for line in ("GITOPS_ORG=acme", "GITOPS_REPO=infra", "GITHUB_APP_ID=9", "PROJECT_ID=p"):
             self.assertIn(line + "\n", text)
 
+    def test_a_previewed_or_declined_switch_records_nothing(self):
+        # bootstrap runs at step 10, before the confirmation and the
+        # --generate-only exit; only the post-confirmation call may write.
+        dest = self._tmp / "install.env"
+        original = "PROJECT_ID=p\nGITOPS_ORG=acme\nGITOPS_REPO=infra\n"
+        dest.write_text(original)
+        proc = self._bash(
+            "export GITOPS_FORGE=gitlab GITOPS_REPO=g/p GITOPS_ORG=\n"
+            f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(dest.read_text(), original)
+        source = _INSTALL_SH.read_text()
+        call = source.index('  record_gitops_forge_keys "$INSTALL_ENV_FILE"')
+        self.assertLess(source.index('write_json_report "GENERATE_ONLY_SUCCESS"'), call)
+        self.assertLess(source.index('write_json_report "PAUSED"'), call)
+        self.assertLess(call, source.index('print_step "12. Applying the Install'))
+        self.assertEqual(source.count("record_gitops_forge_keys \""), 1)
+
+    def test_a_switch_to_gitlab_drops_the_pem_path_too(self):
+        dest = self._tmp / "install.env"
+        dest.write_text("GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=1\nGITHUB_PEM_PATH=/k.pem\n")
+        proc = self._bash(f'export GITOPS_FORGE=gitlab GITOPS_REPO=g/p\nrecord_gitops_forge_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertNotIn("GITHUB_PEM_PATH", dest.read_text())
+
+    def _source_with(self, recorded, *flags):
+        """Source install.sh over an install.env, then parse flags and validate."""
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text(recorded)
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"parse_args {' '.join(shlex.quote(f) for f in flags)}\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc forge=$PARAM_GITOPS_FORGE host=[$PARAM_GITOPS_HOST] app=[$PARAM_GITHUB_APP_ID] pem=[$PARAM_GITHUB_PEM_PATH]"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            stdin=subprocess.DEVNULL, start_new_session=True, timeout=60,
+            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+        )
+
+    def test_a_recorded_github_app_does_not_block_a_switch_to_gitlab(self):
+        proc = self._source_with(
+            "GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=123\nGITHUB_PEM_PATH=/k.pem\n",
+            "--gitops-forge=gitlab", "--gitops-repo=g/p",
+        )
+        self.assertIn("rc=0 forge=gitlab host=[] app=[] pem=[]", proc.stdout, proc.stderr)
+        self.assertIn("Dropping the recorded GitHub App", proc.stdout)
+
+    def test_a_github_app_flag_with_gitlab_is_still_refused(self):
+        proc = self._source_with("", "--gitops-forge=gitlab", "--gitops-repo=g/p", "--github-app-id=1")
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr)
+
+    def test_a_recorded_self_managed_host_does_not_block_a_switch_to_github(self):
+        proc = self._source_with(
+            "GITOPS_FORGE=gitlab\nGITOPS_HOST=gitlab.example.com\nGITOPS_REPO=g/p\nGITLAB_TOKEN_SECRET=gl\n",
+            "--gitops-forge=github", "--gitops-org=acme", "--gitops-repo=infra",
+        )
+        self.assertIn("rc=0 forge=github host=[]", proc.stdout, proc.stderr)
+
+    def test_a_host_flag_with_github_is_still_refused(self):
+        proc = self._source_with("", "--gitops-forge=github", "--gitops-host=gitlab.example.com")
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr)
+
+    def test_a_shell_export_does_not_choose_install_sh_s_forge(self):
+        # install.sh loads install.env through bootstrap_install_env, not
+        # load_install_env; both must ignore the shell.
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text("GITOPS_ORG=acme\nGITOPS_REPO=infra\n")
+        body = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\necho "forge=[$PARAM_GITOPS_FORGE] host=[$PARAM_GITOPS_HOST] secret=[$PARAM_GITLAB_TOKEN_SECRET]"\n'
+        proc = subprocess.run(
+            ["bash", "-c", body], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            stdin=subprocess.DEVNULL, start_new_session=True, timeout=60,
+            env=get_isolated_test_env(overrides={
+                "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITOPS_FORGE": "gitlab",
+                "GITOPS_HOST": "h.example", "GITLAB_TOKEN_SECRET": "x",
+            }),
+        )
+        self.assertIn("forge=[] host=[] secret=[]", proc.stdout, proc.stderr)
+
     def test_an_unchanged_github_install_env_is_not_touched(self):
         dest = self._tmp / "install.env"
         original = "PROJECT_ID=p\n# a comment\nGITOPS_ORG=acme\nGITOPS_REPO=infra\n"
         dest.write_text(original)
-        proc = self._bash(f'export GITOPS_ORG=acme GITOPS_REPO=infra\nbootstrap_install_env_file "{dest}" 0.5.0\n')
+        proc = self._bash(f'export GITOPS_ORG=acme GITOPS_REPO=infra\nrecord_gitops_forge_keys "{dest}"\n')
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertEqual(dest.read_text(), original)
         self.assertNotIn("Recorded the GitOps forge", proc.stdout)
@@ -632,7 +723,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         original = "GITOPS_FORGE=gitlab\nGITOPS_HOST=\nGITLAB_TOKEN_SECRET=gl\nGITOPS_REPO=g/p\n# kept\n"
         dest.write_text(original)
         proc = self._bash(
-            f'export GITOPS_FORGE=gitlab GITOPS_HOST= GITLAB_TOKEN_SECRET=gl GITOPS_REPO=g/p\nbootstrap_install_env_file "{dest}" 0.5.0\n'
+            f'export GITOPS_FORGE=gitlab GITOPS_HOST= GITLAB_TOKEN_SECRET=gl GITOPS_REPO=g/p\nrecord_gitops_forge_keys "{dest}"\n'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertEqual(dest.read_text(), original)
@@ -679,7 +770,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
             ("gitops_forge", '"github"'),
             ("gitops_host", '""'),
             ("gitlab_repo", '""'),
-            ("gitlab_credentials_secret", '"gitlab-forge-token"'),
+            ("gitlab_token_secret_name", '"gitlab-forge-token"'),
         ):
             m = re.search(r'variable "%s" \{(.*?)\n\}' % name, self.variables, re.S)
             self.assertIsNotNone(m, name)
@@ -687,11 +778,13 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
             self.assertNotIn("sensitive", m.group(1))
 
     def test_no_token_variable(self):
-        self.assertNotRegex(self.variables, r'variable "gitlab_token')
+        # Only the Secret's name is a variable; nothing that could hold the token.
+        names = re.findall(r'^variable "(gitlab_\w+)"', self.variables, re.M)
+        self.assertEqual(sorted(names), ["gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
         self.assertIn("!local.gitops_is_gitlab && (local.github_org", self.main)
-        self.assertIn("credentialsRef = { name = var.gitlab_credentials_secret }", self.main)
+        self.assertIn("credentialsRef = { name = var.gitlab_token_secret_name }", self.main)
         self.assertIn('role = "gitops"', self.main)
 
     def test_precondition_refuses_a_minter_on_gitlab(self):

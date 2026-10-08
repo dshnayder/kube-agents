@@ -581,7 +581,7 @@ variable "github_repo" {
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_credentials_secret names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install declares one gitlab forge and its gitops repository through spec.integration.forges/repositories; github_repo and enable_github_minter must be left unset."
   type        = string
   default     = "github"
   validation {
@@ -606,13 +606,13 @@ variable "gitlab_repo" {
   default     = ""
 }
 
-variable "gitlab_credentials_secret" {
+variable "gitlab_token_secret_name" {
   description = "Name of the Kubernetes Secret, in the agent's namespace, holding the GitLab access token under the key `token`. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is gitlab."
   type        = string
   default     = "gitlab-forge-token"
   validation {
-    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_credentials_secret)) && length(var.gitlab_credentials_secret) <= 253
-    error_message = "gitlab_credentials_secret must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_token_secret_name)) && length(var.gitlab_token_secret_name) <= 253
+    error_message = "gitlab_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 

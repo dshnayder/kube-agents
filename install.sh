@@ -297,6 +297,10 @@ bootstrap_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
+  # switch a recorded GitHub install's forge for this run. --gitops-forge is
+  # the per-run way in.
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -401,6 +405,11 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# Whether a value came from a flag rather than install.env: a switch of forge
+# by flag drops what the file recorded for the other forge, but refuses a flag
+# that contradicts it.
+PARAM_GITOPS_HOST_FROM_FLAG="false"
+PARAM_GITHUB_APP_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -874,11 +883,11 @@ parse_args() {
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
-      --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; shift ;;
+      --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
-      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -1680,7 +1689,7 @@ warn_unrecorded_interview_answers() {
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "install.env is an input: install.sh reads it and rewrites only its GitOps forge keys, when an applied run changes them."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1867,7 +1876,7 @@ record_gitops_forge_keys() {
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -1893,11 +1902,11 @@ bootstrap_install_env_file() {
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
     print_info "Left your install configuration as you wrote it: ${destination}"
-    record_gitops_forge_keys "$destination"
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
-    # The flags that override a recorded value for one run. Beyond the forge
-    # keys above, this function never rewrites an existing file, so only a
+    # The flags that override a recorded value for one run. This function
+    # never rewrites an existing file (record_gitops_forge_keys, after the
+    # apply is chosen, is the one writer of an existing file), so only a
     # first install can record any of them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
@@ -2138,7 +2147,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it, except the GitOps forge keys when an applied run changes them."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -3965,17 +3974,22 @@ GITLAB_HOST_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+
 # ending, which GitLab reserves.
 gitlab_repo_path() {
   local repo="$1" host="${2:-gitlab.com}"
+  # Whitespace, a newline included, is in no segment the grammar admits; the
+  # split below reads one line, so it is refused here, whole.
+  [[ "$repo" =~ [[:space:]] ]] && return 0
   repo="${repo%/}"
   repo="${repo%.git}"
   case "$repo" in
     https://"$host"/*) repo="${repo#https://"$host"/}" ;;
     http://*|https://*|*://*|*@*:*) return 0 ;;
   esac
-  local seg n=0 segs=()
+  local seg lower n=0 segs=()
   IFS=/ read -r -a segs <<<"$repo"
   [[ "$repo" == */ ]] && return 0
   for seg in "${segs[@]}"; do
-    if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$seg" == *.git ]] || [[ "$seg" == *.atom ]]; then
+    # The reserved endings in any case, as the operator compares them.
+    lower="$(printf '%s' "$seg" | tr '[:upper:]' '[:lower:]')"
+    if ! [[ "$seg" =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?$ ]] || [[ "$lower" == *.git ]] || [[ "$lower" == *.atom ]]; then
       return 0
     fi
     n=$((n + 1))
@@ -4014,6 +4028,12 @@ validate_gitops_forge_flags() {
       ;;
   esac
   if [ "${PARAM_GITOPS_FORGE:-github}" != "gitlab" ]; then
+    # A host install.env recorded for a GitLab install is that install's, not
+    # this run's: a switch back to GitHub drops it.
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ]; then
+      print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
+      PARAM_GITOPS_HOST=""
+    fi
     if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
       print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
       return 1
@@ -4033,8 +4053,16 @@ validate_gitops_forge_flags() {
     esac
   fi
   if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
-    print_error "--github-app-id and --github-pem-path configure the GitHub token minter, which a GitLab install does not have."
-    return 1
+    if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
+      print_error "--github-app-id and --github-pem-path configure the GitHub token minter, which a GitLab install does not have."
+      return 1
+    fi
+    # Recorded by a GitHub install this run switches to GitLab: the minter
+    # goes with the forge, and install.env stops recording it once the
+    # switch is applied.
+    print_info "Dropping the recorded GitHub App (GITHUB_APP_ID, GITHUB_PEM_PATH): a GitLab install has no token minter."
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
   fi
   if [ -n "${PARAM_GITOPS_REPO:-}" ]; then
     local path
@@ -5614,6 +5642,9 @@ main() {
     PARAM_GITHUB_APP_ID=""
     PARAM_GITHUB_PEM_PATH=""
     if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+      # A single name is the GitHub default (or a GitHub repository) the
+      # forge question was asked over; a GitLab project has no default path.
+      [[ "$github_repo" == */* ]] || github_repo=""
       while true; do
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
         [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
@@ -6449,6 +6480,11 @@ main() {
     write_json_report "GENERATE_ONLY_SUCCESS"
     exit 0
   fi
+
+  # Only now, with the apply chosen: a forge switch the operator previewed
+  # (--generate-only) or declined must leave install.env as it was, or the
+  # next upgrade.sh would render the forge nobody applied.
+  record_gitops_forge_keys "$INSTALL_ENV_FILE"
 
   # 12. Execute the Terraform Engine
   print_step "12. Applying the Install (Terraform + Helm)"

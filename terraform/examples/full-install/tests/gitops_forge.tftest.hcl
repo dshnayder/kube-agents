@@ -18,6 +18,7 @@ mock_provider "google" {
 mock_provider "google-beta" {}
 mock_provider "helm" {}
 mock_provider "http" {}
+mock_provider "time" {}
 mock_provider "random" {
   mock_resource "random_password" {
     defaults = { result = "mock-password" }
@@ -74,7 +75,7 @@ run "gitlab_renders_the_lists" {
     gitops_forge              = "gitlab"
     gitops_host               = "gitlab.example.com"
     gitlab_repo               = "platform/infra/gitops"
-    gitlab_credentials_secret = "gl-token"
+    gitlab_token_secret_name  = "gl-token"
   }
   assert {
     condition = local.gitlab_forges == [{
@@ -122,6 +123,22 @@ run "gitlab_needs_a_repo" {
   command = plan
   variables {
     gitops_forge = "gitlab"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "gitlab_inputs_need_the_gitlab_forge" {
+  command = plan
+  variables {
+    gitlab_repo = "g/p"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "a_gitlab_host_needs_the_gitlab_forge" {
+  command = plan
+  variables {
+    gitops_host = "gitlab.example.com"
   }
   expect_failures = [helm_release.kube_agents]
 }
@@ -177,7 +194,7 @@ run "gitlab_release_values" {
     gitops_forge              = "gitlab"
     gitops_host               = "gitlab.example.com"
     gitlab_repo               = "platform/infra/gitops"
-    gitlab_credentials_secret = "gl-token"
+    gitlab_token_secret_name  = "gl-token"
   }
   assert {
     condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration) == jsonencode({

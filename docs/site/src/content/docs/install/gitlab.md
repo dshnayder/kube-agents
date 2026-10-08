@@ -78,10 +78,15 @@ Use `--server-side`. A plain `kubectl apply` stores the whole object, token
 included, in the Secret's `kubectl.kubernetes.io/last-applied-configuration`
 annotation.
 
-`install.sh` records the forge, host, project and Secret name in `install.env`, on a
-first install and whenever a run changes the forge, so `upgrade.sh` and the Day-2 menu go
-on rendering GitLab. A switch to GitLab also drops the file's `GITHUB_APP_ID`. A
-`GITOPS_FORGE` exported in your shell is ignored; use `--gitops-forge` for one run.
+`install.sh` records the forge, host, project and Secret name in `install.env`: on a
+first install, and on any later run that goes on to apply with a forge, host, project or
+Secret name different from the file's. So `upgrade.sh` and the Day-2 menu go on rendering
+what was applied, and on a GitLab install a `--gitops-repo`, `--gitops-host` or
+`--gitlab-token-secret` is recorded, not a one-run override. A run you decline or end with
+`--generate-only` records nothing. A switch to GitLab drops the file's `GITOPS_ORG`,
+`GITHUB_APP_ID` and `GITHUB_PEM_PATH`; a switch back to GitHub drops the GitLab keys. Once
+`install.env` exists, a `GITOPS_FORGE`, `GITOPS_HOST` or `GITLAB_TOKEN_SECRET` exported in
+your shell is ignored; use the flags.
 
 A re-run of `install.sh` keeps an existing Secret unless you give it a new token file, or
 choose to replace it at the prompt. An empty token (whitespace only) is refused, and
