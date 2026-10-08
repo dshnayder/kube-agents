@@ -6931,11 +6931,11 @@ main() {
   # Past every gate that can stop this route (set -e makes each step above
   # one): a chat flag whose key the install.env lacks is recorded for the
   # apply.
-  record_flags_into_install_env
   # The forge keys likewise, and only here: a forge switch the operator
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
   record_gitops_forge_keys "$INSTALL_ENV_FILE"
+  record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope
