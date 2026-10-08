@@ -126,7 +126,7 @@ UNREAD_SUBNET_USAGE = "UNREAD_SUBNET_USAGE"
 COMMAND_JOINER = " && "
 LIMITATION_JOINER = "; "
 SUBNETS_FORMAT = "--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)"
-CLUSTERS_FORMAT = "--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools)"
+CLUSTERS_FORMAT = "--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)"
 INSTANCES_FORMAT = "--format=json(networkInterfaces[].networkIP,networkInterfaces[].subnetwork)"
 ADDRESSES_FILTER = "--filter=addressType=INTERNAL"
 ADDRESSES_FORMAT = "--format=json(address,subnetwork)"
@@ -174,14 +174,23 @@ FLEET_INSTANCES_UNREAD_LIMITATION = (
     "firewall-world-open-ingress measured these rules without the instances of "
     "{count} other project(s), because their `instances list` read failed: {names}"
 )
-# The project target's limitation for a target-scoped rule that opens a
-# management port to the internet and reaches no instance the audit can see.
+# The project target's limitation for a rule that opens a management port to
+# the internet and reaches no instance the audit can see, where an instance
+# the audit cannot see can get the rule: a target-scoped rule whose target no
+# visible instance carries, or a rule without a target on a network that holds
+# a GKE Autopilot cluster.
 UNDECIDED_FIREWALL_LIMITATION = (
-    "firewall-world-open-ingress could not decide {count} target-scoped rule(s) "
-    "that open a management port to the internet and reach no instance visible "
-    "to the audit identity, which does not see GKE Autopilot nodes; confirm by "
-    "hand that no instance carries their target: {names}"
+    "firewall-world-open-ingress could not decide {count} rule(s) that open a "
+    "management port to the internet and reach no instance visible to the audit "
+    "identity, which does not see GKE Autopilot nodes; confirm by hand that no "
+    "instance gets the rule: {names}"
 )
+# The load-balancing scheme of an external passthrough Network Load Balancer.
+# It keeps the load balancer IP as the destination of each packet, so the VPC
+# firewall applies to the backends with that IP as the destination.
+EXTERNAL_PASSTHROUGH_SCHEME = "EXTERNAL"
+# The forwarding rule protocols that carry TCP to the backends.
+PASSTHROUGH_TCP_PROTOCOLS = ("TCP", "L3_DEFAULT")
 # The instance fields that the firewall check reads. The projection keeps each
 # stored instance small for the fleet pass.
 FIREWALL_INSTANCES_FORMAT = "--format=json(name,selfLink,zone,status,networkInterfaces,tags,serviceAccounts)"
@@ -225,6 +234,8 @@ NON_PRODUCTION_TOKENS = ("test", "staging", "stage", "dev", "sandbox", "qa")
 WORLD_IPV4_RANGE = "0.0.0.0/0"
 WORLD_IPV6_RANGE = "::/0"
 WORLD_SOURCE_RANGES = (WORLD_IPV4_RANGE, WORLD_IPV6_RANGE)
+# The `version` that `ipaddress` gives an IPv4 address.
+IPV4_VERSION = 4
 # `IPProtocol` values that carry TCP: `all` is every protocol, and the API
 # accepts the IANA number in place of the name.
 TCP_PROTOCOL_TOKENS = ("tcp", "6", "all")
@@ -664,6 +675,7 @@ def read_subnet_usage(projects: list[str]) -> dict:
     used_ips: dict[tuple[str, str, str], set[str]] = {}
     readers: dict[tuple[str, str, str], set[str]] = {}
     limitations: dict[str, list[str]] = {}
+    autopilot_networks: dict[str, set[str]] = {}
     for project_id in projects:
         cmds = subnet_commands(project_id)
         own = limitations.setdefault(project_id, [])
@@ -683,6 +695,12 @@ def read_subnet_usage(projects: list[str]) -> dict:
                 f"{partial[:ERROR_EXCERPT_CHARS]}"
             )
         pod_range_utilization(clusters, project_id, pod_ranges)
+        for cluster in clusters:
+            if isinstance(cluster, dict) and (cluster.get("autopilot") or {}).get("enabled"):
+                network = (cluster.get("networkConfig") or {}).get("network") or cluster.get("network", "")
+                autopilot_networks.setdefault(_network_key(network, project_id), set()).add(
+                    f"{project_id}/{cluster.get('location', '')}/{cluster.get('name', '')}"
+                )
 
         primary_reads = {}
         for role, read in (("instances", "VM NICs"), ("addresses", "internal addresses"),
@@ -700,7 +718,16 @@ def read_subnet_usage(projects: list[str]) -> dict:
                                               primary_reads["forwarding_rules"]).items():
             used_ips.setdefault(key, set()).update(ips)
             readers.setdefault(key, set()).add(project_id)
-    return {"pod_ranges": pod_ranges, "used_ips": used_ips, "readers": readers, "limitations": limitations}
+    return {
+        "pod_ranges": pod_ranges,
+        "used_ips": used_ips,
+        "readers": readers,
+        "limitations": limitations,
+        # Network key to the Autopilot clusters on it, from the clusters reads
+        # that passed. The firewall check marks an untargeted rule on such a
+        # network undecided, because the audit cannot see Autopilot nodes.
+        "autopilot_networks": autopilot_networks,
+    }
 
 
 def subnet_entry(target: str, region: str, project_id: str, command: str, limitations: list[str]) -> dict:
@@ -1284,8 +1311,64 @@ def _in_target(rule: dict, inst: dict, project: str) -> bool:
     return True
 
 
+def _forwarding_rule_ports(forwarding_rule: dict) -> set[int]:
+    """The `MANAGEMENT_PORTS` a forwarding rule sends to its backends."""
+    if forwarding_rule.get("allPorts"):
+        return set(MANAGEMENT_PORTS)
+    specs = list(forwarding_rule.get("ports") or [])
+    if forwarding_rule.get("portRange"):
+        specs.append(forwarding_rule["portRange"])
+    covered: set[int] = set()
+    for spec in specs:
+        low_text, _, high_text = str(spec).partition("-")
+        try:
+            low, high = int(low_text), int(high_text or low_text)
+        except ValueError:
+            continue
+        covered.update(port for port in MANAGEMENT_PORTS if low <= port <= high)
+    return covered
+
+
+def _load_balancer_paths(rule: dict, forwarding_rules: list) -> list[tuple[str, str, object, set[int]]]:
+    """`(name, family, address, ports)` for each external passthrough load
+    balancer that this allow names in its `destinationRanges`.
+
+    A GKE LoadBalancer Service writes this shape: an allow from the internet on
+    the node tag, with the load balancer IP as its only destination range. The
+    backends can have no external IP, because the packets keep the load
+    balancer IP as their destination. An allow without destination ranges names
+    no load balancer, so this test does not apply to it."""
+    if not rule.get("destinationRanges"):
+        return []
+    families = _world_families(rule)
+    paths = []
+    for forwarding_rule in forwarding_rules or []:
+        if not isinstance(forwarding_rule, dict):
+            continue
+        if str(forwarding_rule.get("loadBalancingScheme", "")).upper() != EXTERNAL_PASSTHROUGH_SCHEME:
+            continue
+        if str(forwarding_rule.get("IPProtocol", "")).upper() not in PASSTHROUGH_TCP_PROTOCOLS:
+            continue
+        try:
+            address = ipaddress.ip_address(str(forwarding_rule.get("IPAddress", "")))
+        except ValueError:
+            continue
+        family = WORLD_IPV4_RANGE if address.version == IPV4_VERSION else WORLD_IPV6_RANGE
+        if family not in families or not _in_ranges(address, rule):
+            continue
+        ports = _forwarding_rule_ports(forwarding_rule)
+        if ports:
+            paths.append((str(forwarding_rule.get("name", "")), family, address, ports))
+    return paths
+
+
 def _reachable_instances(
-    rule: dict, instances: list, project: str, ports: list[int], firewalls: list | None = None
+    rule: dict,
+    instances: list,
+    project: str,
+    ports: list[int],
+    firewalls: list | None = None,
+    forwarding_rules: list | None = None,
 ) -> list[tuple[str, str, set[int]]]:
     """`(label, origin project, ports)` for each instance that this rule admits
     internet traffic to on at least one of `ports`.
@@ -1294,10 +1377,14 @@ def _reachable_instances(
     network. The address must be in a family that the rule opens to the world
     and inside the rule's destination ranges, if any. A DENY removes the ports
     it blocks for that address. The instance must be live and inside the rule's
-    target. This is a floor, not a total: GKE Autopilot node VMs are not
-    returned to `roles/compute.viewer` (see `gce_compute_fleet_sop.md` §1)."""
+    target. An external passthrough load balancer that the allow names in its
+    destination ranges is a second path (`_load_balancer_paths`): through it,
+    a target instance is reachable with or without an external IP. This is a
+    floor, not a total: GKE Autopilot node VMs are not returned to
+    `roles/compute.viewer` (see `gce_compute_fleet_sop.md` §1)."""
     network = _network_key(rule.get("network", ""), project)
     families = _world_families(rule)
+    paths = _load_balancer_paths(rule, forwarding_rules or [])
     exposed = []
     for inst in instances or []:
         if not isinstance(inst, dict):
@@ -1315,6 +1402,11 @@ def _reachable_instances(
             if reach:
                 open_ports |= reach
                 first = first or address
+        for lb_name, family, address, lb_ports in paths:
+            reach = (set(ports) & lb_ports) - _denied_at(rule, inst, family, address, firewalls or [], project)
+            if reach:
+                open_ports |= reach
+                first = first or f"through {lb_name} {address}"
         if open_ports:
             label = f"{inst.get('name', '')} ({first})"
             exposed.append((label, inst.get(ORIGIN_PROJECT_KEY, project), open_ports))
@@ -1329,18 +1421,32 @@ def _target_scope_phrase(rule: dict) -> str:
     return "no target restriction, so every instance on the network"
 
 
-def check_world_open_ingress(firewalls: list, instances: list, project: str) -> list[dict]:
+def check_world_open_ingress(
+    firewalls: list,
+    instances: list,
+    project: str,
+    forwarding_rules: list | None = None,
+    autopilot_networks: dict | None = None,
+) -> list[dict]:
     """SOP 2.6: one hit per enabled INGRESS rule opening a management port to a
     world source range on at least one instance holding an external IP. One per
     rule, not per port: the rule is what a reader goes and changes."""
-    return world_open_ingress(firewalls, instances, project)[0]
+    return world_open_ingress(firewalls, instances, project, forwarding_rules, autopilot_networks)[0]
 
 
-def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[list[dict], list[str]]:
-    """`(hits, undecided)`: the §2.6 hits, and the names of the target-scoped
-    rules that open a management port to the world but reach no instance the
-    audit can see. Those are undecided rather than clear: the audit identity
-    does not see GKE Autopilot nodes, which such a rule may well target."""
+def world_open_ingress(
+    firewalls: list,
+    instances: list,
+    project: str,
+    forwarding_rules: list | None = None,
+    autopilot_networks: dict | None = None,
+) -> tuple[list[dict], list[str]]:
+    """`(hits, undecided)`: the §2.6 hits, and the rules that open a management
+    port to the world, reach no instance the audit can see, and can reach an
+    instance it cannot see. The audit identity does not see GKE Autopilot
+    nodes. Thus a target-scoped rule whose target no visible instance carries
+    is undecided, and so is a rule without a target on a network that holds an
+    Autopilot cluster (`autopilot_networks`: network key to cluster names)."""
     hits = []
     undecided = []
     for rule in firewalls or []:
@@ -1354,7 +1460,7 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
         ports = sorted(_tcp_management_ports(rule.get("allowed") or []) - _shadowed_ports(rule, firewalls, project))
         if not ports:
             continue
-        reachable = _reachable_instances(rule, instances, project, ports, firewalls)
+        reachable = _reachable_instances(rule, instances, project, ports, firewalls, forwarding_rules)
         exposed = [label for label, _origin, _ports in reachable]
         if not exposed:
             # Undecided only when no visible instance carries the target. A
@@ -1365,6 +1471,10 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
                 isinstance(inst, dict) and _in_target(rule, inst, project) for inst in instances or []
             ):
                 undecided.append(str(rule.get("name", "")))
+            elif not target_scoped:
+                clusters = (autopilot_networks or {}).get(_network_key(rule.get("network", ""), project))
+                if clusters:
+                    undecided.append(f"{rule.get('name', '')} (Autopilot cluster(s) {', '.join(sorted(clusters))})")
             continue
         remainder = len(exposed) - MAX_NAMED_EXPOSED_INSTANCES
         # The ports that some reported instance can be reached on, not every
@@ -1416,7 +1526,12 @@ def firewall_command(project: str, hit: dict) -> str:
     return joined_command(parts)
 
 
-def apply_fleet_firewall_reads(entries: list[dict], projects: list[str] = (), api_off: list[str] = ()) -> None:
+def apply_fleet_firewall_reads(
+    entries: list[dict],
+    projects: list[str] = (),
+    api_off: list[str] = (),
+    autopilot_networks: dict | None = None,
+) -> None:
     """Measure again the §2.6 rules of each collected project target against the
     instances of every project, not its own only. A Shared VPC host holds the
     firewall rules, and its service projects hold the VMs.
@@ -1424,15 +1539,24 @@ def apply_fleet_firewall_reads(entries: list[dict], projects: list[str] = (), ap
     A project in scope with no firewall reads had a read that failed, and its
     instances are not in the fleet list. Each target names those projects in
     its `limitations`, so its verdict does not rest on a blind read. A project
-    whose Compute Engine API is off holds no instance, so it is not named."""
+    whose Compute Engine API is off holds no instance, so it is not named.
+
+    The forwarding rules of every project are a second fleet list: a service
+    project can hold the load balancer that a host's rule names. The Autopilot
+    networks come from the subnet sweep's clusters read, when the run made it."""
     fleet_instances = instance_union([reads["instances"] for reads in FIREWALL_READS.values()])
+    fleet_forwarding_rules = [
+        rule for reads in FIREWALL_READS.values() for rule in reads.get("forwarding_rules") or []
+    ]
     unread_projects = sorted(set(projects) - set(FIREWALL_READS) - set(api_off))
     for entry in entries:
         project = entry.get("project", "")
         if entry.get("outcome") != OUTCOME_COLLECTED or project not in FIREWALL_READS:
             continue
         reads = FIREWALL_READS[project]
-        hits, undecided = world_open_ingress(reads["firewalls"], fleet_instances, project)
+        hits, undecided = world_open_ingress(
+            reads["firewalls"], fleet_instances, project, fleet_forwarding_rules, autopilot_networks
+        )
         entry["candidates"] = [c for c in entry["candidates"] if c["check"] != FIREWALL_CHECK_SLUG] + [
             emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits
         ]
@@ -1599,8 +1723,11 @@ def collect_project_target(project: str) -> dict | None:
             if hit:
                 candidates.append(emit(NAT_CHECK_SLUG, hit, joined_command([shlex.join(c) for c in router_reads])))
 
+    project_forwarding_rules: list = []
+
     def psc() -> None:
         forwarding_rules = gated(cmds["forwarding_rules"], PSC_CHECK_SLUG)
+        project_forwarding_rules.extend(forwarding_rules)
         candidates.extend(
             emit(PSC_CHECK_SLUG, hit, shlex.join(cmds["forwarding_rules"]))
             for hit in check_psc_routing(forwarding_rules)
@@ -1633,8 +1760,9 @@ def collect_project_target(project: str) -> dict | None:
             "firewalls_command": shlex.join(cmds["firewall_rules"]),
             "instances_command": shlex.join(cmds["instances"]),
             "limitations": limitations,
+            "forwarding_rules": project_forwarding_rules,
         }
-        hits, rules = world_open_ingress(firewalls, instances, project)
+        hits, rules = world_open_ingress(firewalls, instances, project, project_forwarding_rules)
         candidates.extend(emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits)
         undecided.extend(rules)
 
@@ -1698,13 +1826,13 @@ def candidate_from_finding(finding: dict) -> dict:
     }
 
 
-def subnet_targets(projects: list[str]) -> list[dict]:
+def subnet_targets(projects: list[str], usage: dict | None = None) -> list[dict]:
     """The subnet sweep's entries, skipped rows and findings as manifest
     targets: each evaluated subnet `collected` with its findings as candidates,
     each skipped row `gate-failed` with its reason as the error."""
     skipped: list[dict] = []
     active: list[dict] = []
-    usage = read_subnet_usage(projects)
+    usage = usage if usage is not None else read_subnet_usage(projects)
     findings = audit_subnet_capacity(projects, usage, skipped, active)
     by_target: dict[str, list[dict]] = {}
     for finding in findings:
@@ -1758,6 +1886,9 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
     entries: list[dict] = []
     api_off: list[str] = []
     FIREWALL_READS.clear()
+    # The subnet sweep's reads come first: the firewall check uses its clusters
+    # read to find the networks that hold an Autopilot cluster.
+    usage = read_subnet_usage(projects) if check in (CHECK_ALL, SUBNET_CHECK_SLUG) else None
     if check in (CHECK_ALL, PROJECT_CHECKS_CHOICE):
         for project in projects:
             entry = collect_project_target(project)
@@ -1765,9 +1896,9 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
                 api_off.append(project)
             else:
                 entries.append(entry)
-        apply_fleet_firewall_reads(entries, projects, api_off)
+        apply_fleet_firewall_reads(entries, projects, api_off, (usage or {}).get("autopilot_networks"))
     if check in (CHECK_ALL, SUBNET_CHECK_SLUG):
-        entries.extend(subnet_targets(projects))
+        entries.extend(subnet_targets(projects, usage))
     if notes:
         entries.append(unenumerated_entry(notes))
     if not projects:

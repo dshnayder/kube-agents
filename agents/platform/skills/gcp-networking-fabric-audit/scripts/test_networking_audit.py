@@ -534,7 +534,7 @@ class SubnetCapacityTest(unittest.TestCase):
         self.assertEqual(
             finding["evidence"]["command"],
             "gcloud container clusters list --project=p1 "
-            "'--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools)'",
+            "'--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools,autopilot)'",
         )
         # 1 - 0.9 is 0.0999... in floating point; it reads as the 10% the excerpt implies.
         self.assertEqual(finding["title"], "Pod range pods-a of subnet gke in us-central1 has 10% available")
@@ -1844,6 +1844,103 @@ class FleetInstancesUnreadTest(unittest.TestCase):
         self.assertEqual(host["candidates"], [])
         self.assertIn("without the instances of 1 other project(s)", host["limitations"])
         self.assertIn("svc", host["limitations"])
+
+
+LB_IP = "34.1.2.3"
+
+
+def gke_lb_rule(ports=("5432",), **extra):
+    """The allow a GKE LoadBalancer Service writes: the internet to the node
+    tag, with the load balancer IP as the only destination range."""
+    return world_open(
+        name="k8s-fw-abc", ports=ports, targetTags=["gke-node"], destinationRanges=[f"{LB_IP}/32"], **extra
+    )
+
+
+def passthrough(scheme="EXTERNAL", ports=("5432",), **extra):
+    return {
+        "name": "a1b2c3",
+        "IPAddress": LB_IP,
+        "loadBalancingScheme": scheme,
+        "IPProtocol": "TCP",
+        "ports": list(ports),
+        **extra,
+    }
+
+
+def private_node(name="node-1"):
+    return {
+        "name": name,
+        "networkInterfaces": [{"network": NETWORK, "networkIP": "10.128.0.5"}],
+        "tags": {"items": ["gke-node"]},
+    }
+
+
+class WorldOpenLoadBalancerTest(unittest.TestCase):
+    """An external passthrough load balancer keeps its IP as the packet
+    destination, so the backends get internet traffic with or without an
+    external IP."""
+
+    def test_a_private_backend_behind_a_passthrough_load_balancer_is_reachable(self):
+        hits = na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [passthrough()])
+        self.assertEqual(len(hits), 1)
+        self.assertIn(f"through a1b2c3 {LB_IP}", hits[0]["excerpt"])
+        self.assertIn("5432 (PostgreSQL)", hits[0]["excerpt"])
+
+    def test_without_the_forwarding_rule_the_private_backend_is_not_reachable(self):
+        self.assertEqual(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", []), [])
+
+    def test_a_public_backend_is_reachable_on_the_load_balancer_ip(self):
+        node = public_node(tags={"items": ["gke-node"]})
+        hits = na.check_world_open_ingress([gke_lb_rule()], [node], "p1", [passthrough()])
+        self.assertEqual(len(hits), 1)
+
+    def test_a_proxy_load_balancer_is_not_a_passthrough_path(self):
+        managed = passthrough(scheme="EXTERNAL_MANAGED")
+        self.assertEqual(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [managed]), [])
+
+    def test_the_forwarding_rule_must_carry_the_management_port(self):
+        web = passthrough(ports=("443",))
+        self.assertEqual(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [web]), [])
+        everything = passthrough(ports=(), allPorts=True)
+        self.assertEqual(len(na.check_world_open_ingress([gke_lb_rule()], [private_node()], "p1", [everything])), 1)
+
+
+class WorldOpenAutopilotNetworkTest(unittest.TestCase):
+    """The audit identity does not see GKE Autopilot nodes, and a rule without
+    a target applies to every node on its network."""
+
+    AUTOPILOT = {na._network_key(NETWORK, "p1"): {"p1/us-central1/ap-1"}}
+
+    def test_an_untargeted_rule_on_an_autopilot_network_is_undecided(self):
+        rule = world_open(name="allow-kubelet", ports=("10250",))
+        hits, undecided = na.world_open_ingress([rule], [], "p1", [], self.AUTOPILOT)
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["allow-kubelet (Autopilot cluster(s) p1/us-central1/ap-1)"])
+
+    def test_an_untargeted_rule_without_an_autopilot_cluster_is_clear(self):
+        rule = world_open(name="allow-kubelet", ports=("10250",))
+        self.assertEqual(na.world_open_ingress([rule], [], "p1", [], {}), ([], []))
+
+    def test_the_collector_finds_the_autopilot_network_in_its_clusters_read(self):
+        cluster = {
+            "name": "ap-1",
+            "location": "us-central1",
+            "autopilot": {"enabled": True},
+            "networkConfig": {"network": "projects/p1/global/networks/default"},
+        }
+        per_project = {
+            "p1": project_answers(**{
+                "clusters list": [cluster],
+                "firewall-rules list": [world_open(name="allow-kubelet", ports=("10250",))],
+            }),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["p1"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        target = {e["name"]: e for e in manifest["clusters"]}["project/p1"]
+        self.assertIn("allow-kubelet (Autopilot cluster(s) p1/us-central1/ap-1)", target["limitations"])
 
 
 class ManagementPortsPinTest(unittest.TestCase):
