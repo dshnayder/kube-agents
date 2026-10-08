@@ -28,7 +28,9 @@ then give the host (enter for gitlab.com), the project path, and the name of the
 create. The installer asks for the token itself only after the cluster is up, at the health
 check step. The prompt does not echo.
 
-Non-interactively, the token comes from a file you name; there is no flag or variable that
+Non-interactively, the token comes from a file you name, or anything readable that a
+shell can name, such as a password manager through process substitution:
+`--gitlab-token-file=<(pass show gitlab/agent-token)`. There is no flag or variable that
 takes the token's value:
 
 ```bash
@@ -39,13 +41,13 @@ takes the token's value:
   --gitlab-token-file="$HOME/secure/gitlab-token"
 ```
 
-| Flag                    | `install.env` key     | Meaning                                                                                                                               |
-| ----------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `--gitops-forge`        | `GITOPS_FORGE`        | `github` (default) or `gitlab`.                                                                                                       |
-| `--gitops-host`         | `GITOPS_HOST`         | The GitLab hostname, with no scheme, port or path. Omit for gitlab.com. A GitHub host is refused.                                     |
-| `--gitops-repo`         | `GITOPS_REPO`         | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used. |
-| `--gitlab-token-file`   | _never recorded_      | A file holding the token. Read once, piped into the Secret, and neither its path nor its contents is written anywhere else.           |
-| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET` | The Secret's name, default `gitlab-forge-token`.                                                                                      |
+| Flag                    | `install.env` key     | Meaning                                                                                                                                                        |
+| ----------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gitops-forge`        | `GITOPS_FORGE`        | `github` (default) or `gitlab`.                                                                                                                                |
+| `--gitops-host`         | `GITOPS_HOST`         | The GitLab hostname, with no scheme, port or path. Omit for gitlab.com. A GitHub host is refused.                                                              |
+| `--gitops-repo`         | `GITOPS_REPO`         | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                          |
+| `--gitlab-token-file`   | _never recorded_      | A file (or `/dev/stdin`, or `<(command)`) holding the token. Read once, piped into the Secret, and neither its path nor its contents is written anywhere else. |
+| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET` | The Secret's name, default `gitlab-forge-token`.                                                                                                               |
 
 `--github-app-id` and `--github-pem-path` are refused with `--gitops-forge=gitlab`.
 
@@ -56,8 +58,8 @@ no restart.
 
 ## Where the token goes
 
-The installer pipes the token straight into `kubectl create secret … --from-file=token=…`,
-so it never appears in a process's arguments, an exported environment variable, the
+The installer pipes the token straight into `kubectl create secret … --from-file=token=…`
+and a server-side `kubectl apply`, so it never appears in a process's arguments, an exported environment variable, the
 installer's output, `install.env`, `terraform.tfvars` or the Terraform state. Terraform and
 the Helm release name the Secret and nothing more. The operator mounts the Secret's `token`
 key into the credential broker's pod only; the agent and its shell sandbox never see it.
@@ -69,11 +71,21 @@ Replace the Secret's value; the broker picks the new token up on its next call:
 ```bash
 kubectl create secret generic gitlab-forge-token -n <namespace> \
   --from-file=token="$HOME/secure/gitlab-token" --dry-run=client -o yaml \
-  | kubectl apply -f -
+  | kubectl apply --server-side --force-conflicts -f -
 ```
 
+Use `--server-side`. A plain `kubectl apply` stores the whole object, token
+included, in the Secret's `kubectl.kubernetes.io/last-applied-configuration`
+annotation.
+
+`install.sh` records the forge, host, project and Secret name in `install.env`, on a
+first install and whenever a run changes the forge, so `upgrade.sh` and the Day-2 menu go
+on rendering GitLab. A switch to GitLab also drops the file's `GITHUB_APP_ID`. A
+`GITOPS_FORGE` exported in your shell is ignored; use `--gitops-forge` for one run.
+
 A re-run of `install.sh` keeps an existing Secret unless you give it a new token file, or
-choose to replace it at the prompt.
+choose to replace it at the prompt. An empty token (whitespace only) is refused, and
+nothing is stored.
 
 ## What the install declares
 

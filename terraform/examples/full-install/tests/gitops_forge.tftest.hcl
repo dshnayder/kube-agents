@@ -2,13 +2,32 @@
 # nothing else, a GitLab install renders the forges/repositories lists with a
 # credentialsRef and never the alias, and the plan refuses a GitLab install that
 # also asks for the GitHub token minter. The providers are mocked and the
-# cluster module's outputs fixed, so a plan here creates nothing.
+# cluster module's outputs fixed, so nothing here reaches a cloud.
 
-mock_provider "google" {}
+# Fixed where the mock would otherwise generate a value per run, so the
+# rendered release values can be compared byte for byte.
+mock_provider "google" {
+  mock_resource "google_service_account" {
+    defaults = {
+      name   = "projects/tftest-project/serviceAccounts/mock-service-account@tftest-project.iam.gserviceaccount.com"
+      email  = "mock-service-account@tftest-project.iam.gserviceaccount.com"
+      member = "serviceAccount:mock-service-account@tftest-project.iam.gserviceaccount.com"
+    }
+  }
+}
 mock_provider "google-beta" {}
 mock_provider "helm" {}
-mock_provider "random" {}
-mock_provider "tls" {}
+mock_provider "http" {}
+mock_provider "random" {
+  mock_resource "random_password" {
+    defaults = { result = "mock-password" }
+  }
+}
+mock_provider "tls" {
+  mock_resource "tls_private_key" {
+    defaults = { private_key_openssh = "mock-private-key", public_key_openssh = "mock-public-key" }
+  }
+}
 
 override_module {
   target = module.gke_cluster
@@ -123,4 +142,52 @@ run "the_host_is_bare" {
     gitops_host  = "https://gitlab.example.com"
   }
   expect_failures = [var.gitops_host]
+}
+
+# The release values a GitHub install renders, byte for byte as the composition
+# rendered them before GitLab support (testdata/*.values.golden, rendered by
+# these same runs at that commit).
+run "github_values_are_unchanged" {
+  command = apply
+  variables {
+    github_repo = "acme/infra"
+  }
+  assert {
+    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tests/testdata/github.values.golden")
+    error_message = "a GitHub install's release values changed"
+  }
+}
+
+run "github_minter_values_are_unchanged" {
+  command = apply
+  variables {
+    github_repo          = "acme/infra"
+    enable_github_minter = true
+    github_app_id        = "123"
+  }
+  assert {
+    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tests/testdata/github_minter.values.golden")
+    error_message = "a GitHub minter install's release values changed"
+  }
+}
+
+run "gitlab_release_values" {
+  command = apply
+  variables {
+    gitops_forge              = "gitlab"
+    gitops_host               = "gitlab.example.com"
+    gitlab_repo               = "platform/infra/gitops"
+    gitlab_credentials_secret = "gl-token"
+  }
+  assert {
+    condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration) == jsonencode({
+      forges       = [{ credentialsRef = { name = "gl-token" }, host = "gitlab.example.com", name = "gitlab", provider = "gitlab" }]
+      repositories = [{ forge = "gitlab", repository = "platform/infra/gitops", role = "gitops" }]
+    })
+    error_message = "integration: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration)}"
+  }
+  assert {
+    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).githubMinter.enabled == false
+    error_message = "a GitLab install enabled the GitHub minter"
+  }
 }

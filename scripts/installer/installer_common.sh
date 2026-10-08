@@ -569,6 +569,10 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
+  # GitLab forge, and drop the GitHub alias and minter, for one run of an
+  # install the file records as GitHub. --gitops-forge is the per-run way in.
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
