@@ -394,6 +394,13 @@ PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
 PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_KMS_KEY="${KMS_KEY:-}"
+# GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
+# token is read from. There is deliberately no token-value input: a value in
+# argv or the environment is a value in `ps`, shell history and CI logs.
+PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
+PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
+PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
+PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -600,6 +607,16 @@ Flags for AI Agents & Automation:
   --gitops-org=ORG              GitHub Org for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
                                 currently gke-fleet-iac)
+  --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
+                                For gitlab, --gitops-repo is the project's full path
+                                (group/subgroup/project) and --gitops-org is not used
+  --gitops-host=HOST            Self-managed GitLab hostname (default: gitlab.com)
+  --gitlab-token-file=PATH      File holding the GitLab access token (scopes: api,
+                                write_repository); read into the Kubernetes Secret after the
+                                apply and never stored. Without it the installer prompts, or,
+                                non-interactively, leaves the Secret for you to create
+  --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
+                                (default: gitlab-forge-token)
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -856,6 +873,10 @@ parse_args() {
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
+      --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; shift ;;
+      --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
+      --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
@@ -1642,7 +1663,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -2125,6 +2146,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+  # The forge, host and Secret NAME only. The token, and the path of the file
+  # it came from, are never recorded: a re-run asks again or keeps the Secret.
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    write_env_var "$tmp" GITOPS_FORGE "gitlab"
+    write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
+    write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+  fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
@@ -2480,7 +2508,13 @@ resolve_shared_defaults() {
   PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
-  PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
+  PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$DEFAULT_GITLAB_TOKEN_SECRET}"
+  # DEFAULT_GITOPS_REPO is a GitHub repository name; a GitLab project has no
+  # default path, so the validator asks for one instead of inventing it.
+  if [ "$PARAM_GITOPS_FORGE" != "gitlab" ]; then
+    PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  fi
   PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
@@ -2977,7 +3011,9 @@ write_json_report() {
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")
 
   local report_gitops_repo=""
-  if [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "${GITOPS_REPO:-}" ]; then
+    report_gitops_repo="$(gitlab_repo_url)"
+  elif [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
     report_gitops_repo="https://github.com/${github_org}/${github_repo}"
   fi
 
@@ -3854,6 +3890,163 @@ validate_existing_cluster_opt_in_flags() {
   fi
 }
 
+# ─── GitLab as the GitOps forge ───────────────────────────────────────────────
+# The repository is a GitLab project path, the credential an access token the
+# operator mounts into the credential broker from a Kubernetes Secret. The
+# installer creates that Secret after the apply, from a prompt or a file, and
+# never holds the token anywhere it persists: not install.env, not the tfvars,
+# not the Terraform state, not argv, not an exported variable.
+
+# The bare-hostname rule the operator and the broker apply to a forge host.
+GITLAB_HOST_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+
+# GITOPS_REPO as the project's path: a URL on the forge's host, or a path,
+# with a trailing .git or / dropped. Prints nothing for anything else.
+gitlab_repo_path() {
+  local repo="$1" host="${2:-gitlab.com}"
+  repo="${repo%/}"
+  repo="${repo%.git}"
+  case "$repo" in
+    https://"$host"/*) repo="${repo#https://"$host"/}" ;;
+    http://*|https://*|*://*|*@*:*) return 0 ;;
+  esac
+  local seg n=0 segs=()
+  IFS=/ read -r -a segs <<<"$repo"
+  [[ "$repo" == */ ]] && return 0
+  for seg in "${segs[@]}"; do
+    if ! [[ "$seg" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ ]] || [ "$seg" = "." ] || [ "$seg" = ".." ] || [[ "$seg" == *.git ]]; then
+      return 0
+    fi
+    n=$((n + 1))
+  done
+  [ "$n" -ge 2 ] && printf '%s' "$repo"
+}
+
+gitlab_repo_url() {
+  printf 'https://%s/%s' "${GITOPS_HOST:-gitlab.com}" "${GITOPS_REPO:-}"
+}
+
+# Checks the GitLab inputs, and that a GitHub install was given none of them.
+validate_gitops_forge_flags() {
+  case "${PARAM_GITOPS_FORGE:-github}" in
+    github|gitlab) ;;
+    *)
+      print_error "--gitops-forge must be github or gitlab (got '${PARAM_GITOPS_FORGE}')."
+      return 1
+      ;;
+  esac
+  if [ "${PARAM_GITOPS_FORGE:-github}" != "gitlab" ]; then
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
+      return 1
+    fi
+    return 0
+  fi
+  if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+    if ! [[ "$PARAM_GITOPS_HOST" =~ $GITLAB_HOST_RE ]]; then
+      print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${PARAM_GITOPS_HOST}')."
+      return 1
+    fi
+    case "$PARAM_GITOPS_HOST" in
+      github.com|*.github.com|githubusercontent.com|*.githubusercontent.com)
+        print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+        return 1
+        ;;
+    esac
+  fi
+  if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
+    print_error "--github-app-id and --github-pem-path configure the GitHub token minter, which a GitLab install does not have."
+    return 1
+  fi
+  if [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+    local path
+    path="$(gitlab_repo_path "$PARAM_GITOPS_REPO" "${PARAM_GITOPS_HOST:-gitlab.com}")"
+    if [ -z "$path" ]; then
+      print_error "--gitops-repo must be the GitLab project's full path, group/project or group/subgroup/project, or its https URL on ${PARAM_GITOPS_HOST:-gitlab.com} (got '${PARAM_GITOPS_REPO}')."
+      return 1
+    fi
+    PARAM_GITOPS_REPO="$path"
+  elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    print_error "A GitLab install needs --gitops-repo: the project's full path (group/project)."
+    return 1
+  fi
+  if ! [[ "${PARAM_GITLAB_TOKEN_SECRET:-}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; then
+    print_error "--gitlab-token-secret must be a valid Kubernetes Secret name (got '${PARAM_GITLAB_TOKEN_SECRET:-}')."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    PARAM_GITLAB_TOKEN_FILE="$(expand_tilde_path "$PARAM_GITLAB_TOKEN_FILE")"
+    if [ ! -f "$PARAM_GITLAB_TOKEN_FILE" ] || [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ]; then
+      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not a readable file."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# the agent's namespace, after the apply has made the namespace. The token
+# reaches kubectl through a pipe -- from the named file, or from a no-echo
+# prompt held in a local that is cleared at once -- so it is never in argv, an
+# exported variable, a file this installer writes, or its output. The broker
+# reads the token on every call, so a Secret created after the agent started
+# needs no restart.
+create_gitlab_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local exists="false"
+  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+    exists="true"
+  fi
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+      --from-file=token="$PARAM_GITLAB_TOKEN_FILE" --dry-run=client -o yaml |
+      kubectl apply -n "$namespace" --context "$context" -f - >/dev/null || {
+      print_error "Could not write the GitLab token Secret '${name}'."
+      return 1
+    }
+    print_success "GitLab token stored in Secret '${name}' (namespace ${namespace}) from the file you named."
+    return 0
+  fi
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    if [ "$exists" = "true" ]; then
+      print_info "Keeping the existing GitLab token Secret '${name}'."
+    else
+      print_warning "No GitLab token was given (--gitlab-token-file), so the agent cannot reach GitLab yet."
+      print_info "Create the Secret yourself; the agent picks it up with no restart:"
+      print_info "  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=token=<path-to-token-file>"
+    fi
+    return 0
+  fi
+  if [ "$exists" = "true" ]; then
+    local replace_choice="1"
+    prompt_menu "A GitLab token Secret '${name}' already exists." \
+      "Keep it" \
+      "Replace it with a new token" \
+      replace_choice
+    [ "$replace_choice" = "1" ] && return 0
+  fi
+  print_info "Paste the GitLab access token (scopes: api, write_repository). It is not echoed and not saved anywhere but the Secret."
+  local token=""
+  read -r -s token </dev/tty
+  echo "" >/dev/tty
+  if [ -z "$token" ]; then
+    print_warning "No token entered; create Secret '${name}' later (see the install guide)."
+    return 0
+  fi
+  printf '%s' "$token" | kubectl create secret generic "$name" -n "$namespace" --context "$context" \
+    --from-file=token=/dev/stdin --dry-run=client -o yaml |
+    kubectl apply -n "$namespace" --context "$context" -f - >/dev/null
+  local rc=$?
+  token=""
+  unset token
+  if [ "$rc" -ne 0 ]; then
+    print_error "Could not write the GitLab token Secret '${name}'."
+    return 1
+  fi
+  print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
 # (Path 2: AOT) or a valid PEM file path (Path 1: automated import) whenever there
 # is an explicit intention to configure the token minter.
@@ -4385,6 +4578,14 @@ run_menu_system() {
         esac
         ;;
       5)
+        if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+          # This panel edits the GitHub coordinates only. Saving them on a
+          # GitLab install would leave GITOPS_REPO a GitHub name.
+          print_info "This install's GitOps repository is on GitLab: $(gitlab_repo_url)."
+          print_info "Re-run ./install.sh to change it, or replace the token with:"
+          print_info "  kubectl create secret generic ${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET}} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --from-file=token=<path-to-token-file> --dry-run=client -o yaml | kubectl apply -f -"
+          continue
+        fi
         # An organization, never a login: the minter resolves App installations
         # at /orgs/{org}/installation, so a personal account deploys cleanly and
         # then 404s every token request. The fresh-install interview settles
@@ -5258,7 +5459,54 @@ main() {
   local kms_key="$PARAM_KMS_KEY"
   local github_pem_path="$PARAM_GITHUB_PEM_PATH"
 
+  # The forge comes first: a GitLab repository has no GitHub organization, App
+  # or token minter, so the GitHub interview below does not apply to it.
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local forge_choice="1"
+    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="2"
+    prompt_menu "Where does the GitOps repository live?" \
+      "GitHub" \
+      "GitLab (gitlab.com or self-managed)" \
+      forge_choice
+    if [ "$forge_choice" = "2" ]; then
+      PARAM_GITOPS_FORGE="gitlab"
+    else
+      PARAM_GITOPS_FORGE="github"
+      PARAM_GITOPS_HOST=""
+    fi
+  fi
+
+  if [ "$PARAM_GITOPS_FORGE" = "gitlab" ]; then
+    # No GitHub org and no minter: write_tfvars_from_state renders neither for
+    # GitLab, and the CR names the forge and its token Secret instead.
+    github_org=""
+    github_app_id=""
+    github_pem_path=""
+    PARAM_GITHUB_APP_ID=""
+    PARAM_GITHUB_PEM_PATH=""
+    if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+      while true; do
+        prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
+        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
+        prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        PARAM_GITOPS_REPO="$github_repo"
+        if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
+          github_repo="$PARAM_GITOPS_REPO"
+          break
+        fi
+        [ -z "$github_repo" ] && print_error "A GitLab install needs the project's full path."
+        # With no terminal every answer is the same default, so asking again
+        # would spin.
+        has_controlling_tty || exit 1
+      done
+      print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+      print_info "It needs the api and write_repository scopes, with Developer access to the project."
+    else
+      validate_gitops_forge_flags || exit 1
+      github_repo="$PARAM_GITOPS_REPO"
+    fi
+  elif [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # An install that already names an org has a repository to connect, so
     # option 2 is what pressing enter should mean. Options 1 and 2 run the same
     # block, so this only makes the offered wording match the install — what
@@ -5461,6 +5709,7 @@ main() {
   # holds whatever install.env seeded, where True/yes/on are spellings the
   # documentation invites and is_truthy honours.
   validate_existing_cluster_opt_in_flags
+  validate_gitops_forge_flags || exit 1
   # An agent that forgets every conversation is the worse default, so memory is
   # on unless it is turned off. The choice decides two things: whether the
   # harness keeps memory at all, and — when it does — whether that costs an
@@ -5770,6 +6019,9 @@ main() {
   export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
+  export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
+  export GITOPS_HOST="$PARAM_GITOPS_HOST"
+  export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -5923,7 +6175,9 @@ main() {
     echo -e "  • ${C_CYAN}Container Registry:${C_RESET} ${registry_prefix}"
     echo -e "  • ${C_CYAN}Third-Party Images:${C_RESET} ${third_party_registry_prefix:-upstream registries (quay.io, ghcr.io, docker.io, us-docker.pkg.dev)}"
   fi
-  if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
+  if [ "${PARAM_GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "$github_repo" ]; then
+    echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} $(GITOPS_HOST="$PARAM_GITOPS_HOST" GITOPS_REPO="$github_repo" gitlab_repo_url) (GitLab; token in Secret ${PARAM_GITLAB_TOKEN_SECRET})"
+  elif [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi
   echo -e "${C_CYAN}${C_BOLD}"
@@ -6169,6 +6423,9 @@ main() {
   if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
+  fi
+  if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
+    create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
