@@ -487,8 +487,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. With a `gitlab` forge
-  declared beside GitHub, name repositories by URL wherever one is addressed:
-  the broker then refuses a bare `owner/name`. Apply `crds/` before upgrading
+  declared beside GitHub, a bare `owner/name` still works for a GitHub
+  repository that the install registered by URL. Name a GitLab repository, or
+  a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` must be a GitHub spelling (`github.com`, `www.github.com`,
   `ssh.github.com`), and a repository must name a declared forge.
