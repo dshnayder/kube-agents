@@ -72,10 +72,10 @@ run "github_renders_the_alias" {
 run "gitlab_renders_the_lists" {
   command = plan
   variables {
-    gitops_forge              = "gitlab"
-    gitops_host               = "gitlab.example.com"
-    gitlab_repo               = "platform/infra/gitops"
-    gitlab_token_secret_name  = "gl-token"
+    gitops_forge             = "gitlab"
+    gitops_host              = "gitlab.example.com"
+    gitlab_repo              = "platform/infra/gitops"
+    gitlab_token_secret_name = "gl-token"
   }
   assert {
     condition = local.gitlab_forges == [{
@@ -191,10 +191,10 @@ run "github_minter_values_are_unchanged" {
 run "gitlab_release_values" {
   command = apply
   variables {
-    gitops_forge              = "gitlab"
-    gitops_host               = "gitlab.example.com"
-    gitlab_repo               = "platform/infra/gitops"
-    gitlab_token_secret_name  = "gl-token"
+    gitops_forge             = "gitlab"
+    gitops_host              = "gitlab.example.com"
+    gitlab_repo              = "platform/infra/gitops"
+    gitlab_token_secret_name = "gl-token"
   }
   assert {
     condition = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.integration) == jsonencode({
