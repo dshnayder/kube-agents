@@ -2038,12 +2038,19 @@ forge claims its host only when it is valid and serves something, and the same r
 which forges the broker is given, so a forge the status refuses is never one whose token is
 mounted.
 
-**A mixed install names its repositories by URL.** Once a forge beside GitHub is declared, the
-broker serves more than one forge and refuses a bare `owner/name`, which no longer says which
-forge is meant ([Forge neutrality](#forge-neutrality)). This is a deliberate trade, not a gap: a
-guess would send a GitLab group's name to GitHub. Everything that addresses a repository on such
-an install — a cron, a skill invocation, a `--repo` — spells it `https://<host>/<path>` or
-`<host>/<path>`.
+**A mixed install still takes a registered bare GitHub name.** When a forge beside GitHub is
+declared, the broker serves more than one forge. The broker then refuses a bare `owner/name`,
+because the name does not tell which forge it is on ([Forge neutrality](#forge-neutrality)). This
+refusal is intentional: a guess can send the name of a GitLab group to GitHub. The sandbox client
+prevents the refusal for a GitHub repository that the install registered by URL: it sends the
+bare name as the URL of the registration. Thus a cron, a skill invocation or a `--repo` that names
+such a repository does not change when an administrator adds GitLab. Use `https://<host>/<path>`
+or `<host>/<path>` for a repository on another forge. Also use it for a GitHub repository in
+these cases:
+
+- The install did not register the repository.
+- An administrator registered the repository without a URL.
+- A repository on another forge has the same path.
 
 A missing Secret, or one without a `token` key, does not stop the broker: the projection is
 optional, so GitHub and chat keep working, and each call to that forge answers
