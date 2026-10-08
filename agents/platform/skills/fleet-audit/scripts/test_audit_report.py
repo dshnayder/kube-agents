@@ -17788,6 +17788,14 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(), ("--no-collector-manifest", "skipped it")), 2)
         self.assertIn("pass it with --manifest-file", self.err)
 
+    def test_a_manifest_given_as_the_findings_file_names_draft(self):
+        path = Path(self.workspace) / "manifest.json"
+        path.write_text(json.dumps({"version": 1, "audit": AUDIT, "clusters": []}))
+        with self.assertRaises(audit_report.ValidationError) as refused:
+            audit_report.load_findings(str(path), AUDIT)
+        self.assertIn("is a collector manifest", str(refused.exception))
+        self.assertIn("audit_report.py draft", str(refused.exception))
+
     def test_a_findings_file_written_before_start_is_refused(self):
         self.harness.replies = {"issue-list": issues_view([])}
         doc_path = self.write_findings(make_doc())

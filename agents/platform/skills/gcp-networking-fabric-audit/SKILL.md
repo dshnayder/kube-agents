@@ -14,8 +14,10 @@ Audit Google Cloud VPC subnet IPAM allocation headroom, Cloud NAT port capacity,
 Open the run first with the `fleet-audit` harness's `start` (SOP §0): `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then run the collector, which resolves the SOP §1 project scope itself and writes the run manifest:
 
 ```bash
-python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
+python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 ./skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 ```
+
+`draft` writes the findings document (`findings_gcp-networking-fabric-audit.json`) from the manifest. Write each `recommendation` and `remediation` in it. The manifest is not a findings document.
 
 ## 2. Evaluate Findings Against SOP Checks
 

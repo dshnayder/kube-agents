@@ -13010,6 +13010,15 @@ def load_findings(path: str, audit_id: str) -> dict:
         data = json.loads(findings_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValidationError(f"--findings-file: {path} is not valid JSON: {exc}") from exc
+    # A collector manifest given as the findings document fails validation on
+    # its shape, and that message does not tell the worker what to do next.
+    if isinstance(data, dict) and "clusters" in data and not FINDINGS_DOCUMENT_KEYS & set(data):
+        raise ValidationError(
+            f"--findings-file: {path} is a collector manifest, not a findings document. "
+            f"Write the findings document from it with `audit_report.py draft --audit {audit_id} "
+            f"--manifest-file {path} --out <findings file>`, fill each recommendation, then give "
+            "that file as --findings-file and the manifest as --manifest-file."
+        )
     return validate_findings(data, audit_id)
 
 
