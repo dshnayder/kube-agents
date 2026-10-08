@@ -679,6 +679,58 @@ resource "google_compute_disk" "orphan_pd" {
   labels = local.fleet_labels
 }
 
+# Defect (networking): an etcd port open to the whole internet on a VM with an
+# external IP. The networking audit's §2.6 (`firewall-world-open-ingress`)
+# flags an enabled INGRESS rule opening a management port to 0.0.0.0/0 that
+# reaches at least one instance holding an external IP. Port 2379 because
+# nothing on this VM listens on it: the rule is a real finding with no service
+# behind it. No service account, project SSH keys blocked, OS Login on.
+resource "google_compute_instance" "world_open" {
+  name         = "world-open-${var.cluster_prefix}"
+  machine_type = "e2-micro"
+  zone         = var.zone
+  tags         = ["${var.cluster_prefix}-world-open"]
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {}
+  }
+
+  metadata = {
+    block-project-ssh-keys = "true"
+    enable-oslogin         = "TRUE"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+
+  labels = local.fleet_labels
+}
+
+# The name leads with `world-open-2379-` so the case can grade
+# `FirewallRule/world-open-2379-`, which only the finding's object carries.
+resource "google_compute_firewall" "world_open" {
+  name          = "world-open-2379-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["2379"]
+  }
+}
+
 # ---------------------------------------------------------------------------
 # seeded-d: the multi-zonal cluster, and the only one whose SHAPE is the
 # fixture. The anomaly-detection checks have to tell one cause of zonal skew

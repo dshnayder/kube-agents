@@ -1,0 +1,64 @@
+# NIGHTLY-TIER once its fixture is applied: a full audit, the same cost band
+# as the other fleet-audit cases. Until then a FIXTURE_NOT_READY entry in
+# scripts/validate_bench_cases.py, because the rule below exists in no pool
+# project yet.
+#
+# The check this case grades is `firewall-world-open-ingress`, networking SOP
+# §2.6: an enabled INGRESS rule opening a management port to the whole
+# internet on at least one instance holding an external IP. The collector
+# (skills/gcp-networking-fabric-audit/scripts/networking_audit.py) reads the
+# firewall rules and the instances and flags the rule.
+#
+# Planted state: bench/tf/fleet/main.tf `google_compute_firewall.world_open`
+# (`world-open-2379-<cluster_prefix>`, tcp:2379 from 0.0.0.0/0 to a tag) and
+# `google_compute_instance.world_open`, the one VM carrying that tag, with an
+# external IP. Nothing listens on 2379. Project-level objects, so there is no
+# fixtures.json role.
+#
+# Eval-driven development (.agents/rules/eval_driven_development.md): red on
+# main, whose roster has no `firewall-world-open-ingress`, so no finding can
+# carry it; green once the collector and §2.6 land.
+#
+# Isolation class: read-only on the project; writes the ledger issue to the
+# eval GitOps repo, as every fleet-audit stream does.
+id: networking-world-open-ingress
+name: Networking audit files the firewall rule that opens a management port to the internet
+prompt: >-
+  Run the GCP networking fabric audit, following the gcp-networking-fabric-audit SOP.
+expected_output: >-
+  The ledger issue carries a firewall-world-open-ingress finding against the
+  rule that opens tcp:2379 to 0.0.0.0/0 on a VM with an external IP. The
+  closing response is the SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+verification_spec:
+  # The slug against the LEDGER's finding ids (scope: finding_ids), as
+  # consistency-no-environment-label explains: only a filed finding carries
+  # it there. The rule's name is graded against the body as
+  # `FirewallRule/world-open-2379-`, which only the finding's object path
+  # carries; the evidence appendix names the rule in a command, never after
+  # that prefix.
+  - name: a-world-open-ingress-finding-was-filed
+    role: objective
+    # assert, not converge: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      scope: finding_ids
+      required_phrases: ["firewall-world-open-ingress"]
+  - name: the-ledger-names-the-planted-rule
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gcp-networking-fabric-audit
+      required_phrases: ["FirewallRule/world-open-2379-"]
