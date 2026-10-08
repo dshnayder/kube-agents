@@ -186,9 +186,11 @@ fixtures:
     objects:
       - firewall/world-open-2379-<prefix>
       - instance/world-open-<prefix>
+      - firewall/world-open-deny-remote-<prefix>
     defect: >-
       A firewall rule opening tcp:2379 to the internet on the one VM that
       carries its tag, which holds an external IP. Nothing listens on 2379.
+      A deny rule blocks tcp:22 and tcp:3389 on that VM.
 
   - role: orphan-disks
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

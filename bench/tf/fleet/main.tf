@@ -684,7 +684,8 @@ resource "google_compute_disk" "orphan_pd" {
 # flags an enabled INGRESS rule opening a management port to 0.0.0.0/0 that
 # reaches at least one instance holding an external IP. Port 2379 because
 # nothing on this VM listens on it: the rule is a real finding with no service
-# behind it. No service account, project SSH keys blocked, OS Login on.
+# behind it. No service account, project SSH keys blocked, OS Login on. The
+# `world_open_deny_remote` rule below blocks tcp:22 and tcp:3389.
 resource "google_compute_instance" "world_open" {
   name         = "world-open-${var.cluster_prefix}"
   machine_type = "e2-micro"
@@ -728,6 +729,25 @@ resource "google_compute_firewall" "world_open" {
   allow {
     protocol = "tcp"
     ports    = ["2379"]
+  }
+}
+
+# A project often keeps the stock `default-allow-ssh` and `default-allow-rdp`
+# rules, which open tcp:22 and tcp:3389 to the internet on every instance.
+# This rule blocks those two ports on the world-open VM, so its sshd is not
+# open to the internet. The collector does not let a target-scoped deny hide
+# other rules, so this rule does not change the finding the case grades.
+resource "google_compute_firewall" "world_open_deny_remote" {
+  name          = "world-open-deny-remote-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 900
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  deny {
+    protocol = "tcp"
+    ports    = ["22", "3389"]
   }
 }
 

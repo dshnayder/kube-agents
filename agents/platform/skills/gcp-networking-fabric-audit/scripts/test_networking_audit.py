@@ -1664,6 +1664,14 @@ class WorldOpenUndecidedTest(unittest.TestCase):
         self.assertEqual(hits, [])
         self.assertEqual(undecided, ["allow-ssh-autopilot"])
 
+    def test_a_target_whose_instances_have_no_external_ip_is_not_undecided(self):
+        """The audit sees the tagged instance, so the rule is decided: nothing
+        on the internet can dial an instance with no external IP."""
+        rule = world_open(name="db-open", ports=("5432",), targetTags=["db"])
+        vm = {"name": "db-1", "tags": {"items": ["db"]}, "networkInterfaces": [{"network": NETWORK}]}
+        hits, undecided = na.world_open_ingress([rule], [vm], "p1")
+        self.assertEqual((hits, undecided), ([], []))
+
     def test_an_unscoped_rule_reaching_nothing_is_not_undecided(self):
         hits, undecided = na.world_open_ingress([world_open()], [], "p1")
         self.assertEqual((hits, undecided), ([], []))
@@ -1706,6 +1714,31 @@ class SharedVpcFirewallTest(unittest.TestCase):
         command = by_name["project/host"]["candidates"][0]["command"]
         self.assertIn("gcloud compute firewall-rules list --project=host", command)
         self.assertIn("gcloud compute instances list --project=svc", command)
+
+
+class FleetInstancesUnreadTest(unittest.TestCase):
+    def setUp(self):
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+        self.addCleanup(networking_audit.FIREWALL_READS.clear)
+
+    def test_a_failed_instance_read_in_another_project_is_named_on_the_host(self):
+        """The host's rules are measured against the fleet's instances. A
+        service project whose `instances list` failed is missing from that
+        list, so the host's verdict names it rather than read clean."""
+        rule = dict(world_open(name="host-allow-ssh"), network=HOST_NETWORK)
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [rule]}),
+            "svc": project_answers(**{"instances list": (1, "ERROR: deadline exceeded")}),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        host = {e["name"]: e for e in manifest["clusters"]}["project/host"]
+        self.assertEqual(host["candidates"], [])
+        self.assertIn("without the instances of 1 other project(s)", host["limitations"])
+        self.assertIn("svc", host["limitations"])
 
 
 class ManagementPortsPinTest(unittest.TestCase):

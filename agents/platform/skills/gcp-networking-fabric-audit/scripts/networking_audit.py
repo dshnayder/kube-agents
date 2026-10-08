@@ -24,8 +24,9 @@ Two target shapes, matching `AuditSpec.scopes` for this stream:
   (`networks list`, comparing ACTIVE peerings), `cloud-armor-false-positive`
   (`security-policies list` against `backend-services list`) and
   `firewall-world-open-ingress` (`firewall-rules list` against `instances
-  list`). Any of those reads failing gates the whole project target closed:
-  one `outcome` per entry, not one per check.
+  list`). A failed read costs only the checks that use it. Each such check
+  goes in the target's `checks_unevaluated`, and the other checks keep their
+  verdicts. The target is `gate-failed` only when no read passes.
 
 `--check` narrows a run to the subnet sweep or to the project-level checks;
 the default runs both. With `--output` the manifest is written there and a
@@ -169,6 +170,12 @@ ARMOR_CHECK_SLUG = "cloud-armor-false-positive"
 FIREWALL_CHECK_SLUG = "firewall-world-open-ingress"
 # The project target's limitation for a target-scoped rule that opens a
 # management port to the internet and reaches no instance the audit can see.
+# The project target's limitation when the fleet pass measured its rules
+# without the instances of other projects whose `instances list` failed.
+FLEET_INSTANCES_UNREAD_LIMITATION = (
+    "firewall-world-open-ingress measured these rules without the instances of "
+    "{count} other project(s), because their `instances list` read failed: {names}"
+)
 UNDECIDED_FIREWALL_LIMITATION = (
     "firewall-world-open-ingress could not decide {count} target-scoped rule(s) "
     "that open a management port to the internet and reach no instance visible "
@@ -1197,6 +1204,23 @@ def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
     return blocked
 
 
+def _matches_target(rule: dict, inst: dict, project: str) -> bool:
+    """Whether `inst` is a RUNNING instance on the rule's network inside the
+    rule's target scope. The external address is not part of this test."""
+    if inst.get("status", INSTANCE_RUNNING) != INSTANCE_RUNNING:
+        return False
+    wanted = _network_key(rule.get("network", ""), project)
+    if not any(_network_key(nic.get("network", ""), project) == wanted for nic in inst.get("networkInterfaces") or []):
+        return False
+    tags = {t.lower() for t in rule.get("targetTags") or []}
+    if tags and not tags & {t.lower() for t in (inst.get("tags") or {}).get("items") or []}:
+        return False
+    accounts = {a.lower() for a in rule.get("targetServiceAccounts") or []}
+    if accounts and not accounts & {(sa.get("email") or "").lower() for sa in inst.get("serviceAccounts") or []}:
+        return False
+    return True
+
+
 def _reachable_instances(rule: dict, instances: list, project: str) -> list[tuple[str, str]]:
     """The instances this rule admits internet traffic to: on its network,
     holding an external IP, inside its target scope. An instance with no
@@ -1275,7 +1299,13 @@ def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[
         reachable = _reachable_instances(rule, instances, project)
         exposed = [label for label, _origin in reachable]
         if not exposed:
-            if rule.get("targetTags") or rule.get("targetServiceAccounts"):
+            # Undecided only when no visible instance carries the target. A
+            # target whose instances all have no external IP is clear: nothing
+            # on the internet can dial them.
+            target_scoped = rule.get("targetTags") or rule.get("targetServiceAccounts")
+            if target_scoped and not any(
+                isinstance(inst, dict) and _matches_target(rule, inst, project) for inst in instances or []
+            ):
                 undecided.append(str(rule.get("name", "")))
             continue
         remainder = len(exposed) - MAX_NAMED_EXPOSED_INSTANCES
@@ -1325,11 +1355,17 @@ def firewall_command(project: str, hit: dict) -> str:
     return joined_command(parts)
 
 
-def apply_fleet_firewall_reads(entries: list[dict]) -> None:
+def apply_fleet_firewall_reads(entries: list[dict], projects: list[str] = (), api_off: list[str] = ()) -> None:
     """Measure again the §2.6 rules of each collected project target against the
     instances of every project, not its own only. A Shared VPC host holds the
-    firewall rules, and its service projects hold the VMs."""
+    firewall rules, and its service projects hold the VMs.
+
+    A project in scope with no firewall reads had a read that failed, and its
+    instances are not in the fleet list. Each target names those projects in
+    its `limitations`, so its verdict does not rest on a blind read. A project
+    whose Compute Engine API is off holds no instance, so it is not named."""
     fleet_instances = instance_union([reads["instances"] for reads in FIREWALL_READS.values()])
+    unread_projects = sorted(set(projects) - set(FIREWALL_READS) - set(api_off))
     for entry in entries:
         project = entry.get("project", "")
         if entry.get("outcome") != OUTCOME_COLLECTED or project not in FIREWALL_READS:
@@ -1339,7 +1375,11 @@ def apply_fleet_firewall_reads(entries: list[dict]) -> None:
         entry["candidates"] = [c for c in entry["candidates"] if c["check"] != FIREWALL_CHECK_SLUG] + [
             emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits
         ]
-        limitations = [*reads["limitations"], undecided_limitation(undecided)]
+        others = [other for other in unread_projects if other != project]
+        fleet_gap = (
+            FLEET_INSTANCES_UNREAD_LIMITATION.format(count=len(others), names=", ".join(others)) if others else ""
+        )
+        limitations = [*reads["limitations"], undecided_limitation(undecided), fleet_gap]
         limitations = [text for text in limitations if text]
         if limitations:
             entry["limitations"] = LIMITATION_JOINER.join(limitations)
@@ -1664,7 +1704,7 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
                 api_off.append(project)
             else:
                 entries.append(entry)
-        apply_fleet_firewall_reads(entries)
+        apply_fleet_firewall_reads(entries, projects, api_off)
     if check in (CHECK_ALL, SUBNET_CHECK_SLUG):
         entries.extend(subnet_targets(projects))
     if notes:

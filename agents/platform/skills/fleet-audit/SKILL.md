@@ -404,7 +404,7 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 §3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2), the
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3) and the networking
 stream (`networking_audit.py`, `governance/gcp_networking_fabric_sop.md` §2).
-The compliance, obtainability, stockout and cost collectors may also give a target `checks_unevaluated`,
+The compliance, obtainability, stockout, cost and networking collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
