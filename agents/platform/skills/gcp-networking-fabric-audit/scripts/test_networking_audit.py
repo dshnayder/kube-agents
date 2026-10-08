@@ -1699,6 +1699,69 @@ class WorldOpenDenyScopeTest(unittest.TestCase):
         self.assertEqual(na.world_open_ingress([rule], [stopped], "p1"), ([], []))
 
 
+class WorldOpenExternalAddressTest(unittest.TestCase):
+    """Internet traffic arrives at an external address. The rules decide
+    reachability for each external address on the rule's network."""
+
+    def deny(self, ports=("22",), priority=100, source="0.0.0.0/0", **extra):
+        return {
+            "name": "deny-some",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": priority,
+            "sourceRanges": [source],
+            "denied": [{"IPProtocol": "tcp", "ports": list(ports)}],
+            **extra,
+        }
+
+    def test_a_deny_for_an_internal_range_does_not_clear_the_external_address(self):
+        node = {
+            "name": "node-1",
+            "networkInterfaces": [
+                {"network": NETWORK, "networkIP": "10.128.0.5", "accessConfigs": [{"natIP": "203.0.113.7"}]}
+            ],
+        }
+        rules = [world_open(), self.deny(destinationRanges=["10.128.0.0/9"])]
+        self.assertEqual(len(na.check_world_open_ingress(rules, [node], "p1")), 1)
+
+    def test_a_deny_that_matches_an_interface_on_another_network_does_not_clear(self):
+        node = {
+            "name": "node-1",
+            "networkInterfaces": [
+                {"network": NETWORK, "accessConfigs": [{"natIP": "203.0.113.7"}]},
+                {"network": OTHER_NETWORK, "accessConfigs": [{"natIP": "198.51.100.9"}]},
+            ],
+        }
+        rules = [world_open(), self.deny(destinationRanges=["198.51.100.9/32"])]
+        self.assertEqual(len(na.check_world_open_ingress(rules, [node], "p1")), 1)
+
+    def test_an_ipv4_deny_blocks_an_ipv4_only_instance_of_a_dual_stack_allow(self):
+        allow = world_open(sourceRanges=["0.0.0.0/0", "::/0"], priority=1000)
+        self.assertEqual(na.check_world_open_ingress([allow, self.deny()], [public_node()], "p1"), [])
+
+    def test_the_allow_destination_ranges_must_contain_the_address(self):
+        allow = world_open(destinationRanges=["198.51.100.0/24"])
+        self.assertEqual(na.check_world_open_ingress([allow], [public_node()], "p1"), [])
+        inside = public_node(ip="198.51.100.20")
+        self.assertEqual(len(na.check_world_open_ingress([allow], [inside], "p1")), 1)
+
+    def test_the_excerpt_names_only_the_ports_that_are_reachable(self):
+        # A target-scoped DENY blocks 22 on the one instance it targets.
+        allow = world_open(ports=("22", "3389"))
+        deny = self.deny(ports=("22",), targetTags=["x"])
+        node = public_node(tags={"items": ["x"]})
+        hits = na.check_world_open_ingress([allow, deny], [node], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("3389 (RDP)", hits[0]["excerpt"])
+        self.assertNotIn("22 (SSH)", hits[0]["excerpt"])
+
+    def test_a_staging_or_repairing_instance_is_live(self):
+        for status in ("STAGING", "PROVISIONING", "REPAIRING"):
+            with self.subTest(status=status):
+                node = public_node(status=status)
+                self.assertEqual(len(na.check_world_open_ingress([world_open()], [node], "p1")), 1)
+
+
 class WorldOpenUndecidedTest(unittest.TestCase):
     def test_a_target_scoped_rule_reaching_no_visible_instance_is_undecided(self):
         rule = world_open(name="allow-ssh-autopilot", targetTags=["gk3-pool"])
