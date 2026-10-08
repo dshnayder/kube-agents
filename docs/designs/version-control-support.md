@@ -237,11 +237,23 @@ repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry there
 reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
-pr-conversation, submit-suggestion and the scan gate. It names each entry the way the verbs take it.
-A GitHub entry is its bare `owner/name` while GitHub is the only forge the list names; any other
+pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
+each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
+the list names, so a repository's name does not change when a second forge is added and the names
+already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
-canonical host to leave off; and once the list names a second forge, GitHub's entries are
-`github.com/owner/name` too, because the broker refuses a hostless name then. An entry of a type no
+canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
+and the sandbox client answers that, not the list: it sends a bare name the install registered as
+GitHub as the URL it was registered by. The list and the client use one rule to decide which names
+the client can send this way. Thus they cannot disagree. Sometimes the client cannot send a GitHub
+entry this way. Then the list spells it `github.com/owner/name`, if the managed list or the context
+list holds an entry of another forge. This occurs in two cases. In the first case, an entry of
+another forge in one of the two lists spells the same path. That entry counts even if the list skips
+it, because the client does not select between forges. The usual example is a GitLab context
+repository with the same path as a managed GitHub repository, such as the upstream of a mirror. In
+the second case, an administrator registered the entry by hand without a URL, and the client does
+not make a URL. `gitops_workspace.qualify` turns a name in
+either spelling into the one the list uses, so a gate compares like with like. An entry of a type no
 forge in the image serves, or one that names no host, is logged and skipped, so a repository an
 administrator registered is visible as unsupported instead of indistinguishable from one that was
 never registered. `get_managed_github_repos()` remains for the callers that are GitHub's alone, such
@@ -2086,6 +2098,10 @@ GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
 `githubMinter.kms.*`. All of them are provider-conditional: an install that declares no GitHub
 forge provisions no KMS key and no minter.
+A provider whose credential is a token an administrator holds takes it as
+a Secret in the agent's namespace: the installer reads the token from a no-echo prompt or a file
+and pipes it into that Secret, and the Terraform composition, the chart values and the CR carry
+only the Secret's name, so the token is never in Terraform state, a values file or `install.env`.
 
 **What the surface does not carry is a switch for the abstraction itself.** An
 install declares _which_ forge it uses, never _whether_ the abstraction is in
