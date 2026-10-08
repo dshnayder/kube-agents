@@ -427,6 +427,23 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+            "firewall-world-open-ingress",
+        ),
+        # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
+        # subnet for the IPAM check, one `project/<id>` entry for the other
+        # five. This stream enumerates no clusters.
+        scopes=(
+            ("subnet", ("subnet-ip-exhaustion",)),
+            (
+                "project",
+                (
+                    "cloud-nat-exhaustion",
+                    "psc-routing-deadlock",
+                    "mtu-packet-fragmentation",
+                    "cloud-armor-false-positive",
+                    "firewall-world-open-ingress",
+                ),
+            ),
         ),
     ),
     "gce-compute-fleet-audit": AuditSpec(
@@ -457,6 +474,7 @@ COLLECTOR_AUDITS = frozenset(
         "compliance-audit",
         "fleet-consistency-drift",
         "fleet-wide-cost-analysis",
+        "gcp-networking-fabric-audit",
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
