@@ -89,6 +89,10 @@ PROJECT_DESCRIBE_CMD = (GCLOUD, "projects", "describe")
 # for it: a project with the Compute Engine API off refuses five reads here.
 # fleet_waste._describing_once answers the repeats from the first result too.
 PROJECT_NUMBERS: dict[str, tuple[int, str, str]] = {}
+# Each project target's firewall and instance reads, kept for the run so
+# `collect_fleet` can measure a Shared VPC host's rules against its service
+# projects' instances: `{project: (firewalls, instances, command)}`.
+FIREWALL_READS: dict[str, tuple[list, list, str]] = {}
 PROJECT_NUMBER_FORMAT = "--format=value(projectNumber)"
 PROJECT_FLAG = "--project"
 JSON_INDENT = 2
@@ -163,6 +167,14 @@ NAT_CHECK_SLUG = "cloud-nat-exhaustion"
 MTU_CHECK_SLUG = "mtu-packet-fragmentation"
 ARMOR_CHECK_SLUG = "cloud-armor-false-positive"
 FIREWALL_CHECK_SLUG = "firewall-world-open-ingress"
+# The project target's limitation for a target-scoped rule that opens a
+# management port to the internet and reaches no instance the audit can see.
+UNDECIDED_FIREWALL_LIMITATION = (
+    "firewall-world-open-ingress could not decide {count} target-scoped rule(s) "
+    "that open a management port to the internet and reach no instance visible "
+    "to the audit identity, which does not see GKE Autopilot nodes; confirm by "
+    "hand that no instance carries their target: {names}"
+)
 # The `--check` value that runs the project-level checks. `psc-routing-deadlock`
 # was this flag's value when PSC was the only project-level check here, and the
 # value is kept so a caller that passes it still runs PSC, now beside the rest.
@@ -186,8 +198,11 @@ CLOUD_ARMOR_DEFAULT_RULE_PRIORITY = 2147483647
 # A backend service whose name carries one of these is not production, and
 # SOP 2.5's Do-NOT-flag limb excludes it.
 NON_PRODUCTION_TOKENS = ("test", "staging", "stage", "dev", "sandbox", "qa")
-# The two source ranges that mean "every host on the internet".
-WORLD_SOURCE_RANGES = ("0.0.0.0/0", "::/0")
+# The two source ranges that mean "every host on the internet", one per
+# address family: a rule or a deny covers a family only through its own range.
+WORLD_IPV4_RANGE = "0.0.0.0/0"
+WORLD_IPV6_RANGE = "::/0"
+WORLD_SOURCE_RANGES = (WORLD_IPV4_RANGE, WORLD_IPV6_RANGE)
 # `IPProtocol` values that carry TCP: `all` is every protocol, and the API
 # accepts the IANA number in place of the name.
 TCP_PROTOCOL_TOKENS = ("tcp", "6", "all")
@@ -1138,13 +1153,20 @@ def _tcp_management_ports(block: list) -> set[int]:
     return covered
 
 
+def _world_families(rule: dict) -> set[str]:
+    """The world source ranges a rule names, one per address family."""
+    return {r for r in rule.get("sourceRanges") or [] if r in WORLD_SOURCE_RANGES}
+
+
 def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
-    """Ports an unconditional higher-priority DENY already blocks on this rule:
-    same network, world source range, no target restriction. A target-scoped
-    DENY may or may not cover the instances found reachable, so it is not
-    subtracted."""
+    """Ports an unconditional DENY of higher or equal priority already blocks on
+    this rule: same network, no target restriction, and a world source range
+    for every address family the rule opens to the world. GCP lets a deny win
+    at equal priority. A target-scoped DENY may or may not cover the instances
+    found reachable, so it is not subtracted."""
     network = _network_key(rule.get("network", ""), project)
     priority = rule.get("priority", DEFAULT_FIREWALL_PRIORITY)
+    families = _world_families(rule)
     blocked: set[int] = set()
     for other in firewalls or []:
         if not isinstance(other, dict):
@@ -1155,9 +1177,9 @@ def _shadowed_ports(rule: dict, firewalls: list, project: str) -> set[int]:
             continue
         if _network_key(other.get("network", ""), project) != network:
             continue
-        if other.get("priority", DEFAULT_FIREWALL_PRIORITY) >= priority:
+        if other.get("priority", DEFAULT_FIREWALL_PRIORITY) > priority:
             continue
-        if not any(r in WORLD_SOURCE_RANGES for r in other.get("sourceRanges") or []):
+        if not families or not families <= _world_families(other):
             continue
         blocked |= _tcp_management_ports(other.get("denied") or [])
     return blocked
@@ -1172,17 +1194,23 @@ def _reachable_instances(rule: dict, instances: list, project: str) -> list[str]
     tags = {t.lower() for t in rule.get("targetTags") or []}
     accounts = {a.lower() for a in rule.get("targetServiceAccounts") or []}
     wanted = _network_key(rule.get("network", ""), project)
+    families = _world_families(rule)
     exposed = []
     for inst in instances or []:
         if not isinstance(inst, dict):
             continue
-        addresses = [
-            access.get("natIP")
-            for nic in inst.get("networkInterfaces") or []
-            if _network_key(nic.get("network", ""), project) == wanted
-            for access in nic.get("accessConfigs") or []
-            if access.get("natIP")
-        ]
+        # Only an address in a family the rule opens to the world is dialable
+        # through it: an IPv6-only world allow does not reach an IPv4 natIP.
+        addresses = []
+        for nic in inst.get("networkInterfaces") or []:
+            if _network_key(nic.get("network", ""), project) != wanted:
+                continue
+            if WORLD_IPV4_RANGE in families:
+                addresses += [a.get("natIP") for a in nic.get("accessConfigs") or [] if a.get("natIP")]
+            if WORLD_IPV6_RANGE in families:
+                addresses += [
+                    a.get("externalIpv6") for a in nic.get("ipv6AccessConfigs") or [] if a.get("externalIpv6")
+                ]
         if not addresses:
             continue
         if tags and not tags & {t.lower() for t in (inst.get("tags") or {}).get("items") or []}:
@@ -1207,7 +1235,16 @@ def check_world_open_ingress(firewalls: list, instances: list, project: str) -> 
     """SOP 2.6: one hit per enabled INGRESS rule opening a management port to a
     world source range on at least one instance holding an external IP. One per
     rule, not per port: the rule is what a reader goes and changes."""
+    return world_open_ingress(firewalls, instances, project)[0]
+
+
+def world_open_ingress(firewalls: list, instances: list, project: str) -> tuple[list[dict], list[str]]:
+    """`(hits, undecided)`: the §2.6 hits, and the names of the target-scoped
+    rules that open a management port to the world but reach no instance the
+    audit can see. Those are undecided rather than clear: the audit identity
+    does not see GKE Autopilot nodes, which such a rule may well target."""
     hits = []
+    undecided = []
     for rule in firewalls or []:
         if not isinstance(rule, dict):
             continue
@@ -1221,6 +1258,8 @@ def check_world_open_ingress(firewalls: list, instances: list, project: str) -> 
             continue
         exposed = _reachable_instances(rule, instances, project)
         if not exposed:
+            if rule.get("targetTags") or rule.get("targetServiceAccounts"):
+                undecided.append(str(rule.get("name", "")))
             continue
         remainder = len(exposed) - MAX_NAMED_EXPOSED_INSTANCES
         hits.append({
@@ -1234,7 +1273,48 @@ def check_world_open_ingress(firewalls: list, instances: list, project: str) -> 
                 + (f", +{remainder} more" if remainder > 0 else "")
             ),
         })
-    return hits
+    return hits, sorted(undecided)
+
+
+def undecided_limitation(undecided: list[str]) -> str:
+    """The project target's limitations sentence for undecided rules, or ""."""
+    if not undecided:
+        return ""
+    return UNDECIDED_FIREWALL_LIMITATION.format(count=len(undecided), names=", ".join(undecided))
+
+
+def instance_union(groups: list[list]) -> list[dict]:
+    """Every instance in `groups`, each once, keyed by its selfLink, or by name
+    and zone where a test fixture carries no link."""
+    seen: dict[str, dict] = {}
+    for group in groups:
+        for inst in group or []:
+            if isinstance(inst, dict):
+                key = inst.get("selfLink") or f"{inst.get('zone', '')}/{inst.get('name', '')}"
+                seen.setdefault(key, inst)
+    return list(seen.values())
+
+
+def apply_fleet_firewall_reads(entries: list[dict]) -> None:
+    """Re-measure each collected project target's §2.6 against every project's
+    instances, not its own alone. A Shared VPC host holds the firewall rules and
+    its service projects hold the VMs, so a host-only measurement misses every
+    exposure the shared network carries."""
+    fleet_instances = instance_union([reads[1] for reads in FIREWALL_READS.values()])
+    for entry in entries:
+        project = entry.get("project", "")
+        if entry.get("outcome") != OUTCOME_COLLECTED or project not in FIREWALL_READS:
+            continue
+        firewalls, _own, command = FIREWALL_READS[project]
+        hits, undecided = world_open_ingress(firewalls, fleet_instances, project)
+        entry["candidates"] = [c for c in entry["candidates"] if c["check"] != FIREWALL_CHECK_SLUG] + [
+            emit(FIREWALL_CHECK_SLUG, hit, command) for hit in hits
+        ]
+        limitation = undecided_limitation(undecided)
+        if limitation:
+            entry["limitations"] = limitation
+        else:
+            entry.pop("limitations", None)
 
 
 # --------------------------------------------------------------------------- #
@@ -1386,10 +1466,9 @@ def collect_project_target(project: str) -> dict | None:
         firewalls = gated(cmds["firewall_rules"], FIREWALL_CHECK_SLUG)
         instances = gated(cmds["instances"], FIREWALL_CHECK_SLUG)
         firewall_command = command_text(cmds["firewall_rules"], cmds["instances"])
-        candidates += [
-            emit(FIREWALL_CHECK_SLUG, hit, firewall_command)
-            for hit in check_world_open_ingress(firewalls, instances, project)
-        ]
+        firewall_hits, undecided = world_open_ingress(firewalls, instances, project)
+        candidates += [emit(FIREWALL_CHECK_SLUG, hit, firewall_command) for hit in firewall_hits]
+        FIREWALL_READS[project] = (firewalls, instances, firewall_command)
     except ComputeApiDisabled:
         sys.stderr.write(f"{project}: Compute Engine API is not enabled; nothing here to audit\n")
         return None
@@ -1401,7 +1480,7 @@ def collect_project_target(project: str) -> dict | None:
             "outcome": OUTCOME_GATE_FAILED,
             "error": str(exc),
         }
-    return {
+    entry = {
         "name": name,
         "project": project,
         "location": GLOBAL_LOCATION,
@@ -1410,6 +1489,10 @@ def collect_project_target(project: str) -> dict | None:
         "candidates": candidates,
         "checks_not_applicable": [],
     }
+    limitation = undecided_limitation(undecided)
+    if limitation:
+        entry["limitations"] = limitation
+    return entry
 
 
 def candidate_from_finding(finding: dict) -> dict:
@@ -1487,6 +1570,7 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
         sys.stderr.write(f"{note}; auditing {projects or 'no project'}\n")
     entries: list[dict] = []
     api_off: list[str] = []
+    FIREWALL_READS.clear()
     if check in (CHECK_ALL, PROJECT_CHECKS_CHOICE):
         for project in projects:
             entry = collect_project_target(project)
@@ -1494,6 +1578,7 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
                 api_off.append(project)
             else:
                 entries.append(entry)
+        apply_fleet_firewall_reads(entries)
     if check in (CHECK_ALL, SUBNET_CHECK_SLUG):
         entries.extend(subnet_targets(projects))
     if notes:

@@ -138,6 +138,12 @@ misconfigurations:
   - id: GCP-0031
     paths:
       - "bench/tf/fleet/**"
+  # Ignore GCP-0027 on the seeded fleet only: `world-open-2379-<prefix>` opens
+  # tcp:2379 to the internet on purpose, for the same check. Nothing listens
+  # on that port.
+  - id: GCP-0027
+    paths:
+      - "bench/tf/fleet/**"
   - id: GCP-0053
     paths:
       - "bench/tf/fleet/**"

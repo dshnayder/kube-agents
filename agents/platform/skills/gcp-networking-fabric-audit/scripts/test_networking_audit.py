@@ -1620,6 +1620,105 @@ def dynamic_router(name="nat-router", nat="nat-gw"):
     }
 
 
+HOST_NETWORK = "https://www.googleapis.com/compute/v1/projects/host/global/networks/shared"
+
+
+class WorldOpenPrecedenceAndFamilyTest(unittest.TestCase):
+    def deny(self, priority, source):
+        return {
+            "name": "deny-all",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": priority,
+            "sourceRanges": [source],
+            "denied": [{"IPProtocol": "tcp"}],
+        }
+
+    def test_an_equal_priority_deny_blocks_the_allow(self):
+        """GCP lets a deny win at equal priority."""
+        allow = world_open(priority=1000)
+        self.assertEqual(na.check_world_open_ingress([allow, self.deny(1000, "0.0.0.0/0")], [public_node()], "p1"), [])
+
+    def test_an_ipv6_only_deny_does_not_cancel_an_ipv4_allow(self):
+        allow = world_open(priority=1000)
+        hits = na.check_world_open_ingress([allow, self.deny(100, "::/0")], [public_node()], "p1")
+        self.assertEqual(len(hits), 1)
+
+    def test_an_ipv6_only_allow_does_not_reach_an_ipv4_address(self):
+        rule = world_open(sourceRanges=["::/0"])
+        self.assertEqual(na.check_world_open_ingress([rule], [public_node()], "p1"), [])
+
+    def test_an_ipv6_only_allow_reaches_an_external_ipv6_address(self):
+        rule = world_open(sourceRanges=["::/0"])
+        node = {
+            "name": "v6-node",
+            "networkInterfaces": [{"network": NETWORK, "ipv6AccessConfigs": [{"externalIpv6": "2001:db8::7"}]}],
+        }
+        self.assertEqual(len(na.check_world_open_ingress([rule], [node], "p1")), 1)
+
+
+class WorldOpenUndecidedTest(unittest.TestCase):
+    def test_a_target_scoped_rule_reaching_no_visible_instance_is_undecided(self):
+        rule = world_open(name="allow-ssh-autopilot", targetTags=["gk3-pool"])
+        hits, undecided = na.world_open_ingress([rule], [public_node()], "p1")
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["allow-ssh-autopilot"])
+
+    def test_an_unscoped_rule_reaching_nothing_is_not_undecided(self):
+        hits, undecided = na.world_open_ingress([world_open()], [], "p1")
+        self.assertEqual((hits, undecided), ([], []))
+
+    def test_the_project_target_names_an_undecided_rule_in_limitations(self):
+        answers = project_answers(**{
+            "firewall-rules list": [world_open(name="allow-ssh-autopilot", targetTags=["gk3-pool"])],
+        })
+        with patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd({"p1": answers})), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            entry = networking_audit.collect_project_target("p1")
+        self.assertIn("allow-ssh-autopilot", entry["limitations"])
+        self.assertIn("confirm by hand", entry["limitations"])
+
+
+class SharedVpcFirewallTest(unittest.TestCase):
+    def setUp(self):
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+        self.addCleanup(networking_audit.FIREWALL_READS.clear)
+
+    def test_a_host_project_rule_reaches_a_service_project_vm(self):
+        """The rule lives in the host project and the external-IP VM in a
+        service project on the host's network: measured against its own
+        project's instances alone, the host never fires."""
+        rule = dict(world_open(name="host-allow-ssh"), network=HOST_NETWORK)
+        vm = public_node(name="svc-vm", network=HOST_NETWORK)
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [rule]}),
+            "svc": project_answers(**{"instances list": [vm]}),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        by_name = {e["name"]: e for e in manifest["clusters"]}
+        objects = [c["object"] for c in by_name["project/host"]["candidates"]]
+        self.assertEqual(objects, ["FirewallRule/host-allow-ssh"])
+        self.assertIn("svc-vm", by_name["project/host"]["candidates"][0]["excerpt"])
+
+
+class ManagementPortsPinTest(unittest.TestCase):
+    def test_the_networking_port_set_matches_the_compliance_collectors(self):
+        """`collect.py` checks LoadBalancer Services against the same ports; a
+        port admitted on one side only is a rule reported daily for a Service
+        the other side leaves open."""
+        import importlib.util
+
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "fleet-audit", "scripts", "collect.py")
+        spec = importlib.util.spec_from_file_location("collect_for_pin", path)
+        collect = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collect)
+        self.assertEqual(set(na.MANAGEMENT_PORTS), set(collect._WORLD_OPEN_LB_PORTS))
+
+
 class ProjectTargetTest(unittest.TestCase):
     def setUp(self):
         networking_audit.PROJECT_NUMBERS.clear()
