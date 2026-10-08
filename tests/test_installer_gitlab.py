@@ -644,7 +644,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         call = source.index('  record_gitops_forge_keys "$INSTALL_ENV_FILE"')
         self.assertLess(source.index('write_json_report "GENERATE_ONLY_SUCCESS"'), call)
         self.assertLess(source.index('write_json_report "PAUSED"'), call)
-        self.assertLess(call, source.index('print_step "12. Applying the Install'))
+        self.assertLess(call, source.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"'))
         self.assertEqual(source.count("record_gitops_forge_keys \""), 1)
 
     def test_a_switch_to_gitlab_drops_the_pem_path_too(self):
