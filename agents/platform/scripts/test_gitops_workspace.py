@@ -1709,12 +1709,40 @@ class TestForgeNeutralNames(unittest.TestCase):
             self.names(("gitlab", "https://gitlab.example.com/acme/platform/infra.git")),
         )
 
-    def test_a_second_forge_qualifies_githubs_names_too(self):
-        # The broker refuses a name with no host once it serves two forges.
+    def test_a_second_forge_leaves_githubs_names_bare(self):
+        # Review (#2437): the name flipped to `github.com/owner/name` when a
+        # second forge was added, so leases, run records and cron `--repo`
+        # args written before and after spelt one repository two ways. The
+        # sandbox client sends a registered bare name by its URL instead.
         self.assertEqual(
-            ["github.com/acme/fleet", "gitlab.com/acme/infra"],
+            ["acme/fleet", "gitlab.com/acme/infra"],
             self.names(("github", "https://github.com/acme/fleet"), ("gitlab", "https://gitlab.com/acme/infra")),
         )
+
+    def test_a_slug_another_forge_also_spells_is_named_with_its_host(self):
+        # `vcs_client._registered_urls` will not choose a forge for it, so a
+        # bare name would reach a two-forge broker hostless and be refused.
+        self.assertEqual(
+            ["github.com/Acme/Infra", "acme/fleet", "gitlab.com/acme/infra"],
+            self.names(
+                ("github", "https://github.com/Acme/Infra"),
+                ("github", "https://github.com/acme/fleet"),
+                ("gitlab", "https://gitlab.com/acme/infra"),
+            ),
+        )
+
+    def test_a_github_entry_registered_without_a_url_is_named_with_its_host(self):
+        # The sandbox client sends only a registration's own URL; a hand-written
+        # bare entry has none, so beside another forge it keeps its host here.
+        self.assertEqual(
+            ["github.com/acme/hand", "acme/fleet", "gitlab.com/acme/infra"],
+            self.names(
+                ("github", "acme/hand"),
+                ("github", "https://github.com/acme/fleet"),
+                ("gitlab", "https://gitlab.com/acme/infra"),
+            ),
+        )
+        self.assertEqual(["acme/hand"], self.names(("github", "acme/hand")))
 
     def test_an_entry_with_no_host_or_no_provider_is_skipped_and_says_why(self):
         with self.assertLogs("gitops_workspace", level="WARNING") as logs:
@@ -1819,6 +1847,18 @@ class TestForgeNeutralNames(unittest.TestCase):
         # Not GitHub-shaped, so not GitHub's to lower.
         self.assertEqual("github.com/a/b/c", gitops_workspace.qualify("github.com/a/b/c", ["acme/fleet"]))
 
+    def test_qualify_answers_the_lists_spelling_not_the_forge_count(self):
+        # Review (#2437): a `github.com/acme/fleet` persisted by a release that
+        # qualified every GitHub name beside a second forge compares equal to
+        # the bare entry the list now holds, and a bare name to a qualified
+        # entry where the list keeps one.
+        mixed_bare = ["acme/fleet", "gitlab.com/acme/infra"]
+        self.assertEqual("acme/fleet", gitops_workspace.qualify("github.com/acme/fleet", mixed_bare))
+        self.assertEqual("acme/fleet", gitops_workspace.qualify("acme/fleet", mixed_bare))
+        collided = ["github.com/acme/infra", "gitlab.com/acme/infra"]
+        self.assertEqual("github.com/acme/infra", gitops_workspace.qualify("acme/infra", collided))
+        self.assertEqual("github.com/Acme/Infra", gitops_workspace.qualify("Acme/Infra", collided))
+
     def test_a_local_clone_of_another_forges_repository_is_refused_up_front(self):
         # Review: directory mode cloned with GitHub's credential only, so a
         # private GitLab project failed mid-clone naming nothing.
@@ -1893,7 +1933,7 @@ class TestNoBrokerImports(unittest.TestCase):
         with patch.dict(sys.modules, blocked), \
                 patch("gitops_workspace.get_managed_repo_entries", return_value=entries):
             self.assertEqual(
-                ["github.com/acme/fleet", "gitlab.com/acme/infra"], gitops_workspace.get_managed_repos()
+                ["acme/fleet", "gitlab.com/acme/infra"], gitops_workspace.get_managed_repos()
             )
             self.assertEqual("merge request", gitops_workspace.proposal_noun("gitlab.com/acme/infra"))
             self.assertTrue(gitops_workspace.is_valid_repo_slug("gitlab.com/acme/infra"))

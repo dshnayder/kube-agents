@@ -237,11 +237,18 @@ repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry there
 reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
-pr-conversation, submit-suggestion and the scan gate. It names each entry the way the verbs take it.
-A GitHub entry is its bare `owner/name` while GitHub is the only forge the list names; any other
+pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
+each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
+the list names, so a repository's name does not change when a second forge is added and the names
+already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
-canonical host to leave off; and once the list names a second forge, GitHub's entries are
-`github.com/owner/name` too, because the broker refuses a hostless name then. An entry of a type no
+canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
+and the sandbox client answers that, not the list: it sends a bare name the install registered as
+GitHub as the URL it was registered by. Two GitHub entries it cannot send that way are spelt
+`github.com/owner/name` in the list instead, once another forge is listed: one whose path another
+forge's entry also spells, because the client does not choose between forges, and one registered by
+hand without a URL, because the client composes none. `gitops_workspace.qualify` turns a name in
+either spelling into the one the list uses, so a gate compares like with like. An entry of a type no
 forge in the image serves, or one that names no host, is logged and skipped, so a repository an
 administrator registered is visible as unsupported instead of indistinguishable from one that was
 never registered. `get_managed_github_repos()` remains for the callers that are GitHub's alone, such

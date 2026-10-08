@@ -779,14 +779,16 @@ def clone_url(repo: str) -> str:
 def qualify(repo: str, managed: list[str] | None = None) -> str:
     """`repo` as the managed list and the broker spell it on this install.
 
-    GitHub's repositories have two spellings and the list uses one at a time:
-    bare `owner/name` while GitHub is the only forge it names, and
-    `github.com/owner/name` once it names a second -- the broker then refuses
-    a hostless name. A name from somewhere that saw the other period -- a
-    cron's `--repo`, a lease record, a workspace directory, the list's own
-    output copied while a second forge was registered -- is turned into the
-    current spelling either way, so every gate can compare it with the list
-    as written. A repository on another forge is returned unchanged.
+    GitHub's repositories have two spellings. The list names one bare
+    (`owner/name`) unless the sandbox client could not send that name to a
+    broker serving two forges, and then as `github.com/owner/name` (see
+    `get_managed_repos`). A name from
+    somewhere that used the other spelling -- a cron's `--repo`, a lease
+    record, a workspace directory, the list's output copied while it spelt
+    the repository the other way, including from a release that qualified
+    every GitHub name once a second forge was listed -- is turned into the
+    spelling the list uses, so every gate can compare it with the list as
+    written. A repository on another forge is returned unchanged.
 
     `managed` is the list when the caller has read it already; otherwise it is
     read here, and a list that cannot be read leaves the name as it was for the
@@ -806,8 +808,9 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
             managed = get_managed_repos()
         except Exception:
             return repo
-    if any(split_host(name)[0] for name in managed):
-        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
+    qualified = f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
+    if any(isinstance(name, str) and name.lower() == qualified.lower() for name in managed):
+        return qualified
     return bare
 
 
@@ -1279,12 +1282,17 @@ def get_managed_repos() -> list[str]:
     """Every managed repository, named the way the verbs take it.
 
     A GitHub entry is its bare `owner/name`, spelt as registered -- exactly
-    what `get_managed_github_repos` answers -- as long as GitHub is the only
-    forge the list names. Every other forge's entry is `host/path`, because
-    there is no canonical host to leave off: `gitlab.com/acme/infra`, or a
-    self-managed instance's own. Once the list names a second forge, GitHub's
-    entries become `github.com/owner/name` too, because the broker refuses a
-    name with no host when it serves more than one forge.
+    what `get_managed_github_repos` answers -- whatever other forges the list
+    names, so a repository's name does not change when a second forge is
+    added. Every other forge's entry is `host/path`, because there is no
+    canonical host to leave off: `gitlab.com/acme/infra`, or a self-managed
+    instance's own. The broker refuses a name with no host when it serves
+    more than one forge; the sandbox client sends a registered bare GitHub
+    name as its URL (`vcs_client._on_the_wire`), so that refusal is never
+    reached. Two GitHub entries are the exception, once another forge is
+    listed: a slug another forge's entry also spells, since that client will
+    not choose a forge for it, and an entry registered by hand without a
+    URL, since that client composes none. Each is `github.com/owner/name`.
 
     An entry of a type no forge in this image serves, or one that names no
     host, is logged and skipped, as an unreadable GitHub URL is.
@@ -1298,6 +1306,7 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
         [e for e in entries if e.get("type") == GITHUB_REPO_TYPE], key, fold_case=False
     )]
     others: list[str] = []
+    spelt: set[str] = set()
     for entry in entries:
         kind, url = entry.get("type"), entry.get("url", "")
         if kind == GITHUB_REPO_TYPE:
@@ -1337,8 +1346,30 @@ def _forge_repo_names(entries: list[dict[str, str]], key: str) -> list[str]:
         name = f"{ref.host}/{ref.path}"
         if name not in others:
             others.append(name)
+            spelt.add("/".join(ref.segments).lower())
+    # A GitHub name stays bare however many forges the list names: the sandbox
+    # client sends a bare name the install registered as GitHub by its URL
+    # (`vcs_client._on_the_wire`), so the broker never sees it hostless. With
+    # another forge listed, a slug that client cannot resolve is named with
+    # its host here instead: one another forge's entry also spells
+    # (`acme/infra` beside `gitlab.com/acme/infra`), which it leaves alone
+    # because it does not choose between forges, and one registered by hand
+    # without a URL, which it does not compose one for. The operator registers
+    # every repository by URL, so on an install it seeded neither happens.
     if others:
-        github = [f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" for slug in github]
+        by_url = {
+            extract_github_slug(entry.get("url", "")).lower()
+            for entry in entries
+            if entry.get("type") == GITHUB_REPO_TYPE
+            and "://" in str(entry.get("url", ""))
+            and extract_github_slug(entry.get("url", ""))
+        }
+        github = [
+            f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}"
+            if slug.lower() in spelt or slug.lower() not in by_url
+            else slug
+            for slug in github
+        ]
     return github + others
 
 
