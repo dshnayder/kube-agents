@@ -2069,6 +2069,10 @@ GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
 `githubMinter.kms.*`. All of them are provider-conditional: an install that declares no GitHub
 forge provisions no KMS key and no minter.
+A provider whose credential is a token an administrator holds takes it as
+a Secret in the agent's namespace: the installer reads the token from a no-echo prompt or a file
+and pipes it into that Secret, and the Terraform composition, the chart values and the CR carry
+only the Secret's name, so the token is never in Terraform state, a values file or `install.env`.
 
 **What the surface does not carry is a switch for the abstraction itself.** An
 install declares _which_ forge it uses, never _whether_ the abstraction is in
