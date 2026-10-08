@@ -245,6 +245,7 @@ AUDITS: dict[str, AuditSpec] = {
             "rwo-claim-contended",
             "hpa-floors-at-one",
             "pdb-overlapping",
+            "untargeted-compute-class-workload",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -5773,15 +5774,7 @@ def _declared_intent_gap(data: dict) -> str | None:
     findings = list(held.get("findings") or [])
     unsearched = [str(slug) for slug in held.get("unsearched") or []]
     if held.get("run_record"):
-        # A repository the content workspace cannot open says so, rather than
-        # reading like a search that failed.
-        named_unsearched = [
-            f"{slug} (its forge's files cannot be read in content mode yet)"
-            if content_workspace_refusal(slug) is not None
-            else slug
-            for slug in unsearched
-        ]
-        where = f"repositories not searched: {', '.join(named_unsearched)}"
+        where = f"repositories not searched: {', '.join(unsearched)}"
     else:
         where = "no run record from `start`, so every repository counts as unsearched"
     if findings:
@@ -11696,37 +11689,14 @@ def _land_group_via_clone(
     return _GroupPush(base, True)
 
 
-def content_workspace_refusal(repo: str) -> str | None:
-    """Why the broker's file workspace cannot open `repo`, or None if it can.
-
-    The content workspace clones GitHub and nothing else: its managed clones
-    ride the write credential the GitHub CLI installed in the broker, which no
-    other forge's host answers to. A repository on another forge still gets
-    its ledger -- issues and comments go through the verbs, which reach every
-    forge -- but its remediation files cannot be read or published in content
-    mode until the workspace clones from the repository's own forge.
-    """
-    import gitops_workspace
-
-    host, _ = gitops_workspace.split_host(repo)
-    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
-        return None
-    return (
-        f"{repo} is on {host}, and the broker's file workspace clones GitHub "
-        "repositories only, so its files -- remediation targets and declared "
-        "intent alike -- cannot be read or published in content mode yet. The "
-        "ledger issue is unaffected."
-    )
-
-
 def content_workspace_repo(repo: str) -> str:
     """`repo` as the broker's file workspace takes it: GitHub's bare `owner/name`.
 
-    The workspace opens bare GitHub slugs only, and an install managing a
-    second forge spells GitHub's repositories `github.com/owner/name`
+    The workspace keys GitHub's repositories by the bare slug, and an install
+    managing a second forge spells them `github.com/owner/name`
     (`gitops_workspace.qualify`), so that spelling is put back to the slug at
-    the door. Every other name is returned as it is, for
-    `content_workspace_refusal` to have answered first.
+    the door. A repository on another forge is passed with its host, and the
+    broker clones it from the forge that serves it.
     """
     import gitops_workspace
 
@@ -11763,10 +11733,6 @@ def _land_group_via_broker(
     """
     import credential_proxy_client
 
-    refusal = content_workspace_refusal(repo)
-    if refusal:
-        log(f"{branch}: {refusal} No {noun or _proposal_noun(repo)} opened.")
-        return _GroupPush("", False)
     changes = {path: snapshot[path] for path in paths}
     with credential_proxy_client.Workspace.open(
         proxy_endpoint(), content_workspace_repo(repo), branch=branch
@@ -13836,13 +13802,6 @@ def discover_declarations(
                     log(f"WARNING: {slug}: no commit sha for the checkout; not searched.")
                     continue
             else:
-                # Asked before the clone, as `fetch`, `list`, `grep` and the
-                # remediation step ask it: otherwise the workspace's own
-                # refusal surfaces as a clone that "exited 1".
-                refusal = content_workspace_refusal(slug)
-                if refusal is not None:
-                    log(f"WARNING: {slug}: not searched. {refusal}")
-                    continue
                 into = Path(tempfile.mkdtemp(prefix=CLONE_TMP_PREFIX, dir=SCRATCH_DIR))
                 copied = _clone_for_search(slug, ref, audit_id, into)
                 if copied is None:
@@ -14161,9 +14120,6 @@ def handle_fetch(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    refusal = content_workspace_refusal(repo) if content_mode() else None
-    if refusal:
-        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"fetch needs the content-passing broker; this run is in directory "
@@ -14212,9 +14168,6 @@ def handle_list(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    refusal = content_workspace_refusal(repo) if content_mode() else None
-    if refusal:
-        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"list needs the content-passing broker; this run is in directory "
@@ -14379,9 +14332,6 @@ def handle_grep(args: argparse.Namespace) -> None:
     repo = resolve_repo(audit_id=audit_id)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
-    refusal = content_workspace_refusal(repo) if content_mode() else None
-    if refusal:
-        raise ValidationError(refusal)
     if not content_mode():
         raise ValidationError(
             f"grep needs the content-passing broker; this run is in directory "
@@ -14803,24 +14753,56 @@ def _remediation_outcomes(
     return outcomes
 
 
+def _unserved_host_refusal(repo: str, host: str) -> str:
+    """Why content mode cannot publish to `repo`'s host, or "".
+
+    The broker's file workspace clones from any forge the install serves, and
+    the managed list is the sandbox's view of which those are: a non-GitHub
+    host no managed entry names is one the broker would refuse at the open, a
+    failure the person who asked would read as a broken run. Said up front
+    instead. A list that cannot be read refuses nothing here; the broker still
+    refuses an unserved host itself.
+    """
+    import gitops_workspace
+
+    if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
+        return ""
+    try:
+        served = {
+            gitops_workspace.split_host(entry)[0]
+            for entry in gitops_workspace.get_managed_repos()
+        }
+    except Exception:  # noqa: BLE001 - advisory; the broker is the gate
+        return ""
+    if host in served:
+        return ""
+    return (
+        f"{repo} is on {host}, which is not a forge this install serves -- no "
+        "managed repository names it -- so a retry will not change this."
+    )
+
+
 def remediation_refusal(repo: str) -> str:
     """Why no remediation proposal can be published to `repo`, or "".
 
-    Both ways a remediation is published -- the broker's file workspace in
-    content mode, a local clone in directory mode -- reach GitHub only today,
-    so a repository on another forge gets its ledger and no proposal. Said in
-    the `/remediate` reply, because the person who asked reads that, not the
-    log.
+    In content mode the broker's file workspace clones from the repository's
+    own forge, so every forge gets its proposal. In directory mode the local
+    clone rides the credential the GitHub CLI installed and reaches GitHub
+    only; `start` and `finish` stop at that clone for a repository on another
+    forge, so this answer is for a direct `remediate` call there. Said in the
+    reply, because the person who asked reads that, not the log.
     """
     import gitops_workspace
 
     host, _ = gitops_workspace.split_host(repo)
+    if content_mode():
+        return _unserved_host_refusal(repo, host)
     if not host or host == gitops_workspace.repo_ref.GITHUB_CANONICAL_HOST:
         return ""
     return (
-        f"{repo} is on {host}, and remediation files are published to GitHub "
-        "repositories only for now, so a retry will not change this. The "
-        "findings stay on the ledger."
+        f"{repo} is on {host}, and this run is in directory mode, whose local "
+        "clone reaches GitHub only, so a retry will not change this. Content "
+        "mode publishes to every forge."
     )
 
 
@@ -14844,6 +14826,10 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # dry run would preview a body no run sends -- with or without `--repo`,
     # since without it the dry run still resolves the repository it previews.
     refusal_repo = _dry_run_repo(audit_id, opt_repo) if args.dry_run else repo_hint
+    # Resolved once for the whole preview, as `_handle_finish_dry_run` does: a
+    # failed read falls back to "pull request", so a lookup per group could
+    # preview one group as a merge request and the next as a pull request.
+    dry_noun = _proposal_noun(refusal_repo) if args.dry_run else ""
     refusal = remediation_refusal(refusal_repo) if refusal_repo else ""
     if refusal:
         raise ValidationError(refusal)
@@ -14949,7 +14935,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
                     group,
                     issue_number=args.issue,
                     generated_at=now,
-                    noun=_proposal_noun(_dry_run_repo(audit_id, opt_repo)),
+                    noun=dry_noun,
                 )
             )
         return

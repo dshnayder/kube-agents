@@ -2359,6 +2359,39 @@ Four endpoints need naming because they are not a rename of GitHub's:
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
 
+### GitLab in the content workspace
+
+The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
+the install serves. The caller names a repository and never a host or a URL:
+
+- **A bare `owner/name` is GitHub's,** and the workspace composes its github.com URL
+  as it always has.
+- **A host-qualified name is resolved through the forges the install serves.** The
+  forge parses it (nested groups, `allowed_paths`) and composes the clone URL with
+  `clone_url`. A name no served forge owns is refused before anything is cloned.
+
+What a clone presents follows the forge's credential:
+
+- **GitHub is unchanged.** A context repository gets a read-only minted token. A
+  managed repository rides the write credential the CLI installed in the broker,
+  so its clone, fetch and push carry no credential of their own.
+- **GitLab's credential is a stored token, with nothing ambient behind it.** A
+  managed repository's clone, fetch and push present it through the forge's
+  credential helper, so the token never enters argv, the environment or the tree.
+  The token is asked for again before every fetch and push, so a repository
+  unregistered after `open` stops receiving it. An unregistered repository
+  presents nothing, as on GitHub.
+
+**A context repository never receives the write token.** It gets the forge's
+read-only credential when the forge offers one, and GitLab's stored token has no
+read-only variant here, so a GitLab context repository is cloned with no
+credential. That reads a public project and refuses a private one at the clone,
+with a log line saying why. A read-only GitLab token for context repositories
+would lift that: a second Secret and a second `Credential`, with nothing here
+depending on its absence. The write gate is unchanged: `commit` and `push`
+resolve the repository's own forge and refuse anything that forge's managed list
+does not hold.
+
 ### GitLab errors
 
 GitLab returns conventional statuses: 401, 403, 404, 409, 422 and 429 are all in
