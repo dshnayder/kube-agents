@@ -435,6 +435,9 @@ PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
 # never recorded.
 PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
 PARAM_GITOPS_CA_CONFIGMAP="${GITOPS_CA_CONFIGMAP:-}"
+# Whether the CA file came from --gitops-ca-file rather than the interview: a
+# flag with gitlab.com is refused, an interview answer is cleared.
+PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # Whether a value came from a flag rather than install.env: a switch of forge
 # by flag drops what the file recorded for the other forge, but refuses a flag
 # that contradicts it.
@@ -943,7 +946,7 @@ parse_args() {
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
-      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; shift ;;
+      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
@@ -4476,6 +4479,13 @@ validate_gitops_forge_flags() {
   local self_managed="true"
   case "${PARAM_GITOPS_HOST:-}" in ""|gitlab.com|www.gitlab.com) self_managed="false" ;; esac
   if [ "$self_managed" != "true" ]; then
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+      # An interview answer for an earlier host: the user went back and chose
+      # gitlab.com, so the file is not theirs to keep. Refusing it would
+      # repeat on every pass, with no prompt left to clear it.
+      print_info "Dropping the CA file from the earlier answer: gitlab.com uses the public CAs."
+      PARAM_GITOPS_CA_FILE=""
+    fi
     if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
       print_error "--gitops-ca-file is for a self-managed GitLab: give its hostname with --gitops-host. gitlab.com uses the public CAs."
       return 1

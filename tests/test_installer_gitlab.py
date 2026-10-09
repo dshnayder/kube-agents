@@ -546,7 +546,7 @@ _PEM = "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
 
 
 class GitLabPrivateCATest(unittest.TestCase):
-    """#2750: --gitops-ca-file puts a self-managed instance's private CA into
+    """--gitops-ca-file puts a self-managed instance's private CA into
     a ConfigMap the forge's caBundleRef names. The file's path is never
     recorded, and a private key is never stored."""
 
@@ -642,22 +642,55 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
         ca.write_text(_PEM)
         for case in (
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_FILE": str(ca)},
-            self._gitlab(PARAM_GITOPS_CA_FILE=str(self._tmp / "missing.pem")),
-            self._gitlab(PARAM_GITOPS_CA_FILE=str(self._tmp)),
+            self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_FILE=str(self._tmp / "missing.pem")),
+            self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_FILE=str(self._tmp)),
         ):
             with self.subTest(case=case):
                 proc = self._validate_ca(case)
                 self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
 
     def test_the_ca_flag_needs_a_self_managed_host(self):
-        # #2750 review: gitlab.com presents a certificate the public CAs sign.
+        # gitlab.com presents a certificate the public CAs sign, so a private
+        # CA must never vouch for it.
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         for host in ("", "gitlab.com", "www.gitlab.com"):
             with self.subTest(host=host):
-                proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST=host, PARAM_GITOPS_CA_FILE=str(ca)))
+                proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST=host, PARAM_GITOPS_CA_FILE=str(ca),
+                                                      PARAM_GITOPS_CA_FILE_FROM_FLAG="true"))
                 self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
                 self.assertIn("self-managed GitLab", proc.stdout + proc.stderr)
+
+    def test_an_interview_that_goes_back_to_gitlab_com_is_not_trapped(self):
+        # The interview loop: a self-managed host and a CA file, a project
+        # path the validator refuses, then gitlab.com on the next pass. The CA
+        # prompt is skipped for gitlab.com, so the earlier file must be cleared,
+        # or the refusal repeats on every pass.
+        ca = self._tmp / "ca.pem"
+        ca.write_text(_PEM)
+        body = (
+            f"PARAM_GITOPS_FORGE=gitlab PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token "
+            f"PARAM_GITOPS_HOST=gitlab.internal PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))} "
+            "PARAM_GITOPS_REPO=project\n"
+            'validate_gitops_forge_flags && first=0 || first=$?\n'
+            "PARAM_GITOPS_HOST= PARAM_GITOPS_REPO=group/project\n"
+            'validate_gitops_forge_flags && second=0 || second=$?\n'
+            'echo "first=$first second=$second ca=[$PARAM_GITOPS_CA_FILE] cm=[$PARAM_GITOPS_CA_CONFIGMAP]"'
+        )
+        proc = self._run_install_func(body)
+        self.assertRegex(proc.stdout, r"first=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("second=0 ca=[] cm=[]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_a_ca_flag_with_gitlab_com_is_still_refused(self):
+        ca = self._tmp / "ca.pem"
+        ca.write_text(_PEM)
+        proc = self._run_install_func(
+            f"parse_args --gitops-forge=gitlab --gitops-repo=group/project --gitops-ca-file={shlex.quote(str(ca))}\n"
+            "PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"'
+        )
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("self-managed GitLab", proc.stdout + proc.stderr)
 
     def test_a_host_of_gitlab_com_drops_the_recorded_configmap(self):
         proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="", PARAM_GITOPS_CA_CONFIGMAP="gitlab-forge-ca"))
