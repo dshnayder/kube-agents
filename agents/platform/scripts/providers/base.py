@@ -227,8 +227,10 @@ class Forge:
 
         Composed from the validated repository and this forge's own host, as
         `clone_url` is, so it needs no credential and no network. The caller
-        fills `{ref}` with a branch or a commit, and `{path}` with the file's
-        path, each segment URL-encoded. None when the forge has no such page.
+        URL-encodes `{path}` one segment at a time and keeps its `/`
+        separators. The caller puts `{ref}` in as it is: a branch name with
+        `/` is valid there. A link that must outlive the branch uses a commit
+        SHA as `{ref}`. None when the forge has no such page.
         """
         return None
 
