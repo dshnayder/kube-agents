@@ -345,10 +345,35 @@ class GitTrustTest(unittest.TestCase):
         self.assertEqual("false", redirects_for("https://gitlab.internal/platform/infra.git"))
         self.assertEqual("", redirects_for("https://github.com/acme/infra.git"))
 
+    # Entries as the registry loads them, so the forges build.
+    BUILT = (
+        {"provider": "github", "host": "github.com", "token_path": "", "allowed_paths": None, "ca_file": ""},
+        {"provider": "gitlab", "host": "gitlab.internal", "token_path": "/t", "allowed_paths": ("g",),
+         "ca_file": "/ca/internal.crt", "ca_source": ""},
+        {"provider": "gitlab", "host": "gitlab.example.com", "token_path": "/u", "allowed_paths": ("h",),
+         "ca_file": ""},
+    )
+
+    def test_a_github_entry_with_a_ca_is_refused_and_pins_nothing(self):
+        # The GitHub forge reads no CA bundle. Git alone trusting one for
+        # github.com would leave the two clients disagreeing about the host.
+        entry = {"provider": "github", "host": "github.com", "token_path": "", "allowed_paths": None,
+                 "ca_file": "/ca/private.crt"}
+        with self.assertRaisesRegex(ValueError, "caFile is not supported for github"):
+            providers.build_forges({"forges": [entry]})
+        self.assertEqual((), credential_proxy._ca_reading_entries([entry, *self.BUILT[1:]]))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=(entry,)):
+            executor = credential_proxy.CommandExecutor(
+                timeout_seconds=5, max_output_bytes=1024, state_dir=tmp.name, scoped_pool=None
+            )
+        self.assertEqual((), executor.forge_ca_config)
+
     def test_every_git_the_executor_runs_carries_the_pin(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=self.ENTRIES):
+        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=self.BUILT):
             executor = credential_proxy.CommandExecutor(
                 timeout_seconds=5, max_output_bytes=1024, state_dir=tmp.name, scoped_pool=None
             )
@@ -386,7 +411,8 @@ class GitLoopbackTrustTest(unittest.TestCase):
 
     def executor(self, *, pinned: bool):
         entries = (
-            {"host": f"localhost:{self.port}", "ca_file": str(self.ca),
+            {"provider": "gitlab", "host": f"localhost:{self.port}", "token_path": "/t",
+             "allowed_paths": ("g",), "ca_file": str(self.ca),
              "ca_source": "the ConfigMap test-ca or its key ca.crt"},
         ) if pinned else ()
         state = Path(self.tmp.name) / ("pinned" if pinned else "bare")
@@ -434,6 +460,104 @@ class GitLoopbackTrustTest(unittest.TestCase):
         self.assertIsNotNone(refusal, result.stderr)
         self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
         self.assertIn("the ConfigMap test-ca or its key ca.crt is missing", refusal.fields["detail"])
+
+
+class OpenerTest(unittest.TestCase):
+    def test_a_forge_with_no_ca_builds_its_opener_once(self):
+        # Every install without a CA file takes this path on every API call
+        # and every page of a paginating verb.
+        with mock.patch.object(urllib.request, "build_opener") as build:
+            transport = HttpTransport("https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024)
+            for _ in range(3):
+                transport._open(urllib.request.Request("https://gitlab.internal/api/v4/user"), timeout=1)
+        self.assertEqual(1, build.call_count)
+        self.assertEqual(3, build.return_value.open.call_count)
+
+    def test_a_forge_with_a_ca_builds_per_call(self):
+        transport = HttpTransport(
+            "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024, ca_file="/ca/ca.crt"
+        )
+        self.assertIsNone(transport._fixed_opener)
+
+
+class UncheckedGitPathsTest(unittest.TestCase):
+    """git runs that read a failure themselves (`check=False`) answer a
+    certificate by its cause too, not as "push failed" or a retryable call
+    failure: the content workspace's push, and the version-control verbs'
+    `ls-remote` reads."""
+
+    UNTRUSTED = ("fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
+                 "certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none)")
+
+    def test_a_push_answers_a_certificate_by_its_cause(self):
+        import content_workspace
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "agent").mkdir()
+
+        class Result:
+            exit_code = 128
+            stdout = ""
+            stderr = self.UNTRUSTED
+
+        store = content_workspace.ContentWorkspaceStore(
+            root / "trees", root / "agent", lambda argv, cwd, **kwargs: Result()
+        )
+        handle = "a" * 32
+        tree = store.tree_root / handle / "repo"
+        tree.mkdir(parents=True)
+        store._workspaces[handle] = content_workspace.Workspace(
+            handle=handle, repo="gitlab.internal/g/p", tree=tree, base="main", base_sha="1" * 40,
+            branch="platform-agent/fix", head="2" * 40, default_branch="main",
+        )
+        with self.assertRaises(content_workspace.TlsUntrusted) as caught:
+            store.push(handle, "platform-agent/fix")
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.code)
+        self.assertIn("`git push` failed", str(caught.exception))
+
+    def _bound(self, stderr: str, returncode: int = 128):
+        import types
+
+        calls = []
+
+        def git(root, *args, check=True):
+            calls.append(args)
+            return types.SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+        forge = types.SimpleNamespace(clone_url=lambda repo: f"https://gitlab.internal/{repo}.git")
+        return types.SimpleNamespace(git=git, forge=forge, repo="g/p"), calls
+
+    def test_a_remote_read_answers_a_certificate_by_its_cause(self):
+        import vcs_broker
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / ".git").mkdir()
+        broker = vcs_broker.VcsBroker.__new__(vcs_broker.VcsBroker)
+        broker._tls_refusal = providers.tls_refusal
+        bound, _calls = self._bound(self.UNTRUSTED)
+        with self.assertRaises(WorkspaceError) as caught:
+            broker._remote_tip(bound, root, "platform-agent/fix")
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        # Any other failure keeps the retryable fallback.
+        bound, _calls = self._bound("fatal: the remote end hung up unexpectedly")
+        with self.assertRaises(WorkspaceError) as caught:
+            broker._remote_tip(bound, root, "platform-agent/fix")
+        self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+
+    def test_the_default_branch_probe_does_not_read_a_certificate_as_no_default(self):
+        import vcs_broker
+
+        bound, _calls = self._bound(self.UNTRUSTED)
+        with self.assertRaises(WorkspaceError) as caught:
+            vcs_broker.VcsBroker._default_branch_of_remote(bound.git, Path("/tmp"))
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        # A remote that advertises no HEAD still answers "".
+        bound, _calls = self._bound("", returncode=0)
+        self.assertEqual("", vcs_broker.VcsBroker._default_branch_of_remote(bound.git, Path("/tmp")))
 
 
 class CertificateFailureTest(unittest.TestCase):

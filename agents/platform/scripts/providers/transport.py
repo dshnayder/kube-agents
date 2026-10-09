@@ -510,6 +510,10 @@ class HttpTransport:
         self._whoami_route = whoami_route
         self._outer_deadline = outer_deadline
         self._opener = opener
+        # Built once for the transport's life when no CA file is named, as
+        # before CA files existed; only a forge that names one builds per
+        # call, so a remounted file is the next call's trust.
+        self._fixed_opener = None if (opener is not None or ca_file) else self._build_opener()
 
     def _open(self, request: urllib.request.Request, timeout: float) -> Any:
         """Send `request`, trusting the forge's own CA when it names one.
@@ -520,6 +524,8 @@ class HttpTransport:
         """
         if self._opener is not None:
             return self._opener(request, timeout=timeout)
+        if self._fixed_opener is not None:
+            return self._fixed_opener.open(request, timeout=timeout)
         return self._build_opener().open(request, timeout=timeout)
 
     def _build_opener(self) -> urllib.request.OpenerDirector:

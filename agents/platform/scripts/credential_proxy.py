@@ -3336,6 +3336,23 @@ def forge_ca_sources(entries) -> dict[str, str]:
     }
 
 
+def _ca_reading_entries(entries) -> tuple[dict[str, str], ...]:
+    """`{host, ca_file, ca_source}` for each built forge that reads a CA file.
+
+    A configuration the forges refuse yields none: the registry reads the same
+    file when the broker is built and refuses to start with its own message.
+    """
+    try:
+        forges = providers.build_forges({"forges": list(entries or ())}) if entries else ()
+    except ValueError:
+        return ()
+    return tuple(
+        {"host": forge.hosts[0], "ca_file": forge.ca_file, "ca_source": forge.ca_source}
+        for forge in forges
+        if forge.ca_file and forge.hosts
+    )
+
+
 def _configured_forge_entries():
     """The forge configuration's entries, or () when there is none or it is unreadable.
 
@@ -4792,14 +4809,13 @@ class CommandExecutor:
         # layer rather than in a credential's config, because a context
         # repository on such a forge is cloned with no credential at all and
         # still needs the trust.
-        entries = _configured_forge_entries()
+        # From the built forges, not the raw file: only a forge that reads its
+        # CA in its API client gets git pinned to it, so the two clients never
+        # disagree about a host's certificate.
+        entries = _ca_reading_entries(_configured_forge_entries())
         self.forge_ca_config = forge_ca_git_config(entries)
         self.forge_ca_sources = forge_ca_sources(entries)
-        self.forge_ca_files = {
-            str(entry.get("host") or "").strip().lower(): str(entry.get("ca_file") or "").strip()
-            for entry in entries
-            if str(entry.get("ca_file") or "").strip()
-        }
+        self.forge_ca_files = {entry["host"]: entry["ca_file"] for entry in entries}
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -6704,6 +6720,7 @@ def build_vcs_broker(
         http_max_bytes=executor.max_output_bytes,
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",

@@ -1845,6 +1845,12 @@ class ContentWorkspaceStore:
                 config=self._push_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
+                # Read as `_git` reads a checked failure: a certificate is
+                # answered by its cause, not as "push failed".
+                refusal = self._tls_refusal(getattr(result, "stderr", ""))
+                if refusal is not None:
+                    detail = getattr(refusal, "fields", {}).get("detail", "")
+                    raise TlsUntrusted(f"`git push` failed: {refusal} ({self._redact(detail)})")
                 stderr = (getattr(result, "stderr", "") or "").lower()
                 if "stale info" in stderr or "rejected" in stderr:
                     raise Conflict(
