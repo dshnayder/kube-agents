@@ -168,8 +168,11 @@ Notes:
   its key ca.crt is missing". A wrong key looks the same as a missing ConfigMap.
 - **`FORGE_TLS_UNTRUSTED` names its cause.** The text says which of these it is:
   a certificate that does not chain to a trusted CA, a certificate that has
-  expired or is not valid yet, a certificate for another hostname, or a CA
-  bundle that is not mounted. No retry fixes any of them.
+  expired or is not valid yet, a certificate for another hostname, a CA bundle
+  that is not mounted, or a CA bundle that could not be loaded (not PEM, or no
+  certificate in it). No retry fixes any of them. In git, a file with no
+  certificate in it at all reads as a certificate that does not chain to a
+  trusted CA.
 - **Terraform and Helm.** Terraform takes `gitlab_ca_configmap_name`. The chart
   takes `platformAgent.integration.forges[].caBundleRef.name` (and an optional
   `key`). Both only name the ConfigMap. You create it.

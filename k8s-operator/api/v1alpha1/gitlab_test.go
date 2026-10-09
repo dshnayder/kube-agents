@@ -490,7 +490,7 @@ func TestAGitLabNamespaceSegmentMayNotEndInAReservedSuffix(t *testing.T) {
 	}
 }
 
-// #2750: a self-managed forge behind a private CA names it in caBundleRef, and
+// A self-managed forge behind a private CA names it in caBundleRef, and
 // the broker's entry for that forge, and no other, carries the file it is
 // mounted at. The key defaults to ca.crt.
 func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
@@ -535,7 +535,7 @@ func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
 	badName.CABundleRef = &ForgeCABundleRef{Name: "Not_A_Name"}
 	badKey := glForge("bad-key", "gitlab.two.example", "team")
 	badKey.CABundleRef = &ForgeCABundleRef{Name: "ok", Key: "no spaces allowed"}
-	// #2750 review: the provider's public host never takes a private CA, in
+	// The provider's public host never takes a private CA, in
 	// any spelling, and an empty host is that host.
 	saas := glForge("saas", "", "acme")
 	saas.CABundleRef = &ForgeCABundleRef{Name: "ca"}

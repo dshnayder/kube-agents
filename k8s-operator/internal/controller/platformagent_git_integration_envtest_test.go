@@ -90,7 +90,7 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "Bad_Name"}}},
 		}, "credentialsRef.name"},
-		// #2750: caBundleRef is for a gitlab forge, and its names are the
+		// caBundleRef is for a gitlab forge, and its names are the
 		// API server's own, held with the webhook off.
 		"github-ca-bundle": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs",

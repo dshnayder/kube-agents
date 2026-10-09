@@ -592,7 +592,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
         self.assertEqual(len(integration["repositories"]), 2)
 
     def test_a_gitlab_forge_renders_its_ca_bundle(self):
-        """#2750: a self-managed instance behind a private CA names the
+        """A self-managed instance behind a private CA names the
         ConfigMap that holds the CA. A forge without one renders no field."""
         integration = _integration(
             *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
@@ -627,7 +627,8 @@ class ChartGitIntegrationTest(unittest.TestCase):
               "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "ok", "caBundleRef.key": "no/slash"}, "caBundleRef.key"),
-            # #2750 review: never on gitlab.com, in any spelling, or with no host.
+            # Never on gitlab.com, in any spelling, or with no host: a private CA
+            # must never vouch for a host the public CAs sign.
             ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
             ({"provider": "gitlab", "host": "gitlab.com", "namespace": "acme", "credentialsRef.name": "t",

@@ -204,7 +204,7 @@ func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
 	}
 }
 
-// #2750: a forge's CA bundle is the ConfigMap key caBundleRef names, mounted
+// A forge's CA bundle is the ConfigMap key caBundleRef names, mounted
 // into the broker's pod only, at the path its configuration entry names.
 // Optional, so a missing ConfigMap does not stop the broker, and not a SubPath,
 // so kubelet's refresh of the ConfigMap reaches the broker with no restart.

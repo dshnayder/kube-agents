@@ -984,7 +984,8 @@ says to fix a field rather than repeat the call, and 5xx is 503
 `FORGE_UNAVAILABLE` and says to retry the same call unchanged. A TLS
 certificate that does not verify is 502 `FORGE_TLS_UNTRUSTED` and says that no
 retry fixes it; its text names the cause (an untrusted chain, an expired
-certificate, a wrong name, or a CA bundle that is not mounted). Everything
+certificate, a wrong name, or a CA bundle that is not mounted or not
+loadable). Everything
 unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
@@ -2445,9 +2446,10 @@ a Secret. The operator mounts the key into the broker's pod only, and the
 forge's entry in the broker configuration names the file (`caFile`). The
 agent's pod and the shell sandbox get nothing.
 
-The broker trusts the CA for that forge's host and for no other host. A private
-CA must never vouch for github.com or gitlab.com, so a forge at the provider's
-public host (gitlab.com, or an empty host) refuses `caBundleRef`:
+A private CA must never vouch for github.com or gitlab.com, so a forge at the
+provider's public host (gitlab.com, or an empty host) refuses `caBundleRef`.
+For the other forges, the broker trusts the CA for that forge's host and for no
+other host:
 
 - The API client builds one TLS context for the forge: the system bundle plus the
   CA file. Other forges keep the default context.
@@ -2475,8 +2477,17 @@ The mount is optional, as the token's is: a missing ConfigMap does not stop the
 broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
 clients, and the detail names what to create: "the ConfigMap <name> or its key
 <key> is missing". A wrong key looks the same as a missing ConfigMap, so the
-detail names both. The forge's broker entry carries the two names for this. The broker reads the file on each
-call, so an update of the ConfigMap reaches the broker with no restart.
+detail names both. The forge's broker entry carries the two names for this.
+
+A ConfigMap key that holds no usable PEM certificate gets its own answer from
+both clients: the CA file could not be loaded (not PEM, or no certificate in
+it). git words a missing CA file and a malformed one alike, so the broker tells
+the two apart by whether the forge's file exists. A file with no certificate
+in it at all loads as an empty CA list in git, and git then reports an
+untrusted chain.
+
+The broker reads the file on each call, so an update of the ConfigMap reaches
+the broker with no restart.
 
 Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
 CA bundle, so it refuses the field: a CA that nothing reads would hide a
@@ -2537,8 +2548,9 @@ whose fields it validated and refused — is not. Two specifics:
   cause, because each one needs a different action: a chain that does not reach
   a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
   TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
-  certificate for another name (fix the certificate or the host), and a CA
-  bundle that is not mounted (create the ConfigMap). One code serves all four,
+  certificate for another name (fix the certificate or the host), a CA bundle
+  that is not mounted (create the ConfigMap), and a CA bundle that is not PEM
+  or holds no certificate (correct the ConfigMap). One code serves all five,
   because the caller does the same in each case: it stops and reports. Lines
   that git prints from the server (`remote: ...`) are never read as a verdict.
 
