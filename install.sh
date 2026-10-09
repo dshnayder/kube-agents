@@ -4476,9 +4476,7 @@ validate_gitops_forge_flags() {
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
   # certificate the public CAs sign, and a private CA must never vouch for it.
-  local self_managed="true"
-  case "${PARAM_GITOPS_HOST:-}" in ""|gitlab.com|www.gitlab.com) self_managed="false" ;; esac
-  if [ "$self_managed" != "true" ]; then
+  if ! gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}"; then
     if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
       # An interview answer for an earlier host: the user went back and chose
       # gitlab.com, so the file is not theirs to keep. Refusing it would
@@ -4496,18 +4494,61 @@ validate_gitops_forge_flags() {
     fi
   fi
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
-    # Read once, after the apply, as the token is: a process substitution can
-    # be read only once, so its content is checked there, not here.
     case "$PARAM_GITOPS_CA_FILE" in
       \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
     esac
     if [ ! -r "$PARAM_GITOPS_CA_FILE" ] || [ -d "$PARAM_GITOPS_CA_FILE" ]; then
       print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' is not readable."
+      # An interview answer is cleared, so the next pass can answer "none":
+      # its prompt offers no default.
+      [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
       return 1
+    fi
+    # A regular file is checked now, before the apply records the ConfigMap's
+    # name in install.env, the tfvars and the CR. /dev/stdin and a process
+    # substitution can be read only once, so they are checked when they are
+    # read, after the apply.
+    if [ -f "$PARAM_GITOPS_CA_FILE" ]; then
+      local pem_problem
+      pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
+      if [ -n "$pem_problem" ]; then
+        print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+        [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
+        return 1
+      fi
     fi
     PARAM_GITOPS_CA_CONFIGMAP="${PARAM_GITOPS_CA_CONFIGMAP:-${DEFAULT_GITOPS_CA_CONFIGMAP:-gitlab-forge-ca}}"
   fi
+  # A name from install.env or the environment is held to the rule the CRD,
+  # the chart and Terraform hold it to, here, where the message names the key.
+  if [ -n "${PARAM_GITOPS_CA_CONFIGMAP:-}" ] &&
+    { [ "${#PARAM_GITOPS_CA_CONFIGMAP}" -gt 253 ] ||
+      ! [[ "$PARAM_GITOPS_CA_CONFIGMAP" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+    print_error "GITOPS_CA_CONFIGMAP must be a valid Kubernetes ConfigMap name (got '${PARAM_GITOPS_CA_CONFIGMAP}')."
+    return 1
+  fi
   return 0
+}
+
+# True when HOST is a self-managed GitLab: not empty and not gitlab.com in
+# either spelling. The one definition the interview and the validator share.
+gitlab_host_is_self_managed() {
+  case "${1:-}" in
+    ""|gitlab.com|www.gitlab.com) return 1 ;;
+  esac
+  return 0
+}
+
+# Why PEM text cannot be stored as the GitLab CA, or "" when it can: it holds
+# no certificate, or it holds a private key. A CA's key in a ConfigMap is a key
+# any reader of the namespace can sign with.
+gitlab_ca_pem_problem() {
+  local pem="$1"
+  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
+    printf '%s' "holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
+  elif [[ "$pem" == *"PRIVATE KEY"* ]]; then
+    printf '%s' "holds a private key. Give the CA certificate alone; nothing was stored."
+  fi
 }
 
 # Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
@@ -4557,15 +4598,18 @@ create_gitlab_ca_configmap() {
     fi
     return 0
   fi
-  local pem=""
+  local pem="" pem_problem=""
   IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
-  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
-    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
-    return 1
-  fi
-  if [[ "$pem" == *"PRIVATE KEY"* ]]; then
-    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' holds a private key. Give the CA certificate alone; nothing was stored."
-    return 1
+  pem_problem="$(gitlab_ca_pem_problem "$pem")"
+  if [ -n "$pem_problem" ]; then
+    # Only a one-shot source (/dev/stdin, a process substitution) reaches
+    # here with bad content: a regular file was checked before the apply. The
+    # apply has named the ConfigMap already, so say how to create it and go on
+    # to the health checks, as a missing token does.
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
+    print_warning "The agent cannot verify the GitLab host's certificate until ConfigMap '${name}' exists. Create it; the agent picks it up with no restart:"
+    print_info "  kubectl create configmap ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    return 0
   fi
   printf '%s' "$pem" | kubectl create configmap "$name" -n "$namespace" --context "$context" \
     --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
@@ -6113,12 +6157,13 @@ main() {
       [[ "$github_repo" == */* ]] || github_repo=""
       while true; do
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
-        [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
+        gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
         # Only a self-managed instance can be behind a private CA.
-        if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]; then
-          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE "${PARAM_GITOPS_CA_FILE:-}"
+        # No default: empty must stay a way to answer "none" on every pass.
+        if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]; then
+          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
         fi
         PARAM_GITOPS_REPO="$github_repo"
         if [ -n "$github_repo" ] && validate_gitops_forge_flags; then

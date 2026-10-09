@@ -592,8 +592,12 @@ class GitLabPrivateCATest(unittest.TestCase):
                     f"GITOPS_CA_CONFIGMAP=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
                     'create_gitlab_ca_configmap agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
                 )
-                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr)
+                # A one-shot source is read after the apply has named the
+                # ConfigMap: refused, nothing stored, the way to create it
+                # named, and the install goes on to its health checks.
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
                 self.assertIn(message, proc.stdout + proc.stderr)
+                self.assertIn("kubectl create configmap gitlab-forge-ca", proc.stdout + proc.stderr)
                 self.assertEqual([], self._configmaps())
 
     def test_without_a_file_a_missing_configmap_is_named_and_an_existing_one_kept(self):
@@ -691,6 +695,54 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
         )
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
         self.assertIn("self-managed GitLab", proc.stdout + proc.stderr)
+
+    def test_a_bad_regular_file_is_refused_before_the_apply(self):
+        # Checked here, so install.env, the tfvars and the CR never name a
+        # ConfigMap the installer then cannot write.
+        for name, content, message in (
+            ("not-pem", "hello\n", "no PEM certificate"),
+            ("with-key", _PEM + "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n", "private key"),
+        ):
+            with self.subTest(name=name):
+                ca = self._tmp / f"{name}.pem"
+                ca.write_text(content)
+                proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_FILE=str(ca),
+                                                      PARAM_GITOPS_CA_FILE_FROM_FLAG="true"))
+                self.assertRegex(proc.stdout, r"rc=[1-9] cm=\s*$", proc.stderr + proc.stdout)
+                self.assertIn(message, proc.stdout + proc.stderr)
+
+    def test_an_interview_on_an_unreadable_ca_path_can_answer_none_next(self):
+        # The prompt offers no default, and a refused interview answer is
+        # cleared, so the next pass can leave the CA empty.
+        body = (
+            "PARAM_GITOPS_FORGE=gitlab PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token "
+            f"PARAM_GITOPS_HOST=gitlab.internal PARAM_GITOPS_CA_FILE={shlex.quote(str(self._tmp / 'missing.pem'))} "
+            "PARAM_GITOPS_REPO=group/project\n"
+            'validate_gitops_forge_flags && first=0 || first=$?\n'
+            'echo "first=$first ca=[$PARAM_GITOPS_CA_FILE]"\n'
+            'validate_gitops_forge_flags && second=0 || second=$?\n'
+            'echo "second=$second cm=[$PARAM_GITOPS_CA_CONFIGMAP]"'
+        )
+        proc = self._run_install_func(body)
+        self.assertRegex(proc.stdout, r"first=[1-9] ca=\[\]", proc.stderr + proc.stdout)
+        self.assertIn("second=0 cm=[]", proc.stdout, proc.stderr + proc.stdout)
+        self.assertNotIn('PARAM_GITOPS_CA_FILE "${PARAM_GITOPS_CA_FILE', _INSTALL_SH.read_text())
+
+    def test_the_interview_and_the_validator_share_one_self_managed_test(self):
+        proc = self._run_install_func(
+            'for h in "" gitlab.com www.gitlab.com gitlab.internal; do '
+            'gitlab_host_is_self_managed "$h" && echo "[$h]=yes" || echo "[$h]=no"; done'
+        )
+        for line in ("[]=no", "[gitlab.com]=no", "[www.gitlab.com]=no", "[gitlab.internal]=yes"):
+            self.assertIn(line, proc.stdout, proc.stderr)
+        source = _INSTALL_SH.read_text()
+        self.assertIn('gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""', source)
+        self.assertIn('if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]', source)
+
+    def test_a_recorded_configmap_name_is_checked(self):
+        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_CONFIGMAP="My_CA"))
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("GITOPS_CA_CONFIGMAP must be a valid Kubernetes ConfigMap name", proc.stdout + proc.stderr)
 
     def test_a_host_of_gitlab_com_drops_the_recorded_configmap(self):
         proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="", PARAM_GITOPS_CA_CONFIGMAP="gitlab-forge-ca"))
