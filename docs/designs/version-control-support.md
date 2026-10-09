@@ -884,6 +884,15 @@ another for no property gained.
 Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
 must name it; [The shape](#the-shape) has the rule and the doors that hold it.
 
+`capabilities` also answers `fileUrl`: the web address of a file in the
+repository, with `{ref}` and `{path}` for the caller to fill. It is
+`https://github.com/<owner>/<name>/blob/{ref}/{path}` on GitHub, and
+`https://<host>/<group>/.../<project>/-/blob/{ref}/{path}` on GitLab. The forge
+composes it from the repository and its own host, so the sandbox builds no
+forge URL. A link in an issue or a proposal uses it, because a bare relative
+path resolves against the page and opens nothing. A forge that this install
+does not serve answers no `fileUrl`.
+
 The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
