@@ -3299,6 +3299,38 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 )
 
 
+def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
+    """git config that trusts each forge's own CA on that forge's hosts only.
+
+    One `http.https://<host>/.sslCAInfo` pair for every configured forge that
+    names a `caFile`. git matches the key's URL against the remote's, so the
+    file is the CA bundle for that host and nothing else: github.com and
+    gitlab.com go on using the system bundle. This works with git built on
+    either OpenSSL or GnuTLS, which `SSL_CERT_FILE` does not.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in entries or ():
+        ca_file = str(entry.get("ca_file") or "").strip()
+        host = str(entry.get("host") or "").strip().lower()
+        if not ca_file or not host:
+            continue
+        hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
+        pairs.extend((f"http.https://{name}/.sslCAInfo", ca_file) for name in hosts)
+    return tuple(pairs)
+
+
+def _configured_forge_entries():
+    """The forge configuration's entries, or () when there is none or it is unreadable.
+
+    Unreadable is not refused here: the forge registry reads the same file
+    when the broker is built and refuses to start with its own message.
+    """
+    try:
+        return providers.load_forge_entries() or ()
+    except ValueError:
+        return ()
+
+
 def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
     """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
 
@@ -4738,6 +4770,12 @@ class CommandExecutor:
             name: shutil.which(name, path=trusted_path)
             for name in self.ALLOWED_EXECUTABLES
         }
+        # The CA each self-managed forge names, as URL-scoped git config: git
+        # trusts it for that forge's host and for no other. In the forced
+        # layer rather than in a credential's config, because a context
+        # repository on such a forge is cloned with no credential at all and
+        # still needs the trust.
+        self.forge_ca_config = forge_ca_git_config(_configured_forge_entries())
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -4806,7 +4844,11 @@ class CommandExecutor:
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
             **_git_forced_config_environment(
-                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+                (
+                    *self.forge_ca_config,
+                    ("core.hooksPath", str(self.git_hooks_dir)),
+                    *GIT_FORCED_CONFIG,
+                )
             ),
         }
         # Forward only variables required by supported credential clients. Chat
@@ -6459,6 +6501,7 @@ class CommandExecutor:
                 _git_forced_config_environment(
                     (
                         *extra_config,
+                        *self.forge_ca_config,
                         ("core.hooksPath", str(self.git_hooks_dir)),
                         *GIT_FORCED_CONFIG,
                     )
@@ -8538,6 +8581,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 exc.returncode,
                 redact_credentials(str(exc.stderr or "")[:2000]),
             )
+            # A certificate that does not verify is answered by name: the one
+            # matching line, redacted, and no other part of stderr.
+            why = providers.certificate_failure(str(exc.stderr or ""))
+            if why:
+                refusal = providers.tls_untrusted("", redact_credentials(why))
+                self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
+                return
             self._json(
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},

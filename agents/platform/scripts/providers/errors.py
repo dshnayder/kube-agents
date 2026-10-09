@@ -55,9 +55,12 @@ __all__ = [
     "GUIDANCE",
     "Guidance",
     "Override",
+    "TLS_UNTRUSTED",
     "UNAVAILABLE",
     "UNRECOGNISED",
+    "certificate_failure",
     "forge_error",
+    "tls_untrusted",
 ]
 
 
@@ -122,6 +125,58 @@ UNRECOGNISED = Guidance(
     "The forge did not answer this call and did not say why in a form this "
     "broker recognises. One retry is reasonable; two is not.",
 )
+
+
+TLS_UNTRUSTED = Guidance(
+    502,
+    "FORGE_TLS_UNTRUSTED",
+    "The broker could not verify the forge's TLS certificate. No retry fixes "
+    "this: the certificate does not chain to a CA this broker trusts for the "
+    "host. Report it and stop. An administrator gives the forge the CA that "
+    "signed its certificate, in the forge's caBundleRef (install.sh "
+    "--gitops-ca-file).",
+)
+
+# What git, through libcurl with OpenSSL or GnuTLS, writes when the peer's
+# certificate does not verify, or when the CA file it was told to load cannot
+# be loaded. Lowercased; matched as substrings of one stderr line.
+_CERTIFICATE_MARKERS = (
+    "server verification failed",
+    "certificate verify failed",
+    "ssl certificate problem",
+    "certificate is not trusted",
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "self signed certificate",
+    "error setting certificate",
+    "could not load ca file",
+    "problem with the ssl ca cert",
+)
+
+
+def certificate_failure(text: str) -> str:
+    """The line of `text` that says a TLS certificate failed, or "".
+
+    `text` is a client's error output -- git's stderr, or the reason a send
+    failed. Only the matching line is answered, cut short, so a caller can put
+    it in a reply without also passing on a URL that carries a credential.
+    """
+    for line in str(text or "").splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in _CERTIFICATE_MARKERS):
+            return line.strip()[:200]
+    return ""
+
+
+def tls_untrusted(host: str, why: str) -> WorkspaceError:
+    """The refusal for a certificate that does not verify, naming `host`."""
+    named = f"{host}: {why}" if host else why
+    return WorkspaceError(
+        TLS_UNTRUSTED.text,
+        status=TLS_UNTRUSTED.status,
+        code=TLS_UNTRUSTED.code,
+        detail=named.strip()[:400],
+    )
 
 
 def forge_error(

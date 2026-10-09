@@ -61,7 +61,9 @@ _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
-    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?}]}`.
+    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?, "caFile"?}]}`.
+    `caFile` is an absolute path to PEM CA certificates that this forge's host,
+    and no other, is trusted under.
     Read at registry construction, never cached across it, so a test or a
     remount sees the file it names. A file that is named and cannot be read
     raises: a broker that does not know which forges it serves must not start
@@ -97,11 +99,15 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
             not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed)
         ):
             raise ValueError(f"forges[{index}].allowedPaths in {path} must be a list of paths")
+        ca_file = item.get("caFile")
+        if ca_file is not None and (not isinstance(ca_file, str) or not os.path.isabs(ca_file.strip())):
+            raise ValueError(f"forges[{index}].caFile in {path} must be an absolute path")
         entries.append(
             {
                 "provider": provider,
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
+                "ca_file": (ca_file or "").strip(),
                 # Passed through unfiltered: an entry that trims to nothing is
                 # the forge's to refuse, not the loader's to drop.
                 "allowed_paths": None if allowed is None else tuple(allowed),

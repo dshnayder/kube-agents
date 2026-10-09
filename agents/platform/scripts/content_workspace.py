@@ -69,7 +69,7 @@ from typing import Callable, Iterable, Mapping
 
 import repo_ref
 import workspace_paths
-from providers import pinned_base
+from providers import certificate_failure, pinned_base
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -214,6 +214,18 @@ class Conflict(ContentWorkspaceError):
 class GitFailed(ContentWorkspaceError):
     status = 502
     code = "workspace.git-failed"
+
+
+class TlsUntrusted(ContentWorkspaceError):
+    """git could not verify the forge's TLS certificate.
+
+    Its own code rather than `workspace.git-failed`: no retry fixes a
+    certificate, and the action is an administrator's -- the forge's
+    caBundleRef -- not the caller's.
+    """
+
+    status = 502
+    code = "FORGE_TLS_UNTRUSTED"
 
 
 class BaseBranchMissing(ContentWorkspaceError):
@@ -941,6 +953,14 @@ class ContentWorkspaceStore:
             result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
+            why = certificate_failure(getattr(result, "stderr", ""))
+            if why:
+                raise TlsUntrusted(
+                    f"`git {argv[0]}` could not verify the forge's TLS certificate: "
+                    f"{self._redact(why)}. No retry fixes this: an administrator "
+                    "gives the forge the CA that signed its certificate, in the "
+                    "forge's caBundleRef (install.sh --gitops-ca-file)."
+                )
             raise GitFailed(
                 f"`git {argv[0]}` failed with exit code {exit_code}: "
                 f"{self._redact(getattr(result, 'stderr', ''))}"

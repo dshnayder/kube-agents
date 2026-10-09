@@ -119,9 +119,10 @@ class GitLabForge(Forge):
     )
 
     def __init__(
-        self, host: str, token_path: str, allowed_paths: Iterable[str] = ()
+        self, host: str, token_path: str, allowed_paths: Iterable[str] = (), ca_file: str = ""
     ) -> None:
         super().__init__()
+        self.ca_file = ca_file
         # gitlab.com answers on `www.` too, and the operator folds that
         # spelling onto gitlab.com, so a URL written with it resolves here.
         # The canonical host stays first: clone URLs and managed-list keys
@@ -209,7 +210,7 @@ class GitLabForge(Forge):
                     f"the {cls.name} forge at {entry.get('host')} names no allowedPaths: "
                     "list the namespaces it may reach, or [] for the whole host"
                 )
-            built.append(cls(entry["host"], token_path, allowed))
+            built.append(cls(entry["host"], token_path, allowed, str(entry.get("ca_file") or "")))
         return tuple(built)
 
     #: How many pages of the token account's projects `reach` reads: enough
