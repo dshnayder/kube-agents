@@ -325,7 +325,7 @@ bootstrap_install_env() {
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_CONFIGMAP
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -430,6 +430,11 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# A self-managed GitLab behind a private CA: a FILE the CA is read from, and
+# the ConfigMap it goes into, which install.env records. The file's path is
+# never recorded.
+PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
+PARAM_GITOPS_CA_CONFIGMAP="${GITOPS_CA_CONFIGMAP:-}"
 # Whether a value came from a flag rather than install.env: a switch of forge
 # by flag drops what the file recorded for the other forge, but refuses a flag
 # that contradicts it.
@@ -651,6 +656,9 @@ Flags for AI Agents & Automation:
                                 non-interactively, leaves the Secret for you to create
   --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
                                 (default: gitlab-forge-token)
+  --gitops-ca-file=PATH         PEM CA that signed a self-managed GitLab's certificate (a private
+                                CA). Read into ConfigMap gitlab-forge-ca after the apply; the
+                                broker trusts it for the GitLab host only
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -935,6 +943,7 @@ parse_args() {
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
+      --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
@@ -1767,7 +1776,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET)
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_CONFIGMAP)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
@@ -1962,16 +1971,17 @@ record_gitops_forge_keys() {
   [ -z "$recorded" ] && recorded="github"
   [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
   if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
-    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO
+    read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO GITOPS_CA_CONFIGMAP
     if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
       [ "$(recorded_install_env_value "$file" GITLAB_TOKEN_SECRET)" = "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}" ] &&
-      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ]; then
+      [ "$(recorded_install_env_value "$file" GITOPS_REPO)" = "${GITOPS_REPO:-}" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_CONFIGMAP)" = "${GITOPS_CA_CONFIGMAP:-}" ]; then
       return 0
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_CONFIGMAP GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -1979,6 +1989,7 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+    write_env_var "$tmp" GITOPS_CA_CONFIGMAP "${GITOPS_CA_CONFIGMAP:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   else
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -2565,6 +2576,7 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+    write_env_var "$tmp" GITOPS_CA_CONFIGMAP "${GITOPS_CA_CONFIGMAP:-}"
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
@@ -4387,8 +4399,12 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
       PARAM_GITOPS_HOST=""
     fi
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
-      print_error "--gitops-host and --gitlab-token-file apply only with --gitops-forge=gitlab."
+    if [ -n "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]; then
+      print_info "Dropping the recorded GitLab CA ConfigMap '${PARAM_GITOPS_CA_CONFIGMAP}': this run's GitOps forge is GitHub."
+      PARAM_GITOPS_CA_CONFIGMAP=""
+    fi
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] || [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-host, --gitlab-token-file and --gitops-ca-file apply only with --gitops-forge=gitlab."
       return 1
     fi
     return 0
@@ -4455,6 +4471,18 @@ validate_gitops_forge_flags() {
       return 1
     fi
   fi
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    # Read once, after the apply, as the token is: a process substitution can
+    # be read only once, so its content is checked there, not here.
+    case "$PARAM_GITOPS_CA_FILE" in
+      \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
+    esac
+    if [ ! -r "$PARAM_GITOPS_CA_FILE" ] || [ -d "$PARAM_GITOPS_CA_FILE" ]; then
+      print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' is not readable."
+      return 1
+    fi
+    PARAM_GITOPS_CA_CONFIGMAP="${PARAM_GITOPS_CA_CONFIGMAP:-${DEFAULT_GITOPS_CA_CONFIGMAP:-gitlab-forge-ca}}"
+  fi
   return 0
 }
 
@@ -4484,6 +4512,47 @@ gitlab_token_strip() {
   local t="$1"
   t="${t//[[:space:]]/}"
   printf '%s' "$t"
+}
+
+# Creates (or replaces) the ConfigMap the GitLab forge's caBundleRef names,
+# from --gitops-ca-file, under the key ca.crt. Server-side apply, as for the
+# token Secret. The file is read once, here: a process substitution cannot be
+# read twice. It must hold at least one PEM certificate and no private key: a
+# CA's key in a ConfigMap is a key any reader of the namespace can sign with.
+# Without a file, an existing ConfigMap is kept, and a missing one is named,
+# because until it exists every call to the forge fails on its certificate.
+create_gitlab_ca_configmap() {
+  local namespace="$1" context="$2"
+  local name="${GITOPS_CA_CONFIGMAP:-}"
+  [ -n "$name" ] || return 0
+  if [ -z "${PARAM_GITOPS_CA_FILE:-}" ]; then
+    if ! kubectl get configmap "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+      print_warning "ConfigMap '${name}' with the GitLab CA does not exist, so the agent cannot verify the GitLab host's certificate yet."
+      print_info "Create it; the agent picks it up with no restart:"
+      print_info "  kubectl create configmap ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    fi
+    return 0
+  fi
+  local pem=""
+  IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
+  if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
+    return 1
+  fi
+  if [[ "$pem" == *"PRIVATE KEY"* ]]; then
+    print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' holds a private key. Give the CA certificate alone; nothing was stored."
+    return 1
+  fi
+  printf '%s' "$pem" | kubectl create configmap "$name" -n "$namespace" --context "$context" \
+    --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+      -n "$namespace" --context "$context" -f - >/dev/null 2>&1
+  local rcs=("${PIPESTATUS[@]}")
+  if [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
+    print_error "Could not write the GitLab CA ConfigMap '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
+    return 1
+  fi
+  print_success "GitLab CA stored in ConfigMap '${name}' (namespace ${namespace})."
 }
 
 # Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
@@ -6023,6 +6092,10 @@ main() {
         [ "$PARAM_GITOPS_HOST" = "gitlab.com" ] && PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # Only a self-managed instance can be behind a private CA.
+        if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]; then
+          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE "${PARAM_GITOPS_CA_FILE:-}"
+        fi
         PARAM_GITOPS_REPO="$github_repo"
         if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
           github_repo="$PARAM_GITOPS_REPO"
@@ -6555,6 +6628,7 @@ main() {
   export GITOPS_FORGE="$PARAM_GITOPS_FORGE"
   export GITOPS_HOST="$PARAM_GITOPS_HOST"
   export GITLAB_TOKEN_SECRET="$PARAM_GITLAB_TOKEN_SECRET"
+  export GITOPS_CA_CONFIGMAP="$PARAM_GITOPS_CA_CONFIGMAP"
   # One release of overlap: the agent runtime and the chart still speak
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
@@ -6974,6 +7048,7 @@ main() {
   fi
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_ca_configmap "$namespace" "$expected_ctx" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do

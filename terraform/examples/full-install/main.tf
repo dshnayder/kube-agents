@@ -72,7 +72,8 @@ locals {
   gitops_is_gitlab = var.gitops_forge == "gitlab"
   gitlab_forges = [merge(
     { name = "gitlab", provider = "gitlab", credentialsRef = { name = var.gitlab_token_secret_name } },
-    var.gitops_host != "" ? { host = var.gitops_host } : {}
+    var.gitops_host != "" ? { host = var.gitops_host } : {},
+    var.gitlab_ca_configmap_name != "" ? { caBundleRef = { name = var.gitlab_ca_configmap_name } } : {}
   )]
   gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
 
@@ -1015,8 +1016,8 @@ resource "helm_release" "kube_agents" {
     # The reverse: GitLab inputs under the default forge would be dropped,
     # applying a CR with no GitOps repository and no error.
     precondition {
-      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "")
-      error_message = "gitlab_repo and gitops_host apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "" && var.gitlab_ca_configmap_name == "")
+      error_message = "gitlab_repo, gitops_host and gitlab_ca_configmap_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
     }
 
     # What this refuses is an install that asks for the detector without the
