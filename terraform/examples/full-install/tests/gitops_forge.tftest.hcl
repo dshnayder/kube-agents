@@ -117,7 +117,7 @@ run "gitlab_with_a_private_ca_names_its_configmap" {
   }
   assert {
     condition = local.gitlab_forges == [{
-      name = "gitlab", provider = "gitlab", host = "gitlab.example.com",
+      name           = "gitlab", provider = "gitlab", host = "gitlab.example.com",
       credentialsRef = { name = "gitlab-forge-token" }, caBundleRef = { name = "gitlab-forge-ca" }
     }]
     error_message = "gitlab forge: ${jsonencode(local.gitlab_forges)}"

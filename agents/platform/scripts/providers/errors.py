@@ -204,6 +204,8 @@ _TLS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "certificate verify failed",
         "ssl certificate problem",
         "server verification failed",
+        # Older GnuTLS builds (Ubuntu's git) give no reason with it.
+        "server certificate verification failed",
         "certificate is not trusted",
     )),
 )

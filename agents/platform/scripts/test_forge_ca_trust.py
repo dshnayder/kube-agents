@@ -447,6 +447,12 @@ class CertificateFailureTest(unittest.TestCase):
             with self.subTest(line=line[:40]):
                 self.assertTrue(providers.classify_tls("Cloning into 'repo'...\n" + line)[0])
 
+    def test_an_older_gnutls_verification_failure_reads_as_untrusted(self):
+        # Ubuntu's git (the CI runner's) gives no reason with the failure.
+        line = ("fatal: unable to access 'https://localhost:40867/g/p.git/': "
+                "server certificate verification failed. CAfile: none CRLfile: none")
+        self.assertEqual("untrusted", providers.classify_tls(line)[0])
+
     # git 2.47.3 with libcurl-gnutls, as measured in the broker image.
     GNUTLS = {
         "untrusted": "fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
