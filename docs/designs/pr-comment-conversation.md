@@ -251,8 +251,10 @@ Three shapes exist because of a forge that is not GitHub:
 - **`can_write_known` says whether the permission question was answered.** A `can_write` of `False`
   conflates "this account is not a collaborator" with "the lookup failed", and the two want opposite
   handling: the first is refused, the second must not be, because a refusal carries a marker and is
-  therefore permanent. The collaborator endpoint's 404 is an answer; any other failure is not, so
-  the provider reports it as unknown and the sweep holds the trigger for a tick rather than guessing.
+  therefore permanent. A 404 from the permission lookup is an answer only when the repository itself
+  answers: the forge reads the repository once, and a repository that this token cannot see also
+  gives that 404. Any other failure is not an answer, so the provider reports it as unknown and the
+  sweep holds the trigger for a tick rather than guessing.
 
 The module used to own the plumbing that would otherwise become a third copy: a `gh` runner and a
 `gh auth status` preflight. Neither exists any more. The runner is the broker's, reached through

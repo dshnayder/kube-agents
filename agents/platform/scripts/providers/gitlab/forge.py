@@ -355,6 +355,11 @@ class GitLabForge(Forge):
         A login nobody holds, or a member below Developer, is a definitive no;
         a lookup that failed is not an answer and says so.
 
+        A 404 from the member lookup has two meanings: not a member, and a
+        project this token cannot see. The project is read once to tell them
+        apart: if it answers, the user is not a member, which is a no. If it
+        does not, nothing is known about the user.
+
         An automation is a no whatever its role. A comment's author carries no
         `bot` field, so a service account with a name of its own reads as a
         person until here, where the user object is read: the username search
@@ -387,7 +392,13 @@ class GitLabForge(Forge):
         try:
             member = api("GET", f"{self._project(repo)}/members/all/{user_id}")
         except WorkspaceError as exc:
-            return False if exc.status == 404 else None
+            if exc.status != 404:
+                return None
+            try:
+                api("GET", self._project(repo))
+            except WorkspaceError:
+                return None
+            return False
         return int((member or {}).get("access_level") or 0) >= DEVELOPER_ACCESS
 
     # -- proposals ----------------------------------------------------------

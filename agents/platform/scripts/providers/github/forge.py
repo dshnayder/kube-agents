@@ -48,10 +48,6 @@ DIFF_MEDIA_TYPE = "application/vnd.github.v3.diff"
 # so a repository that is nearly all proposals cannot make one call unbounded.
 MAX_ISSUE_PAGES = 10
 
-# What GitHub's collaborator-permission endpoint says, in its 404, for a login
-# that is no user at all: `{"message": "renovate is not a user"}`.
-_NOT_A_USER = "is not a user"
-
 # `repos/{r}/collaborators/{login}/permission` values that mean "may write".
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
 
@@ -253,12 +249,16 @@ class GitHubForge(Forge):
     ) -> bool | None:
         # The collaborator-permission endpoint rather than `author_association`
         # off a comment: an App installation token sees every association as
-        # NONE, which is the blindness forge.py's history records. A login that
-        # is not a user is a definitive no: GitHub answers 404 with "<login> is
-        # not a user". Every other 404 is not an answer. GitHub also answers
-        # 404 for a repository this token cannot see (the App lost its
-        # installation, or the repository moved), and that says nothing about
-        # the login. Any other failure is not an answer either, and says so.
+        # NONE, which is the blindness forge.py's history records.
+        #
+        # A 404 from that endpoint has two meanings: a login that is no user,
+        # and a repository this token cannot see (the App lost its
+        # installation, or the repository moved). Only the first is a no. The
+        # repository is read once to tell them apart: if it answers, the 404
+        # was about the login. If it does not, nothing is known about the
+        # login. A real user who is not a collaborator answers 200 with a
+        # permission, so the 404 never stands for "a stranger". Any other
+        # failure is not an answer and says so.
         #
         # An automation's login gets its App spelling back before it is asked
         # about. `translate.actor` took `[bot]` off every author this forge
@@ -276,9 +276,13 @@ class GitHubForge(Forge):
         try:
             data = api("GET", f"repos/{repo}/collaborators/{quoted}/permission")
         except WorkspaceError as exc:
-            if exc.status == 404 and _NOT_A_USER in str(exc.fields.get("detail") or "").lower():
-                return False
-            return None
+            if exc.status != 404:
+                return None
+            try:
+                api("GET", f"repos/{repo}")
+            except WorkspaceError:
+                return None
+            return False
         permission = str((data or {}).get("permission") or "").strip().lower()
         return permission in WRITE_PERMISSIONS
 

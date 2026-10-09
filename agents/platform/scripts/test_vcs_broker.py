@@ -2715,37 +2715,49 @@ class CollaborationTest(unittest.TestCase):
             broker.identity({"repository": "acme/infra"})
         self.assertEqual(caught.exception.fields.get("code"), "FORGE_RATE_LIMITED")
 
-    def test_a_github_404_is_no_only_when_the_login_is_not_a_user(self):
-        """A 404 for an unreadable repository is unknown, not "may not write".
+    def test_a_github_404_is_no_only_when_the_repository_answers(self):
+        """A 404 for a repository the token cannot see is unknown, not a no.
 
-        GitHub answers 404 with "<login> is not a user" for a login that is no
-        user, and 404 "Not Found" for a repository the token cannot see. The
-        second said nothing about the login, but read as a settled no, so a
-        `/remediate` from a maintainer was refused while the App had lost its
-        installation, and the refusal stayed.
+        The collaborator-permission endpoint answers 404 for a login that is
+        no user, and 404 for a repository that this token cannot see. Read as
+        a settled no, the second refused a maintainer's `/remediate` while the
+        App had lost its installation, and the refusal stayed. The forge reads
+        the repository once: it answers, so the 404 was about the login (no);
+        it does not, so nothing is known (unknown). The CLI output below is
+        what `gh api` printed for each case on 2026-10-09.
         """
-        # Through the package surface: tests outside `providers` do not import a
-        # forge package.
-        github = next(cls for cls in providers.AVAILABLE if cls.name == "github")
-
-        def api_raising(error):
-            def api(method, path, **kwargs):
-                raise error
-            return api
-
-        forge = github.__new__(github)
-        cases = (
-            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND",
-                            detail="gh: renovate is not a user (HTTP 404): renovate is not a user"), False),
-            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND",
-                            detail="gh: Not Found (HTTP 404): Not Found"), None),
-            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND"), None),
-            (WorkspaceError("x", status=502, code="FORGE_UNAVAILABLE",
-                            detail="gh: Server Error (HTTP 502)"), None),
+        status = subprocess.CompletedProcess(
+            ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
         )
-        for error, expected in cases:
-            with self.subTest(detail=error.fields.get("detail"), status=error.status):
-                self.assertIs(expected, forge.can_write(api_raising(error), "acme/infra", "renovate"))
+
+        def gh_failed(message, code):
+            body = json.dumps({
+                "message": message,
+                "documentation_url": "https://docs.github.com/rest",
+                "status": str(code),
+            })
+            return subprocess.CompletedProcess(["gh"], 1, body, f"gh: {message} (HTTP {code})\n")
+
+        not_a_user = gh_failed("nobody-at-all is not a user", 404)
+        cases = (
+            ("the repository answers", (not_a_user, {"full_name": "acme/infra"}), False),
+            ("the repository is not found", (not_a_user, gh_failed("Not Found", 404)), None),
+            ("the repository read fails", (not_a_user, gh_failed("Server Error", 502)), None),
+            ("the permission read fails", (gh_failed("Server Error", 502),), None),
+        )
+        for name, answers, expected in cases:
+            with self.subTest(case=name):
+                broker, recorder = self.broker(status, *answers)
+                answer = broker.identity({"repository": "acme/infra", "login": "nobody-at-all"})
+                self.assertIs(expected, answer["identity"]["canWrite"])
+                self.assertIn("collaborators/nobody-at-all/permission", recorder.calls[1][4])
+                if len(answers) == 2:
+                    self.assertEqual("repos/acme/infra", recorder.calls[2][4])
+        # A real user who is not a collaborator answers 200, with no 404 at all.
+        broker, recorder = self.broker(status, {"permission": "read"})
+        answer = broker.identity({"repository": "acme/infra", "login": "stranger"})
+        self.assertIs(False, answer["identity"]["canWrite"])
+        self.assertEqual(2, len(recorder.calls))
 
     def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
         """`bot` puts the suffix back that the translation took off.

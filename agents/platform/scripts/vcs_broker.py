@@ -1489,8 +1489,9 @@ class VcsBroker:
             raise WorkspaceError("bot must be true or false")
         # `canWrite` is answered for a login the caller named, never for the
         # credential itself: on the shipped forge an App's own bot login is
-        # not a collaborator, so the permission endpoint answers 404 for it
-        # and would report the account that just pushed as unable to write. The
+        # not a collaborator, so the permission endpoint answers 200 with
+        # permission "none" for it, and would report the account that just
+        # pushed as unable to write. The
         # callers that ask this ask about comment authors; the credential's own
         # standing is what `publish` proves by doing it.
         subject = (login or "").strip()

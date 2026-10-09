@@ -420,7 +420,16 @@ class WriteAccessTest(unittest.TestCase):
     def test_a_stranger_is_no_and_a_failed_lookup_is_not_an_answer(self):
         person = {"id": 7, "bot": False}
         self.assertIs(False, forge().can_write(Api([]), "acme/infra", "nobody"))
-        self.assertIs(False, forge().can_write(Api([person], WorkspaceError("x", status=404)), "acme/infra", "dev"))
+        # A member 404 is a no only when the project itself answers: a project
+        # this token cannot see also answers 404 there.
+        member_404 = WorkspaceError("x", status=404)
+        seen = Api([person], member_404, {"id": 1001})
+        self.assertIs(False, forge().can_write(seen, "acme/infra", "dev"))
+        self.assertEqual("projects/acme%2Finfra", seen.calls[2][1])
+        unseen = Api([person], member_404, WorkspaceError("x", status=404))
+        self.assertIsNone(forge().can_write(unseen, "acme/infra", "dev"))
+        down = Api([person], member_404, WorkspaceError("x", status=502, code="FORGE_UNAVAILABLE"))
+        self.assertIsNone(forge().can_write(down, "acme/infra", "dev"))
         self.assertIsNone(forge().can_write(Api([person], WorkspaceError("x", status=502)), "acme/infra", "dev"))
         self.assertIsNone(forge().can_write(Api(WorkspaceError("x", status=502)), "acme/infra", "dev"))
 
