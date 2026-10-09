@@ -69,7 +69,7 @@ from typing import Callable, Iterable, Mapping
 
 import repo_ref
 import workspace_paths
-from providers import certificate_failure, pinned_base
+from providers import pinned_base, tls_refusal as _tls_refusal
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -703,6 +703,7 @@ class ContentWorkspaceStore:
         clock: Callable[[], float] = time.monotonic,
         locate: Locate | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], object] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -725,6 +726,10 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None. The broker hands its own, which names a forge's CA ConfigMap;
+        # without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or _tls_refusal
         self.base_branch = (
             base_branch.strip()
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
@@ -953,14 +958,10 @@ class ContentWorkspaceStore:
             result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
-            why = certificate_failure(getattr(result, "stderr", ""))
-            if why:
-                raise TlsUntrusted(
-                    f"`git {argv[0]}` could not verify the forge's TLS certificate: "
-                    f"{self._redact(why)}. No retry fixes this: an administrator "
-                    "gives the forge the CA that signed its certificate, in the "
-                    "forge's caBundleRef (install.sh --gitops-ca-file)."
-                )
+            refusal = self._tls_refusal(getattr(result, "stderr", ""))
+            if refusal is not None:
+                detail = getattr(refusal, "fields", {}).get("detail", "")
+                raise TlsUntrusted(f"`git {argv[0]}` failed: {refusal} ({self._redact(detail)})")
             raise GitFailed(
                 f"`git {argv[0]}` failed with exit code {exit_code}: "
                 f"{self._redact(getattr(result, 'stderr', ''))}"

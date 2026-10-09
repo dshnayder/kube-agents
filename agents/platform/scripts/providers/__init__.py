@@ -29,7 +29,15 @@ from .credentials import (
     NoCredential,
     StaticFileCredential,
 )
-from .errors import GUIDANCE, Guidance, certificate_failure, forge_error, tls_untrusted
+from .errors import (
+    GUIDANCE,
+    Guidance,
+    certificate_failure,
+    classify_tls,
+    forge_error,
+    tls_refusal,
+    tls_untrusted,
+)
 from .registry import AVAILABLE, Registry, build_forges, load_forge_entries
 from .transport import CliTransport, HttpTransport, Transport
 from .validate import (
@@ -74,8 +82,10 @@ __all__ = [
     "WorkspaceError",
     "build_forges",
     "certificate_failure",
+    "classify_tls",
     "forge_error",
     "load_forge_entries",
+    "tls_refusal",
     "tls_untrusted",
     "listing",
     "pinned_base",

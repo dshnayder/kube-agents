@@ -153,6 +153,9 @@ class Forge:
     # signed. Empty for every public forge. The broker reads it for both of
     # its clients, scoped to this forge's hosts.
     ca_file = ""
+    # Where `ca_file` comes from, as the answer for a missing file names it:
+    # "the ConfigMap <name> or its key <key>". Empty when nothing says.
+    ca_source = ""
     # The well-known host this forge answers for when an install has not
     # configured it, and what is missing then. The registry turns them into a
     # named gap -- "no credential is configured for <host>" -- rather than a

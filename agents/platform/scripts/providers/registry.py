@@ -61,9 +61,11 @@ _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
-    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?, "caFile"?}]}`.
-    `caFile` is an absolute path to PEM CA certificates that this forge's host,
-    and no other, is trusted under.
+    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?,
+    "caFile"?, "caConfigMap"?, "caKey"?}]}`. `caFile` is an absolute path to
+    PEM CA certificates that this forge's host, and no other, is trusted
+    under; `caConfigMap` and `caKey` name where the file comes from, for the
+    answer when it is missing.
     Read at registry construction, never cached across it, so a test or a
     remount sees the file it names. A file that is named and cannot be read
     raises: a broker that does not know which forges it serves must not start
@@ -108,12 +110,22 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
                 "ca_file": (ca_file or "").strip(),
+                "ca_source": _ca_source(item),
                 # Passed through unfiltered: an entry that trims to nothing is
                 # the forge's to refuse, not the loader's to drop.
                 "allowed_paths": None if allowed is None else tuple(allowed),
             }
         )
     return entries
+
+
+def _ca_source(item: Mapping[str, Any]) -> str:
+    """"the ConfigMap <name> or its key <key>", or "" when the entry names neither."""
+    name = str(item.get("caConfigMap") or "").strip()
+    key = str(item.get("caKey") or "").strip()
+    if not name:
+        return ""
+    return f"the ConfigMap {name} or its key {key or 'ca.crt'}"
 
 
 def build_forges(config: Mapping[str, Any] | None = None) -> tuple[Forge, ...]:

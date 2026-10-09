@@ -3302,8 +3302,9 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
     """git config that trusts each forge's own CA on that forge's hosts only.
 
-    One `http.https://<host>/.sslCAInfo` pair for every configured forge that
-    names a `caFile`. git matches the key's URL against the remote's, so the
+    For every configured forge that names a `caFile`: `http.https://<host>/.sslCAInfo`,
+    and `followRedirects=false` for the same host, so a redirect cannot carry
+    the CA to another host. git matches the key's URL against the remote's, so the
     file is the CA bundle for that host and nothing else: github.com and
     gitlab.com go on using the system bundle. This works with git built on
     either OpenSSL or GnuTLS, which `SSL_CERT_FILE` does not.
@@ -3314,9 +3315,25 @@ def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
         host = str(entry.get("host") or "").strip().lower()
         if not ca_file or not host:
             continue
-        hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
-        pairs.extend((f"http.https://{name}/.sslCAInfo", ca_file) for name in hosts)
+        # Measured in the broker image (git 2.47, libcurl-gnutls): the file
+        # is trusted beside the system bundle, not in place of it, as the API
+        # client's context is.
+        pairs.append((f"http.https://{host}/.sslCAInfo", ca_file))
+        # curl keeps the CA file on the handle across a redirect, so a hop
+        # would carry this host's CA to another host. GitLab answers a moved
+        # project in-band ("remote: Project ... was moved"), and its clone URLs
+        # end in .git, so none of its git traffic needs a redirect.
+        pairs.append((f"http.https://{host}/.followRedirects", "false"))
     return tuple(pairs)
+
+
+def forge_ca_sources(entries) -> dict[str, str]:
+    """Each forge host that names a CA, mapped to where the CA comes from."""
+    return {
+        str(entry.get("host") or "").strip().lower(): str(entry.get("ca_source") or "")
+        for entry in entries or ()
+        if str(entry.get("ca_file") or "").strip()
+    }
 
 
 def _configured_forge_entries():
@@ -4775,7 +4792,9 @@ class CommandExecutor:
         # layer rather than in a credential's config, because a context
         # repository on such a forge is cloned with no credential at all and
         # still needs the trust.
-        self.forge_ca_config = forge_ca_git_config(_configured_forge_entries())
+        entries = _configured_forge_entries()
+        self.forge_ca_config = forge_ca_git_config(entries)
+        self.forge_ca_sources = forge_ca_sources(entries)
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -5470,6 +5489,18 @@ class CommandExecutor:
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
             )
+
+    def tls_refusal(self, output: str):
+        """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
+
+        A CA file git could not load is named by the ConfigMap and key it comes
+        from, as the API client names it. Redacted: the one line kept can quote
+        the remote's URL.
+        """
+        refusal = providers.tls_refusal(output, self.forge_ca_sources)
+        if refusal is not None and "detail" in refusal.fields:
+            refusal.fields["detail"] = redact_credentials(str(refusal.fields["detail"]))
+        return refusal
 
     def execute_vcs_git(
         self,
@@ -6629,6 +6660,7 @@ def build_workspace_store(
         # it, which composes the URL; a bare `owner/name` stays GitHub's.
         locate=_workspace_locate,
         pinned_bases=pinned_bases,
+        tls_refusal=executor.tls_refusal,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
@@ -8583,9 +8615,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             # A certificate that does not verify is answered by name: the one
             # matching line, redacted, and no other part of stderr.
-            why = providers.certificate_failure(str(exc.stderr or ""))
-            if why:
-                refusal = providers.tls_untrusted("", redact_credentials(why))
+            refusal = self.executor.tls_refusal(str(exc.stderr or "")) if self.executor else None
+            if refusal is not None:
                 self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
                 return
             self._json(

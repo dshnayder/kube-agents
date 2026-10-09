@@ -219,6 +219,35 @@ class ForgeConfigurationTest(unittest.TestCase):
         self.assertEqual("/etc/kube-agents/forge-ca/gitlab/ca.crt", forges[0].ca_file)
         self.assertEqual("", forges[1].ca_file)
 
+    def test_the_configmap_and_key_reach_the_forge(self):
+        path = self.write(
+            '{"forges": [{"provider": "gitlab", "host": "gitlab.internal", "tokenPath": "/t",'
+            ' "allowedPaths": ["g"], "caFile": "/ca/gitlab/ca.crt", "caConfigMap": "gl-ca", "caKey": "root.pem"}]}'
+        )
+        forge = [f for f in providers.build_forges({"forges": load_forge_entries(path)}) if f.name == "gitlab"][0]
+        self.assertEqual("the ConfigMap gl-ca or its key root.pem", forge.ca_source)
+
+    def test_gitlab_com_never_takes_a_ca(self):
+        # #2750 review: the operator refuses it; a configuration written
+        # another way is refused when the broker builds its forges.
+        for host in ("gitlab.com", "www.gitlab.com"):
+            with self.subTest(host=host), self.assertRaisesRegex(ValueError, "only a self-managed host"):
+                providers.build_forges({"forges": [
+                    {"provider": "gitlab", "host": host, "token_path": "/t", "allowed_paths": ("g",),
+                     "ca_file": "/ca/ca.crt"},
+                ]})
+
+    def test_a_missing_ca_file_names_its_configmap_and_key_in_the_api_client(self):
+        transport_module._CA_CONTEXTS.clear()
+        with self.assertRaises(WorkspaceError) as caught:
+            HttpTransport(
+                "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024,
+                ca_file="/nonexistent/ca.crt", ca_source="the ConfigMap gl-ca or its key root.pem",
+            ).api("GET", "user")
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        self.assertIn("the ConfigMap gl-ca or its key root.pem is missing", caught.exception.fields["detail"])
+        self.assertEqual(providers.errors.TLS_GUIDANCE["ca_missing"], str(caught.exception))
+
     def test_a_relative_ca_file_is_refused(self):
         path = self.write(
             '{"forges": [{"provider": "gitlab", "host": "gitlab.internal", "tokenPath": "/t",'
@@ -254,7 +283,10 @@ class GitTrustTest(unittest.TestCase):
 
     def test_only_a_forge_that_names_a_ca_gets_a_url_scoped_pin(self):
         self.assertEqual(
-            (("http.https://gitlab.internal/.sslCAInfo", "/ca/internal.crt"),),
+            (
+                ("http.https://gitlab.internal/.sslCAInfo", "/ca/internal.crt"),
+                ("http.https://gitlab.internal/.followRedirects", "false"),
+            ),
             credential_proxy.forge_ca_git_config(self.ENTRIES),
         )
         self.assertEqual((), credential_proxy.forge_ca_git_config(None))
@@ -284,6 +316,18 @@ class GitTrustTest(unittest.TestCase):
         self.assertEqual("", ca_for("https://gitlab.com/acme/infra.git"))
         self.assertEqual("", ca_for("https://gitlab.internal.evil.test/x.git"))
 
+        def redirects_for(url: str) -> str:
+            result = subprocess.run(
+                ["git", "config", "--get-urlmatch", "http.followRedirects", url],
+                env=environment, capture_output=True, text=True, check=False,
+            )
+            return result.stdout.strip()
+
+        # #2750 review: curl keeps the CA across a redirect, so the CA host
+        # follows none; every other host keeps git's default.
+        self.assertEqual("false", redirects_for("https://gitlab.internal/platform/infra.git"))
+        self.assertEqual("", redirects_for("https://github.com/acme/infra.git"))
+
     def test_every_git_the_executor_runs_carries_the_pin(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -305,6 +349,76 @@ class GitTrustTest(unittest.TestCase):
             self.assertEqual((), credential_proxy._configured_forge_entries())
 
 
+@unittest.skipUnless(OPENSSL and shutil.which("git"), "openssl and git are needed")
+class GitLoopbackTrustTest(unittest.TestCase):
+    """The pin on the paths that clone and push: `execute_vcs_git` and
+    `execute_workspace_git`, which rebuild the forced layer with the caller's
+    credential config ahead of it (#2750 review). A real git talks TLS to a
+    loopback server that a test CA signed: with the pin the handshake passes,
+    and without it git refuses the certificate."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.ca, cert, key = make_pki(root / "pki", key_usage=True)
+        server, self.port = serve_tls(cert, key)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"https://localhost:{self.port}/g/p.git"
+
+    def executor(self, *, pinned: bool):
+        entries = (
+            {"host": f"localhost:{self.port}", "ca_file": str(self.ca),
+             "ca_source": "the ConfigMap test-ca or its key ca.crt"},
+        ) if pinned else ()
+        state = Path(self.tmp.name) / ("pinned" if pinned else "bare")
+        with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=entries), \
+                mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+            executor = credential_proxy.CommandExecutor(
+                timeout_seconds=20, max_output_bytes=1 << 16, state_dir=str(state), scoped_pool=None
+            )
+        executor.vcs_root.mkdir(parents=True, exist_ok=True)
+        executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+        return executor
+
+    # A credential's own config rides ahead of the pins on these paths; one is
+    # passed so the layer is rebuilt the way a stored token's clone rebuilds it.
+    CREDENTIAL_CONFIG = (("credential.helper", ""),)
+
+    def vcs_ls_remote(self, executor):
+        return executor.execute_vcs_git(
+            ["git", "ls-remote", self.url], executor.vcs_root, check=False, config=self.CREDENTIAL_CONFIG
+        )
+
+    def test_the_vcs_path_trusts_the_pinned_ca(self):
+        pinned = self.vcs_ls_remote(self.executor(pinned=True))
+        self.assertIsNone(providers.classify_tls(pinned.stderr)[0] or None, pinned.stderr)
+        bare = self.vcs_ls_remote(self.executor(pinned=False))
+        self.assertEqual("untrusted", providers.classify_tls(bare.stderr)[0], bare.stderr)
+
+    def test_the_workspace_path_trusts_the_pinned_ca(self):
+        for pinned, expect in ((True, ""), (False, "untrusted")):
+            with self.subTest(pinned=pinned):
+                executor = self.executor(pinned=pinned)
+                target = executor.content_workspace_root / "clone"
+                result = executor.execute_workspace_git(
+                    ["git", "clone", "--quiet", self.url, str(target / "repo")],
+                    executor.content_workspace_root,
+                    config=self.CREDENTIAL_CONFIG,
+                )
+                self.assertEqual(expect, providers.classify_tls(result.stderr)[0], result.stderr)
+
+    def test_a_missing_ca_file_names_its_configmap_and_key(self):
+        executor = self.executor(pinned=True)
+        Path(self.ca).unlink()
+        result = self.vcs_ls_remote(executor)
+        refusal = executor.tls_refusal(result.stderr)
+        self.assertIsNotNone(refusal, result.stderr)
+        self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
+        self.assertIn("the ConfigMap test-ca or its key ca.crt is missing", refusal.fields["detail"])
+
+
 class CertificateFailureTest(unittest.TestCase):
     def test_gits_certificate_errors_are_recognised(self):
         for line in (
@@ -315,6 +429,74 @@ class CertificateFailureTest(unittest.TestCase):
         ):
             with self.subTest(line=line[:40]):
                 self.assertTrue(providers.certificate_failure("Cloning into 'repo'...\n" + line))
+
+    # git 2.47.3 with libcurl-gnutls, as measured in the broker image.
+    GNUTLS = {
+        "untrusted": "fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
+                     "certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none)",
+        "hostname": "fatal: unable to access 'https://gitlab.internal/g/p.git/': SSL: certificate subject name "
+                    "(other.example) does not match target hostname 'gitlab.internal'",
+        "expired": "fatal: unable to access 'https://gitlab.internal/g/p.git/': server verification failed: "
+                   "certificate has expired. (CAfile: /tmp/combined.pem CRLfile: none)",
+        "ca_missing": "fatal: unable to access 'https://gitlab.internal/g/p.git/': Problem with the SSL CA cert "
+                      "(path? access rights?)",
+    }
+    # Another git and curl build words a missing CA file this way.
+    OTHER_CA_MISSING = ("fatal: unable to access 'https://gitlab.internal/g/p.git/': error adding trust anchors "
+                        "from file: /etc/kube-agents/forge-ca/gitlab/ca.crt")
+
+    def test_each_cause_is_told_apart_with_its_own_advice(self):
+        # #2750 review: an expired certificate and a wrong name read as a
+        # missing CA, and git's hostname mismatch matched nothing at all.
+        for kind, line in self.GNUTLS.items():
+            with self.subTest(kind=kind):
+                refusal = providers.tls_refusal("Cloning into 'repo'...\n" + line,
+                                                {"gitlab.internal": "the ConfigMap gl-ca or its key ca.crt"})
+                self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
+                self.assertEqual(502, refusal.status)
+                self.assertTrue(refusal.fields["detail"].startswith("gitlab.internal: "))
+                self.assertEqual(kind, providers.classify_tls(line)[0])
+        advice = {kind: str(providers.tls_refusal(line)) for kind, line in self.GNUTLS.items()}
+        self.assertIn("caBundleRef", advice["untrusted"])
+        self.assertIn("TLS-inspecting proxy", advice["untrusted"])
+        self.assertIn("public host", advice["untrusted"])
+        self.assertNotIn("caBundleRef", advice["expired"])
+        self.assertNotIn("caBundleRef", advice["hostname"])
+        self.assertIn("renews", advice["expired"])
+        self.assertIn("does not name the host", advice["hostname"])
+
+    def test_a_missing_ca_file_from_git_names_the_configmap_and_key(self):
+        for line in (self.GNUTLS["ca_missing"], self.OTHER_CA_MISSING):
+            with self.subTest(line=line[60:100]):
+                refusal = providers.tls_refusal(line, {"gitlab.internal": "the ConfigMap gl-ca or its key root.pem"})
+                self.assertIn("the ConfigMap gl-ca or its key root.pem is missing", refusal.fields["detail"])
+
+    def test_the_servers_own_words_are_not_read_as_a_verdict(self):
+        # #2750 review: a hook or a project description can print anything.
+        self.assertEqual(("", ""), providers.classify_tls("remote: certificate verify failed\nremote: done"))
+        self.assertIsNone(providers.tls_refusal("remote: SSL certificate problem: self-signed certificate"))
+
+    def test_python_names_the_same_causes_from_the_verifiers_code(self):
+        def failure(code, message):
+            error = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+            error.verify_code = code
+            error.verify_message = message
+            return urllib.error.URLError(error)
+
+        for code, message, kind in (
+            (20, "unable to get local issuer certificate", "untrusted"),
+            (10, "certificate has expired", "expired"),
+            (9, "certificate is not yet valid", "expired"),
+            (62, "Hostname mismatch, certificate is not valid for 'gitlab.internal'.", "hostname"),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(kind, transport_module._certificate_failure(failure(code, message))[0])
+                with self.assertRaises(WorkspaceError) as caught:
+                    HttpTransport(
+                        "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024,
+                        opener=lambda request, timeout: (_ for _ in ()).throw(failure(code, message)),
+                    ).api("GET", "user")
+                self.assertEqual(providers.errors.TLS_GUIDANCE[kind], str(caught.exception))
 
     def test_other_failures_are_not(self):
         self.assertEqual("", providers.certificate_failure("fatal: could not read Username for 'https://h': No such device"))
@@ -336,6 +518,7 @@ class CertificateFailureTest(unittest.TestCase):
         store = content_workspace.ContentWorkspaceStore.__new__(content_workspace.ContentWorkspaceStore)
         store._runner = lambda argv, cwd, **kwargs: Result()
         store._redact = lambda text: str(text)
+        store._tls_refusal = providers.tls_refusal
         with self.assertRaises(content_workspace.TlsUntrusted) as caught:
             store._git(Path("/tmp"), ["clone", "--quiet", "https://gitlab.internal/g/p.git", "repo"])
         self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.code)

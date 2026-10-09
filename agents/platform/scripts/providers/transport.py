@@ -43,7 +43,7 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
-from .errors import Guidance, Override, forge_error, tls_untrusted
+from .errors import Guidance, Override, ca_missing_reason, classify_tls, forge_error, tls_untrusted
 
 LOGGER = logging.getLogger(__name__)
 
@@ -300,7 +300,7 @@ _CA_CONTEXTS: dict[str, tuple[tuple[int, int], ssl.SSLContext]] = {}
 _CA_CONTEXTS_LOCK = threading.Lock()
 
 
-def ca_context(ca_file: str, host: str) -> ssl.SSLContext:
+def ca_context(ca_file: str, host: str, ca_source: str = "") -> ssl.SSLContext:
     """The TLS context for a forge that names its own CA, at `ca_file`.
 
     The system bundle, plus the CA file. Only the forge that names the file
@@ -312,17 +312,19 @@ def ca_context(ca_file: str, host: str) -> ssl.SSLContext:
     It is cleared on this context only: the chain and the hostname are still
     verified, and a public forge keeps the strict check.
 
-    A file that is not there raises FORGE_TLS_UNTRUSTED naming the host: the
-    operator projects the ConfigMap as optional, so the broker starts without
-    it, and kubelet writes the file once the ConfigMap exists.
+    A file that is not there raises FORGE_TLS_UNTRUSTED naming the host and,
+    as `ca_source`, the ConfigMap and key it comes from: the operator projects
+    the ConfigMap as optional, so the broker starts without it, and kubelet
+    writes the file once the ConfigMap exists. A wrong key reads the same as a
+    missing ConfigMap, so the answer names both.
     """
     try:
         status = os.stat(ca_file)
     except OSError as exc:
         raise tls_untrusted(
             host,
-            f"the CA file that the forge's caBundleRef names is not mounted ({exc.strerror}); "
-            "create the ConfigMap it names",
+            ca_missing_reason(ca_source, f"the CA file {ca_file} is not mounted ({exc.strerror})"),
+            "ca_missing",
         ) from exc
     identity = (status.st_mtime_ns, status.st_size)
     with _CA_CONTEXTS_LOCK:
@@ -374,12 +376,29 @@ def _unreachable(exc: BaseException) -> str:
     return f"the forge could not be reached: {type(exc).__name__}"
 
 
-def _certificate_reason(exc: BaseException) -> str:
-    """The verifier's reason when the send failed on the peer's certificate, or ""."""
+# OpenSSL verify codes for the causes that are not an untrusted chain.
+_EXPIRED_CODES = frozenset({9, 10})  # not yet valid, expired
+_HOSTNAME_CODES = frozenset({62, 64})  # hostname mismatch, IP address mismatch
+
+
+def _certificate_failure(exc: BaseException) -> tuple[str, str]:
+    """`(kind, reason)` when the send failed on the peer's certificate, else ("", "").
+
+    The kind is read from the verifier's code where it gives one, and from its
+    words otherwise, with the same markers git's output is read by, so both
+    clients name a cause alike.
+    """
     cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
-        return (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
-    return ""
+    if not (isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause)):
+        return "", ""
+    why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
+    code = getattr(cause, "verify_code", None)
+    if code in _EXPIRED_CODES:
+        return "expired", why
+    if code in _HOSTNAME_CODES:
+        return "hostname", why
+    kind, _line = classify_tls(why)
+    return (kind if kind in ("expired", "hostname") else "untrusted"), why
 
 
 def _broken_answer(exc: BaseException) -> str:
@@ -476,12 +495,14 @@ class HttpTransport:
         opener: Callable[..., Any] | None = None,
         outer_deadline: Callable[[], float | None] | None = None,
         ca_file: str = "",
+        ca_source: str = "",
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("a forge API is reached over https only")
         self._base = base_url.rstrip("/")
         self._host = self._base.split("://", 1)[1].split("/", 1)[0]
         self._ca_file = ca_file
+        self._ca_source = ca_source
         self._headers = headers
         self._overrides = overrides or {}
         self._timeout = timeout
@@ -505,7 +526,9 @@ class HttpTransport:
         """An opener that follows no redirect and trusts the forge's own CA, if any."""
         handlers: list[Any] = [_RefuseRedirect]
         if self._ca_file:
-            handlers.append(urllib.request.HTTPSHandler(context=ca_context(self._ca_file, self._host)))
+            handlers.append(
+                urllib.request.HTTPSHandler(context=ca_context(self._ca_file, self._host, self._ca_source))
+            )
         return urllib.request.build_opener(*handlers)
 
     def api(
@@ -584,9 +607,9 @@ class HttpTransport:
             # earlier calls spent it, is the request's time, not the forge.
             if isinstance(exc.reason, TimeoutError) and slow.startswith("the request's time"):
                 raise forge_error(0, "the request's time ran out while connecting to the forge") from exc
-            why = _certificate_reason(exc)
-            if why:
-                raise tls_untrusted(self._host, why) from exc
+            kind, why = _certificate_failure(exc)
+            if kind:
+                raise tls_untrusted(self._host, why, kind) from exc
             raise forge_error(0, _unreachable(exc)) from exc
         except TimeoutError as exc:
             # Bare, so not the send: the request went out and the status line
