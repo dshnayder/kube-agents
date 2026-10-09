@@ -493,7 +493,7 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   instance whose certificate a private CA signed also sets `caBundleRef`
   (`name`, and an optional `key` that defaults to `ca.crt`): a ConfigMap that
   holds the CA, which the broker trusts for that host only. It is for a
-  `gitlab` forge. With a `gitlab` forge
+  `gitlab` forge at a self-managed host, never gitlab.com. With a `gitlab` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
   repository that the install registered by URL. Name a GitLab repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading

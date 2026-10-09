@@ -101,6 +101,10 @@ Many self-managed instances use a TLS certificate that a private CA signed. The
 agent does not trust that CA by default. Without it, each call to the instance
 fails with `FORGE_TLS_UNTRUSTED`, and the detail names the host.
 
+A private CA is for a self-managed host only. `--gitops-ca-file` needs a
+`--gitops-host` that is not gitlab.com: gitlab.com presents a certificate that
+the public CAs sign, and a private CA must never vouch for it.
+
 Give the installer the CA certificate in PEM format:
 
 ```bash
@@ -125,12 +129,17 @@ The installer then does these steps:
    `GITOPS_CA_CONFIGMAP` in `install.env`. The path of the file is not recorded.
 
 In the interactive interview, the installer asks for the CA file after the
-token Secret, for a self-managed host only.
+token Secret, for a self-managed host only. It does not ask when `install.env`
+already records a CA ConfigMap: the ConfigMap stays as it is. To replace the CA,
+give `--gitops-ca-file`, or update the ConfigMap as shown below. A later run
+with gitlab.com as the host drops the recorded ConfigMap.
 
 The operator mounts the ConfigMap into the credential broker's pod only. The
 broker trusts the CA for this forge's host and for no other host: github.com and
-gitlab.com keep the system CAs. Both of the broker's clients use it: the client
-for the GitLab API, and git for clones and pushes.
+gitlab.com keep the system CAs. Both of the broker's clients use it, beside the
+system CAs: the client for the GitLab API, and git for clones and pushes. git
+follows no HTTP redirect from this host, so a redirect cannot carry the CA to
+another host.
 
 To replace the CA, update the ConfigMap. The broker reads the file on each call,
 so the change needs no restart. kubelet can take about a minute to write a new
@@ -154,8 +163,13 @@ Notes:
   cluster can resolve, for example a Cloud DNS private zone on the cluster's
   VPC, needs no other setting.
 - **A missing ConfigMap does not stop the agent.** Until the ConfigMap exists,
-  each call to the instance fails with `FORGE_TLS_UNTRUSTED`, and the detail says
-  that the CA file is not mounted.
+  each call to the instance fails with `FORGE_TLS_UNTRUSTED`, from the API client
+  and from git. The detail names what to create: "the ConfigMap gitlab-forge-ca or
+  its key ca.crt is missing". A wrong key looks the same as a missing ConfigMap.
+- **`FORGE_TLS_UNTRUSTED` names its cause.** The text says which of these it is:
+  a certificate that does not chain to a trusted CA, a certificate that has
+  expired or is not valid yet, a certificate for another hostname, or a CA
+  bundle that is not mounted. No retry fixes any of them.
 - **Terraform and Helm.** Terraform takes `gitlab_ca_configmap_name`. The chart
   takes `platformAgent.integration.forges[].caBundleRef.name` (and an optional
   `key`). Both only name the ConfigMap. You create it.
@@ -164,6 +178,7 @@ Notes:
 
 The installer writes the forge into the `PlatformAgent` as `spec.integration.forges` and
 `spec.integration.repositories`, not the `github` alias: one forge with `provider: gitlab`,
-your host and the Secret as its `credentialsRef`, and the project as the `gitops`
+your host and the Secret as its `credentialsRef`, the CA ConfigMap as its
+`caBundleRef` when `--gitops-ca-file` gave one, and the project as the `gitops`
 repository. The [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/)
 describes those fields, and a GitLab forge's limits, in full.

@@ -963,7 +963,7 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED`, `FORGE_TLS_UNTRUSTED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -981,7 +981,10 @@ ones, an unthrottled 403 is `FORGE_FORBIDDEN` and says retrying will not change
 the answer, 404 `FORGE_NOT_FOUND` says that a private repository this install
 cannot see answers the same way so absence is not proven, 422 `FORGE_REJECTED`
 says to fix a field rather than repeat the call, and 5xx is 503
-`FORGE_UNAVAILABLE` and says to retry the same call unchanged. Everything
+`FORGE_UNAVAILABLE` and says to retry the same call unchanged. A TLS
+certificate that does not verify is 502 `FORGE_TLS_UNTRUSTED` and says that no
+retry fixes it; its text names the cause (an untrusted chain, an expired
+certificate, a wrong name, or a CA bundle that is not mounted). Everything
 unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
@@ -2443,7 +2446,8 @@ forge's entry in the broker configuration names the file (`caFile`). The
 agent's pod and the shell sandbox get nothing.
 
 The broker trusts the CA for that forge's host and for no other host. A private
-CA must never vouch for github.com or gitlab.com:
+CA must never vouch for github.com or gitlab.com, so a forge at the provider's
+public host (gitlab.com, or an empty host) refuses `caBundleRef`:
 
 - The API client builds one TLS context for the forge: the system bundle plus the
   CA file. Other forges keep the default context.
@@ -2451,7 +2455,13 @@ CA must never vouch for github.com or gitlab.com:
   that the broker forces on every git it runs. git matches the key's URL against
   the remote's URL, so the CA applies to that host only. The pin is in the forced
   layer, not in the credential's configuration, because a context repository on
-  such a forge is cloned with no credential and still needs the CA.
+  such a forge is cloned with no credential and still needs the CA. With the
+  broker image's git (libcurl with GnuTLS), the file is trusted beside the
+  system bundle, as the API client's context is, not in place of it.
+- git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
+  file across a redirect, so a redirect would carry the CA to another host.
+  GitLab answers a moved project in the git protocol itself, and its clone URLs
+  end in `.git`, so its git traffic needs no redirect.
 
 Python 3.13 turns on strict X.509 checks in its default context. These checks
 refuse a CA certificate with no Key Usage extension, and a server certificate
@@ -2462,8 +2472,10 @@ keeps the strict checks. The administrator chose to trust this CA for this host,
 and a refusal of a common CA profile would only make the feature fail.
 
 The mount is optional, as the token's is: a missing ConfigMap does not stop the
-broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, and the
-detail says that the CA file is not mounted. The broker reads the file on each
+broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
+clients, and the detail names what to create: "the ConfigMap <name> or its key
+<key> is missing". A wrong key looks the same as a missing ConfigMap, so the
+detail names both. The forge's broker entry carries the two names for this. The broker reads the file on each
 call, so an update of the ConfigMap reaches the broker with no restart.
 
 Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
@@ -2521,8 +2533,14 @@ whose fields it validated and refused — is not. Two specifics:
 - **A certificate that does not verify is not a forge error.** Both clients
   answer it with `FORGE_TLS_UNTRUSTED` (502), which names the host and the
   verifier's reason. The shared fallback, `FORGE_CALL_FAILED`, says that one
-  retry is reasonable, and no retry fixes a certificate. The action is an
-  administrator's: the forge's `caBundleRef`.
+  retry is reasonable, and no retry fixes a certificate. The text names the
+  cause, because each one needs a different action: a chain that does not reach
+  a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
+  TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
+  certificate for another name (fix the certificate or the host), and a CA
+  bundle that is not mounted (create the ConfigMap). One code serves all four,
+  because the caller does the same in each case: it stops and reports. Lines
+  that git prints from the server (`remote: ...`) are never read as a verdict.
 
 ### What GitLab does not include
 
