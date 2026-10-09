@@ -317,7 +317,7 @@ class VcsBroker:
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
         # None, for the git runs that read a failure themselves rather than
         # raising it. The broker hands its own, which names a forge's CA
-        # ConfigMap; without one, the shared reading names the cause alone.
+        # Secret; without one, the shared reading names the cause alone.
         self._tls_refusal = tls_refusal or tls_refusal_default
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner

@@ -687,7 +687,7 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $caMap := ($f.caBundleRef | default dict).name | default "" -}}
 {{- /* A caBundleRef with no name renders nothing, so the CA would be silently missing: the CRD requires the name, and so does the chart. */ -}}
 {{- if and $f.caBundleRef (not $caMap) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the ConfigMap that holds the CA" $i) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the Secret that holds the CA" $i) -}}
 {{- end -}}
 {{- if $caMap -}}
 {{- if ne $provider "gitlab" -}}
@@ -698,11 +698,11 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com uses the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
 {{- end -}}
 {{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a ConfigMap name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
 {{- end -}}
 {{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
 {{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a ConfigMap key" $i $caKey) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $provider "gitlab" -}}

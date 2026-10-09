@@ -65,10 +65,10 @@ type ResolvedForge struct {
 	Namespace string
 	// CredentialsSecret is the name credentialsRef points at, if any.
 	CredentialsSecret string
-	// CABundleConfigMap and CABundleKey are what caBundleRef names, if
-	// anything. The key is "ca.crt" when the ConfigMap is named without one.
-	CABundleConfigMap string
-	CABundleKey       string
+	// CABundleSecret and CABundleKey are what caBundleRef names, if
+	// anything. The key is "ca.crt" when the Secret is named without one.
+	CABundleSecret string
+	CABundleKey    string
 }
 
 // ResolvedRepository is one declared repository.
@@ -163,7 +163,7 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			forge.CredentialsSecret = strings.TrimSpace(f.CredentialsRef.Name)
 		}
 		if f.CABundleRef != nil {
-			forge.CABundleConfigMap = strings.TrimSpace(f.CABundleRef.Name)
+			forge.CABundleSecret = strings.TrimSpace(f.CABundleRef.Name)
 			forge.CABundleKey = strings.TrimSpace(f.CABundleRef.Key)
 			if forge.CABundleKey == "" {
 				forge.CABundleKey = ForgeCABundleDefaultKey
@@ -222,7 +222,7 @@ func (f *ResolvedForge) valid() bool {
 // names nothing they did. The names are checked as the API server checks
 // them on the broker Deployment, as credentialsProblem does for the Secret.
 func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
-	if f.CABundleConfigMap == "" {
+	if f.CABundleSecret == "" {
 		return nil
 	}
 	if !provider.AcceptsCABundle {
@@ -234,11 +234,12 @@ func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
 	if f.Host == "" || provider.Hosts[lowerASCII(f.Host)] {
 		return fmt.Errorf("caBundleRef is for a self-managed host; %s uses the public CAs", provider.canonicalHost(f.Host))
 	}
-	if errs := validation.IsDNS1123Subdomain(f.CABundleConfigMap); len(errs) > 0 {
-		return fmt.Errorf("caBundleRef.name %q is not a ConfigMap name: %s", f.CABundleConfigMap, strings.Join(errs, "; "))
+	if errs := validation.IsDNS1123Subdomain(f.CABundleSecret); len(errs) > 0 {
+		return fmt.Errorf("caBundleRef.name %q is not a Secret name: %s", f.CABundleSecret, strings.Join(errs, "; "))
 	}
+	// Kubernetes holds a Secret's data keys to the ConfigMap key rule.
 	if errs := validation.IsConfigMapKey(f.CABundleKey); len(errs) > 0 {
-		return fmt.Errorf("caBundleRef.key %q is not a ConfigMap key: %s", f.CABundleKey, strings.Join(errs, "; "))
+		return fmt.Errorf("caBundleRef.key %q is not a Secret key: %s", f.CABundleKey, strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -654,7 +655,7 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 			add(ri.forgePath(f, gitCredentialsField), f.CredentialsSecret, err)
 		}
 		if err := f.caBundleProblem(provider); err != nil {
-			add(ri.forgePath(f, gitCABundleField), f.CABundleConfigMap, err)
+			add(ri.forgePath(f, gitCABundleField), f.CABundleSecret, err)
 		}
 	}
 
@@ -868,11 +869,11 @@ type BrokerForge struct {
 	// the broker, which is handed the file instead.
 	CredentialsSecret string `json:"-"`
 	TokenPath         string `json:"tokenPath,omitempty"`
-	// CABundleConfigMap and CABundleKey are the ConfigMap key the CA bundle
+	// CABundleSecret and CABundleKey are the Secret key the CA bundle
 	// is projected from. The broker reads the file at CAFile; it is handed the
 	// two names too, so that a missing file is answered with what to create.
-	CABundleConfigMap string `json:"caConfigMap,omitempty"`
-	CABundleKey       string `json:"caKey,omitempty"`
+	CABundleSecret string `json:"caSecret,omitempty"`
+	CABundleKey    string `json:"caKey,omitempty"`
 	// CAFile is where the broker reads the forge's CA bundle, when the forge
 	// names one in caBundleRef.
 	CAFile string `json:"caFile,omitempty"`
@@ -932,8 +933,8 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
 			AllowedPaths:      allowed,
 		}
-		if f.CABundleConfigMap != "" {
-			entry.CABundleConfigMap = f.CABundleConfigMap
+		if f.CABundleSecret != "" {
+			entry.CABundleSecret = f.CABundleSecret
 			entry.CABundleKey = f.CABundleKey
 			entry.CAFile = caDir + pathSeparator + f.Name + pathSeparator + ForgeCABundleFileName
 		}

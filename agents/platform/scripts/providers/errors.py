@@ -160,13 +160,13 @@ TLS_GUIDANCE: dict[str, str] = {
     "ca_missing": (
         "The CA bundle that the forge's caBundleRef names is not mounted. No "
         "retry fixes this until it is. Report it and stop: an administrator "
-        "creates the ConfigMap, with the key, that caBundleRef names."
+        "creates the Secret, with the key, that caBundleRef names."
     ),
     "ca_unloadable": (
         "The CA bundle that the forge's caBundleRef names could not be loaded: "
         "it is not PEM, or it holds no certificate. No retry fixes this. Report "
         "it and stop: an administrator puts the PEM CA certificate in the "
-        "ConfigMap key that caBundleRef names."
+        "Secret key that caBundleRef names."
     ),
 }
 
@@ -245,14 +245,14 @@ def tls_untrusted(host: str, why: str, kind: str = "untrusted") -> WorkspaceErro
 
 
 def ca_missing_reason(ca_source: str, fallback: str = "") -> str:
-    """Why a forge's CA file is not there, naming its ConfigMap and key if known."""
+    """Why a forge's CA file is not there, naming its Secret and key if known."""
     if ca_source:
         return f"{ca_source} is missing"
     return fallback or "the CA file that the forge's caBundleRef names is missing"
 
 
 def ca_unloadable_reason(ca_source: str, error: str = "") -> str:
-    """Why a forge's CA file could not be loaded, naming its ConfigMap and key if known."""
+    """Why a forge's CA file could not be loaded, naming its Secret and key if known."""
     where = f"the CA file from {ca_source.removeprefix('the ')}" if ca_source else "the CA file"
     reason = f"{where} could not be loaded (not PEM, or no certificate in it)"
     return f"{reason}: {error}" if error else reason
@@ -265,7 +265,7 @@ def tls_refusal(
 ) -> WorkspaceError | None:
     """The FORGE_TLS_UNTRUSTED refusal a git error output stands for, or None.
 
-    `ca_sources` maps a forge host to where its CA comes from ("the ConfigMap
+    `ca_sources` maps a forge host to where its CA comes from ("the Secret
     <name> or its key <key>"), and `ca_files` to the file it is mounted at. A
     CA file git could not load is answered as missing when the file is not
     there and as unloadable when it is, with what to fix, as the API client

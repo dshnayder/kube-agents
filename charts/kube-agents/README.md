@@ -491,8 +491,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A self-managed
   instance whose certificate a private CA signed also sets `caBundleRef`
-  (`name`, and an optional `key` that defaults to `ca.crt`): a ConfigMap that
-  holds the CA, which the broker trusts for that host only. It is for a
+  (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
+  holds the CA, which the broker trusts for that host only. A Secret, so
+  changing the CA needs the same rights as changing the token. It is for a
   `gitlab` forge at a self-managed host, never gitlab.com. With a `gitlab` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
   repository that the install registered by URL. Name a GitLab repository, or

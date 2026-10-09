@@ -222,7 +222,7 @@ class TlsUntrusted(ContentWorkspaceError):
     Its own code rather than `workspace.git-failed`: no retry fixes it, and the
     action is an administrator's, which the message names by its cause -- a CA
     to name in caBundleRef, a certificate to renew or reissue, or a CA
-    ConfigMap to create or correct.
+    Secret to create or correct.
     """
 
     status = 502
@@ -728,7 +728,7 @@ class ContentWorkspaceStore:
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
-        # None. The broker hands its own, which names a forge's CA ConfigMap;
+        # None. The broker hands its own, which names a forge's CA Secret;
         # without one, the shared reading names the cause alone.
         self._tls_refusal = tls_refusal or _tls_refusal
         self.base_branch = (

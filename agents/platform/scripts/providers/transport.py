@@ -303,7 +303,7 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
 # One TLS context per CA file, rebuilt when the file changes. Building one
 # loads the system bundle, so it is not done on every call; keyed on the
-# file's identity so a ConfigMap update reaches the next call with no restart.
+# file's identity so a Secret update reaches the next call with no restart.
 _CA_CONTEXTS: dict[str, tuple[tuple[int, int], ssl.SSLContext]] = {}
 _CA_CONTEXTS_LOCK = threading.Lock()
 
@@ -321,10 +321,10 @@ def ca_context(ca_file: str, host: str, ca_source: str = "") -> ssl.SSLContext:
     verified, and a public forge keeps the strict check.
 
     A file that is not there raises FORGE_TLS_UNTRUSTED naming the host and,
-    as `ca_source`, the ConfigMap and key it comes from: the operator projects
-    the ConfigMap as optional, so the broker starts without it, and kubelet
-    writes the file once the ConfigMap exists. A wrong key reads the same as a
-    missing ConfigMap, so the answer names both.
+    as `ca_source`, the Secret and key it comes from: the operator projects
+    the Secret as optional, so the broker starts without it, and kubelet
+    writes the file once the Secret exists. A wrong key reads the same as a
+    missing Secret, so the answer names both.
     """
     try:
         status = os.stat(ca_file)

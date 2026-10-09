@@ -62,9 +62,9 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
     The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?,
-    "caFile"?, "caConfigMap"?, "caKey"?}]}`. `caFile` is an absolute path to
+    "caFile"?, "caSecret"?, "caKey"?}]}`. `caFile` is an absolute path to
     PEM CA certificates that this forge's host, and no other, is trusted
-    under; `caConfigMap` and `caKey` name where the file comes from, for the
+    under; `caSecret` and `caKey` name where the file comes from, for the
     answer when it is missing.
     Read at registry construction, never cached across it, so a test or a
     remount sees the file it names. A file that is named and cannot be read
@@ -120,12 +120,12 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
 
 
 def _ca_source(item: Mapping[str, Any]) -> str:
-    """"the ConfigMap <name> or its key <key>", or "" when the entry names neither."""
-    name = str(item.get("caConfigMap") or "").strip()
+    """"the Secret <name> or its key <key>", or "" when the entry names neither."""
+    name = str(item.get("caSecret") or "").strip()
     key = str(item.get("caKey") or "").strip()
     if not name:
         return ""
-    return f"the ConfigMap {name} or its key {key or 'ca.crt'}"
+    return f"the Secret {name} or its key {key or 'ca.crt'}"
 
 
 def build_forges(config: Mapping[str, Any] | None = None) -> tuple[Forge, ...]:

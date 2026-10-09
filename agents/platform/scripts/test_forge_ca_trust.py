@@ -185,7 +185,7 @@ class HttpTransportTrustTest(unittest.TestCase):
         self.assertIn("not mounted", caught.exception.fields["detail"])
 
     def test_a_changed_ca_file_is_read_again(self):
-        # kubelet rewrites the projected ConfigMap in place; the next call
+        # kubelet rewrites the projected Secret in place; the next call
         # uses the new bundle, with no restart.
         ca, _port = self.serve(key_usage=True)
         target = Path(self.tmp.name) / "bundle.crt"
@@ -219,13 +219,20 @@ class ForgeConfigurationTest(unittest.TestCase):
         self.assertEqual("/etc/kube-agents/forge-ca/gitlab/ca.crt", forges[0].ca_file)
         self.assertEqual("", forges[1].ca_file)
 
-    def test_the_configmap_and_key_reach_the_forge(self):
+    def test_the_secret_and_key_reach_the_forge(self):
+        path = self.write(
+            '{"forges": [{"provider": "gitlab", "host": "gitlab.internal", "tokenPath": "/t",'
+            ' "allowedPaths": ["g"], "caFile": "/ca/gitlab/ca.crt", "caSecret": "gl-ca", "caKey": "root.pem"}]}'
+        )
+        forge = [f for f in providers.build_forges({"forges": load_forge_entries(path)}) if f.name == "gitlab"][0]
+        self.assertEqual("the Secret gl-ca or its key root.pem", forge.ca_source)
+        # The CA comes from a Secret: a configuration that names a ConfigMap
+        # names nothing the broker reads.
         path = self.write(
             '{"forges": [{"provider": "gitlab", "host": "gitlab.internal", "tokenPath": "/t",'
             ' "allowedPaths": ["g"], "caFile": "/ca/gitlab/ca.crt", "caConfigMap": "gl-ca", "caKey": "root.pem"}]}'
         )
-        forge = [f for f in providers.build_forges({"forges": load_forge_entries(path)}) if f.name == "gitlab"][0]
-        self.assertEqual("the ConfigMap gl-ca or its key root.pem", forge.ca_source)
+        self.assertEqual("", load_forge_entries(path)[0]["ca_source"])
 
     def test_gitlab_com_never_takes_a_ca(self):
         # The operator refuses it; a configuration written
@@ -238,8 +245,8 @@ class ForgeConfigurationTest(unittest.TestCase):
                 ]})
 
     def test_a_ca_file_that_is_not_pem_is_unloadable_in_the_api_client(self):
-        # The ConfigMap exists, but its key holds no certificate: a different
-        # fix from a missing ConfigMap, and the same answer as git's.
+        # The Secret exists, but its key holds no certificate: a different
+        # fix from a missing Secret, and the same answer as git's.
         transport_module._CA_CONTEXTS.clear()
         for name, content in (("text", "not a certificate\n"), ("empty", ""),
                               ("garbled", "-----BEGIN CERTIFICATE-----\nnotbase64!!\n-----END CERTIFICATE-----\n")):
@@ -248,21 +255,21 @@ class ForgeConfigurationTest(unittest.TestCase):
                 with self.assertRaises(WorkspaceError) as caught:
                     HttpTransport(
                         "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024,
-                        ca_file=path, ca_source="the ConfigMap gl-ca or its key root.pem",
+                        ca_file=path, ca_source="the Secret gl-ca or its key root.pem",
                     ).api("GET", "user")
                 self.assertEqual(providers.errors.TLS_GUIDANCE["ca_unloadable"], str(caught.exception))
                 self.assertIn("could not be loaded (not PEM, or no certificate in it)",
                               caught.exception.fields["detail"])
 
-    def test_a_missing_ca_file_names_its_configmap_and_key_in_the_api_client(self):
+    def test_a_missing_ca_file_names_its_secret_and_key_in_the_api_client(self):
         transport_module._CA_CONTEXTS.clear()
         with self.assertRaises(WorkspaceError) as caught:
             HttpTransport(
                 "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024,
-                ca_file="/nonexistent/ca.crt", ca_source="the ConfigMap gl-ca or its key root.pem",
+                ca_file="/nonexistent/ca.crt", ca_source="the Secret gl-ca or its key root.pem",
             ).api("GET", "user")
         self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
-        self.assertIn("the ConfigMap gl-ca or its key root.pem is missing", caught.exception.fields["detail"])
+        self.assertIn("the Secret gl-ca or its key root.pem is missing", caught.exception.fields["detail"])
         self.assertEqual(providers.errors.TLS_GUIDANCE["ca_missing"], str(caught.exception))
 
     def test_a_relative_ca_file_is_refused(self):
@@ -413,7 +420,7 @@ class GitLoopbackTrustTest(unittest.TestCase):
         entries = (
             {"provider": "gitlab", "host": f"localhost:{self.port}", "token_path": "/t",
              "allowed_paths": ("g",), "ca_file": str(self.ca),
-             "ca_source": "the ConfigMap test-ca or its key ca.crt"},
+             "ca_source": "the Secret test-ca or its key ca.crt"},
         ) if pinned else ()
         state = Path(self.tmp.name) / ("pinned" if pinned else "bare")
         with mock.patch.object(credential_proxy, "_configured_forge_entries", return_value=entries), \
@@ -452,14 +459,14 @@ class GitLoopbackTrustTest(unittest.TestCase):
                 )
                 self.assertEqual(expect, providers.classify_tls(result.stderr)[0], result.stderr)
 
-    def test_a_missing_ca_file_names_its_configmap_and_key(self):
+    def test_a_missing_ca_file_names_its_secret_and_key(self):
         executor = self.executor(pinned=True)
         Path(self.ca).unlink()
         result = self.vcs_ls_remote(executor)
         refusal = executor.tls_refusal(result.stderr)
         self.assertIsNotNone(refusal, result.stderr)
         self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
-        self.assertIn("the ConfigMap test-ca or its key ca.crt is missing", refusal.fields["detail"])
+        self.assertIn("the Secret test-ca or its key ca.crt is missing", refusal.fields["detail"])
 
 
 class OpenerTest(unittest.TestCase):
@@ -598,7 +605,7 @@ class CertificateFailureTest(unittest.TestCase):
         for kind, line in self.GNUTLS.items():
             with self.subTest(kind=kind):
                 refusal = providers.tls_refusal("Cloning into 'repo'...\n" + line,
-                                                {"gitlab.internal": "the ConfigMap gl-ca or its key ca.crt"})
+                                                {"gitlab.internal": "the Secret gl-ca or its key ca.crt"})
                 self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
                 self.assertEqual(502, refusal.status)
                 self.assertTrue(refusal.fields["detail"].startswith("gitlab.internal: "))
@@ -613,11 +620,11 @@ class CertificateFailureTest(unittest.TestCase):
         self.assertIn("renews", advice["expired"])
         self.assertIn("does not name the host", advice["hostname"])
 
-    def test_a_missing_ca_file_from_git_names_the_configmap_and_key(self):
+    def test_a_missing_ca_file_from_git_names_the_secret_and_key(self):
         for line in (self.GNUTLS["ca_missing"], self.OTHER_CA_MISSING):
             with self.subTest(line=line[60:100]):
-                refusal = providers.tls_refusal(line, {"gitlab.internal": "the ConfigMap gl-ca or its key root.pem"})
-                self.assertIn("the ConfigMap gl-ca or its key root.pem is missing", refusal.fields["detail"])
+                refusal = providers.tls_refusal(line, {"gitlab.internal": "the Secret gl-ca or its key root.pem"})
+                self.assertIn("the Secret gl-ca or its key root.pem is missing", refusal.fields["detail"])
 
     def test_a_ca_file_git_could_not_load_is_unloadable_when_it_is_there(self):
         # GnuTLS prints "Problem with the SSL CA cert" for a missing file and
@@ -627,12 +634,12 @@ class CertificateFailureTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         present = Path(tmp.name) / "ca.crt"
         present.write_text("-----BEGIN CERTIFICATE-----\nnotbase64!!\n-----END CERTIFICATE-----\n")
-        sources = {"gitlab.internal": "the ConfigMap gl-ca or its key root.pem"}
+        sources = {"gitlab.internal": "the Secret gl-ca or its key root.pem"}
         for line in (self.GNUTLS["ca_missing"], self.OTHER_CA_MISSING):
             with self.subTest(line=line[60:100]):
                 there = providers.tls_refusal(line, sources, {"gitlab.internal": str(present)})
                 self.assertEqual(providers.errors.TLS_GUIDANCE["ca_unloadable"], str(there))
-                self.assertIn("the CA file from ConfigMap gl-ca or its key root.pem could not be loaded",
+                self.assertIn("the CA file from Secret gl-ca or its key root.pem could not be loaded",
                               there.fields["detail"])
                 gone = providers.tls_refusal(line, sources, {"gitlab.internal": str(Path(tmp.name) / "gone.crt")})
                 self.assertEqual(providers.errors.TLS_GUIDANCE["ca_missing"], str(gone))

@@ -593,7 +593,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
 
     def test_a_gitlab_forge_renders_its_ca_bundle(self):
         """A self-managed instance behind a private CA names the
-        ConfigMap that holds the CA. A forge without one renders no field."""
+        Secret that holds the CA. A forge without one renders no field."""
         integration = _integration(
             *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
                     namespace="platform"),

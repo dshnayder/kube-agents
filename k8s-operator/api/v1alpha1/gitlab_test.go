@@ -514,13 +514,13 @@ func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
 	}
 	want := `[{"provider":"github","host":"github.com"},` +
 		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]},` +
-		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caConfigMap":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
+		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caSecret":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}
 	last := forges[len(forges)-1]
-	if last.CABundleConfigMap != "onprem-ca" || last.CABundleKey != ForgeCABundleDefaultKey {
-		t.Errorf("the entry projects %q key %q; expected onprem-ca key %q", last.CABundleConfigMap, last.CABundleKey, ForgeCABundleDefaultKey)
+	if last.CABundleSecret != "onprem-ca" || last.CABundleKey != ForgeCABundleDefaultKey {
+		t.Errorf("the entry projects %q key %q; expected onprem-ca key %q", last.CABundleSecret, last.CABundleKey, ForgeCABundleDefaultKey)
 	}
 }
 

@@ -5514,7 +5514,7 @@ class CommandExecutor:
     def tls_refusal(self, output: str):
         """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
 
-        A CA file git could not load is named by the ConfigMap and key it comes
+        A CA file git could not load is named by the Secret and key it comes
         from, as missing or as unloadable by whether the file is there, as the
         API client names it. Redacted: the one line kept can quote the remote's
         URL.

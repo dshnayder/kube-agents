@@ -1535,8 +1535,8 @@ type ForgeSpec struct {
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
-	// CABundleRef names a ConfigMap in the PlatformAgent's namespace that
-	// holds the PEM CA certificates that signed this forge's TLS certificate:
+	// CABundleRef names a Secret in the PlatformAgent's namespace that holds
+	// the PEM CA certificates that signed this forge's TLS certificate:
 	// a self-managed instance behind a private CA. The broker trusts these
 	// certificates for this forge's host only, beside the system bundle, in
 	// its API client and in git, so they never vouch for another host. It is
@@ -1544,7 +1544,7 @@ type ForgeSpec struct {
 	// empty or gitlab.com, whose certificate the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
-	// The mount is optional: a missing ConfigMap does not stop the broker, and
+	// The mount is optional: a missing Secret does not stop the broker, and
 	// calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
 	// broker reads the file on each call, so an update reaches it with no
 	// restart.
@@ -1552,21 +1552,24 @@ type ForgeSpec struct {
 	CABundleRef *ForgeCABundleRef `json:"caBundleRef,omitempty"`
 }
 
-// ForgeCABundleRef names the ConfigMap key that holds a forge's CA
-// certificates. A CA certificate is public, so a ConfigMap holds it, not a
-// Secret.
+// ForgeCABundleRef names the Secret key that holds a forge's CA certificates.
+// A CA certificate is public, but it is kept in a Secret for its integrity:
+// whoever can change it chooses which servers the broker presents the forge's
+// token to. In a Secret, changing it needs the same rights as changing the
+// token Secret beside it, which a ConfigMap does not.
 //
-// The key rule is the operator's IsConfigMapKey, which the pattern alone does
-// not hold: it also refuses "." and a key that starts with "..".
+// The key rule is the operator's IsConfigMapKey, which Kubernetes applies to
+// Secret keys too and which the pattern alone does not hold: it also refuses
+// "." and a key that starts with "..".
 // +kubebuilder:validation:XValidation:rule="!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))",message="caBundleRef.key may not be . or start with .."
 type ForgeCABundleRef struct {
-	// Name is the ConfigMap's name: a lowercase DNS subdomain.
+	// Name is the Secret's name: a lowercase DNS subdomain.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Name string `json:"name"`
 
-	// Key is the ConfigMap key that holds the PEM certificates. Defaults to
+	// Key is the Secret key that holds the PEM certificates. Defaults to
 	// "ca.crt".
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
