@@ -60,6 +60,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -2255,6 +2256,9 @@ def inflight_path_for(audit_id: str) -> str:
 # it sooner is an operator's action from outside the session, described in
 # agents/platform/cron/README.md; the CLI has no flag for it on purpose.
 INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+# The keys of the in-flight note that `start` writes.
+INFLIGHT_AUDIT_KEY = "audit"
+INFLIGHT_STARTED_KEY = "started_at"
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -2402,7 +2406,7 @@ def claim_in_flight(audit_id: str) -> None:
         staged = Path(f"{path}.tmp")
         try:
             staged.write_text(
-                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                json.dumps({INFLIGHT_AUDIT_KEY: audit_id, INFLIGHT_STARTED_KEY: time.time()}),
                 encoding="utf-8",
             )
             os.replace(staged, path)
@@ -2442,22 +2446,23 @@ def inflight_started_at(audit_id: str, now: float) -> float | None:
     """The `started_at` that `start` wrote in this stream's in-flight note.
 
     `None` when the note is missing, does not parse, names a different
-    stream, or is older than the lease. `_in_flight_since` uses the mtime of
-    a note that does not parse, because a lease must fail closed. A timer
+    stream, or gives a time in the future. `_in_flight_since` uses the mtime
+    of a note that does not parse, because a lease must fail closed. A timer
     must not: that mtime is not the start of this run, and a timer gives no
-    number rather than a wrong one. A note older than the lease can belong
-    to a run that died, and not to this run.
+    number rather than a wrong one. A note older than the lease stays valid
+    here. `start` writes a new note on each run, so an old note at `finish`
+    is the note of this run, and the run took longer than the lease.
     """
     try:
         note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(note, dict) or note.get("audit") != audit_id:
+    if not isinstance(note, dict) or note.get(INFLIGHT_AUDIT_KEY) != audit_id:
         return None
-    started = note.get("started_at")
+    started = note.get(INFLIGHT_STARTED_KEY)
     if not isinstance(started, (int, float)) or isinstance(started, bool):
         return None
-    if not 0 <= now - started <= INFLIGHT_TTL_SECONDS:
+    if not math.isfinite(started) or started > now:
         return None
     return float(started)
 

@@ -23994,9 +23994,7 @@ class TestPhaseTimers(HarnessTestCase):
             "has a boolean": json.dumps({"audit": AUDIT, "started_at": True}),
             "has a string": json.dumps({"audit": AUDIT, "started_at": "yesterday"}),
             "is in the future": json.dumps({"audit": AUDIT, "started_at": now.timestamp() + 60}),
-            "is past the lease": json.dumps(
-                {"audit": AUDIT, "started_at": now.timestamp() - audit_report.INFLIGHT_TTL_SECONDS - 60}
-            ),
+            "is infinite": '{"audit": "%s", "started_at": -Infinity}' % AUDIT,
         }
         for name, text in cases.items():
             with self.subTest(note=name):
@@ -24004,6 +24002,17 @@ class TestPhaseTimers(HarnessTestCase):
                 self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
         path.unlink()
         self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
+
+    def test_a_run_longer_than_the_lease_keeps_its_inspect_timer(self):
+        # `start` writes a new note on each run, so an old note at `finish` is
+        # this run's own note. The timer must report the long run.
+        now = datetime.now(timezone.utc)
+        path = Path(audit_report.inflight_path_for(AUDIT))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        elapsed = audit_report.INFLIGHT_TTL_SECONDS + 60
+        path.write_text(json.dumps({"audit": AUDIT, "started_at": now.timestamp() - elapsed}), encoding="utf-8")
+        self.assertEqual(audit_report.inspect_seconds(AUDIT, now), float(elapsed))
+        path.unlink()
 
     def test_a_bad_manifest_stamp_gives_no_collect_timer(self):
         good = {"started_at": "2026-08-01T09:00:00Z", "finished_at": "2026-08-01T09:10:30Z"}

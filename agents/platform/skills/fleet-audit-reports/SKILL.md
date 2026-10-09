@@ -40,8 +40,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
-  publish, and for the collector to run. An envelope has only the ones `finish` could measure;
-  `streams` and `show` give null for the others.
+  publish, and for the collector to run. An envelope has only the ones `finish` could measure.
+  `show` gives them, with null for the others; `streams` does not carry them.
 - `ledger_body` is the issue body the run left on GitHub — `fleet-audit`'s memory of the previous
   run, not something to answer from. No subcommand returns it.
 
