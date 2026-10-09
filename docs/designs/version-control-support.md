@@ -2426,6 +2426,50 @@ Four endpoints need naming because they are not a rename of GitHub's:
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
 
+### A self-managed instance behind a private CA
+
+A self-managed instance often has a TLS certificate that a private CA signed.
+The broker's two clients do not trust that CA by default:
+
+- The client for the forge API uses Python's default trust store, which is the
+  image's system bundle.
+- git in the broker is built on GnuTLS. It ignores `SSL_CERT_FILE`, so a process
+  variable cannot give it the CA.
+
+The forge declaration therefore names the CA: `caBundleRef`, a ConfigMap key in
+the agent's namespace. A CA certificate is public, so a ConfigMap holds it, not
+a Secret. The operator mounts the key into the broker's pod only, and the
+forge's entry in the broker configuration names the file (`caFile`). The
+agent's pod and the shell sandbox get nothing.
+
+The broker trusts the CA for that forge's host and for no other host. A private
+CA must never vouch for github.com or gitlab.com:
+
+- The API client builds one TLS context for the forge: the system bundle plus the
+  CA file. Other forges keep the default context.
+- git gets `http.https://<host>/.sslCAInfo=<caFile>` in the configuration layer
+  that the broker forces on every git it runs. git matches the key's URL against
+  the remote's URL, so the CA applies to that host only. The pin is in the forced
+  layer, not in the credential's configuration, because a context repository on
+  such a forge is cloned with no credential and still needs the CA.
+
+Python 3.13 turns on strict X.509 checks in its default context. These checks
+refuse a CA certificate with no Key Usage extension, and a server certificate
+with no Authority Key Identifier. Many private CAs issue such certificates. The
+context for a forge that names its own CA turns the strict checks off, and logs
+this once. The chain and the hostname are still verified, and every other host
+keeps the strict checks. The administrator chose to trust this CA for this host,
+and a refusal of a common CA profile would only make the feature fail.
+
+The mount is optional, as the token's is: a missing ConfigMap does not stop the
+broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, and the
+detail says that the CA file is not mounted. The broker reads the file on each
+call, so an update of the ConfigMap reaches the broker with no restart.
+
+Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
+CA bundle, so it refuses the field: a CA that nothing reads would hide a
+certificate problem from the administrator who set it.
+
 ### GitLab in the content workspace
 
 The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
@@ -2474,6 +2518,11 @@ whose fields it validated and refused — is not. Two specifics:
   answers 404, so this does not prove the thing does not exist" — which is the
   clearest evidence that keeping the table forge-neutral was worth it: GitLab
   needs two overrides, for 401 and 400, and not this one.
+- **A certificate that does not verify is not a forge error.** Both clients
+  answer it with `FORGE_TLS_UNTRUSTED` (502), which names the host and the
+  verifier's reason. The shared fallback, `FORGE_CALL_FAILED`, says that one
+  retry is reasonable, and no retry fixes a certificate. The action is an
+  administrator's: the forge's `caBundleRef`.
 
 ### What GitLab does not include
 
