@@ -258,9 +258,10 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   GitLab on an install that has not configured it, parse their specs and then
   tell you exactly what this install is missing. That is the answer, not a bug to work around.
 - **Link to a file with `capabilities`' `fileUrl`.** It is the file's web address
-  on this forge, with `{ref}` and `{path}` to fill. URL-encode `{path}` one
-  segment at a time and keep the `/`. Put `{ref}` in as it is. Use a commit SHA
-  as `{ref}` for a link that must outlive the branch. Do not build a forge URL
+  on this forge, with `{ref}` and `{path}` to fill. Percent-encode each of them
+  and keep the `/` (in Python, `quote(value, safe="/")`): a branch name can hold
+  `#` or `%`, which break a link. Use a commit SHA as `{ref}` for a link that
+  must outlive the branch. Do not build a forge URL
   yourself, and do not use a bare relative path: in an issue it opens nothing.
 
 ## Reference

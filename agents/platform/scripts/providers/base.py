@@ -227,10 +227,10 @@ class Forge:
 
         Composed from the validated repository and this forge's own host, as
         `clone_url` is, so it needs no credential and no network. The caller
-        URL-encodes `{path}` one segment at a time and keeps its `/`
-        separators. The caller puts `{ref}` in as it is: a branch name with
-        `/` is valid there. A link that must outlive the branch uses a commit
-        SHA as `{ref}`. None when the forge has no such page.
+        percent-encodes `{ref}` and `{path}` and keeps their `/` separators
+        (`quote(value, safe="/")`): a branch name may hold `#` or `%`, which
+        would break the link. A link that must outlive the branch uses a
+        commit SHA as `{ref}`. None when the forge has no such page.
         """
         return None
 
