@@ -560,6 +560,8 @@ When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_
 `publish_s`, `inspect_s` and `collect_s` are timing data in seconds, and nothing decides on them.
 `publish_s` is the time `finish` used to publish. `inspect_s` is the time from `start` to `finish`,
 read from the in-flight note that `start` wrote, and is absent when that note gives no start time.
+Because the note carries no run identity, a run that outlives the lease (or an operator release) and
+finishes after a later `start` replaced the note reads that later `start` time.
 `collect_s` is the collector's own time, from the manifest's `started_at` and `finished_at`, and is
 absent without a manifest or without both stamps. A dry run carries none of the three.
 

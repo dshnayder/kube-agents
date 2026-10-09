@@ -23995,6 +23995,9 @@ class TestPhaseTimers(HarnessTestCase):
             "has a string": json.dumps({"audit": AUDIT, "started_at": "yesterday"}),
             "is in the future": json.dumps({"audit": AUDIT, "started_at": now.timestamp() + 60}),
             "is infinite": '{"audit": "%s", "started_at": -Infinity}' % AUDIT,
+            "overflows float": json.dumps({"audit": AUDIT, "started_at": 10**400}),
+            "is before datetime range": json.dumps({"audit": AUDIT, "started_at": -1e300}),
+            "is negative": json.dumps({"audit": AUDIT, "started_at": -1}),
         }
         for name, text in cases.items():
             with self.subTest(note=name):
@@ -24004,8 +24007,8 @@ class TestPhaseTimers(HarnessTestCase):
         self.assertIsNone(audit_report.inspect_seconds(AUDIT, now))
 
     def test_a_run_longer_than_the_lease_keeps_its_inspect_timer(self):
-        # `start` writes a new note on each run, so an old note at `finish` is
-        # this run's own note. The timer must report the long run.
+        # While no later `start` has replaced the expired note, the note at
+        # `finish` is still this run's note.
         now = datetime.now(timezone.utc)
         path = Path(audit_report.inflight_path_for(AUDIT))
         path.parent.mkdir(parents=True, exist_ok=True)

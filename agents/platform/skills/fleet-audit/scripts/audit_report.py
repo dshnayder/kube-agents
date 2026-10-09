@@ -60,7 +60,6 @@ import copy
 import fcntl
 import hashlib
 import json
-import math
 import os
 import re
 import shlex
@@ -2446,12 +2445,15 @@ def inflight_started_at(audit_id: str, now: float) -> float | None:
     """The `started_at` that `start` wrote in this stream's in-flight note.
 
     `None` when the note is missing, does not parse, names a different
-    stream, or gives a time in the future. `_in_flight_since` uses the mtime
-    of a note that does not parse, because a lease must fail closed. A timer
-    must not: that mtime is not the start of this run, and a timer gives no
-    number rather than a wrong one. A note older than the lease stays valid
-    here. `start` writes a new note on each run, so an old note at `finish`
-    is the note of this run, and the run took longer than the lease.
+    stream, or gives a time outside `(0, now]` or `datetime`'s range.
+    `_in_flight_since` uses the mtime of a note that does not parse, because
+    a lease must fail closed. A timer must not: that mtime is not the start
+    of this run. A note older than the lease stays valid here, so a run
+    longer than the lease keeps its timer while no later `start` has
+    replaced the note. As in `release_in_flight`, `start` and `finish` share
+    no run identity: if a run outlives the lease (or an operator releases
+    the note) and a later `start` replaces the note before this run's
+    `finish`, `inspect_s` reads that later `start` time.
     """
     try:
         note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
@@ -2462,7 +2464,11 @@ def inflight_started_at(audit_id: str, now: float) -> float | None:
     started = note.get(INFLIGHT_STARTED_KEY)
     if not isinstance(started, (int, float)) or isinstance(started, bool):
         return None
-    if not math.isfinite(started) or started > now:
+    try:
+        datetime.fromtimestamp(started, timezone.utc)
+    except (OverflowError, ValueError, OSError):
+        return None
+    if started <= 0 or started > now:
         return None
     return float(started)
 
