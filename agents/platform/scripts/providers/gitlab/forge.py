@@ -547,9 +547,15 @@ class GitLabForge(Forge):
                 # value is the last page; a full first page sets the size.
                 page_size = len(files) or 1
             paths = [str(item.get("new_path") or "") for item in files]
-            if not files or (not sized and paths == previous):
-                # No more pages, or an instance that ignored `page` and sent
-                # the same page again.
+            if not files:
+                return "".join(out)
+            if not sized and paths == previous:
+                # An instance that ignored `page` and sent the same page
+                # again. Files past it, if any, cannot be read, so say so.
+                out.append(
+                    f"# diff may be cut short: GitLab sent page {page - 1} again when asked "
+                    f"for page {page}, so files after the first {shown}, if any, are not shown\n"
+                )
                 return "".join(out)
             previous = paths
             shown += len(files)

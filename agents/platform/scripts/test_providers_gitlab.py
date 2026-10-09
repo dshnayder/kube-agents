@@ -370,6 +370,9 @@ class ProposalTest(unittest.TestCase):
         diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
         self.assertEqual(1, diff.count("diff --git a/f0 b/f0"))
         self.assertEqual(5, len(api.calls))
+        # Review: the stop must say that files past the repeat are not shown.
+        self.assertIn("GitLab sent page 1 again when asked for page 2", diff)
+        self.assertIn("files after the first 20, if any, are not shown", diff)
 
     def test_a_first_diff_page_refused_by_the_broker_is_not_retried(self):
         # The broker's own refusals (a ceiling, a deadline) are 502 too, but
