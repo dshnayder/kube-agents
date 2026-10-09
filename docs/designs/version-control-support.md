@@ -908,6 +908,10 @@ rather than a forge verb because half of it is a property of how the call is
 authenticated — a CLI reads its login out of its credential store, an HTTP
 client asks the current-user route — and the other half, `canWrite`, is the
 forge's normalised answer to a question every forge spells differently.
+`canWrite` is true, false, or null when the forge could not find out. A caller
+must not read null as a refusal. On GitHub, a 404 is false only when GitHub
+says that the login is not a user. Every other 404 is null, because GitHub also
+answers 404 for a repository that the token cannot see.
 
 `branch-view` and `branch-delete` exist because a branch name outlives its
 proposal. A squash merge or a close leaves the source branch on the remote at a

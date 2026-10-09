@@ -2715,6 +2715,38 @@ class CollaborationTest(unittest.TestCase):
             broker.identity({"repository": "acme/infra"})
         self.assertEqual(caught.exception.fields.get("code"), "FORGE_RATE_LIMITED")
 
+    def test_a_github_404_is_no_only_when_the_login_is_not_a_user(self):
+        """A 404 for an unreadable repository is unknown, not "may not write".
+
+        GitHub answers 404 with "<login> is not a user" for a login that is no
+        user, and 404 "Not Found" for a repository the token cannot see. The
+        second said nothing about the login, but read as a settled no, so a
+        `/remediate` from a maintainer was refused while the App had lost its
+        installation, and the refusal stayed.
+        """
+        # Through the package surface: tests outside `providers` do not import a
+        # forge package.
+        github = next(cls for cls in providers.AVAILABLE if cls.name == "github")
+
+        def api_raising(error):
+            def api(method, path, **kwargs):
+                raise error
+            return api
+
+        forge = github.__new__(github)
+        cases = (
+            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND",
+                            detail="gh: renovate is not a user (HTTP 404): renovate is not a user"), False),
+            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND",
+                            detail="gh: Not Found (HTTP 404): Not Found"), None),
+            (WorkspaceError("x", status=404, code="FORGE_NOT_FOUND"), None),
+            (WorkspaceError("x", status=502, code="FORGE_UNAVAILABLE",
+                            detail="gh: Server Error (HTTP 502)"), None),
+        )
+        for error, expected in cases:
+            with self.subTest(detail=error.fields.get("detail"), status=error.status):
+                self.assertIs(expected, forge.can_write(api_raising(error), "acme/infra", "renovate"))
+
     def test_identity_asks_about_the_app_account_when_the_login_is_a_bots(self):
         """`bot` puts the suffix back that the translation took off.
 
