@@ -649,6 +649,22 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
                 proc = self._validate_ca(case)
                 self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
 
+    def test_the_ca_flag_needs_a_self_managed_host(self):
+        # #2750 review: gitlab.com presents a certificate the public CAs sign.
+        ca = self._tmp / "ca.pem"
+        ca.write_text(_PEM)
+        for host in ("", "gitlab.com", "www.gitlab.com"):
+            with self.subTest(host=host):
+                proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST=host, PARAM_GITOPS_CA_FILE=str(ca)))
+                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+                self.assertIn("self-managed GitLab", proc.stdout + proc.stderr)
+
+    def test_a_host_of_gitlab_com_drops_the_recorded_configmap(self):
+        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="", PARAM_GITOPS_CA_CONFIGMAP="gitlab-forge-ca"))
+        self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)
+        self.assertNotIn("cm=gitlab-forge-ca", proc.stdout)
+        self.assertIn("uses the public CAs", proc.stdout + proc.stderr)
+
     def test_a_switch_to_github_drops_the_recorded_configmap(self):
         proc = self._validate_ca(
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_CONFIGMAP": "gitlab-forge-ca"}

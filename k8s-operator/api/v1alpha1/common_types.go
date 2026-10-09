@@ -1459,6 +1459,7 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // holds with the webhook off -- the chart ships it off.
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 // +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.provider) && self.provider == 'gitlab')",message="caBundleRef is for a gitlab forge: the github provider does not read it yet, and a CA that nothing reads would hide a certificate problem"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com']))",message="caBundleRef is for a self-managed host: gitlab.com presents a certificate the public CAs sign, and a private CA must never vouch for it"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1537,8 +1538,10 @@ type ForgeSpec struct {
 	// CABundleRef names a ConfigMap in the PlatformAgent's namespace that
 	// holds the PEM CA certificates that signed this forge's TLS certificate:
 	// a self-managed instance behind a private CA. The broker trusts these
-	// certificates for this forge's host only, beside the system bundle, so
-	// they never vouch for another host. It is for a gitlab forge.
+	// certificates for this forge's host only, beside the system bundle, in
+	// its API client and in git, so they never vouch for another host. It is
+	// for a gitlab forge at a self-managed host: it is refused when host is
+	// empty or gitlab.com, whose certificate the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
 	// The mount is optional: a missing ConfigMap does not stop the broker, and

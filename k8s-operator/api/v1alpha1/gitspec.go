@@ -228,6 +228,12 @@ func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
 	if !provider.AcceptsCABundle {
 		return fmt.Errorf("provider %s does not read a CA bundle; caBundleRef is for a gitlab forge", provider.Name)
 	}
+	// The provider's own public host presents a certificate the public CAs
+	// sign. A private CA there would vouch for that host, and the broker would
+	// relax its strict X.509 checks for it.
+	if f.Host == "" || provider.Hosts[lowerASCII(f.Host)] {
+		return fmt.Errorf("caBundleRef is for a self-managed host; %s uses the public CAs", provider.canonicalHost(f.Host))
+	}
 	if errs := validation.IsDNS1123Subdomain(f.CABundleConfigMap); len(errs) > 0 {
 		return fmt.Errorf("caBundleRef.name %q is not a ConfigMap name: %s", f.CABundleConfigMap, strings.Join(errs, "; "))
 	}
@@ -863,9 +869,10 @@ type BrokerForge struct {
 	CredentialsSecret string `json:"-"`
 	TokenPath         string `json:"tokenPath,omitempty"`
 	// CABundleConfigMap and CABundleKey are the ConfigMap key the CA bundle
-	// is projected from. Not read by the broker, which is handed CAFile.
-	CABundleConfigMap string `json:"-"`
-	CABundleKey       string `json:"-"`
+	// is projected from. The broker reads the file at CAFile; it is handed the
+	// two names too, so that a missing file is answered with what to create.
+	CABundleConfigMap string `json:"caConfigMap,omitempty"`
+	CABundleKey       string `json:"caKey,omitempty"`
 	// CAFile is where the broker reads the forge's CA bundle, when the forge
 	// names one in caBundleRef.
 	CAFile string `json:"caFile,omitempty"`

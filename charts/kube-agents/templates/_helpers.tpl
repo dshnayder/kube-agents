@@ -689,6 +689,10 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if ne $provider "gitlab" -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a gitlab forge; provider %s does not read a CA bundle" $i $provider) -}}
 {{- end -}}
+{{- /* gitlab.com presents a certificate the public CAs sign: a private CA must never vouch for it. */ -}}
+{{- if or (not $host) (has (lower $host) (list "gitlab.com" "www.gitlab.com")) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com uses the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- end -}}
 {{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a ConfigMap name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
 {{- end -}}

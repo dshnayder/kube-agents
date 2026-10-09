@@ -4471,6 +4471,20 @@ validate_gitops_forge_flags() {
       return 1
     fi
   fi
+  # A private CA is for a self-managed host only: gitlab.com presents a
+  # certificate the public CAs sign, and a private CA must never vouch for it.
+  local self_managed="true"
+  case "${PARAM_GITOPS_HOST:-}" in ""|gitlab.com|www.gitlab.com) self_managed="false" ;; esac
+  if [ "$self_managed" != "true" ]; then
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a self-managed GitLab: give its hostname with --gitops-host. gitlab.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]; then
+      print_info "Dropping the recorded GitLab CA ConfigMap '${PARAM_GITOPS_CA_CONFIGMAP}': this run's GitLab host is gitlab.com, which uses the public CAs."
+      PARAM_GITOPS_CA_CONFIGMAP=""
+    fi
+  fi
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
     # Read once, after the apply, as the token is: a process substitution can
     # be read only once, so its content is checked there, not here.

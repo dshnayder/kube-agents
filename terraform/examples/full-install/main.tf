@@ -1020,6 +1020,13 @@ resource "helm_release" "kube_agents" {
       error_message = "gitlab_repo, gitops_host and gitlab_ca_configmap_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
     }
 
+    # A private CA is for a self-managed GitLab only: gitlab.com presents a
+    # certificate the public CAs sign, and a private CA must never vouch for it.
+    precondition {
+      condition     = var.gitlab_ca_configmap_name == "" || !contains(["", "gitlab.com", "www.gitlab.com"], var.gitops_host)
+      error_message = "gitlab_ca_configmap_name is for a self-managed GitLab: set gitops_host to its hostname. gitlab.com uses the public CAs."
+    }
+
     # What this refuses is an install that asks for the detector without the
     # subscription it reads, which is silent whichever door asked. Through
     # enable_drift_detector: driftDetector, enabled included, is written inside

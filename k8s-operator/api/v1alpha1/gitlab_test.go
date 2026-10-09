@@ -514,7 +514,7 @@ func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
 	}
 	want := `[{"provider":"github","host":"github.com"},` +
 		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]},` +
-		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
+		`{"provider":"gitlab","host":"gitlab.example.com","tokenPath":"/creds/onprem/token","caConfigMap":"onprem-ca","caKey":"ca.crt","caFile":"/ca/onprem/ca.crt","allowedPaths":["team"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}
@@ -535,8 +535,16 @@ func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
 	badName.CABundleRef = &ForgeCABundleRef{Name: "Not_A_Name"}
 	badKey := glForge("bad-key", "gitlab.two.example", "team")
 	badKey.CABundleRef = &ForgeCABundleRef{Name: "ok", Key: "no spaces allowed"}
+	// #2750 review: the provider's public host never takes a private CA, in
+	// any spelling, and an empty host is that host.
+	saas := glForge("saas", "", "acme")
+	saas.CABundleRef = &ForgeCABundleRef{Name: "ca"}
+	saasNamed := glForge("saas-named", "gitlab.com", "beta")
+	saasNamed.CABundleRef = &ForgeCABundleRef{Name: "ca"}
+	saasWWW := glForge("saas-www", "WWW.GitLab.com", "gamma")
+	saasWWW.CABundleRef = &ForgeCABundleRef{Name: "ca"}
 	in := &IntegrationSpec{
-		Forges: []ForgeSpec{github, badName, badKey},
+		Forges: []ForgeSpec{github, badName, badKey, saas, saasNamed, saasWWW},
 		Repositories: []RepositorySpec{
 			repo("github", "infra", RepositoryRoleGitOps),
 			repo("bad-name", "team/a", RepositoryRoleManaged),
@@ -551,7 +559,10 @@ func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
 	for _, problem := range resolved.Problems() {
 		paths[problem.Path.String()] = true
 	}
-	for _, want := range []string{"forges[0].caBundleRef", "forges[1].caBundleRef", "forges[2].caBundleRef"} {
+	for _, want := range []string{
+		"forges[0].caBundleRef", "forges[1].caBundleRef", "forges[2].caBundleRef",
+		"forges[3].caBundleRef", "forges[4].caBundleRef", "forges[5].caBundleRef",
+	} {
 		if !paths[want] {
 			t.Errorf("no problem at %s; got %v", want, resolved.Problems())
 		}

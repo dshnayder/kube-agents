@@ -623,10 +623,17 @@ class ChartGitIntegrationTest(unittest.TestCase):
         for fields, expected in (
             ({"provider": "github", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
              "caBundleRef is for a gitlab forge"),
-            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
-            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "ok", "caBundleRef.key": "no/slash"}, "caBundleRef.key"),
+            # #2750 review: never on gitlab.com, in any spelling, or with no host.
+            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
+            ({"provider": "gitlab", "host": "gitlab.com", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
+            ({"provider": "gitlab", "host": "WWW.GitLab.com", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
         ):
             with self.subTest(expected=expected, fields=fields):
                 result = _render(_CR_TEMPLATE, *_forge(0, name="f", **fields))

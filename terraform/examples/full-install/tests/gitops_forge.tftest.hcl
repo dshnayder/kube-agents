@@ -144,10 +144,32 @@ run "a_gitlab_ca_needs_the_gitlab_forge" {
   expect_failures = [helm_release.kube_agents]
 }
 
+run "a_gitlab_ca_needs_a_self_managed_host" {
+  command = plan
+  variables {
+    gitops_forge             = "gitlab"
+    gitlab_repo              = "g/p"
+    gitlab_ca_configmap_name = "gitlab-forge-ca"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "a_gitlab_ca_is_refused_for_gitlab_com_by_name" {
+  command = plan
+  variables {
+    gitops_forge             = "gitlab"
+    gitops_host              = "gitlab.com"
+    gitlab_repo              = "g/p"
+    gitlab_ca_configmap_name = "gitlab-forge-ca"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
 run "the_ca_configmap_name_is_a_kubernetes_name" {
   command = plan
   variables {
     gitops_forge             = "gitlab"
+    gitops_host              = "gitlab.example.com"
     gitlab_repo              = "g/p"
     gitlab_ca_configmap_name = "Not_A_Name"
   }

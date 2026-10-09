@@ -210,6 +210,8 @@ func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
 // so kubelet's refresh of the ConfigMap reaches the broker with no restart.
 func TestAForgeCABundleIsMountedIntoTheBrokerOnly(t *testing.T) {
 	agent := gitlabAgent("gitlab-forge-token")
+	// A self-managed host: gitlab.com refuses caBundleRef.
+	agent.Spec.Integration.Forges[1].Host = "gitlab.internal.example"
 	agent.Spec.Integration.Forges[1].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca", Key: "root.pem"}
 
 	var document struct {

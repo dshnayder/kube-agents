@@ -96,13 +96,23 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs",
 				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
 		}, "caBundleRef is for a gitlab forge"},
-		"bad-ca-name": {agentv1alpha1.IntegrationSpec{
+		"gitlab-com-ca": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca"}}},
+		}, "caBundleRef is for a self-managed host"},
+		"gitlab-com-named-ca": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "WWW.GitLab.com", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca"}}},
+		}, "caBundleRef is for a self-managed host"},
+		"bad-ca-name": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
 				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "Bad_Name"}}},
 		}, "caBundleRef.name"},
 		"bad-ca-key": {agentv1alpha1.IntegrationSpec{
-			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
 				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca", Key: "no spaces"}}},
 		}, "caBundleRef.key"},
