@@ -51,17 +51,13 @@ env > "$STUB_DIR/call.$n.env"
 echo "kubectl $*" >> "$log"
 case "$1 $2" in
   "get secret") exit "${STUB_SECRET_EXISTS_RC:-1}" ;;
-  "get configmap") exit "${STUB_CONFIGMAP_EXISTS_RC:-1}" ;;
-  "create configmap")
-    src=""
-    for a in "$@"; do case "$a" in --from-file=ca.crt=*) src="${a#--from-file=ca.crt=}" ;; esac; done
-    printf 'apiVersion: v1\nkind: ConfigMap\ndata:\n  ca.crt: %s\n' "$(base64 < "$src" | tr -d '\n')"
-    exit 0
-    ;;
   "create secret")
-    src=""
-    for a in "$@"; do case "$a" in --from-file=token=*) src="${a#--from-file=token=}" ;; esac; done
-    printf 'apiVersion: v1\nkind: Secret\ndata:\n  token: %s\n' "$(base64 < "$src" | tr -d '\n')"
+    src="" key=""
+    for a in "$@"; do case "$a" in
+      --from-file=token=*) src="${a#--from-file=token=}" key=token ;;
+      --from-file=ca.crt=*) src="${a#--from-file=ca.crt=}" key=ca.crt ;;
+    esac; done
+    printf 'apiVersion: v1\nkind: Secret\ndata:\n  %s: %s\n' "$key" "$(base64 < "$src" | tr -d '\n')"
     exit 0
     ;;
 esac
@@ -547,7 +543,7 @@ _PEM = "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
 
 class GitLabPrivateCATest(unittest.TestCase):
     """--gitops-ca-file puts a self-managed instance's private CA into
-    a ConfigMap the forge's caBundleRef names. The file's path is never
+    a Secret the forge's caBundleRef names. The file's path is never
     recorded, and a private key is never stored."""
 
     # Borrowed, not inherited: a subclass would run every test above again.
@@ -557,27 +553,29 @@ class GitLabPrivateCATest(unittest.TestCase):
     _apply_calls = GitLabTokenNeverLeaksTest._apply_calls
     _assert_server_side = GitLabTokenNeverLeaksTest._assert_server_side
 
-    def _configmaps(self):
+    def _ca_secrets(self):
         return [f.read_text() for f in self._stub_dir.glob("applied.*.yaml")]
 
-    def test_a_ca_file_becomes_the_configmap_server_side(self):
+    def test_a_ca_file_becomes_the_secret_server_side(self):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         proc = self._run_body(
             # After the source, as the main path sets it: sourcing install.sh
-            # clears an inherited GITOPS_CA_CONFIGMAP.
-            f"GITOPS_CA_CONFIGMAP=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-            'create_gitlab_ca_configmap agents ctx1; echo "rc=$?"\n',
+            # clears an inherited GITOPS_CA_SECRET.
+            f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+            'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
         )
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         log = (self._stub_dir / "kubectl.log").read_text()
-        self.assertIn("create configmap gitlab-forge-ca", log)
+        # A Secret, not a ConfigMap: changing the CA needs the token's rights.
+        self.assertIn("create secret generic gitlab-forge-ca", log)
+        self.assertNotIn("configmap", log)
         self.assertIn("--from-file=ca.crt=/dev/stdin", log)
         self.assertNotIn(str(ca), log)
         self._assert_server_side()
         encoded = base64.b64encode(_PEM.encode()).decode()
-        self.assertEqual(1, len(self._configmaps()))
-        self.assertIn(f"ca.crt: {encoded}", self._configmaps()[0])
+        self.assertEqual(1, len(self._ca_secrets()))
+        self.assertIn(f"ca.crt: {encoded}", self._ca_secrets()[0])
 
     def test_a_private_key_or_no_certificate_is_refused_and_nothing_is_stored(self):
         for name, content, message in (
@@ -589,31 +587,31 @@ class GitLabPrivateCATest(unittest.TestCase):
                 ca = self._tmp / f"{name}.pem"
                 ca.write_text(content)
                 proc = self._run_body(
-                    f"GITOPS_CA_CONFIGMAP=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-                    'create_gitlab_ca_configmap agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
+                    f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+                    'create_gitlab_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
                 )
                 # A one-shot source is read after the apply has named the
-                # ConfigMap: refused, nothing stored, the way to create it
+                # Secret: refused, nothing stored, the way to create it
                 # named, and the install goes on to its health checks.
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
                 self.assertIn(message, proc.stdout + proc.stderr)
-                self.assertIn("kubectl create configmap gitlab-forge-ca", proc.stdout + proc.stderr)
-                self.assertEqual([], self._configmaps())
+                self.assertIn("kubectl create secret generic gitlab-forge-ca", proc.stdout + proc.stderr)
+                self.assertEqual([], self._ca_secrets())
 
-    def test_without_a_file_a_missing_configmap_is_named_and_an_existing_one_kept(self):
-        proc = self._run_body('GITOPS_CA_CONFIGMAP=gitlab-forge-ca\n'
-                              'create_gitlab_ca_configmap agents ctx1; echo "rc=$?"\n')
+    def test_without_a_file_a_missing_secret_is_named_and_an_existing_one_kept(self):
+        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertIn("kubectl create configmap gitlab-forge-ca", proc.stdout + proc.stderr)
-        self.assertEqual([], self._configmaps())
-        proc = self._run_body('GITOPS_CA_CONFIGMAP=gitlab-forge-ca\n'
-                              'create_gitlab_ca_configmap agents ctx1; echo "rc=$?"\n',
-                              STUB_CONFIGMAP_EXISTS_RC="0")
+        self.assertIn("kubectl create secret generic gitlab-forge-ca", proc.stdout + proc.stderr)
+        self.assertEqual([], self._ca_secrets())
+        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
+                              STUB_SECRET_EXISTS_RC="0")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("does not exist", proc.stdout + proc.stderr)
 
     def test_an_install_without_a_ca_does_nothing(self):
-        proc = self._run_body('create_gitlab_ca_configmap agents ctx1; echo "rc=$?"\n')
+        proc = self._run_body('create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertFalse((self._stub_dir / "kubectl.log").exists())
 
@@ -632,10 +630,10 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
     def _validate_ca(self, assignments):
         body = "".join(f"{k}={shlex.quote(v)}; " for k, v in assignments.items())
         return self._run_install_func(
-            f'{body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc cm=$PARAM_GITOPS_CA_CONFIGMAP"'
+            f'{body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc cm=$PARAM_GITOPS_CA_SECRET"'
         )
 
-    def test_a_readable_ca_file_names_the_default_configmap(self):
+    def test_a_readable_ca_file_names_the_default_secret(self):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_FILE=str(ca)))
@@ -679,7 +677,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
             'validate_gitops_forge_flags && first=0 || first=$?\n'
             "PARAM_GITOPS_HOST= PARAM_GITOPS_REPO=group/project\n"
             'validate_gitops_forge_flags && second=0 || second=$?\n'
-            'echo "first=$first second=$second ca=[$PARAM_GITOPS_CA_FILE] cm=[$PARAM_GITOPS_CA_CONFIGMAP]"'
+            'echo "first=$first second=$second ca=[$PARAM_GITOPS_CA_FILE] cm=[$PARAM_GITOPS_CA_SECRET]"'
         )
         proc = self._run_install_func(body)
         self.assertRegex(proc.stdout, r"first=[1-9]", proc.stderr + proc.stdout)
@@ -698,7 +696,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
 
     def test_a_bad_regular_file_is_refused_before_the_apply(self):
         # Checked here, so install.env, the tfvars and the CR never name a
-        # ConfigMap the installer then cannot write.
+        # Secret the installer then cannot write.
         for name, content, message in (
             ("not-pem", "hello\n", "no PEM certificate"),
             ("with-key", _PEM + "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n", "private key"),
@@ -721,7 +719,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
             'validate_gitops_forge_flags && first=0 || first=$?\n'
             'echo "first=$first ca=[$PARAM_GITOPS_CA_FILE]"\n'
             'validate_gitops_forge_flags && second=0 || second=$?\n'
-            'echo "second=$second cm=[$PARAM_GITOPS_CA_CONFIGMAP]"'
+            'echo "second=$second cm=[$PARAM_GITOPS_CA_SECRET]"'
         )
         proc = self._run_install_func(body)
         self.assertRegex(proc.stdout, r"first=[1-9] ca=\[\]", proc.stderr + proc.stdout)
@@ -737,28 +735,28 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
             self.assertIn(line, proc.stdout, proc.stderr)
         source = _INSTALL_SH.read_text()
         self.assertIn('gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""', source)
-        self.assertIn('if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_CONFIGMAP:-}" ]', source)
+        self.assertIn('if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]', source)
 
-    def test_a_recorded_configmap_name_is_checked(self):
-        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_CONFIGMAP="My_CA"))
+    def test_a_recorded_secret_name_is_checked(self):
+        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="gitlab.internal", PARAM_GITOPS_CA_SECRET="My_CA"))
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
-        self.assertIn("GITOPS_CA_CONFIGMAP must be a valid Kubernetes ConfigMap name", proc.stdout + proc.stderr)
+        self.assertIn("GITOPS_CA_SECRET must be a valid Kubernetes Secret name", proc.stdout + proc.stderr)
 
-    def test_a_host_of_gitlab_com_drops_the_recorded_configmap(self):
-        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="", PARAM_GITOPS_CA_CONFIGMAP="gitlab-forge-ca"))
+    def test_a_host_of_gitlab_com_drops_the_recorded_secret(self):
+        proc = self._validate_ca(self._gitlab(PARAM_GITOPS_HOST="", PARAM_GITOPS_CA_SECRET="gitlab-forge-ca"))
         self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)
         self.assertNotIn("cm=gitlab-forge-ca", proc.stdout)
         self.assertIn("uses the public CAs", proc.stdout + proc.stderr)
 
-    def test_a_switch_to_github_drops_the_recorded_configmap(self):
+    def test_a_switch_to_github_drops_the_recorded_secret(self):
         proc = self._validate_ca(
-            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_CONFIGMAP": "gitlab-forge-ca"}
+            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca"}
         )
         self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)
         self.assertNotIn("cm=gitlab-forge-ca", proc.stdout)
-        self.assertIn("Dropping the recorded GitLab CA ConfigMap", proc.stdout + proc.stderr)
+        self.assertIn("Dropping the recorded GitLab CA Secret", proc.stdout + proc.stderr)
 
-    def test_install_env_records_the_configmap_name_not_the_file(self):
+    def test_install_env_records_the_secret_name_not_the_file(self):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         dest = self._tmp / "out.env"
@@ -767,7 +765,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             'PARAM_DRY_RUN="false"\n'
             "export GITOPS_FORGE=gitlab GITOPS_HOST=gitlab.internal GITOPS_REPO=g/p "
-            "GITLAB_TOKEN_SECRET=gl-tok GITOPS_CA_CONFIGMAP=gitlab-forge-ca\n"
+            "GITLAB_TOKEN_SECRET=gl-tok GITOPS_CA_SECRET=gitlab-forge-ca\n"
             f"PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
             f'bootstrap_install_env_file "{dest}" 0.5.0\n'
         )
@@ -778,7 +776,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         text = dest.read_text()
-        self.assertIn("GITOPS_CA_CONFIGMAP=gitlab-forge-ca", text)
+        self.assertIn("GITOPS_CA_SECRET=gitlab-forge-ca", text)
         self.assertNotIn(str(ca), text)
         self.assertNotIn("CA_FILE", text)
 
@@ -787,11 +785,11 @@ class GitLabPrivateCATfvarsTest(unittest.TestCase):
     _run = GitLabTfvarsTest._run
     _tfvars = GitLabTfvarsTest._tfvars
 
-    def test_a_ca_configmap_reaches_the_tfvars_only_when_set(self):
-        content = self._tfvars({"GITOPS_FORGE": "gitlab", "GITOPS_REPO": "g/p", "GITOPS_CA_CONFIGMAP": "gitlab-forge-ca"})
-        self.assertIn('gitlab_ca_configmap_name  = "gitlab-forge-ca"', content)
+    def test_a_ca_secret_reaches_the_tfvars_only_when_set(self):
+        content = self._tfvars({"GITOPS_FORGE": "gitlab", "GITOPS_REPO": "g/p", "GITOPS_CA_SECRET": "gitlab-forge-ca"})
+        self.assertIn('gitlab_ca_secret_name     = "gitlab-forge-ca"', content)
         content = self._tfvars({"GITOPS_FORGE": "gitlab", "GITOPS_REPO": "g/p"})
-        self.assertNotIn("gitlab_ca_configmap_name", content)
+        self.assertNotIn("gitlab_ca_secret_name", content)
 
 
 class GitLabThroughMainTest(unittest.TestCase):
@@ -1013,7 +1011,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
 
     def test_the_example_documents_the_forge_keys(self):
         example = (_REPO_ROOT / "install.env.example").read_text()
-        for key in ("GITOPS_FORGE=gitlab", "GITOPS_HOST=", "GITLAB_TOKEN_SECRET=", "GITOPS_CA_CONFIGMAP="):
+        for key in ("GITOPS_FORGE=gitlab", "GITOPS_HOST=", "GITLAB_TOKEN_SECRET=", "GITOPS_CA_SECRET="):
             self.assertIn("# " + key, example)
 
 
@@ -1039,8 +1037,9 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
     def test_no_token_variable(self):
         # Only the Secret's name is a variable; nothing that could hold the token.
         names = re.findall(r'^variable "(gitlab_\w+)"', self.variables, re.M)
-        # gitlab_ca_configmap_name names a ConfigMap of public CA certificates.
-        self.assertEqual(sorted(names), ["gitlab_ca_configmap_name", "gitlab_repo", "gitlab_token_secret_name"])
+        # gitlab_ca_secret_name names a Secret of public CA certificates; it
+        # holds no token.
+        self.assertEqual(sorted(names), ["gitlab_ca_secret_name", "gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
         self.assertIn("!local.gitops_is_gitlab && (local.github_org", self.main)

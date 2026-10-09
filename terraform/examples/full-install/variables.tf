@@ -616,13 +616,13 @@ variable "gitlab_token_secret_name" {
   }
 }
 
-variable "gitlab_ca_configmap_name" {
-  description = "Name of the ConfigMap, in the agent's namespace, holding the PEM CA that signed a self-managed GitLab's TLS certificate, under the key `ca.crt`. The broker trusts it for the GitLab host only. Empty: the system CAs only. The installer creates it from --gitops-ca-file. Read only when gitops_forge is gitlab."
+variable "gitlab_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a self-managed GitLab's TLS certificate, under the key `ca.crt`. A Secret, so changing the CA needs the same rights as changing the token. The broker trusts it for the GitLab host only. Empty: the system CAs only. The installer creates it from --gitops-ca-file; Terraform only names it. Read only when gitops_forge is gitlab."
   type        = string
   default     = ""
   validation {
-    condition     = var.gitlab_ca_configmap_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_ca_configmap_name)) && length(var.gitlab_ca_configmap_name) <= 253)
-    error_message = "gitlab_ca_configmap_name must be a valid Kubernetes ConfigMap name (lowercase DNS subdomain)."
+    condition     = var.gitlab_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_ca_secret_name)) && length(var.gitlab_ca_secret_name) <= 253)
+    error_message = "gitlab_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 
