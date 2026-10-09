@@ -2440,9 +2440,16 @@ The broker's two clients do not trust that CA by default:
 - git in the broker is built on GnuTLS. It ignores `SSL_CERT_FILE`, so a process
   variable cannot give it the CA.
 
-The forge declaration therefore names the CA: `caBundleRef`, a ConfigMap key in
-the agent's namespace. A CA certificate is public, so a ConfigMap holds it, not
-a Secret. The operator mounts the key into the broker's pod only, and the
+The forge declaration therefore names the CA: `caBundleRef`, a Secret key in the
+agent's namespace. A CA certificate is public, but its integrity matters: whoever
+can change it chooses which servers the broker presents the forge's token to,
+and the broker relaxes strict X.509 for that host. In a Secret, changing the CA
+needs the same rights as changing the token Secret beside it. A ConfigMap would
+make the token's trust boundary the wider of the two, because many clusters
+grant ConfigMap write more widely than Secret write. The agent's own
+ServiceAccounts can only read ConfigMaps, so this is about people and
+automation, not the agent. The operator mounts the key into the broker's pod
+only, as it mounts the token, and the
 forge's entry in the broker configuration names the file (`caFile`). The
 agent's pod and the shell sandbox get nothing.
 
@@ -2473,20 +2480,20 @@ this once. The chain and the hostname are still verified, and every other host
 keeps the strict checks. The administrator chose to trust this CA for this host,
 and a refusal of a common CA profile would only make the feature fail.
 
-The mount is optional, as the token's is: a missing ConfigMap does not stop the
+The mount is optional, as the token's is: a missing Secret does not stop the
 broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
-clients, and the detail names what to create: "the ConfigMap <name> or its key
-<key> is missing". A wrong key looks the same as a missing ConfigMap, so the
+clients, and the detail names what to create: "the Secret <name> or its key
+<key> is missing". A wrong key looks the same as a missing Secret, so the
 detail names both. The forge's broker entry carries the two names for this.
 
-A ConfigMap key that holds no usable PEM certificate gets its own answer from
+A Secret key that holds no usable PEM certificate gets its own answer from
 both clients: the CA file could not be loaded (not PEM, or no certificate in
 it). git words a missing CA file and a malformed one alike, so the broker tells
 the two apart by whether the forge's file exists. A file with no certificate
 in it at all loads as an empty CA list in git, and git then reports an
 untrusted chain.
 
-The broker reads the file on each call, so an update of the ConfigMap reaches
+The broker reads the file on each call, so an update of the Secret reaches
 the broker with no restart.
 
 Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
@@ -2549,8 +2556,8 @@ whose fields it validated and refused — is not. Two specifics:
   a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
   TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
   certificate for another name (fix the certificate or the host), a CA bundle
-  that is not mounted (create the ConfigMap), and a CA bundle that is not PEM
-  or holds no certificate (correct the ConfigMap). One code serves all five,
+  that is not mounted (create the Secret), and a CA bundle that is not PEM
+  or holds no certificate (correct the Secret). One code serves all five,
   because the caller does the same in each case: it stops and reports. Lines
   that git prints from the server (`remote: ...`) are never read as a verdict.
 
