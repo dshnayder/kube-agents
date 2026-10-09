@@ -16511,6 +16511,16 @@ class TestCrossCheckManifest(unittest.TestCase):
         doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
         audit_report.cross_check_manifest(doc, manifest)
 
+    def test_a_manifest_limitation_requires_limitations(self):
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest(limitations=note)
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("limitations", str(ctx.exception))
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = note
+        audit_report.cross_check_manifest(doc, manifest)
+
     def test_a_check_the_manifest_never_ran_is_rejected(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
@@ -17533,6 +17543,29 @@ class TestDraftFindings(BaseTestCase):
         self.assertEqual(cluster["checks_not_applicable"], [{"check": na, "reason": "Autopilot sets it"}])
         self.assertNotIn(na, " ".join(audit_report.coverage_gaps(validated)))
         self.assertIn(unevaluated, cluster["limitations"])
+
+    def test_a_manifest_entry_limitation_carries_into_the_draft(self):
+        """A check that ran can still leave part of the target undecided on the
+        manifest entry's `limitations`; `draft` carries that note forward and
+        does not duplicate a check already named in it."""
+        note = "firewall-world-open-ingress could not decide 1 rule(s): gke-ap-node-ssh"
+        manifest = self.manifest()
+        entry = manifest["clusters"][0]
+        entry["limitations"] = note
+        draft = audit_report.draft_findings(manifest, AUDIT)
+        for finding in draft["findings"]:
+            finding["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        validated = audit_report.validate_findings(copy.deepcopy(draft), AUDIT)
+        audit_report.cross_check_manifest(validated, manifest)
+        self.assertEqual(draft["scope"]["clusters"][0]["limitations"], note)
+        self.assertTrue(audit_report.coverage_gaps(validated))
+        checks = [c["check"] for c in entry["commands"]]
+        unevaluated = checks[-1]
+        entry["commands"] = [c for c in entry["commands"] if c["check"] != unevaluated]
+        entry["checks_unevaluated"] = [{"check": unevaluated, "reason": "forbidden"}]
+        entry["limitations"] = f"{unevaluated} could not be evaluated (forbidden)"
+        combined = audit_report.draft_findings(manifest, AUDIT)["scope"]["clusters"][0]["limitations"]
+        self.assertEqual(combined, f"{unevaluated} could not be evaluated (forbidden)")
 
     def test_the_subcommand_writes_the_draft(self):
         path = self.tmp_path / "manifest.json"

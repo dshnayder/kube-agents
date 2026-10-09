@@ -5181,6 +5181,15 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 "failed in `limitations`, so the run reports the gap instead of "
                 "publishing over it."
             )
+        manifest_limitations = str(manifest_cluster.get("limitations") or "").strip()
+        if manifest_limitations and not str(cluster.get("limitations") or "").strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} records `limitations` on {name!r} "
+                f"({manifest_limitations!r}). Copy the collector's limitation "
+                "into `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
         for slug in claimed:
             if slug not in ok_checks:
                 raise ValidationError(
@@ -14374,13 +14383,18 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         ]
         if not_applicable:
             cluster["checks_not_applicable"] = not_applicable
-        # A check whose read failed neither ran nor was found inapplicable;
-        # `finish` requires it named in `limitations`.
+        # A check whose read failed neither ran nor was found inapplicable, and
+        # a check that ran can still leave part of the target undecided in the
+        # manifest entry's `limitations`; `finish` requires both in `limitations`.
         unevaluated = sorted(
             str(e.get("check")) for e in entry.get("checks_unevaluated") or [] if isinstance(e, dict) and e.get("check")
         )
-        if unevaluated:
-            cluster["limitations"] = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unevaluated)}"
+        entry_limitations = str(entry.get("limitations") or "").strip()
+        unmentioned = [c for c in unevaluated if c not in entry_limitations]
+        unevaluated_note = f"{DRAFT_UNEVALUATED_LIMITATION}: {', '.join(unmentioned)}" if unmentioned else ""
+        limitations = "; ".join(part for part in (entry_limitations, unevaluated_note) if part)
+        if limitations:
+            cluster["limitations"] = limitations
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):
