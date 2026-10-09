@@ -2559,16 +2559,11 @@ whose fields it validated and refused — is not. Two specifics:
 Deliberately, and each of these should be a named refusal rather than a
 surprise:
 
-- **Self-managed instances behind a private CA.** The token and the API are the
-  same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one, so a self-signed
-  instance fails to connect — and that failure is the design behaving as
-  specified rather than a gap. Any instance this is exercised against has to
-  carry a certificate the sandbox image already trusts, or have TLS terminated
-  by something that does. The refusal names itself — "the forge's TLS
-  certificate failed verification by this image", followed by the verifier's
-  own reason, such as an unknown issuer, a hostname mismatch or an expired
-  certificate — rather than reading as a call to retry.
+- **A private CA for gitlab.com.** gitlab.com presents a certificate that the
+  public CAs sign, and a private CA must never vouch for it, so its forge
+  refuses `caBundleRef`. A self-managed instance behind a private CA is
+  supported: see
+  [A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca).
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
