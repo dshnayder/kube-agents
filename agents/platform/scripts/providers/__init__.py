@@ -32,7 +32,6 @@ from .credentials import (
 from .errors import (
     GUIDANCE,
     Guidance,
-    certificate_failure,
     classify_tls,
     forge_error,
     tls_refusal,
@@ -81,7 +80,6 @@ __all__ = [
     "Transport",
     "WorkspaceError",
     "build_forges",
-    "certificate_failure",
     "classify_tls",
     "forge_error",
     "load_forge_entries",

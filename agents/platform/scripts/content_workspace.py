@@ -217,11 +217,12 @@ class GitFailed(ContentWorkspaceError):
 
 
 class TlsUntrusted(ContentWorkspaceError):
-    """git could not verify the forge's TLS certificate.
+    """git could not verify the forge's TLS certificate, or load its CA.
 
-    Its own code rather than `workspace.git-failed`: no retry fixes a
-    certificate, and the action is an administrator's -- the forge's
-    caBundleRef -- not the caller's.
+    Its own code rather than `workspace.git-failed`: no retry fixes it, and the
+    action is an administrator's, which the message names by its cause -- a CA
+    to name in caBundleRef, a certificate to renew or reissue, or a CA
+    ConfigMap to create or correct.
     """
 
     status = 502

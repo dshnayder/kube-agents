@@ -30,6 +30,7 @@ most of them do -- inherits nothing it has to opt out of.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Callable, Mapping, Union
@@ -57,12 +58,11 @@ __all__ = [
     "Guidance",
     "Override",
     "TLS_GUIDANCE",
-    "TLS_UNTRUSTED",
     "TLS_UNTRUSTED_CODE",
     "UNAVAILABLE",
     "UNRECOGNISED",
     "ca_missing_reason",
-    "certificate_failure",
+    "ca_unloadable_reason",
     "classify_tls",
     "forge_error",
     "tls_refusal",
@@ -162,16 +162,23 @@ TLS_GUIDANCE: dict[str, str] = {
         "retry fixes this until it is. Report it and stop: an administrator "
         "creates the ConfigMap, with the key, that caBundleRef names."
     ),
+    "ca_unloadable": (
+        "The CA bundle that the forge's caBundleRef names could not be loaded: "
+        "it is not PEM, or it holds no certificate. No retry fixes this. Report "
+        "it and stop: an administrator puts the PEM CA certificate in the "
+        "ConfigMap key that caBundleRef names."
+    ),
 }
-# Kept for callers that name the generic case.
-TLS_UNTRUSTED = Guidance(502, TLS_UNTRUSTED_CODE, TLS_GUIDANCE["untrusted"])
 
 # What git (libcurl with GnuTLS or OpenSSL) and Python's ssl module write for
 # each cause, lowercased, matched as substrings of one line. The kinds are
 # tried in this order: GnuTLS writes "server verification failed: certificate
 # has expired", which also holds an "untrusted" marker.
 _TLS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("ca_missing", (
+    # A CA file the client could not load. git words a missing file and a
+    # malformed one alike (GnuTLS: "Problem with the SSL CA cert"), so
+    # `tls_refusal` tells the two apart by whether the forge's file exists.
+    ("ca_load", (
         "problem with the ssl ca cert",
         "error setting certificate",
         "could not load ca file",
@@ -224,11 +231,6 @@ def classify_tls(text: str) -> tuple[str, str]:
     return "", ""
 
 
-def certificate_failure(text: str) -> str:
-    """The line of `text` that says a TLS certificate failed, or ""."""
-    return classify_tls(text)[1]
-
-
 def tls_untrusted(host: str, why: str, kind: str = "untrusted") -> WorkspaceError:
     """The refusal for a TLS failure of `kind`, naming `host`."""
     named = f"{host}: {why}" if host else why
@@ -247,12 +249,26 @@ def ca_missing_reason(ca_source: str, fallback: str = "") -> str:
     return fallback or "the CA file that the forge's caBundleRef names is missing"
 
 
-def tls_refusal(text: str, ca_sources: Mapping[str, str] | None = None) -> WorkspaceError | None:
+def ca_unloadable_reason(ca_source: str, error: str = "") -> str:
+    """Why a forge's CA file could not be loaded, naming its ConfigMap and key if known."""
+    where = f"the CA file from {ca_source.removeprefix('the ')}" if ca_source else "the CA file"
+    reason = f"{where} could not be loaded (not PEM, or no certificate in it)"
+    return f"{reason}: {error}" if error else reason
+
+
+def tls_refusal(
+    text: str,
+    ca_sources: Mapping[str, str] | None = None,
+    ca_files: Mapping[str, str] | None = None,
+) -> WorkspaceError | None:
     """The FORGE_TLS_UNTRUSTED refusal a git error output stands for, or None.
 
     `ca_sources` maps a forge host to where its CA comes from ("the ConfigMap
-    <name> or its key <key>"), so a CA file git could not load is answered
-    with what to create, as the API client answers it.
+    <name> or its key <key>"), and `ca_files` to the file it is mounted at. A
+    CA file git could not load is answered as missing when the file is not
+    there and as unloadable when it is, with what to fix, as the API client
+    answers it. Without the file, git's line alone says nothing more, and the
+    answer is the missing case's.
     """
     kind, line = classify_tls(text)
     if not kind:
@@ -260,8 +276,13 @@ def tls_refusal(text: str, ca_sources: Mapping[str, str] | None = None) -> Works
     found = _HOST_IN_LINE_RE.search(line)
     host = found.group(1) if found else ""
     why = line
-    if kind == "ca_missing":
-        why = ca_missing_reason((ca_sources or {}).get(host, ""), line)
+    if kind == "ca_load":
+        source = (ca_sources or {}).get(host, "")
+        ca_file = (ca_files or {}).get(host, "")
+        if ca_file and os.path.exists(ca_file):
+            kind, why = "ca_unloadable", ca_unloadable_reason(source)
+        else:
+            kind, why = "ca_missing", ca_missing_reason(source, line)
     return tls_untrusted(host, why, kind)
 
 

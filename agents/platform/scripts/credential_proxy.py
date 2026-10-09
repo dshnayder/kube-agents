@@ -4795,6 +4795,11 @@ class CommandExecutor:
         entries = _configured_forge_entries()
         self.forge_ca_config = forge_ca_git_config(entries)
         self.forge_ca_sources = forge_ca_sources(entries)
+        self.forge_ca_files = {
+            str(entry.get("host") or "").strip().lower(): str(entry.get("ca_file") or "").strip()
+            for entry in entries
+            if str(entry.get("ca_file") or "").strip()
+        }
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -5494,10 +5499,11 @@ class CommandExecutor:
         """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
 
         A CA file git could not load is named by the ConfigMap and key it comes
-        from, as the API client names it. Redacted: the one line kept can quote
-        the remote's URL.
+        from, as missing or as unloadable by whether the file is there, as the
+        API client names it. Redacted: the one line kept can quote the remote's
+        URL.
         """
-        refusal = providers.tls_refusal(output, self.forge_ca_sources)
+        refusal = providers.tls_refusal(output, self.forge_ca_sources, self.forge_ca_files)
         if refusal is not None and "detail" in refusal.fields:
             refusal.fields["detail"] = redact_credentials(str(refusal.fields["detail"]))
         return refusal

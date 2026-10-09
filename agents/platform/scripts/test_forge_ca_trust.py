@@ -147,8 +147,8 @@ class HttpTransportTrustTest(unittest.TestCase):
         self.assertNotIn("retry is reasonable", str(caught.exception))
 
     def test_a_ca_with_no_key_usage_is_trusted_for_its_forge(self):
-        # The user's decision for #2750: Python 3.13's strict check refuses
-        # this CA, and many enterprise CAs are issued this way, so the forge
+        # Python 3.13's strict check refuses this CA, and many enterprise CAs
+        # are issued this way, so the forge
         # that names its CA gets the check off -- and only that forge.
         ca, port = self.serve(key_usage=False)
         self.assertEqual({"username": "bot"}, api(port, str(ca)).api("GET", "user"))
@@ -228,7 +228,7 @@ class ForgeConfigurationTest(unittest.TestCase):
         self.assertEqual("the ConfigMap gl-ca or its key root.pem", forge.ca_source)
 
     def test_gitlab_com_never_takes_a_ca(self):
-        # #2750 review: the operator refuses it; a configuration written
+        # The operator refuses it; a configuration written
         # another way is refused when the broker builds its forges.
         for host in ("gitlab.com", "www.gitlab.com"):
             with self.subTest(host=host), self.assertRaisesRegex(ValueError, "only a self-managed host"):
@@ -236,6 +236,23 @@ class ForgeConfigurationTest(unittest.TestCase):
                     {"provider": "gitlab", "host": host, "token_path": "/t", "allowed_paths": ("g",),
                      "ca_file": "/ca/ca.crt"},
                 ]})
+
+    def test_a_ca_file_that_is_not_pem_is_unloadable_in_the_api_client(self):
+        # The ConfigMap exists, but its key holds no certificate: a different
+        # fix from a missing ConfigMap, and the same answer as git's.
+        transport_module._CA_CONTEXTS.clear()
+        for name, content in (("text", "not a certificate\n"), ("empty", ""),
+                              ("garbled", "-----BEGIN CERTIFICATE-----\nnotbase64!!\n-----END CERTIFICATE-----\n")):
+            with self.subTest(name=name):
+                path = self.write(content)
+                with self.assertRaises(WorkspaceError) as caught:
+                    HttpTransport(
+                        "https://gitlab.internal/api/v4", lambda: {}, timeout=5.0, max_bytes=1024,
+                        ca_file=path, ca_source="the ConfigMap gl-ca or its key root.pem",
+                    ).api("GET", "user")
+                self.assertEqual(providers.errors.TLS_GUIDANCE["ca_unloadable"], str(caught.exception))
+                self.assertIn("could not be loaded (not PEM, or no certificate in it)",
+                              caught.exception.fields["detail"])
 
     def test_a_missing_ca_file_names_its_configmap_and_key_in_the_api_client(self):
         transport_module._CA_CONTEXTS.clear()
@@ -323,7 +340,7 @@ class GitTrustTest(unittest.TestCase):
             )
             return result.stdout.strip()
 
-        # #2750 review: curl keeps the CA across a redirect, so the CA host
+        # curl keeps the CA across a redirect, so the CA host
         # follows none; every other host keeps git's default.
         self.assertEqual("false", redirects_for("https://gitlab.internal/platform/infra.git"))
         self.assertEqual("", redirects_for("https://github.com/acme/infra.git"))
@@ -353,7 +370,7 @@ class GitTrustTest(unittest.TestCase):
 class GitLoopbackTrustTest(unittest.TestCase):
     """The pin on the paths that clone and push: `execute_vcs_git` and
     `execute_workspace_git`, which rebuild the forced layer with the caller's
-    credential config ahead of it (#2750 review). A real git talks TLS to a
+    credential config ahead of it. A real git talks TLS to a
     loopback server that a test CA signed: with the pin the handshake passes,
     and without it git refuses the certificate."""
 
@@ -428,7 +445,7 @@ class CertificateFailureTest(unittest.TestCase):
             "fatal: unable to access 'https://h/x/': error setting certificate file: /etc/kube-agents/forge-ca/gitlab/ca.crt",
         ):
             with self.subTest(line=line[:40]):
-                self.assertTrue(providers.certificate_failure("Cloning into 'repo'...\n" + line))
+                self.assertTrue(providers.classify_tls("Cloning into 'repo'...\n" + line)[0])
 
     # git 2.47.3 with libcurl-gnutls, as measured in the broker image.
     GNUTLS = {
@@ -446,7 +463,7 @@ class CertificateFailureTest(unittest.TestCase):
                         "from file: /etc/kube-agents/forge-ca/gitlab/ca.crt")
 
     def test_each_cause_is_told_apart_with_its_own_advice(self):
-        # #2750 review: an expired certificate and a wrong name read as a
+        # Before, an expired certificate and a wrong name read as a
         # missing CA, and git's hostname mismatch matched nothing at all.
         for kind, line in self.GNUTLS.items():
             with self.subTest(kind=kind):
@@ -455,7 +472,8 @@ class CertificateFailureTest(unittest.TestCase):
                 self.assertEqual("FORGE_TLS_UNTRUSTED", refusal.fields["code"])
                 self.assertEqual(502, refusal.status)
                 self.assertTrue(refusal.fields["detail"].startswith("gitlab.internal: "))
-                self.assertEqual(kind, providers.classify_tls(line)[0])
+                # git words a missing CA file and a malformed one alike.
+                self.assertEqual("ca_load" if kind == "ca_missing" else kind, providers.classify_tls(line)[0])
         advice = {kind: str(providers.tls_refusal(line)) for kind, line in self.GNUTLS.items()}
         self.assertIn("caBundleRef", advice["untrusted"])
         self.assertIn("TLS-inspecting proxy", advice["untrusted"])
@@ -471,8 +489,27 @@ class CertificateFailureTest(unittest.TestCase):
                 refusal = providers.tls_refusal(line, {"gitlab.internal": "the ConfigMap gl-ca or its key root.pem"})
                 self.assertIn("the ConfigMap gl-ca or its key root.pem is missing", refusal.fields["detail"])
 
+    def test_a_ca_file_git_could_not_load_is_unloadable_when_it_is_there(self):
+        # GnuTLS prints "Problem with the SSL CA cert" for a missing file and
+        # for a garbled one alike (measured in the broker image), so the
+        # broker asks whether the forge's file exists.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        present = Path(tmp.name) / "ca.crt"
+        present.write_text("-----BEGIN CERTIFICATE-----\nnotbase64!!\n-----END CERTIFICATE-----\n")
+        sources = {"gitlab.internal": "the ConfigMap gl-ca or its key root.pem"}
+        for line in (self.GNUTLS["ca_missing"], self.OTHER_CA_MISSING):
+            with self.subTest(line=line[60:100]):
+                there = providers.tls_refusal(line, sources, {"gitlab.internal": str(present)})
+                self.assertEqual(providers.errors.TLS_GUIDANCE["ca_unloadable"], str(there))
+                self.assertIn("the CA file from ConfigMap gl-ca or its key root.pem could not be loaded",
+                              there.fields["detail"])
+                gone = providers.tls_refusal(line, sources, {"gitlab.internal": str(Path(tmp.name) / "gone.crt")})
+                self.assertEqual(providers.errors.TLS_GUIDANCE["ca_missing"], str(gone))
+                self.assertIn("is missing", gone.fields["detail"])
+
     def test_the_servers_own_words_are_not_read_as_a_verdict(self):
-        # #2750 review: a hook or a project description can print anything.
+        # A hook or a project description can print anything.
         self.assertEqual(("", ""), providers.classify_tls("remote: certificate verify failed\nremote: done"))
         self.assertIsNone(providers.tls_refusal("remote: SSL certificate problem: self-signed certificate"))
 
@@ -499,8 +536,8 @@ class CertificateFailureTest(unittest.TestCase):
                 self.assertEqual(providers.errors.TLS_GUIDANCE[kind], str(caught.exception))
 
     def test_other_failures_are_not(self):
-        self.assertEqual("", providers.certificate_failure("fatal: could not read Username for 'https://h': No such device"))
-        self.assertEqual("", providers.certificate_failure(""))
+        self.assertEqual(("", ""), providers.classify_tls("fatal: could not read Username for 'https://h': No such device"))
+        self.assertEqual(("", ""), providers.classify_tls(""))
 
     def test_the_content_workspace_answers_a_certificate_by_name(self):
         import content_workspace

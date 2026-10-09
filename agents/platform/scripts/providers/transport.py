@@ -43,7 +43,15 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
-from .errors import Guidance, Override, ca_missing_reason, classify_tls, forge_error, tls_untrusted
+from .errors import (
+    Guidance,
+    Override,
+    ca_missing_reason,
+    ca_unloadable_reason,
+    classify_tls,
+    forge_error,
+    tls_untrusted,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -335,9 +343,7 @@ def ca_context(ca_file: str, host: str, ca_source: str = "") -> ssl.SSLContext:
         try:
             context.load_verify_locations(cafile=ca_file)
         except (OSError, ssl.SSLError, ValueError) as exc:
-            raise tls_untrusted(
-                host, f"the CA file that the forge's caBundleRef names could not be loaded: {exc}"
-            ) from exc
+            raise tls_untrusted(host, ca_unloadable_reason(ca_source, str(exc)), "ca_unloadable") from exc
         strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
         if strict and context.verify_flags & strict:
             context.verify_flags &= ~strict
@@ -359,17 +365,11 @@ _REQUEST_SPENT_SECONDS = 1.0
 def _unreachable(exc: BaseException) -> str:
     """Why the forge could not be reached, in words an operator can act on.
 
-    `URLError` carries the reason -- a refused connection, an unknown name, a
-    certificate -- and the type alone says none of it. A certificate that fails
-    verification is named outright, with the verifier's own reason: no retry
-    fixes it, and "unable to get local issuer" (a private CA), "Hostname
-    mismatch" and "certificate has expired" each send the operator somewhere
-    different.
+    `URLError` carries the reason -- a refused connection, an unknown name --
+    and the type alone says none of it. A certificate never reaches here: the
+    caller answers it first, as FORGE_TLS_UNTRUSTED, by its cause.
     """
     cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-    if isinstance(cause, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(cause):
-        why = (getattr(cause, "verify_message", "") or str(cause)).strip()[:200]
-        return f"the forge's TLS certificate failed verification by this image: {why}"
     reason = str(cause).strip()[:200]
     if reason:
         return f"the forge could not be reached: {type(exc).__name__}: {reason}"
