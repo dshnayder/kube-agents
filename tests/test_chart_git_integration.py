@@ -627,6 +627,14 @@ class ChartGitIntegrationTest(unittest.TestCase):
               "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "ok", "caBundleRef.key": "no/slash"}, "caBundleRef.key"),
+            # The operator's IsConfigMapKey also refuses these.
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": ".."}, "caBundleRef.key"),
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": "..ca"}, "caBundleRef.key"),
+            # A key with no name would render no caBundleRef at all.
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.key": "root.pem"}, "caBundleRef needs a name"),
             # Never on gitlab.com, in any spelling, or with no host: a private CA
             # must never vouch for a host the public CAs sign.
             ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",

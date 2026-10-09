@@ -111,6 +111,11 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
 				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "Bad_Name"}}},
 		}, "caBundleRef.name"},
+		"dotdot-ca-key": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca", Key: ".."}}},
+		}, "caBundleRef.key may not be . or start with .."},
 		"bad-ca-key": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},

@@ -1555,6 +1555,10 @@ type ForgeSpec struct {
 // ForgeCABundleRef names the ConfigMap key that holds a forge's CA
 // certificates. A CA certificate is public, so a ConfigMap holds it, not a
 // Secret.
+//
+// The key rule is the operator's IsConfigMapKey, which the pattern alone does
+// not hold: it also refuses "." and a key that starts with "..".
+// +kubebuilder:validation:XValidation:rule="!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))",message="caBundleRef.key may not be . or start with .."
 type ForgeCABundleRef struct {
 	// Name is the ConfigMap's name: a lowercase DNS subdomain.
 	// +kubebuilder:validation:MinLength=1
