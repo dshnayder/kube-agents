@@ -543,9 +543,10 @@ class GitLabForge(Forge):
                     raise
                 sized = False
                 files = api("GET", f"{base}/diffs", params={"page": page}) or []
-                # GitLab chooses the page size. A first page shorter than this
-                # value is the last page; a full first page sets the size.
-                page_size = len(files) or 1
+                # GitLab chooses the page size, so the first page sets it. A
+                # later page that is shorter, or empty, is the last page. An
+                # empty first page returns below.
+                page_size = len(files)
             paths = [str(item.get("new_path") or "") for item in files]
             if not files:
                 return "".join(out)
