@@ -90,6 +90,22 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "Bad_Name"}}},
 		}, "credentialsRef.name"},
+		// #2750: caBundleRef is for a gitlab forge, and its names are the
+		// API server's own, held with the webhook off.
+		"github-ca-bundle": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs",
+				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
+		}, "caBundleRef is for a gitlab forge"},
+		"bad-ca-name": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "Bad_Name"}}},
+		}, "caBundleRef.name"},
+		"bad-ca-key": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca", Key: "no spaces"}}},
+		}, "caBundleRef.key"},
 	}
 	// baseBranch is held to the branch names the broker's
 	// providers/validate.validate_branch accepts: the pattern and the length
@@ -150,10 +166,14 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 		"forge-only": {Forges: gh},
 		"gitlab": {Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme",
 			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}}}},
-		"alias":      {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
-		"base":       {Forges: gh, Repositories: gitops("release/2026")},
-		"base-max":   {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},
-		"base-ref":   {Forges: gh, Repositories: gitops("refs/heads/main")},
+		"gitlab-ca": {Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com",
+			Namespace:      "acme",
+			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"},
+			CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca"}}}},
+		"alias":    {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
+		"base":     {Forges: gh, Repositories: gitops("release/2026")},
+		"base-max": {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},
+		"base-ref": {Forges: gh, Repositories: gitops("refs/heads/main")},
 		// A name that only contains heads/ or refs/heads/ is a branch name.
 		"base-ref-nested":  {Forges: gh, Repositories: gitops("refs/heads/release/heads/x")},
 		"base-heads-inner": {Forges: gh, Repositories: gitops("team/heads/x")},

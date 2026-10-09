@@ -591,6 +591,49 @@ class ChartGitIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(len(integration["repositories"]), 2)
 
+    def test_a_gitlab_forge_renders_its_ca_bundle(self):
+        """#2750: a self-managed instance behind a private CA names the
+        ConfigMap that holds the CA. A forge without one renders no field."""
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
+                    namespace="platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            f"{_P}forges[0].caBundleRef.name=gitlab-forge-ca",
+            f"{_P}forges[0].caBundleRef.key=root.pem",
+            *_forge(1, name="saas", provider="gitlab", namespace="acme"),
+            f"{_P}forges[1].credentialsRef.name=saas-token",
+            *_repo(0, forge="gitlab", repository="infra", role="gitops"),
+        )
+        self.assertEqual(
+            {"name": "gitlab-forge-ca", "key": "root.pem"},
+            integration["forges"][0]["caBundleRef"],
+        )
+        self.assertNotIn("caBundleRef", integration["forges"][1])
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
+                    namespace="platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            f"{_P}forges[0].caBundleRef.name=gitlab-forge-ca",
+        )
+        self.assertEqual({"name": "gitlab-forge-ca"}, integration["forges"][0]["caBundleRef"])
+
+    def test_a_ca_bundle_the_operator_refuses_fails_the_render(self):
+        """The same refusals the CRD and the operator make, naming the values
+        key: a github forge reads no CA, and the names are Kubernetes names."""
+        for fields, expected in (
+            ({"provider": "github", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
+             "caBundleRef is for a gitlab forge"),
+            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
+            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": "no/slash"}, "caBundleRef.key"),
+        ):
+            with self.subTest(expected=expected, fields=fields):
+                result = _render(_CR_TEMPLATE, *_forge(0, name="f", **fields))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{expected.split()[0]}", result.stderr)
+                self.assertIn(expected, result.stderr)
+
     def test_a_gitlab_forge_without_a_secret_fails_naming_it(self):
         """The broker would have no token to call GitLab with; the operator
         refuses the forge too, and this says so at `helm template`."""

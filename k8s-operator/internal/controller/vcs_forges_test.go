@@ -203,3 +203,65 @@ func TestTheForgeConfigurationRollsTheBrokerNotTheGateway(t *testing.T) {
 		t.Error("declaring a GitLab forge does not change the broker's policy hash")
 	}
 }
+
+// #2750: a forge's CA bundle is the ConfigMap key caBundleRef names, mounted
+// into the broker's pod only, at the path its configuration entry names.
+// Optional, so a missing ConfigMap does not stop the broker, and not a SubPath,
+// so kubelet's refresh of the ConfigMap reaches the broker with no restart.
+func TestAForgeCABundleIsMountedIntoTheBrokerOnly(t *testing.T) {
+	agent := gitlabAgent("gitlab-forge-token")
+	agent.Spec.Integration.Forges[1].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "gitlab-forge-ca", Key: "root.pem"}
+
+	var document struct {
+		Forges []map[string]any `json:"forges"`
+	}
+	raw := buildCredentialProxyPolicyConfigMap(agent).Data[vcsForgesKey]
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatalf("the forge configuration is not JSON: %v\n%s", err, raw)
+	}
+	caFile := forgeCADir + "/gitlab/" + agentv1alpha1.ForgeCABundleFileName
+	if got := document.Forges[1]["caFile"]; got != caFile {
+		t.Errorf("caFile = %v, expected %s", got, caFile)
+	}
+	if _, found := document.Forges[0]["caFile"]; found {
+		t.Error("GitHub's entry carries a caFile")
+	}
+
+	dep := buildCredentialProxyDeployment(agent, "hash")
+	container := dep.Spec.Template.Spec.Containers[0]
+	mount := mountCovering(&container, caFile)
+	if mount == nil {
+		t.Fatalf("%s is supplied by no mount in the broker container", caFile)
+	}
+	if mount.SubPath != "" || !mount.ReadOnly {
+		t.Errorf("the CA mount is %+v; expected a read-only directory mount", mount)
+	}
+	var source *corev1.ConfigMapVolumeSource
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if volume.Name == mount.Name {
+			source = volume.ConfigMap
+		}
+	}
+	if source == nil || source.Name != "gitlab-forge-ca" {
+		t.Fatalf("the CA mount %q is not the ConfigMap gitlab-forge-ca: %+v", mount.Name, source)
+	}
+	if len(source.Items) != 1 || source.Items[0].Key != "root.pem" || source.Items[0].Path != agentv1alpha1.ForgeCABundleFileName {
+		t.Errorf("the ConfigMap projection is %+v; expected only root.pem, as ca.crt", source.Items)
+	}
+	if source.Optional == nil || !*source.Optional {
+		t.Error("the CA ConfigMap projection is not optional, so a missing ConfigMap would stop the broker")
+	}
+
+	gateway := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	sandbox := buildShellSandboxStatefulSet(agent, "keys", credentialProxyURL(agent), "s")
+	for name, podVolumes := range map[string][]corev1.Volume{
+		"gateway": gateway.Spec.Volumes,
+		"sandbox": sandbox.Spec.Template.Spec.Volumes,
+	} {
+		for _, volume := range podVolumes {
+			if volume.ConfigMap != nil && volume.ConfigMap.Name == "gitlab-forge-ca" {
+				t.Errorf("the %s pod mounts the forge's CA as %q", name, volume.Name)
+			}
+		}
+	}
+}

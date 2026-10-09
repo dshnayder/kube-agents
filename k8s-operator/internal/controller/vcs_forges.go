@@ -25,7 +25,9 @@ package controller
 // the forge, its host, the groups it may serve and where its token is, and
 // the token. Both reach the broker's pod and no other: the token is a Secret
 // mounted only there, and the configuration rides in the broker's policy
-// ConfigMap, whose hash already rolls the broker when it changes.
+// ConfigMap, whose hash already rolls the broker when it changes. A
+// self-managed forge behind a private CA adds a third, its CA bundle: a
+// ConfigMap key, mounted only there too.
 //
 // A GitHub-only install renders none of it, so its broker is byte-for-byte
 // what it was.
@@ -56,6 +58,12 @@ const (
 	// position in the rendered configuration: a forge name can be 63
 	// characters, which is a volume name's whole budget.
 	forgeCredentialsVolumePrefix = "vcs-forge-credentials-" // #nosec G101 -- Volume name prefix, not a credential
+	// forgeCADir holds one directory per forge that names a CA bundle in
+	// caBundleRef, named for the forge, with the bundle in it as ca.crt.
+	forgeCADir = "/etc/kube-agents/forge-ca"
+	// forgeCAVolumePrefix names each forge's CA ConfigMap volume, by position,
+	// for the reason forgeCredentialsVolumePrefix gives.
+	forgeCAVolumePrefix = "vcs-forge-ca-"
 )
 
 // brokerForges is the forge configuration the declaration hands the broker,
@@ -69,7 +77,7 @@ func brokerForges(agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.BrokerForg
 	if err != nil {
 		return nil
 	}
-	return resolved.BrokerForges(forgeCredentialsDir)
+	return resolved.BrokerForges(forgeCredentialsDir, forgeCADir)
 }
 
 // vcsForgesJSON renders the configuration, or "" when there is none. No error
@@ -118,6 +126,18 @@ func buildVCSForgesVolumeMounts(agent *agentv1alpha1.PlatformAgent) []corev1.Vol
 			ReadOnly:  true,
 		})
 	}
+	for i, forge := range forges {
+		if forge.CABundleConfigMap == "" {
+			continue
+		}
+		// A directory, not a SubPath: kubelet refreshes a projected
+		// ConfigMap in place, and a SubPath mount never sees an update.
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      fmt.Sprintf("%s%d", forgeCAVolumePrefix, i),
+			MountPath: path.Join(forgeCADir, forge.Name),
+			ReadOnly:  true,
+		})
+	}
 	return mounts
 }
 
@@ -145,6 +165,28 @@ func buildVCSForgesVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 					Path: agentv1alpha1.ForgeCredentialsTokenKey,
 				}},
 				DefaultMode: ptr.To(int32(0o400)),
+				Optional:    ptr.To(true),
+			}},
+		})
+	}
+	for i, forge := range brokerForges(agent) {
+		if forge.CABundleConfigMap == "" {
+			continue
+		}
+		// The one key, as ca.crt. Optional for the token's reason: a missing
+		// ConfigMap must not keep the broker from starting. The broker answers
+		// each call to this forge with FORGE_TLS_UNTRUSTED, naming the missing
+		// file, until kubelet writes it. No hash rolls the broker on a change:
+		// kubelet refreshes the file, and the broker reads it on every call.
+		volumes = append(volumes, corev1.Volume{
+			Name: fmt.Sprintf("%s%d", forgeCAVolumePrefix, i),
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: forge.CABundleConfigMap},
+				Items: []corev1.KeyToPath{{
+					Key:  forge.CABundleKey,
+					Path: agentv1alpha1.ForgeCABundleFileName,
+				}},
+				DefaultMode: ptr.To(int32(0o444)),
 				Optional:    ptr.To(true),
 			}},
 		})

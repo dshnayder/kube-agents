@@ -1458,6 +1458,7 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // A gitlab forge's credentialsRef is required by the API server too, so it
 // holds with the webhook off -- the chart ships it off.
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.provider) && self.provider == 'gitlab')",message="caBundleRef is for a gitlab forge: the github provider does not read it yet, and a CA that nothing reads would hide a certificate problem"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1532,6 +1533,39 @@ type ForgeSpec struct {
 	// call, so rotating the token is updating the Secret.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
+
+	// CABundleRef names a ConfigMap in the PlatformAgent's namespace that
+	// holds the PEM CA certificates that signed this forge's TLS certificate:
+	// a self-managed instance behind a private CA. The broker trusts these
+	// certificates for this forge's host only, beside the system bundle, so
+	// they never vouch for another host. It is for a gitlab forge.
+	//
+	// The operator mounts the one key into the credential broker's pod only.
+	// The mount is optional: a missing ConfigMap does not stop the broker, and
+	// calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
+	// broker reads the file on each call, so an update reaches it with no
+	// restart.
+	// +optional
+	CABundleRef *ForgeCABundleRef `json:"caBundleRef,omitempty"`
+}
+
+// ForgeCABundleRef names the ConfigMap key that holds a forge's CA
+// certificates. A CA certificate is public, so a ConfigMap holds it, not a
+// Secret.
+type ForgeCABundleRef struct {
+	// Name is the ConfigMap's name: a lowercase DNS subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+
+	// Key is the ConfigMap key that holds the PEM certificates. Defaults to
+	// "ca.crt".
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
+	// +kubebuilder:default="ca.crt"
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // ForgeCredentialsRef names the Secret holding a forge's credential. The JSON

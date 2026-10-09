@@ -684,6 +684,19 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
 {{- end -}}
+{{- $caMap := ($f.caBundleRef | default dict).name | default "" -}}
+{{- if $caMap -}}
+{{- if ne $provider "gitlab" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a gitlab forge; provider %s does not read a CA bundle" $i $provider) -}}
+{{- end -}}
+{{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a ConfigMap name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
+{{- end -}}
+{{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
+{{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a ConfigMap key" $i $caKey) -}}
+{{- end -}}
+{{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
 {{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
