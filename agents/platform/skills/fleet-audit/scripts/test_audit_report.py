@@ -17932,7 +17932,12 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             {"a": "apps/a is inside a Kustomize root, where a new file renders only if listed"},
         )
         self.assertIn("`finish` did not write these itself: a: apps/a is inside a Kustomize root", message)
-        self.assertIn("`kustomization.yaml` `resources:`", message)
+        # One file cannot list itself, so the refusal does not ask for that: it
+        # says the guard makes such a fix manual, and what the note must hold.
+        self.assertNotIn("list the new file", message)
+        self.assertIn("`finish` makes a `manifest` fix that adds an unlisted file there `manual`", message)
+        self.assertIn("keep it `kind: manual`, put the new file's content and the `resources:` line", message)
+        self.assertIn("--decline-fix", message)
         self.touch("apps/kustomization.yaml")
         notes = {}
         manifest = self.manifest()
@@ -24144,8 +24149,48 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertEqual((remediation["kind"], remediation["path"]), ("manual", ""))
         self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", remediation["note"])
         self.assertIn("`- checkout-gateway-pdb.yaml` under `resources:`", remediation["note"])
-        # The worker's own note stays in front.
-        self.assertTrue(remediation["note"].startswith("Add a PodDisruptionBudget."))
+        # The guard's text comes first, so the ledger's clip never cuts it;
+        # the worker's own note follows the copied file.
+        self.assertTrue(remediation["note"].startswith("_(The audit did not open"))
+        self.assertTrue(remediation["note"].endswith("Add a PodDisruptionBudget."))
+        self.assertIn("```yaml\nkind: PodDisruptionBudget\n```", remediation["note"])
+
+    def test_the_note_copies_the_file_up_to_the_cap(self):
+        root = self.clone(self.overlay())
+        cap = audit_report.MANUAL_NOTE_MANIFEST_LINES
+        self.write(root, self.PDB, "".join(f"k{i}: v\n" for i in range(cap + 5)))
+        finding = kustomize_fix(self.PDB)
+        self.degrade(root, [finding])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"k{cap - 1}: v", note)
+        self.assertNotIn(f"k{cap}: v", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+
+        # Long lines stop at the character cap, still inside a closed block,
+        # and the published note keeps the whole block under the clip.
+        self.write(root, self.PDB, "".join(f"k{i}: {'v' * 100}\n" for i in range(cap)))
+        finding = kustomize_fix(self.PDB)
+        self.degrade(root, [finding])
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+        self.assertLessEqual(note.index(audit_report.MANUAL_NOTE_TRUNCATED + "\n```"), audit_report.MAX_NOTE_CHARS)
+
+    def test_a_file_that_cannot_be_read_leaves_the_note_without_a_block(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        real_read = Path.read_text
+
+        def unreadable(path, *args, **kwargs):
+            if path.name == "checkout-gateway-pdb.yaml":
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+
+        finding = kustomize_fix(self.PDB)
+        with patch.object(Path, "read_text", unreadable):
+            self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertNotIn("```", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml` under `resources:`", note)
 
     def test_a_listed_file_is_kept(self):
         for entry in ("checkout-gateway-pdb.yaml", "./checkout-gateway-pdb.yaml", "'checkout-gateway-pdb.yaml'"):
@@ -24277,8 +24322,19 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertEqual(self.degrade_via_broker(self.overlay(), [finding]), ["pdb-fix"])
         note = finding["remediation"]["note"]
         self.assertIn("did not open a merge request", note)
+        # The scratch tree holds no file here, so the note has no block.
+        self.assertNotIn("```", note)
         self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", note)
         self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_content_mode_copies_the_scratch_file_into_the_note(self):
+        """The file is only in the scratch tree, so the note carries it."""
+        target = self.tmp_path / self.PDB
+        target.parent.mkdir(parents=True)
+        target.write_text("kind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n", encoding="utf-8")
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding]), ["pdb-fix"])
+        self.assertIn("```yaml\nkind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n```", finding["remediation"]["note"])
 
     def test_content_mode_keeps_a_listed_file(self):
         finding = kustomize_fix(self.PDB)
@@ -24340,6 +24396,8 @@ class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
         (body,) = self.harness.bodies_for("issue-create")
         self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", body)
         self.assertIn("`- payments-netpol.yaml`", body)
+        # The worker's file, copied into the published row.
+        self.assertIn("```yaml\n# remediation\n```", body)
         self.assertNotIn("their fix is not written", self.err)
 
     def test_finish_opens_the_pull_request_for_a_listed_fix(self):

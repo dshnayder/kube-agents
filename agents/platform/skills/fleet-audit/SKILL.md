@@ -1331,7 +1331,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   manifest and the `resources:` line it needs in `recommendation.action`.
   Where the file is not in the repository and the nearest kustomization above it (in its directory
   or a parent) does not name it, `finish` degrades the finding to `manual`. The note names the
-  kustomization and the `resources:` line to add. It does the same when it cannot read the
+  kustomization and the `resources:` line to add, and holds your file as a YAML block, cut at 60
+  lines. It does the same when it cannot read the
   kustomization, and says so. It does not refuse the run for these, and `remediate` refuses them by
   name. A `--dry-run` only warns, and only in directory mode.
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what

@@ -1320,6 +1320,14 @@ KUSTOMIZE_ENTRY_AFTER = r"/?(?![\w./-])"
 # The audited commit in directory mode. `start` resets the clone to the base
 # branch, and the worker's fixes stay untracked until a branch stages them.
 AUDITED_REF = "HEAD"
+# How much of a worker's file the Kustomize pass copies into the `manual`
+# note, so a person can add it by hand. The character cap keeps the fenced
+# block, with the note's own text in front of it, under MAX_NOTE_CHARS, so
+# the ledger's clip cuts the worker's note after it and never the block.
+MANUAL_NOTE_MANIFEST_LINES = 60
+MANUAL_NOTE_MANIFEST_CHARS = 1200
+# The last line of a copied file that went past either cap.
+MANUAL_NOTE_TRUNCATED = "# (truncated)"
 # The selector keys `policy/v1` takes, and nothing else.
 LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
@@ -12563,9 +12571,18 @@ def unwritten_refusal_message(
                 + "."
             )
             if any(KUSTOMIZE_ROOT_REASON in why for _, why in noted):
+                # One remediation cannot carry the new file and the kustomization
+                # edit, and `degrade_unlisted_kustomize_additions` makes such a
+                # `manifest` fix `manual`. So the worker writes it `manual` with
+                # what a person needs, and declines it, or the refusal repeats.
                 parts.append(
-                    "In a Kustomize root, list the new file in its `kustomization.yaml` "
-                    "`resources:` too, or it renders nothing."
+                    "In a Kustomize root, a new file renders only if its kustomization "
+                    "lists it, and a remediation carries one file, so `finish` makes a "
+                    "`manifest` fix that adds an unlisted file there `manual`. For each "
+                    "of these, do not write a `manifest`: keep it `kind: manual`, put the "
+                    "new file's content and the `resources:` line it needs in "
+                    "`remediation.note`, and pass `--decline-fix <id> \"<why>\"` that "
+                    "names the kustomization."
                 )
     parts.append(
         "Then run `finish` again. A declared `no-pdb` finding `finish` can write is "
@@ -13266,6 +13283,30 @@ def _kustomize_entry(path: PurePosixPath, directory: PurePosixPath) -> str:
     return str(target.relative_to(directory))
 
 
+def _manifest_note_block(root: Path, path: str) -> str:
+    """The worker's file at `path` as a fenced YAML block for a `manual` note, or "".
+
+    Capped at MANUAL_NOTE_MANIFEST_LINES lines and MANUAL_NOTE_MANIFEST_CHARS
+    characters, with MANUAL_NOTE_TRUNCATED as the last line past either cap.
+    A file that cannot be read gives "", and the note stays as it is."""
+    try:
+        target = resolve_inside_repo(root, path, "kustomize note")
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValidationError):
+        return ""
+    lines = text.rstrip("\n").splitlines()
+    kept: list[str] = []
+    size = 0
+    for line in lines[:MANUAL_NOTE_MANIFEST_LINES]:
+        if size + len(line) + 1 > MANUAL_NOTE_MANIFEST_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    if len(kept) < len(lines):
+        kept.append(MANUAL_NOTE_TRUNCATED)
+    return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
+
+
 def degrade_unlisted_kustomize_additions(
     findings: list[dict], probe: "_RepositoryProbe", noun: str = DEFAULT_PROPOSAL_NOUN
 ) -> list[str]:
@@ -13290,7 +13331,9 @@ def degrade_unlisted_kustomize_additions(
       degrades only a file the kustomization cannot render.
 
     The finding becomes `manual`, and its note names the kustomization and the
-    `resources:` line a person must add.
+    `resources:` line a person must add. The note also holds the worker's
+    file as a fenced YAML block (`_manifest_note_block`), because in content
+    mode that file is only in the scratch tree and the person cannot see it.
 
     When the probe cannot answer -- git fails, the broker does not answer, or
     the kustomization cannot be read -- the fix degrades too, with a note that
@@ -13350,7 +13393,9 @@ def degrade_unlisted_kustomize_additions(
         note = str(remediation.get("note", "")).strip()
         remediation["kind"] = "manual"
         remediation["path"] = ""
-        remediation["note"] = (f"{note} " if note else "") + f"_(The audit {reason}.)_"
+        # First, so the ledger's clip cuts the worker's note and not the block.
+        block = _manifest_note_block(probe.root, raw)
+        remediation["note"] = f"_(The audit {reason}.)_" + block + (f" {note}" if note else "")
         degraded.append(fid)
     # The next probe caller reads `unanswered` for its own question only.
     probe.unanswered = ""
