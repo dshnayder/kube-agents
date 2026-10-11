@@ -24166,14 +24166,79 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertNotIn(f"k{cap}: v", note)
         self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
 
-        # Long lines stop at the character cap, still inside a closed block,
-        # and the published note keeps the whole block under the clip.
+        # Long lines stop where the room under the clip ends, still inside a
+        # closed block.
         self.write(root, self.PDB, "".join(f"k{i}: {'v' * 100}\n" for i in range(cap)))
         finding = kustomize_fix(self.PDB)
         self.degrade(root, [finding])
         note = finding["remediation"]["note"]
         self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
-        self.assertLessEqual(note.index(audit_report.MANUAL_NOTE_TRUNCATED + "\n```"), audit_report.MAX_NOTE_CHARS)
+        self.assert_fence_survives_the_clip(note)
+
+    def assert_fence_survives_the_clip(self, note):
+        """The note as the ledger renders it has every fence closed."""
+        clipped = audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS)
+        self.assertEqual(clipped.count("```") % 2, 0, clipped)
+
+    def test_a_long_path_leaves_the_block_only_the_room_under_the_clip(self):
+        deep = "/".join(f"level-{i:02d}-{'d' * 40}" for i in range(4))
+        overlay = f"clusters/prod/{deep}"
+        path = f"{overlay}/checkout-gateway-pdb.yaml"
+        root = self.clone({f"{overlay}/kustomization.yaml": "resources:\n- deployment.yaml\n"})
+        self.write(root, path, "".join(f"k{i}: {'v' * 60}\n" for i in range(40)))
+        finding = kustomize_fix(path, fid="pdb-fix")
+        finding["remediation"]["note"] = "w" * 3000
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        # Some of the file fits, and the block ends where the room ends.
+        self.assertIn("```yaml\nk0: ", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+        self.assert_fence_survives_the_clip(note)
+
+    def test_a_long_broker_error_drops_the_block(self):
+        """No room is left after the note's own text, so the block goes."""
+        target = self.tmp_path / self.PDB
+        target.parent.mkdir(parents=True)
+        target.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        finding = kustomize_fix(self.PDB)
+        workspace = FakeBrokerWorkspace(self.overlay())
+        workspace.read_text = mock.MagicMock(side_effect=RuntimeError("e" * 2500))
+        self.assertEqual(self.degrade_via_workspace(workspace, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn("could not check", note)
+        self.assertNotIn("```", note)
+        self.assert_fence_survives_the_clip(note)
+
+    def degrade_with_open(self, opened):
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(self.PDB)
+        with patch.object(credential_proxy_client.Workspace, "open", opened), contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions([finding], probe), finding
+
+    def test_a_broker_that_refuses_the_open_degrades_and_says_so(self):
+        """`has_path` takes a yes and records only `unavailable`; the pass
+        still reads that as no answer, also for a file that may exist."""
+
+        def refused(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
+
+        degraded, finding = self.degrade_with_open(refused)
+        self.assertEqual(degraded, ["pdb-fix"])
+        self.assertIn("could not check", finding["remediation"]["note"])
+        self.assertIn("WorkspaceRequestError", finding["remediation"]["note"])
+
+    def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
+        """An outage, as at publish: nothing is published or degraded, and
+        the worker runs `finish` again."""
+        import urllib.error
+
+        def lost(*_args, **_kwargs):
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        with self.assertRaises(audit_report.BrokerUnavailable):
+            self.degrade_with_open(lost)
 
     def test_a_file_that_cannot_be_read_leaves_the_note_without_a_block(self):
         root = self.clone(self.overlay())
@@ -24305,7 +24370,9 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
     # --- content mode: the broker holds the base ---------------------------- #
 
     def degrade_via_broker(self, files, findings, **failures):
-        workspace = FakeBrokerWorkspace(files, **failures)
+        return self.degrade_via_workspace(FakeBrokerWorkspace(files, **failures), findings)
+
+    def degrade_via_workspace(self, workspace, findings):
         session = mock.MagicMock()
         session.__enter__.return_value = workspace
         module = mock.MagicMock()
@@ -24405,6 +24472,28 @@ class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
 
+    def test_a_declared_fix_the_pass_degrades_is_not_refused_as_unwritten(self):
+        """The worker wrote the fix and the pass made it `manual`; a refusal
+        would ask for the same file again. Here the sweep would name it as a
+        declared `manual` fix, as it does for a major `no-pdb` finding."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.overlay()
+        fid = derived_id()
+        self.patch_attr(
+            "unwritten_sweep_fixes",
+            lambda findings, *a, **k: {
+                str(f["id"]): audit_report.UnwrittenFix("clusters/prod-us-east/deploy.yaml", declared=True)
+                for f in findings
+                if (f.get("remediation") or {}).get("kind") == "manual"
+            },
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("their fix is not written", self.err)
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn(fid, body)
+        self.assertIn("`- payments-netpol.yaml`", body)
+
     def test_remediate_refuses_the_unlisted_fix_by_name(self):
         self.overlay()
         path = self.write_findings(make_doc())
@@ -24420,7 +24509,7 @@ class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
         (self.workspace / self.KUSTOMIZATION).write_text("resources:\n- deployment.yaml\n", encoding="utf-8")
         self.assertEqual(self.run_finish(make_doc(), argv_extra=["--dry-run"]), 0, self.err)
         self.assertEqual(self.harness.calls, [])
-        self.assertIn("kustomization does not list it", self.err)
+        self.assertIn("kustomization in the working tree does not list it", self.err)
         # A warning only: the preview still shows the pull request.
         self.assertIn("WOULD OPEN", self.err)
 

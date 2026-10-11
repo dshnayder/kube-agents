@@ -636,14 +636,20 @@ commit (`HEAD` of the clone, or the broker's base in content mode). A kustomizat
 file's directory or a parent directory. The nearest such kustomization does not name the file's
 path relative to its own directory as a whole token, bare or after `./`. Any mention counts, so the
 pass degrades only a file the kustomization cannot render. The note names the kustomization and
-the `resources:` line to add, and holds the worker's file as a fenced YAML block, capped in lines and
-characters, because in content mode that file exists only in the scratch tree. The block comes before
-the worker's own note, so the ledger's note clip cuts the worker's text and not the block. When git or the broker cannot answer, or the kustomization cannot be
+the `resources:` line to add, and holds the worker's file as a fenced YAML block, because in
+content mode that file exists only in the scratch tree. The block comes before the worker's own
+note, and it gets only the room that the note's own text leaves under the renderer's note clip: it
+keeps at most a fixed number of lines, ends in a truncation line when it keeps less, and is left out
+when no room is left. So the clip cuts the worker's text and never the closing fence. When git or
+the broker cannot answer (a broker that refuses the open included), or the kustomization cannot be
 read, the fix degrades too, and the note says what could not be checked: the audit does not publish
-a pull request it cannot show will render. `finish` does not refuse these fixes as unwritten,
+a pull request it cannot show will render. A broker that does not answer the open at all is an
+outage: the pass raises `BROKER UNAVAILABLE`, nothing is published, and the worker runs the command
+again, as for an outage at publish. `finish` does not refuse these fixes as unwritten,
 because the worker cannot correct them in one file, and `remediate` refuses them by name. The dry
-run does not ask git about the audited commit, so it cannot tell a new file from an existing one. It
-takes each file as new, warns, and does not change the body.
+run does not ask git about the audited commit, so it cannot tell a new file from an existing one,
+and it reads the kustomization in the working tree. It takes each file as new, warns, and does not
+change the body.
 
 Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
 incidental. The agent writes its remediation manifests into the clone _between_ `start` and

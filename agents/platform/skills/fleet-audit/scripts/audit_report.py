@@ -1320,12 +1320,10 @@ KUSTOMIZE_ENTRY_AFTER = r"/?(?![\w./-])"
 # The audited commit in directory mode. `start` resets the clone to the base
 # branch, and the worker's fixes stay untracked until a branch stages them.
 AUDITED_REF = "HEAD"
-# How much of a worker's file the Kustomize pass copies into the `manual`
-# note, so a person can add it by hand. The character cap keeps the fenced
-# block, with the note's own text in front of it, under MAX_NOTE_CHARS, so
-# the ledger's clip cuts the worker's note after it and never the block.
+# How many lines of a worker's file the Kustomize pass copies into the
+# `manual` note, so a person can add it by hand. The characters are capped
+# by the room MAX_NOTE_CHARS leaves after the note's own text.
 MANUAL_NOTE_MANIFEST_LINES = 60
-MANUAL_NOTE_MANIFEST_CHARS = 1200
 # The last line of a copied file that went past either cap.
 MANUAL_NOTE_TRUNCATED = "# (truncated)"
 # The selector keys `policy/v1` takes, and nothing else.
@@ -12657,8 +12655,9 @@ class _RepositoryProbe:
         self.repo, self.root = repo, root
         self._session = None
         self._workspace = None
-        # Why the broker could not be asked, once it could not.
+        # Why the broker could not be asked, once it could not, and the error.
         self.unavailable = ""
+        self.open_error: BaseException | None = None
         # Why the last answer was a yes nobody saw: a call that failed or a
         # listing that stopped short. Read and cleared by `take_unanswered`.
         self.unanswered = ""
@@ -12688,8 +12687,23 @@ class _RepositoryProbe:
                 self._workspace = self._session.__enter__()
             except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
                 self.unavailable = f"{type(exc).__name__}: {exc}"
+                self.open_error = exc
                 log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
         return self._workspace
+
+    def raise_if_lost(self, what: str) -> None:
+        """Raise `BrokerUnavailable` when the broker did not answer the open at all.
+
+        A refusal (an HTTP status) is an answer, and the caller treats it as
+        an unanswered question. A lost broker stops the command with the
+        outage line, as a lost broker does at publish, so the worker runs
+        `finish` again and no fix is published or degraded on an outage."""
+        if content_mode() and self._workspace is None and self.open_error is not None and broker_lost(self.open_error):
+            raise BrokerUnavailable(
+                f"{what}: the broker at {proxy_endpoint()} did not answer ({self.unavailable}). "
+                "This sandbox has no other way to check the repository; check the "
+                "credential-proxy pod and re-run this command."
+            ) from self.open_error
 
     def take_unanswered(self) -> str:
         """Why the broker could not answer since the last call, then forget it."""
@@ -12729,7 +12743,11 @@ class _RepositoryProbe:
         the broker, which lists only the base. An answer the probe cannot get
         is a yes, and `unanswered` says why, as for `has_path`."""
         if content_mode():
-            return self.has_path(path)
+            answer = self.has_path(path)
+            # A broker that did not open answers nothing, and `has_path`
+            # records that only in `unavailable`.
+            self.unanswered = self.unanswered or self.unavailable
+            return answer
         self.ask_committed([path])
         answer, self.unanswered = self._committed[path]
         return answer
@@ -13265,7 +13283,9 @@ def _nearest_kustomization(path: PurePosixPath, probe: "_RepositoryProbe") -> tu
     repository. It reads the audited commit, so a kustomization the worker
     wrote this run does not count. A probe that cannot get an answer takes a
     yes, so the caller then reads a kustomization that may not be there, and
-    reports that it could not."""
+    reports that it could not. The rule is the planner's rule for its own
+    PodDisruptionBudget, and it assumes that the GitOps tool applies each
+    Kustomize root through its kustomization."""
     for parent in path.parents:
         for marker in KUSTOMIZATION_FILE_NAMES:
             candidate = str(parent / marker)
@@ -13283,28 +13303,39 @@ def _kustomize_entry(path: PurePosixPath, directory: PurePosixPath) -> str:
     return str(target.relative_to(directory))
 
 
-def _manifest_note_block(root: Path, path: str) -> str:
-    """The worker's file at `path` as a fenced YAML block for a `manual` note, or "".
+def _manifest_note_block(root: Path, path: str, prefix: str) -> str:
+    """The worker's file at `path` as a fenced YAML block to follow `prefix`, or "".
 
-    Capped at MANUAL_NOTE_MANIFEST_LINES lines and MANUAL_NOTE_MANIFEST_CHARS
-    characters, with MANUAL_NOTE_TRUNCATED as the last line past either cap.
-    A file that cannot be read gives "", and the note stays as it is."""
+    The renderer clips a note at MAX_NOTE_CHARS. A clip inside the block
+    removes the closing fence, and then the rest of the ledger renders as
+    code. So the block gets only the room that `prefix` leaves: it keeps at
+    most MANUAL_NOTE_MANIFEST_LINES lines, ends in MANUAL_NOTE_TRUNCATED when
+    it keeps less than the whole file, and is "" when not even that fits. The
+    length is measured after `publishable_text`, as the renderer measures it.
+    A file that cannot be read also gives "", and the note stays as it is."""
     try:
         target = resolve_inside_repo(root, path, "kustomize note")
         text = target.read_text(encoding="utf-8", errors="replace")
     except (OSError, ValidationError):
         return ""
     lines = text.rstrip("\n").splitlines()
+
+    def render(kept: list[str]) -> str:
+        return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
+
+    def fits(block: str) -> bool:
+        return len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+
+    whole = lines[:MANUAL_NOTE_MANIFEST_LINES]
+    if len(whole) == len(lines) and fits(render(whole)):
+        return render(whole)
     kept: list[str] = []
-    size = 0
-    for line in lines[:MANUAL_NOTE_MANIFEST_LINES]:
-        if size + len(line) + 1 > MANUAL_NOTE_MANIFEST_CHARS:
+    for line in whole:
+        if not fits(render(kept + [line, MANUAL_NOTE_TRUNCATED])):
             break
         kept.append(line)
-        size += len(line) + 1
-    if len(kept) < len(lines):
-        kept.append(MANUAL_NOTE_TRUNCATED)
-    return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
+    block = render(kept + [MANUAL_NOTE_TRUNCATED])
+    return block if fits(block) else ""
 
 
 def degrade_unlisted_kustomize_additions(
@@ -13335,9 +13366,12 @@ def degrade_unlisted_kustomize_additions(
     file as a fenced YAML block (`_manifest_note_block`), because in content
     mode that file is only in the scratch tree and the person cannot see it.
 
-    When the probe cannot answer -- git fails, the broker does not answer, or
-    the kustomization cannot be read -- the fix degrades too, with a note that
-    says what could not be checked. This is the direction
+    When the probe cannot answer -- git fails, the broker refuses or does not
+    answer a question, or the kustomization cannot be read -- the fix
+    degrades too, with a note that says what could not be checked. A broker
+    that does not answer the open at all is an outage: the pass raises
+    `BrokerUnavailable`, so nothing is published and the worker runs the
+    command again, as for an outage at publish. This is the direction
     `degrade_missing_remediations` takes: a fix the audit cannot prove it can
     deliver is published as `manual`, with the reason, and never as a pull
     request that can render nothing.
@@ -13357,7 +13391,9 @@ def degrade_unlisted_kustomize_additions(
         probe.ask_committed(
             [str(path)] + [str(parent / marker) for parent in path.parents for marker in KUSTOMIZATION_FILE_NAMES]
         )
-        if probe.committed(str(path)) and not probe.unanswered:
+        committed = probe.committed(str(path))
+        probe.raise_if_lost(f"checking whether a kustomization lists {path}")
+        if committed and not probe.unanswered:
             continue
         unchecked_new = probe.unanswered
         nearest = _nearest_kustomization(path, probe)
@@ -13394,8 +13430,9 @@ def degrade_unlisted_kustomize_additions(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         # First, so the ledger's clip cuts the worker's note and not the block.
-        block = _manifest_note_block(probe.root, raw)
-        remediation["note"] = f"_(The audit {reason}.)_" + block + (f" {note}" if note else "")
+        prefix = f"_(The audit {reason}.)_"
+        block = _manifest_note_block(probe.root, raw, prefix)
+        remediation["note"] = prefix + block + (f" {note}" if note else "")
         degraded.append(fid)
     # The next probe caller reads `unanswered` for its own question only.
     probe.unanswered = ""
@@ -14836,8 +14873,10 @@ def _handle_finish_dry_run(
         for fid in degrade_unlisted_kustomize_additions(copy.deepcopy(findings), preview, noun):
             log(
                 f"DRY RUN: {fid}'s remediation file is in a Kustomize root whose "
-                "kustomization does not list it. If the file is new, the real run "
-                "publishes it as manual and names the `resources:` line to add."
+                "kustomization in the working tree does not list it. If the file is "
+                "new and the kustomization at the audited commit does not list it "
+                "either, the real run publishes it as manual and names the "
+                "`resources:` line to add."
             )
     paths = manifest_paths(findings)
 
