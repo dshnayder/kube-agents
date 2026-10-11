@@ -1327,6 +1327,78 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
+# The notes `disclose_manual_remediation_routes` adds to a `manual` remediation
+# from the collector's candidate fields. Each note starts with its lede and
+# ends with `ROUTE_NOTE_END`, so the pass can find and remove the note that an
+# earlier copy of the text carries before it writes the note again.
+DECLARED_NOTE_LEDE = "_(Declared in this repository at "
+DECLARED_NOTE = (
+    DECLARED_NOTE_LEDE + "`{path}`. Make the change in the repository, not on the live object.)_"
+)
+RELEASE_NOTE_LEDE = "_(Rendered by "
+RELEASE_NOTE = (
+    RELEASE_NOTE_LEDE + "{noun} declared at `{path}`. Make the change in that file: "
+    "the release reverts a patch to the live object.)_"
+)
+NAMESPACE_DIRECTORY_NOTE_LEDE = "_(A new object for this namespace belongs under "
+NAMESPACE_DIRECTORY_NOTE = NAMESPACE_DIRECTORY_NOTE_LEDE + "`{path}`.)_"
+RECONCILED_NOTE_LEDE = "_(Reconciled by "
+RECONCILED_NOTE = (
+    RECONCILED_NOTE_LEDE + "{reconciler}. A change made by hand to the live object is "
+    "reverted; make the change where that reconciler gets its configuration.)_"
+)
+ROUTE_NOTE_END = ".)_"
+ROUTE_NOTE_LEDES = (
+    DECLARED_NOTE_LEDE,
+    RELEASE_NOTE_LEDE,
+    NAMESPACE_DIRECTORY_NOTE_LEDE,
+    RECONCILED_NOTE_LEDE,
+)
+# One earlier route note, from its lede to the first `ROUTE_NOTE_END`.
+ROUTE_NOTE_PATTERN = re.compile(
+    "(?:" + "|".join(re.escape(lede) for lede in ROUTE_NOTE_LEDES) + r").*?"
+    + re.escape(ROUTE_NOTE_END)
+)
+# The `renderer` values `collect.release_declarations` writes, copied because
+# this script does not import the collector, and the noun the release note
+# uses for each. A Kustomize overlay has no values file, so "the chart
+# release" would send the reader to look for a file that does not exist.
+RELEASE_RENDERER_NOUNS = {
+    "helm": "the chart release",
+    "kustomize": "the Kustomize overlay",
+}
+RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+# What a worker note is cut with when the route notes need its space.
+ROUTE_NOTE_TRUNCATED = " …(truncated)"
+# What joins the worker's note and each route note.
+NOTE_SEPARATOR = " "
+# The worker's own words that say the repository does not declare the object.
+# A clause matches the first pattern alone ("no file declares", "declared
+# nowhere"), or the second and the third together: a negation near a form of
+# "declare", and the repository named in the same clause. Both are necessary
+# for the second form: "the chart does not expose a values key" is a negation
+# and no denial, and "declared in this repository at `x`" names the
+# repository and says the opposite.
+DECLARATION_DENIAL_SELF_SUFFICIENT_RE = re.compile(
+    r"\bno\s+(?:file|files|manifest|manifests)\b[^.;]{0,40}?\bdeclar\w*"
+    r"|\bdeclar\w*\b[^.;]{0,40}?\bnowhere\b",
+    re.I,
+)
+DECLARATION_DENIAL_NEGATED_RE = re.compile(
+    r"\b(?:not|never|no|nothing|neither)\b[^.;]{0,40}?\bdeclar\w*",
+    re.I,
+)
+DECLARATION_DENIAL_SUBJECT_RE = re.compile(r"\b(?:repo|repository|GitOps)\b", re.I)
+# A clause is one sentence, or one part of a sentence between semicolons. A
+# comma does not end a clause: "not declared in the repository, so no pull
+# request can carry it" is a claim and its result, and a cut at the comma
+# keeps the result without its cause.
+CLAUSE_SPLIT_RE = re.compile(r"(?<=[.;])\s+")
+# The fields a denial was seen in, as (section, field). `action` is not here:
+# it carries commands, and a cut at a full stop can break one.
+DECLARATION_DENIAL_FIELDS = (("remediation", "note"), ("recommendation", "rationale"))
+SENTENCE_END = "."
+DANGLING_PUNCTUATION = (";", ",")
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -13255,6 +13327,242 @@ def unwritten_sweep_fixes(
     return unwritten
 
 
+class RouteEvidence(NamedTuple):
+    """What the collector found about where a finding's fix belongs.
+
+    Every field is `""` when the candidate does not carry it. An empty field
+    is no claim: the collector attaches a field only where it resolved one,
+    and a missing `declaration` can mean that the index was empty, that two
+    files declare the object, or that content mode could not copy the YAML.
+    """
+
+    declaration: str
+    release: str
+    renderer: str
+    namespace_directory: str
+    reconciler: str
+
+
+def _field_path(candidate: dict, field: str) -> str:
+    """The `path` inside one of the candidate's location fields, or `""`."""
+    value = candidate.get(field)
+    return str(value.get("path") or "").strip() if isinstance(value, dict) else ""
+
+
+def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
+    """Finding id to the location fields of the candidate with that identity.
+
+    The same join `adopt_collector_evidence` makes: a candidate keyed as the
+    finding it vouches for. Only candidates that carry one of the fields are
+    included.
+    """
+    evidence: dict[str, RouteEvidence] = {}
+    for entry, candidate in _candidates(manifest):
+        release = candidate.get("release_declaration")
+        found = RouteEvidence(
+            declaration=_field_path(candidate, "declaration"),
+            release=_field_path(candidate, "release_declaration"),
+            renderer=str((release or {}).get("renderer") or "") if isinstance(release, dict) else "",
+            namespace_directory=_field_path(candidate, "namespace_directory"),
+            reconciler=str(candidate.get("reconciler") or "").strip(),
+        )
+        if found.declaration or found.release or found.namespace_directory or found.reconciler:
+            evidence[_candidate_identity(entry, candidate)] = found
+    return evidence
+
+
+def _denies_declaration(clause: str) -> bool:
+    """Whether one clause says that the repository does not declare the object."""
+    if DECLARATION_DENIAL_SELF_SUFFICIENT_RE.search(clause):
+        return True
+    return bool(DECLARATION_DENIAL_NEGATED_RE.search(clause) and DECLARATION_DENIAL_SUBJECT_RE.search(clause))
+
+
+def _drop_declaration_denials(text: str) -> str:
+    """`text` without the clauses that deny the declaration.
+
+    A route note this script wrote is kept. The text comes back unchanged when
+    no clause is a denial, so that a caller that compares the two sees no
+    change from whitespace alone. It also comes back unchanged when every
+    clause is a denial: an empty rationale is a worse ledger row than one
+    the note below it corrects.
+    """
+    if not text:
+        return text
+    kept: list[str] = []
+    dropped = False
+    for clause in CLAUSE_SPLIT_RE.split(text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if not any(lede in clause for lede in ROUTE_NOTE_LEDES) and _denies_declaration(clause):
+            dropped = True
+            if kept and kept[-1].endswith(DANGLING_PUNCTUATION):
+                kept[-1] = kept[-1][:-1] + SENTENCE_END
+            continue
+        kept.append(clause)
+    if not dropped or not kept:
+        return text
+    return " ".join(kept)
+
+
+def retract_contradicted_declaration_denials(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str] = frozenset()
+) -> list[str]:
+    """Remove the worker's claim that the repository does not declare the
+    object, where the collector found the declaration. Returns the ids changed.
+
+    The SOPs tell the worker not to deny a `declaration` or a
+    `release_declaration` that its candidate carries, and the worker still
+    writes the denial. The ledger then shows the denial next to the note that
+    names the file, and the reader cannot tell which one the run measured.
+    The collector parsed the repository, so its field is the measured fact.
+
+    Two fields are evidence. `declaration` is the file that declares the
+    object. `release_declaration` is the chart release or overlay that renders
+    it, and an object that something renders has no file of its own, so "no
+    file declares it" is also false there in the sense the reader needs.
+    `namespace_directory` is not evidence: it says where a new object goes,
+    and the object itself can be undeclared, so the denial can be true.
+
+    The pass removes clauses and writes nothing in their place. The route note
+    that `disclose_manual_remediation_routes` appends states the fact. It
+    reads `remediation.note` and `recommendation.rationale`, on a finding of
+    any kind, and leaves alone a finding in `skip`.
+    """
+    evidence = route_evidence(manifest)
+    retracted: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        found = evidence.get(derive_finding_id(finding))
+        if fid in skip or found is None or not (found.declaration or found.release):
+            continue
+        edited = False
+        for section, field in DECLARATION_DENIAL_FIELDS:
+            block = finding.get(section)
+            if not isinstance(block, dict):
+                continue
+            before = str(block.get(field) or "")
+            after = _drop_declaration_denials(before)
+            if after != before:
+                block[field] = after
+                edited = True
+        if edited:
+            retracted.append(fid)
+    return retracted
+
+
+def _route_notes(found: RouteEvidence, worker_note: str) -> list[str]:
+    """The route notes for one `manual` finding, in the order they are written.
+
+    One location note at most, the most specific that the collector found:
+    the object's own file, then the release that renders it, then the
+    directory for a new object. A note whose path the worker's note already
+    names is not written, because it would only repeat the worker. The
+    reconciler note is independent of the location note.
+    """
+    notes: list[str] = []
+    if found.declaration:
+        location, note = found.declaration, DECLARED_NOTE.format(path=found.declaration)
+    elif found.release:
+        noun = RELEASE_RENDERER_NOUNS.get(found.renderer, RELEASE_RENDERER_FALLBACK_NOUN)
+        location, note = found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
+    elif found.namespace_directory:
+        location = found.namespace_directory
+        note = NAMESPACE_DIRECTORY_NOTE.format(path=found.namespace_directory)
+    else:
+        location, note = "", ""
+    if note and location not in worker_note:
+        notes.append(note)
+    if found.reconciler:
+        notes.append(RECONCILED_NOTE.format(reconciler=found.reconciler))
+    return notes
+
+
+def disclose_manual_remediation_routes(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str] = frozenset()
+) -> list[str]:
+    """Add to each `manual` remediation where its fix belongs, as the collector
+    found it. Returns the ids changed.
+
+    A `manual` remediation is prose that asks a person to make a change by
+    hand. It does not say where to make it, and on most objects the obvious
+    place, the live object, is the wrong one: the repository declares the
+    object, or a chart release renders it, or a controller reverts a patch.
+    The collector resolved each of these against the repository and the live
+    object, and the SOPs tell the worker to use them, but the ledger showed
+    the fields only when the worker wrote them into its note.
+
+    The notes come only from fields the candidate carries:
+
+    - `declaration`: the file that declares the object;
+    - `release_declaration`: the chart release or Kustomize overlay that
+      renders it, and that the release reverts a patch to the live object;
+    - `namespace_directory`: the directory where a new object belongs;
+    - `reconciler`: what reasserts the object's spec, and that a change made
+      by hand is reverted.
+
+    There is no note for a candidate without these fields. A missing
+    `declaration` is not a claim that no file declares the object, so a note
+    that says "not declared" would publish a claim that nobody measured.
+
+    A finding in `skip` is left alone: those are the fixes the refusal path
+    in `finish` already handled, which wrote the fix, declined it with a
+    published reason, or found a pull request that carries it.
+
+    The pass first removes the route notes that the text already carries,
+    which a worker that copies the previous ledger brings back, and then
+    writes them again from this run's manifest. The worker's note is cut
+    first when the total is over `MAX_NOTE_CHARS`, because the renderer cuts
+    from the end and the route notes are at the end.
+    """
+    evidence = route_evidence(manifest)
+    disclosed: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        remediation = finding.get("remediation")
+        if fid in skip or not isinstance(remediation, dict) or remediation.get("kind") != "manual":
+            continue
+        found = evidence.get(derive_finding_id(finding))
+        if found is None:
+            continue
+        original = str(remediation.get("note") or "")
+        worker_note = original.strip()
+        if ROUTE_NOTE_PATTERN.search(worker_note):
+            worker_note = NOTE_SEPARATOR.join(ROUTE_NOTE_PATTERN.sub("", worker_note).split())
+        added = NOTE_SEPARATOR.join(_route_notes(found, worker_note))
+        budget = MAX_NOTE_CHARS - len(added) - len(NOTE_SEPARATOR)
+        if added and len(worker_note) > budget:
+            cut = max(budget - len(ROUTE_NOTE_TRUNCATED), 0)
+            worker_note = (worker_note[:cut].rstrip() + ROUTE_NOTE_TRUNCATED) if cut else ""
+        note = NOTE_SEPARATOR.join(part for part in (worker_note, added) if part)
+        if note != original.strip():
+            remediation["note"] = note
+            disclosed.append(fid)
+    return disclosed
+
+
+def disclose_manual_routes_and_log(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str], prefix: str = ""
+) -> None:
+    """Run the retraction, then the disclosure, and log what each changed.
+
+    The retraction runs first: the disclosure appends the note that proves the
+    removed clause false, and a retraction after it would have to read past
+    that note.
+    """
+    if manifest is None:
+        return
+    for fid in retract_contradicted_declaration_denials(findings, manifest, skip):
+        log(
+            f"{prefix}{fid}: its text said that the repository does not declare the "
+            "object, but the collector found its declaration or its release; that "
+            "clause was removed."
+        )
+    for fid in disclose_manual_remediation_routes(findings, manifest, skip):
+        log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
+
+
 class KccDeclaration(NamedTuple):
     """Where a Config Connector resource is declared, and what its spec sets.
 
@@ -14556,7 +14864,13 @@ def _handle_finish_dry_run(
     # The same degradation the real run applies, so a dry run shows the body
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
-    # `handle_finish` does.
+    # `handle_finish` does. What each fix promised is kept first, because the
+    # degrade blanks the path and the route notes below need it.
+    promised_preview = {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -14574,6 +14888,16 @@ def _handle_finish_dry_run(
             f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
             "Connector declaration holds; it degrades to manual, naming the file."
         )
+    # The same notes the real run adds. The preview reads no pull request, so
+    # it leaves alone every fix the real run would refuse, write or decline.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        set(unwritten_sweep_fixes(findings, manifest, promised_preview, degraded, audit_id, []))
+        if findings and manifest is not None
+        else set(),
+        prefix="DRY RUN: ",
+    )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -15777,6 +16101,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if remaining and has_run_record(audit_id, repo):
         raise ValidationError(unwritten_refusal_message(remaining, skipped))
     write_generated_fixes(findings, planned, root)
+    # After every pass that changes a remediation, so the notes describe the
+    # remediation that is published. A fix the refusal path handled (written,
+    # declined, or carried by a pull request) is left as that path wrote it.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        {fid for fid in unwritten if fid in declines or fid in planned or fid in answered},
+    )
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the

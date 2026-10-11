@@ -2471,7 +2471,7 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
-    obtainability-planted-orphan-service) echo 900 ;;
+    obtainability-planted-orphan-service | obtainability-manual-names-reconciler) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
@@ -2576,7 +2576,7 @@ unit_delegation_timeout() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere) echo 3000 ;;
-    obtainability-planted-orphan-service) echo 3000 ;;
+    obtainability-planted-orphan-service | obtainability-manual-names-reconciler) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }

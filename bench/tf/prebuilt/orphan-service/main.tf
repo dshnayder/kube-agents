@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/obtainability-planted-orphan-service.
+# The scenario driver for bench/tasks/obtainability-planted-orphan-service,
+# and for bench/tasks/obtainability-manual-names-reconciler, which sets
+# helm_release_name.
 #
 # It plants ONE ClusterIP Service in ONE otherwise empty namespace on the host
 # cluster, whose selector matches no pod: the shape the obtainability-audit
@@ -65,6 +67,7 @@ resource "null_resource" "defect" {
       local.service,
       var.selector_value,
       var.host_cluster_name,
+      var.helm_release_name,
     ]))
   }
 
@@ -119,6 +122,16 @@ resource "null_resource" "defect" {
             port: 80
             targetPort: 8080
       MANIFEST
+
+      # The Helm release markers, only when a case asks for them. They are
+      # annotations and nothing else: no release record exists, so no Helm
+      # client and no controller acts on them. The collector reads them as
+      # the object's reconciler.
+      if [ -n "${var.helm_release_name}" ]; then
+        kubectl annotate service "${local.service}" -n "${local.ns}" --overwrite \
+          meta.helm.sh/release-name="${var.helm_release_name}" \
+          meta.helm.sh/release-namespace="${local.ns}"
+      fi
 
       echo "Planted ${local.service} (selects app=${var.selector_value}, which nothing carries) in ${local.ns} on ${var.host_cluster_name}."
     EOT

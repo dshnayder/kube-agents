@@ -68,6 +68,15 @@ variable "selector_value" {
   default     = "eval-orders-api-backend"
 }
 
+# The Helm release that the planted Service's markers name. Empty plants no
+# markers. bench/tasks/obtainability-manual-names-reconciler sets it, and its
+# ledger objective names it; change one and change both.
+variable "helm_release_name" {
+  type        = string
+  description = "Helm release named by the Service's meta.helm.sh annotations; empty adds none"
+  default     = ""
+}
+
 variable "prow_build_id" {
   type        = string
   description = "Prow BUILD_ID of the run creating this infra"

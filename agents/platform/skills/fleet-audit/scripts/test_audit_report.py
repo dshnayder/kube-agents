@@ -18354,6 +18354,276 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("DECLINED: " + declined(doc)[1], self.err)
 
 
+class TestManualRemediationRoutes(unittest.TestCase):
+    """`finish` names where a `manual` fix belongs, from the collector's
+    candidate fields, and removes the worker's false "not declared" claim --
+    see `audit_report.disclose_manual_remediation_routes` and
+    `audit_report.retract_contradicted_declaration_denials`.
+    """
+
+    CHECK = "probes-liveness"
+    WORKER_NOTE = "Add a liveness probe that the owner chooses."
+
+    def manifest(self, **fields):
+        candidate = {**_cand(self.CHECK, "c1", "Deployment/a", "web"), "severity": "minor", **fields}
+        return _manifest(("c1", [candidate]))
+
+    def manual(self, note=WORKER_NOTE, rationale="A wedged process is never restarted."):
+        finding = _pub("a", self.CHECK, "c1", "Deployment/a", namespace="web")
+        finding["remediation"] = {"kind": "manual", "note": note}
+        finding["recommendation"] = {**finding["recommendation"], "rationale": rationale}
+        return finding
+
+    def disclose(self, finding, manifest, skip=frozenset()):
+        return audit_report.disclose_manual_remediation_routes([finding], manifest, skip)
+
+    def note(self, finding):
+        return finding["remediation"]["note"]
+
+    def test_a_declared_object_names_its_file(self):
+        finding = self.manual()
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml", "directory": "apps/web"})
+        self.assertEqual(self.disclose(finding, manifest), ["a"])
+        self.assertEqual(
+            self.note(finding),
+            self.WORKER_NOTE + " _(Declared in this repository at `apps/web/a.yaml`. "
+            "Make the change in the repository, not on the live object.)_",
+        )
+
+    def test_a_chart_rendered_object_names_the_release_file_and_says_a_patch_is_reverted(self):
+        finding = self.manual()
+        manifest = self.manifest(release_declaration={"path": "argocd/apps/web.yaml", "renderer": "helm"})
+        self.assertEqual(self.disclose(finding, manifest), ["a"])
+        self.assertIn(
+            "_(Rendered by the chart release declared at `argocd/apps/web.yaml`. Make the change "
+            "in that file: the release reverts a patch to the live object.)_",
+            self.note(finding),
+        )
+
+    def test_an_overlay_is_not_called_a_chart(self):
+        """An overlay has no values file, so "the chart release" sends the
+        reader to look for one."""
+        for renderer, noun in {"kustomize": "the Kustomize overlay", "": "the release"}.items():
+            with self.subTest(renderer=renderer):
+                finding = self.manual()
+                self.disclose(finding, self.manifest(release_declaration={"path": "x.yaml", "renderer": renderer}))
+                self.assertIn(f"Rendered by {noun} declared at `x.yaml`", self.note(finding))
+                self.assertNotIn("chart release", self.note(finding))
+
+    def test_a_namespace_directory_names_where_a_new_object_belongs(self):
+        finding = self.manual()
+        manifest = self.manifest(namespace_directory={"path": "clusters/c1/web", "source": "sibling"})
+        self.assertEqual(self.disclose(finding, manifest), ["a"])
+        self.assertIn("_(A new object for this namespace belongs under `clusters/c1/web`.)_", self.note(finding))
+
+    def test_a_reconciled_object_says_a_change_by_hand_is_reverted(self):
+        for reconciler in ("the Argo CD Application `web`", "the Helm release `web` in web", "`flux`"):
+            with self.subTest(reconciler=reconciler):
+                finding = self.manual()
+                self.assertEqual(self.disclose(finding, self.manifest(reconciler=reconciler)), ["a"])
+                self.assertIn(
+                    f"_(Reconciled by {reconciler}. A change made by hand to the live object is reverted",
+                    self.note(finding),
+                )
+
+    def test_one_location_note_and_the_reconciler_beside_it(self):
+        """The object's own file is the most specific answer; the directory
+        for a new object would only add a second place to look."""
+        finding = self.manual()
+        manifest = self.manifest(
+            declaration={"path": "apps/web/a.yaml"},
+            namespace_directory={"path": "apps/web"},
+            reconciler="the Argo CD Application `web`",
+        )
+        self.disclose(finding, manifest)
+        note = self.note(finding)
+        self.assertIn("Declared in this repository at `apps/web/a.yaml`", note)
+        self.assertNotIn("belongs under", note)
+        self.assertLess(note.index("Declared in"), note.index("Reconciled by"))
+
+    def test_a_candidate_without_the_fields_gets_no_note(self):
+        """A missing `declaration` is no claim that nothing declares the
+        object, so there is no "not declared" note."""
+        finding = self.manual()
+        self.assertEqual(self.disclose(finding, self.manifest()), [])
+        self.assertEqual(self.note(finding), self.WORKER_NOTE)
+        self.assertEqual(self.disclose(finding, None), [])
+
+    def test_only_a_manual_remediation_gets_a_note(self):
+        finding = self.manual()
+        finding["remediation"] = {"kind": "manifest", "path": "apps/web/a.yaml", "note": "x"}
+        self.assertEqual(self.disclose(finding, self.manifest(reconciler="`flux`")), [])
+        self.assertEqual(self.note(finding), "x")
+
+    def test_a_fix_the_refusal_path_handled_is_left_alone(self):
+        finding = self.manual()
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"}, reconciler="`flux`")
+        self.assertEqual(self.disclose(finding, manifest, skip={"a"}), [])
+        self.assertEqual(self.note(finding), self.WORKER_NOTE)
+
+    def test_a_path_the_worker_already_named_is_not_named_again(self):
+        worker = "Edit `argocd/apps/web.yaml` and set livenessProbe in the values."
+        finding = self.manual(note=worker)
+        manifest = self.manifest(
+            release_declaration={"path": "argocd/apps/web.yaml", "renderer": "helm"}, reconciler="`flux`"
+        )
+        self.disclose(finding, manifest)
+        self.assertNotIn("Rendered by", self.note(finding))
+        self.assertEqual(self.note(finding).count("argocd/apps/web.yaml"), 1)
+        self.assertIn("Reconciled by `flux`", self.note(finding))
+        # Nothing to add at all: the note is left as the worker wrote it.
+        finding = self.manual(note=worker)
+        self.assertEqual(self.disclose(finding, self.manifest(release_declaration={"path": "argocd/apps/web.yaml"})), [])
+        self.assertEqual(self.note(finding), worker)
+
+    def test_a_second_pass_and_a_copied_note_do_not_stack(self):
+        """A worker that copies the previous ledger brings the old note back,
+        maybe with a path that has since moved."""
+        manifest = self.manifest(declaration={"path": "apps/new/a.yaml"}, reconciler="`flux`")
+        finding = self.manual()
+        self.disclose(finding, manifest)
+        once = self.note(finding)
+        self.assertEqual(self.disclose(finding, manifest), [])
+        self.assertEqual(self.note(finding), once)
+        stale = audit_report.DECLARED_NOTE.format(path="apps/old/a.yaml")
+        copied = self.manual(note=f"{self.WORKER_NOTE} {stale}")
+        self.disclose(copied, manifest)
+        self.assertEqual(self.note(copied), once)
+
+    def test_the_note_stays_inside_the_cap_and_the_route_note_survives_the_render(self):
+        finding = self.manual(note="x" * audit_report.MAX_NOTE_CHARS)
+        manifest = self.manifest(release_declaration={"path": "argocd/apps/web.yaml", "renderer": "helm"})
+        self.disclose(finding, manifest)
+        note = self.note(finding)
+        self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+        self.assertIn("…(truncated)", note)
+        self.assertTrue(note.endswith("the release reverts a patch to the live object.)_"))
+        rendered = "\n".join(audit_report.render_finding(finding))
+        self.assertIn("the release reverts a patch to the live object.)_", rendered)
+
+    def test_a_false_denial_is_removed_where_the_collector_found_the_declaration(self):
+        for name, fields in {
+            "declaration": {"declaration": {"path": "apps/web/a.yaml"}},
+            "release": {"release_declaration": {"path": "argocd/apps/web.yaml", "renderer": "helm"}},
+        }.items():
+            with self.subTest(name):
+                finding = self.manual(
+                    note="Probe YAML is never generated by this check; the object is not declared in the GitOps repository.",
+                    rationale="No file in this repository declares this Deployment. A wedged process is never restarted.",
+                )
+                retracted = audit_report.retract_contradicted_declaration_denials([finding], self.manifest(**fields))
+                self.assertEqual(retracted, ["a"])
+                self.assertEqual(self.note(finding), "Probe YAML is never generated by this check.")
+                self.assertEqual(finding["recommendation"]["rationale"], "A wedged process is never restarted.")
+
+    def test_a_denial_that_may_be_true_is_kept(self):
+        """A namespace directory says where a new object goes, not that this
+        object is declared; and a candidate with no field says nothing."""
+        denial = "It runs fine. The repository does not declare this Deployment."
+        for name, fields in {
+            "a namespace directory only": {"namespace_directory": {"path": "clusters/c1"}},
+            "a reconciler only": {"reconciler": "`flux`"},
+            "no field": {},
+        }.items():
+            with self.subTest(name):
+                finding = self.manual(note=denial)
+                self.assertEqual(
+                    audit_report.retract_contradicted_declaration_denials([finding], self.manifest(**fields)), []
+                )
+                self.assertEqual(self.note(finding), denial)
+
+    def test_the_retraction_honours_the_skip_and_keeps_a_text_that_is_only_a_denial(self):
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"})
+        denial = "Not declared in the repository."
+        finding = self.manual(note=f"Keep. {denial}")
+        self.assertEqual(audit_report.retract_contradicted_declaration_denials([finding], manifest, {"a"}), [])
+        only = self.manual(note=denial, rationale=denial)
+        self.assertEqual(audit_report.retract_contradicted_declaration_denials([only], manifest), [])
+        self.assertEqual(self.note(only), denial)
+
+    def test_the_retraction_keeps_the_harness_notes(self):
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"})
+        finding = self.manual(note="Not declared in the GitOps repository; add a probe.")
+        audit_report.disclose_manual_routes_and_log([finding], manifest, set())
+        audit_report.disclose_manual_routes_and_log([finding], manifest, set())
+        self.assertEqual(
+            self.note(finding),
+            "add a probe. " + audit_report.DECLARED_NOTE.format(path="apps/web/a.yaml"),
+        )
+
+
+class TestManualRemediationRoutesInFinish(HarnessTestCase):
+    """The wiring: what reaches the ledger body, in the real run and in the
+    preview, and the fix the refusal path handled."""
+
+    RELEASE_NOTE_FRAGMENT = "Make the change in that file: the release reverts a patch to the live object."
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def candidate(self, **fields):
+        return {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments",
+            "impact": "x",
+            "needs_triage": None,
+            **fields,
+        }
+
+    def manual_doc(self):
+        finding = make_finding(remediation={"kind": "manual", "note": "Write a default-deny policy."})
+        return make_doc(findings=[finding])
+
+    def test_the_real_run_publishes_the_release_note(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        manifest = _full_manifest(
+            candidates=[self.candidate(release_declaration={"path": "argocd/apps/payments.yaml", "renderer": "helm"})]
+        )
+        rc = self.run_finish(self.manual_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn("declared at `argocd/apps/payments.yaml`. " + self.RELEASE_NOTE_FRAGMENT, body)
+        self.assertIn("now names where the fix belongs", self.err)
+
+    def test_the_dry_run_previews_the_release_note(self):
+        manifest = _full_manifest(
+            candidates=[self.candidate(release_declaration={"path": "argocd/apps/payments.yaml", "renderer": "helm"})]
+        )
+        rc = self.run_finish(self.manual_doc(), ["--dry-run", "--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(self.RELEASE_NOTE_FRAGMENT, self.out)
+
+    def test_a_declined_fix_keeps_the_decline_and_gets_no_route_note(self):
+        """A declared `manual` fix the sweep would open is refused until it is
+        written or declined; the decline is the published answer."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        # A check on the `major` sweep, so a declared `manual` fix is refused.
+        check, obj = "unbound-sa-automount", "Deployment/api"
+        finding = make_finding(
+            check=check, obj=obj, remediation={"kind": "manual", "note": "Set the field on the pod template."}
+        )
+        doc = make_doc(findings=[finding])
+        manifest = _full_manifest(
+            candidates=[self.candidate(check=check, object=obj, declaration={"path": "clusters/payments/api.yaml"})]
+        )
+        argv = ["--manifest-file", self.manifest_file(manifest)]
+        self.assertEqual(self.run_finish(doc, argv), 2)
+        self.assertEqual(self.run_finish(doc, [*argv, *declined(doc)]), 0, self.err)
+        body = "".join(self.harness.bodies_for("issue-*"))
+        self.assertIn(DECLINE_REASON, body)
+        self.assertNotIn(audit_report.DECLARED_NOTE_LEDE, body)
+
+
 class TestTriageMarkedFindings(BaseTestCase):
     """A finding the collector stands behind whose *fix* it cannot vouch for.
 

@@ -614,6 +614,19 @@ it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudge
 collector's `pod_selector`, in a new file beside the declaration; a decline of that budget stands
 only when its reason carries the URL of the pull request already carrying it. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
 
+After these passes, `finish` adds to each `manual` remediation a note that tells the reader where
+the fix belongs. The note comes only from the collector's candidate for the same finding id. There
+is one location note at most: the `declaration` file, or else the `release_declaration` file with
+the fact that the release reverts a patch to the live object, or else the `namespace_directory`
+where a new object belongs. A `reconciler` adds a second note: a change made by hand is reverted.
+A note whose path the worker's note already names is not written. A candidate without these fields
+gets no note, because a missing `declaration` is not a claim that no file declares the object. A
+fix that the refusal path wrote, declined, or found in a pull request keeps the text that path
+gave it. Where the candidate carries `declaration` or `release_declaration`, `finish` also removes
+the worker's clauses that say the repository does not declare the object, from the note and from
+`recommendation.rationale`. The worker's note is cut first when the total is longer than the note
+cap, so the route notes stay in the rendered row. The dry run shows the same notes.
+
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
 `refused` key of its exit JSON so the acknowledgement comment can say so — while the rest of the

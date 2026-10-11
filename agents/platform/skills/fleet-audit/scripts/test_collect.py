@@ -147,7 +147,7 @@ class TestReconcilerOf(unittest.TestCase):
     All three markers are written at apply time and sit in the dump every check
     already runs on, so naming the reconciler costs no extra call. The phrase
     ends up in the remediation note of any `manual` finding on the object --
-    `audit_report.disclose_reconciled_manual_remediations` -- which is why each
+    `audit_report.disclose_manual_remediation_routes` -- which is why each
     one names the release or Application rather than saying "something".
     """
 
@@ -9346,7 +9346,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertEqual(endpoint[0]["reconciler"], ARGO_PHRASE)
 
     def test_an_unreconciled_endpoint_omits_the_key_rather_than_carrying_none(self):
-        """`disclose_reconciled_manual_remediations` reads the field with a
+        """`disclose_manual_remediation_routes` reads the field with a
         truth test, but the candidate is also what `derive_finding_id` and the
         ledger diff hash over: a `reconciler: null` key on every unmanaged
         object is churn in the stored manifest for no reader's benefit."""

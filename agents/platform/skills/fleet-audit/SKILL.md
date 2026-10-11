@@ -756,6 +756,13 @@ field, and publishes nothing:
   missing parents and commit the file happily. A manifest in a directory the deploying tool does not
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
   then returns next run as `pr-merged-persists`, where neither documented explanation fits.
+- **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
+  It names the `declaration` file, or else the `release_declaration` file (a patch to the live
+  object is reverted), or else the `namespace_directory` for a new object. It also names the
+  `reconciler` that reverts a change made by hand. It writes no note for a candidate without these
+  fields, and none for a fix that the refusal below wrote, declined, or found in a pull request. It
+  removes a clause that says the repository does not declare the object when the candidate carries
+  `declaration` or `release_declaration`. Do not copy these notes into your `note`.
 
 ### Scope, skipped, and limitations
 

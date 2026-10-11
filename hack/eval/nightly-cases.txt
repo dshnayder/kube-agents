@@ -755,3 +755,10 @@
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# The obtainability stream's route-note case (#2686): the orphan-service
+# plant again, in its own namespace, with Helm release markers on the
+# Service. Graded on the note `finish` adds to the manual remediation of a
+# reconciled object (audit_report.disclose_manual_remediation_routes). Priced
+# with the 900s audit band.
+./tasks/obtainability-manual-names-reconciler/task.yaml
