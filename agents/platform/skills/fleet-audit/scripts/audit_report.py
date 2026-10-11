@@ -12568,16 +12568,18 @@ def unwritten_refusal_message(
                 + "; ".join(f"{fid}: {why}" for fid, why in noted)
                 + "."
             )
-            if any(KUSTOMIZE_ROOT_REASON in why for _, why in noted):
+            kustomized = [fid for fid, why in noted if KUSTOMIZE_ROOT_REASON in why]
+            if kustomized:
                 # One remediation cannot carry the new file and the kustomization
                 # edit, and `degrade_unlisted_kustomize_additions` makes such a
                 # `manifest` fix `manual`. So the worker writes it `manual` with
                 # what a person needs, and declines it, or the refusal repeats.
                 parts.append(
-                    "In a Kustomize root, a new file renders only if its kustomization "
-                    "lists it, and a remediation carries one file, so `finish` makes a "
-                    "`manifest` fix that adds an unlisted file there `manual`. For each "
-                    "of these, do not write a `manifest`: keep it `kind: manual`, put the "
+                    f"{', '.join(kustomized)}: in a Kustomize root, a new file renders "
+                    "only if its kustomization lists it, and a remediation carries one "
+                    "file, so `finish` makes a `manifest` fix that adds an unlisted file "
+                    "there `manual`. For these, and only these, do not write a "
+                    "`manifest`: keep it `kind: manual`, put the "
                     "new file's content and the `resources:` line it needs in "
                     "`remediation.note`, and pass `--decline-fix <id> \"<why>\"` that "
                     "names the kustomization."
@@ -12762,11 +12764,12 @@ class _RepositoryProbe:
         # `--full-tree` makes the paths relative to the top of the clone,
         # wherever the process stands; literal, so no path is read as a glob.
         listed = git(
-            ["--literal-pathspecs", "ls-tree", "--full-tree", "--name-only", AUDITED_REF, "--", *wanted],
+            ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", "--name-only", AUDITED_REF, "--", *wanted],
             check=False,
             cwd=self.root,
         )
-        found = set((listed.stdout or "").splitlines())
+        # `-z`: names end in NUL and are not quoted, so a non-ASCII path matches.
+        found = set((listed.stdout or "").split("\0"))
         why = f"git ls-tree: exit {listed.returncode}" if listed.returncode != 0 else ""
         for path in wanted:
             self._committed[path] = (True, why) if why else (path in found, "")
@@ -12848,7 +12851,13 @@ class _WorkingTreeProbe(_RepositoryProbe):
     """A probe for a dry run, which asks git nothing and opens no broker session.
 
     It reads the clone's working tree, and it takes each file a finding names
-    as new, because only git can say if the file is at the audited commit."""
+    as new, because only git can say if the file is at the audited commit.
+    The real run ignores a kustomization the worker wrote. The dry run can
+    see only the ones a finding names (`written`), and it ignores those too."""
+
+    def __init__(self, repo: str, root: Path, written: set[str] | None = None) -> None:
+        super().__init__(repo, root)
+        self.written = written or set()
 
     def ask_committed(self, paths: list[str]) -> None:
         return
@@ -12856,6 +12865,8 @@ class _WorkingTreeProbe(_RepositoryProbe):
     def committed(self, path: str) -> bool:
         # Only a kustomization can be "there"; any other file counts as new.
         self.unanswered = ""
+        if path in self.written:
+            return False
         return PurePosixPath(path).name in KUSTOMIZATION_FILE_NAMES and (self.root / path).is_file()
 
     def read_committed(self, path: str) -> str | None:
@@ -13276,21 +13287,26 @@ def degrade_missing_remediations(
     return degraded
 
 
-def _nearest_kustomization(path: PurePosixPath, probe: "_RepositoryProbe") -> tuple[PurePosixPath, str] | None:
-    """`(directory, kustomization)` for the Kustomize root nearest to `path`, or None.
+def _nearest_kustomization(
+    path: PurePosixPath, probe: "_RepositoryProbe"
+) -> tuple[PurePosixPath, str, str] | None:
+    """`(directory, kustomization, why)` for the Kustomize root nearest to `path`, or None.
 
     The search starts in the file's own directory and goes up to the top of the
-    repository. It reads the audited commit, so a kustomization the worker
-    wrote this run does not count. A probe that cannot get an answer takes a
-    yes, so the caller then reads a kustomization that may not be there, and
-    reports that it could not. The rule is the planner's rule for its own
-    PodDisruptionBudget, and it assumes that the GitOps tool applies each
-    Kustomize root through its kustomization."""
+    repository, the top included: a kustomization there makes the whole
+    repository one Kustomize root. It reads the audited commit, so a
+    kustomization the worker wrote this run does not count. The rule is the
+    planner's rule for its own PodDisruptionBudget, and it assumes that the
+    GitOps tool applies each Kustomize root through its kustomization.
+
+    `why` is not empty when the probe could not get an answer. The probe then
+    takes a yes for a path it did not see, so `directory` and `kustomization`
+    are only the first place it asked, and the caller must not name them."""
     for parent in path.parents:
         for marker in KUSTOMIZATION_FILE_NAMES:
             candidate = str(parent / marker)
             if candidate != str(path) and probe.committed(candidate):
-                return parent, candidate
+                return parent, candidate, probe.unanswered
     return None
 
 
@@ -13399,10 +13415,10 @@ def degrade_unlisted_kustomize_additions(
         nearest = _nearest_kustomization(path, probe)
         if nearest is None:
             continue
-        directory, kustomization = nearest
+        directory, kustomization, unseen = nearest
         entry = _kustomize_entry(path, directory)
-        text = probe.read_committed(kustomization)
-        unread = probe.unanswered if text is None else ""
+        text = None if unseen else probe.read_committed(kustomization)
+        unread = probe.unanswered if text is None and not unseen else ""
         listed = text is not None and re.search(
             KUSTOMIZE_ENTRY_BEFORE + re.escape(entry) + KUSTOMIZE_ENTRY_AFTER, text
         )
@@ -13411,7 +13427,16 @@ def degrade_unlisted_kustomize_additions(
         line = f"`- {entry}`"
         # A kustomization that was read is there, so only these two are open.
         why = unread or unchecked_new
-        if why:
+        if unseen:
+            # The probe saw no kustomization, so the note names none.
+            reason = (
+                f"could not check whether the directory of `{path}` is under a "
+                f"kustomization ({unseen}). A new file in a Kustomize root renders "
+                "only if its kustomization lists it. If its directory or a parent "
+                "directory holds a kustomization, make sure that `resources:` there "
+                "lists the file, then apply the recommendation above by hand"
+            )
+        elif why:
             reason = (
                 f"could not check whether `{kustomization}` lists the file `{path}` ({why}). "
                 f"A new file in a Kustomize root renders only if its kustomization lists it. "
@@ -14869,7 +14894,7 @@ def _handle_finish_dry_run(
     # `remediate --dry-run`. A content-mode scratch tree has no `.git`, so the
     # dry run does not preview this pass there.
     if stream_tree is not None and (stream_tree / GIT_DIR_NAME).exists():
-        preview = _WorkingTreeProbe(str(repo or ""), stream_tree)
+        preview = _WorkingTreeProbe(str(repo or ""), stream_tree, set(manifest_paths(findings)))
         for fid in degrade_unlisted_kustomize_additions(copy.deepcopy(findings), preview, noun):
             log(
                 f"DRY RUN: {fid}'s remediation file is in a Kustomize root whose "

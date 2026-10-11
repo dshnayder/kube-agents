@@ -17926,6 +17926,23 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         )
         self.assertNotIn("kustomization.yaml", message)
 
+    def test_the_kustomize_instruction_names_only_the_kustomize_fixes(self):
+        message = audit_report.unwritten_refusal_message(
+            {
+                "a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True),
+                "b": audit_report.UnwrittenFix("apps/b/deploy.yaml", declared=True),
+            },
+            {
+                "a": "apps/a is inside a Kustomize root, where a new file renders only if listed",
+                "b": "the collector attached no selector to write it from",
+            },
+        )
+        self.assertIn("a: in a Kustomize root", message)
+        self.assertNotIn("b: in a Kustomize root", message)
+        self.assertNotIn("a, b: in a Kustomize root", message)
+        self.assertIn("b: the collector attached no selector", message)
+        self.assertIn("For these, and only these", message)
+
     def test_the_refusal_says_why_finish_did_not_write_a_fix(self):
         message = audit_report.unwritten_refusal_message(
             {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
@@ -24229,6 +24246,26 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertIn("could not check", finding["remediation"]["note"])
         self.assertIn("WorkspaceRequestError", finding["remediation"]["note"])
 
+    def test_no_answer_in_a_repository_without_kustomize_names_no_kustomization(self):
+        """The probe takes a yes it did not see; the note must not state a
+        kustomization path as fact."""
+
+        def refused(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
+
+        path = "clusters/prod/apps/web/web-pdb.yaml"
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(path)
+        with patch.object(credential_proxy_client.Workspace, "open", refused), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not check whether the directory of `{path}` is under a kustomization", note)
+        self.assertIn("WorkspaceRequestError", note)
+        self.assertNotIn("kustomization.yaml", note)
+        self.assertNotIn("Kustomization`", note)
+
     def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
         the worker runs `finish` again."""
@@ -24359,7 +24396,25 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.patch_attr("git", lambda args, **kwargs: CompletedProcess(args, 128, "", "fatal"))
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
-        self.assertIn("could not check", finding["remediation"]["note"])
+        note = finding["remediation"]["note"]
+        # Git saw no kustomization, so the note names none.
+        self.assertIn(f"could not check whether the directory of `{self.PDB}` is under a kustomization", note)
+        self.assertNotIn("kustomization.yaml", note)
+
+    def test_a_non_ascii_directory_is_matched(self):
+        """`git ls-tree` quotes a non-ASCII name unless `-z` is given."""
+        overlay = "clusters/prod/apps/café-gateway"
+        files = {
+            f"{overlay}/kustomization.yaml": "resources:\n- deployment.yaml\n",
+            f"{overlay}/deployment.yaml": "kind: Deployment\n",
+        }
+        root = self.clone(files)
+        self.write(root, f"{overlay}/pdb.yaml")
+        finding = kustomize_fix(f"{overlay}/pdb.yaml")
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{overlay}/kustomization.yaml` does not list it", finding["remediation"]["note"])
+        self.write(root, f"{overlay}/deployment.yaml", "kind: Deployment\nspec: {}\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(f"{overlay}/deployment.yaml")]), [])
 
     def test_other_remediation_kinds_are_left_alone(self):
         root = self.clone(self.overlay())
@@ -24451,7 +24506,8 @@ class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
         # What the recorder answers for `git ls-tree` and `git show HEAD:`.
         self.harness.replies = {
             "issue-list": issues_view([]),
-            "ls-tree": f"{self.KUSTOMIZATION}\n",
+            # `git ls-tree -z` ends each name in NUL.
+            "ls-tree": f"{self.KUSTOMIZATION}\0",
             f"show HEAD:{self.KUSTOMIZATION}": "resources:\n" + resources,
         }
         self.touch(self.PATH)
@@ -24512,6 +24568,23 @@ class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
         self.assertIn("kustomization in the working tree does not list it", self.err)
         # A warning only: the preview still shows the pull request.
         self.assertIn("WOULD OPEN", self.err)
+
+    def test_the_dry_run_ignores_a_kustomization_the_worker_wrote(self):
+        """The real run reads the audited commit, where the worker's new
+        sub-kustomization is not; the dry run ignores it the same way."""
+        budgets = "clusters/prod-us-east/budgets"
+        (self.workspace / budgets).mkdir(parents=True)
+        (self.workspace / self.KUSTOMIZATION).write_text("resources:\n- deployment.yaml\n", encoding="utf-8")
+        (self.workspace / budgets / "pdb.yaml").write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        (self.workspace / budgets / "kustomization.yaml").write_text("resources:\n- pdb.yaml\n", encoding="utf-8")
+        findings = [
+            make_finding(fid="pdb", remediation={"kind": "manifest", "path": f"{budgets}/pdb.yaml", "note": ""}),
+            make_finding(fid="sub", remediation={"kind": "manifest", "path": f"{budgets}/kustomization.yaml", "note": ""}),
+        ]
+        self.assertEqual(self.run_finish(make_doc(findings=findings), argv_extra=["--dry-run"]), 0, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertIn(f"DRY RUN: {derived_id(fid='pdb')}'s remediation file is in a Kustomize root", self.err)
+        self.assertIn(f"DRY RUN: {derived_id(fid='sub')}'s remediation file is in a Kustomize root", self.err)
 
 
 if __name__ == "__main__":
