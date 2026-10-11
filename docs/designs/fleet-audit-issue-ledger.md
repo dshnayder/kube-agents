@@ -627,6 +627,22 @@ thirty fixes with zero, and leave the operator to work out which one was to blam
 where _every_ named target is refused is an error, since there is then no partial success to report
 and an exit 0 with an empty list would read as "done".
 
+A second degrade pass follows the missing-file pass in `finish`, in `remediate`, and as a warning in
+the `finish` dry run. Kustomize renders only the files its kustomization lists, and a remediation
+carries one file. Thus a pull request that adds a file to a Kustomize root, but not its entry,
+merges, the GitOps controller reports it in sync, and the finding comes back. The pass makes a
+`manifest` fix `manual` when all three of these are true. The file is new: it is not at the audited
+commit (`HEAD` of the clone, or the broker's base in content mode). A kustomization is in the
+file's directory or a parent directory. The nearest such kustomization does not name the file's
+path relative to its own directory as a whole token, bare or after `./`. Any mention counts, so the
+pass degrades only a file the kustomization cannot render. The note names the kustomization and
+the `resources:` line to add. When git or the broker cannot answer, or the kustomization cannot be
+read, the fix degrades too, and the note says what could not be checked: the audit does not publish
+a pull request it cannot show will render. `finish` does not refuse these fixes as unwritten,
+because the worker cannot correct them in one file, and `remediate` refuses them by name. The dry
+run does not ask git about the audited commit, so it cannot tell a new file from an existing one. It
+takes each file as new, warns, and does not change the body.
+
 Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
 incidental. The agent writes its remediation manifests into the clone _between_ `start` and
 `finish`, and they are untracked until a remediation branch stages them — so a `git clean -fd` on

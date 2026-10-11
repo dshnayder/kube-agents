@@ -1312,6 +1312,14 @@ CLUSTER_TREE_DEPTH = 2
 # How the planner names a declaration inside a Kustomize root, and what the
 # refusal looks for to add the `resources:` instruction.
 KUSTOMIZE_ROOT_REASON = "inside a Kustomize root"
+# How a kustomization names a file it lists: the path relative to the
+# kustomization's directory, bare or after `./`, as one whole token. The
+# entry goes between the two parts, escaped. A directory entry can end in `/`.
+KUSTOMIZE_ENTRY_BEFORE = r"(?<![\w./-])(?:\./)?"
+KUSTOMIZE_ENTRY_AFTER = r"/?(?![\w./-])"
+# The audited commit in directory mode. `start` resets the clone to the base
+# branch, and the worker's fixes stay untracked until a branch stages them.
+AUDITED_REF = "HEAD"
 # The selector keys `policy/v1` takes, and nothing else.
 LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
 # What the finding's ledger row says about a fix `finish` wrote.
@@ -12646,6 +12654,8 @@ class _RepositoryProbe:
         # Content mode's answers to `has_path`, one broker call per path, with
         # why an answer was a default yes.
         self._paths: dict[str, tuple[bool, str]] = {}
+        # Directory mode's answers to `committed`, filled by `ask_committed`.
+        self._committed: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
 
     def broker(self):
@@ -12694,6 +12704,62 @@ class _RepositoryProbe:
             return True
         return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
 
+    def committed(self, path: str) -> bool:
+        """Whether `path` is a file at the audited commit, not only in the tree.
+
+        Directory mode asks git about `HEAD`, because the worker writes its
+        fixes into the clone and `has_path` sees them there. Content mode asks
+        the broker, which lists only the base. An answer the probe cannot get
+        is a yes, and `unanswered` says why, as for `has_path`."""
+        if content_mode():
+            return self.has_path(path)
+        self.ask_committed([path])
+        answer, self.unanswered = self._committed[path]
+        return answer
+
+    def ask_committed(self, paths: list[str]) -> None:
+        """Directory mode: ask git about each of `paths` in one call, for `committed`.
+
+        Content mode does nothing here: the broker answers one path a call."""
+        wanted = [path for path in dict.fromkeys(paths) if path not in self._committed]
+        if content_mode() or not wanted:
+            return
+        # `--full-tree` makes the paths relative to the top of the clone,
+        # wherever the process stands; literal, so no path is read as a glob.
+        listed = git(
+            ["--literal-pathspecs", "ls-tree", "--full-tree", "--name-only", AUDITED_REF, "--", *wanted],
+            check=False,
+            cwd=self.root,
+        )
+        found = set((listed.stdout or "").splitlines())
+        why = f"git ls-tree: exit {listed.returncode}" if listed.returncode != 0 else ""
+        for path in wanted:
+            self._committed[path] = (True, why) if why else (path in found, "")
+
+    def read_committed(self, path: str) -> str | None:
+        """The text of `path` at the audited commit, or None when it cannot be read.
+
+        Directory mode reads `HEAD` and not the working tree: a remediation
+        carries one file, so an edit the worker made to another file in the
+        clone does not go into the pull request. Content mode reads through
+        the broker session. On None, `unanswered` says why."""
+        self.unanswered = ""
+        if not content_mode():
+            shown = git(["show", f"{AUDITED_REF}:{path}"], check=False, cwd=self.root)
+            if shown.returncode != 0:
+                self.unanswered = f"git show {AUDITED_REF}:{path}: exit {shown.returncode}"
+                return None
+            return shown.stdout or ""
+        workspace = self.broker()
+        if workspace is None:
+            self.unanswered = self.unavailable or "the broker could not be opened"
+            return None
+        try:
+            return workspace.read_text(path)
+        except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
+            self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
+            return None
+
     def mentions(self, name: str, prefix: str = "") -> bool:
         """Whether a tracked YAML file under `prefix` has a line whose `name:` is `name`.
 
@@ -12741,6 +12807,29 @@ class _RepositoryProbe:
                 session.__exit__(None, None, None)
             except Exception:  # noqa: BLE001 -- closing a lease is best effort
                 pass
+
+
+class _WorkingTreeProbe(_RepositoryProbe):
+    """A probe for a dry run, which asks git nothing and opens no broker session.
+
+    It reads the clone's working tree, and it takes each file a finding names
+    as new, because only git can say if the file is at the audited commit."""
+
+    def ask_committed(self, paths: list[str]) -> None:
+        return
+
+    def committed(self, path: str) -> bool:
+        # Only a kustomization can be "there"; any other file counts as new.
+        self.unanswered = ""
+        return PurePosixPath(path).name in KUSTOMIZATION_FILE_NAMES and (self.root / path).is_file()
+
+    def read_committed(self, path: str) -> str | None:
+        self.unanswered = ""
+        try:
+            return (self.root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self.unanswered = f"reading {path}: {exc}"
+            return None
 
 
 def plan_generated_fixes(
@@ -13149,6 +13238,122 @@ def degrade_missing_remediations(
             "re-run the audit.)_"
         )
         degraded.append(fid)
+    return degraded
+
+
+def _nearest_kustomization(path: PurePosixPath, probe: "_RepositoryProbe") -> tuple[PurePosixPath, str] | None:
+    """`(directory, kustomization)` for the Kustomize root nearest to `path`, or None.
+
+    The search starts in the file's own directory and goes up to the top of the
+    repository. It reads the audited commit, so a kustomization the worker
+    wrote this run does not count. A probe that cannot get an answer takes a
+    yes, so the caller then reads a kustomization that may not be there, and
+    reports that it could not."""
+    for parent in path.parents:
+        for marker in KUSTOMIZATION_FILE_NAMES:
+            candidate = str(parent / marker)
+            if candidate != str(path) and probe.committed(candidate):
+                return parent, candidate
+    return None
+
+
+def _kustomize_entry(path: PurePosixPath, directory: PurePosixPath) -> str:
+    """The entry that lists `path` in the kustomization in `directory`.
+
+    A new kustomization in a subdirectory is listed by its directory, as
+    Kustomize requires. Any other file is listed by its own path."""
+    target = path.parent if path.name in KUSTOMIZATION_FILE_NAMES else path
+    return str(target.relative_to(directory))
+
+
+def degrade_unlisted_kustomize_additions(
+    findings: list[dict], probe: "_RepositoryProbe", noun: str = DEFAULT_PROPOSAL_NOUN
+) -> list[str]:
+    """Downgrade a `manifest` fix that adds a file its Kustomize root does not list.
+
+    Kustomize renders only the files its kustomization names. A pull request
+    that adds one file to a Kustomize root, and not the `resources:` entry,
+    merges, the GitOps controller reports it in sync, and the finding comes
+    back. A remediation carries one file, so it cannot carry the entry too.
+
+    The rule, for each `manifest` remediation whose file exists:
+
+    - The file is new: it is not in the repository at the audited commit. An
+      edit to a file that is there already is kept.
+    - A kustomization is in the file's directory or a parent directory. The
+      nearest one is the only one that can list the file, because a directory
+      between them has no kustomization, and Kustomize lists a directory only
+      through its own kustomization.
+    - That kustomization's text does not name the file's path relative to the
+      kustomization's directory, bare or after `./`, as a whole token. Any
+      mention counts, also in a comment or under `patches:`. So this pass
+      degrades only a file the kustomization cannot render.
+
+    The finding becomes `manual`, and its note names the kustomization and the
+    `resources:` line a person must add.
+
+    When the probe cannot answer -- git fails, the broker does not answer, or
+    the kustomization cannot be read -- the fix degrades too, with a note that
+    says what could not be checked. This is the direction
+    `degrade_missing_remediations` takes: a fix the audit cannot prove it can
+    deliver is published as `manual`, with the reason, and never as a pull
+    request that can render nothing.
+
+    Run it after `degrade_missing_remediations`, which settles that each path
+    is a readable file inside the repository. Returns the degraded ids.
+    """
+    degraded: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        raw = str(remediation.get("path") or "")
+        if remediation.get("kind") != "manifest" or not raw:
+            continue
+        path = PurePosixPath(raw)
+        # One question to git for the file and every place a kustomization
+        # can be, in directory mode.
+        probe.ask_committed(
+            [str(path)] + [str(parent / marker) for parent in path.parents for marker in KUSTOMIZATION_FILE_NAMES]
+        )
+        if probe.committed(str(path)) and not probe.unanswered:
+            continue
+        unchecked_new = probe.unanswered
+        nearest = _nearest_kustomization(path, probe)
+        if nearest is None:
+            continue
+        directory, kustomization = nearest
+        entry = _kustomize_entry(path, directory)
+        text = probe.read_committed(kustomization)
+        unread = probe.unanswered if text is None else ""
+        listed = text is not None and re.search(
+            KUSTOMIZE_ENTRY_BEFORE + re.escape(entry) + KUSTOMIZE_ENTRY_AFTER, text
+        )
+        if listed:
+            continue
+        line = f"`- {entry}`"
+        # A kustomization that was read is there, so only these two are open.
+        why = unread or unchecked_new
+        if why:
+            reason = (
+                f"could not check whether `{kustomization}` lists the file `{path}` ({why}). "
+                f"A new file in a Kustomize root renders only if its kustomization lists it. "
+                f"Make sure that `resources:` in `{kustomization}` has the line {line}, "
+                "then apply the recommendation above by hand"
+            )
+        else:
+            reason = (
+                f"did not open a {noun} for this fix. `{path}` is a new file in the "
+                f"Kustomize root `{directory}`, and `{kustomization}` does not list it, "
+                "so the file alone renders nothing. To apply the fix, add the file and "
+                f"add the line {line} under `resources:` in `{kustomization}`"
+            )
+        fid = str(finding.get("id", ""))
+        note = str(remediation.get("note", "")).strip()
+        remediation["kind"] = "manual"
+        remediation["path"] = ""
+        remediation["note"] = (f"{note} " if note else "") + f"_(The audit {reason}.)_"
+        degraded.append(fid)
+    # The next probe caller reads `unanswered` for its own question only.
+    probe.unanswered = ""
     return degraded
 
 
@@ -14568,12 +14773,27 @@ def _handle_finish_dry_run(
     # only: the dry run never opens a broker session, and starting one here
     # would make the preview the first thing in the run to need the broker.
     # A content-mode dry run therefore previews no Config Connector degrade.
-    kcc_roots = kcc_declaration_roots(audit_id, derived_workspace(audit_id, repo=repo), record)
+    stream_tree = derived_workspace(audit_id, repo=repo)
+    kcc_roots = kcc_declaration_roots(audit_id, stream_tree, record)
     for fid in degrade_reverted_gcloud_remediations(findings, kcc_roots):
         log(
             f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
             "Connector declaration holds; it degrades to manual, naming the file."
         )
+    # The Kustomize pass, as a warning only. The dry run asks git nothing
+    # about the audited commit, so it cannot tell a new file from an old one; it asks the
+    # question as if each file were new, against the stream's own clone, on a
+    # copy of the findings. Thus the body below does not change, as for
+    # `remediate --dry-run`. A content-mode scratch tree has no `.git`, so the
+    # dry run does not preview this pass there.
+    if stream_tree is not None and (stream_tree / GIT_DIR_NAME).exists():
+        preview = _WorkingTreeProbe(str(repo or ""), stream_tree)
+        for fid in degrade_unlisted_kustomize_additions(copy.deepcopy(findings), preview, noun):
+            log(
+                f"DRY RUN: {fid}'s remediation file is in a Kustomize root whose "
+                "kustomization does not list it. If the file is new, the real run "
+                "publishes it as manual and names the `resources:` line to add."
+            )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -15132,9 +15352,28 @@ def handle_remediate(args: argparse.Namespace) -> None:
             "resolve inside the clone (a `SECURITY:` line above says which). "
             "Write the manifest inside the clone, then ask again."
         )
+    # A new file its kustomization does not list renders nothing, so a pull
+    # request for it is refused the same way: by name, with the rest kept.
+    probe = _RepositoryProbe(repo, root)
+    try:
+        unlisted = set(degrade_unlisted_kustomize_additions(findings, probe, noun))
+    finally:
+        probe.close()
+    for fid in [fid for fid in requested if fid in unlisted]:
+        why = str((by_id[fid].get("remediation") or {}).get("note") or "")
+        log(f"REFUSED {fid}: {why}")
+    refused += [fid for fid in requested if fid in unlisted]
+    requested = [fid for fid in requested if fid not in unlisted]
     if refused and not requested:
         # Nothing survives, so there is no partial success to report and an
         # exit 0 with an empty list would read as "done".
+        if unlisted & set(refused):
+            raise ValidationError(
+                f"--finding: {', '.join(refused)} cannot become a {noun}: the "
+                "remediation path is not a readable file inside the clone, or it "
+                "adds a file its kustomization does not list (the REFUSED lines "
+                "above say which and name the `resources:` line to add)"
+            )
         raise ValidationError(
             f"--finding: the remediation path for {', '.join(refused)} is not a "
             f"readable file inside {root} — it was never written, or it does not "
@@ -15497,6 +15736,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "Connector declaration holds, so it would be reverted on the next "
             "reconcile; it is published as manual, naming the file to change."
         )
+    # After the Config Connector scan, which keeps both of the probe's opens.
+    # A new file in a Kustomize root that its kustomization does not list
+    # renders nothing, so the fix publishes as `manual` and names the
+    # `resources:` line to add. The worker cannot fix this in one file, so
+    # these are not refused as unwritten below.
+    unlisted = degrade_unlisted_kustomize_additions(findings, probe, noun)
+    for fid in unlisted:
+        log(
+            f"WARNING: {fid}'s remediation adds a file its kustomization does not "
+            "list, or the audit could not check it; the finding is published with "
+            "a manual remediation that names the `resources:` line to add."
+        )
 
     # "Absent from this document" only means "fixed" if the audit actually
     # looked. When it could not, resolution is unknowable — so nothing is
@@ -15746,6 +15997,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         promised,
         root,
     )
+    # The worker wrote these fixes, and the Kustomize pass made them `manual`.
+    # A refusal would ask for the same file again, and one file cannot list
+    # itself in its kustomization.
+    unwritten = {fid: fix for fid, fix in unwritten.items() if fid not in unlisted}
     # A fix `finish` can derive is written rather than refused, but only once
     # the run is past the refusal, so a refused run leaves no file behind.
     skipped: dict[str, str] = {}

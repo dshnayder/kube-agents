@@ -1325,6 +1325,15 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   (its clone, or through the broker in content mode) or in a context repo `start` still has checked
   out, it degrades the finding to `manual`, naming the file above the fenced command — because the
   command would be reverted on the next reconcile. A content-mode `--dry-run` does not preview it.
+- **Never write a `manifest` fix that adds a new file to a Kustomize root its kustomization does not
+  list.** Kustomize renders only the files its kustomization names, and a remediation carries one
+  file, so it cannot add the `resources:` entry too. Make such a finding `manual`, and put the
+  manifest and the `resources:` line it needs in `recommendation.action`.
+  Where the file is not in the repository and the nearest kustomization above it (in its directory
+  or a parent) does not name it, `finish` degrades the finding to `manual`. The note names the
+  kustomization and the `resources:` line to add. It does the same when it cannot read the
+  kustomization, and says so. It does not refuse the run for these, and `remediate` refuses them by
+  name. A `--dry-run` only warns, and only in directory mode.
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.

@@ -1,0 +1,159 @@
+# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
+# FIXTURE_NOT_READY (#2686), in no roster file under hack/eval/ until its
+# fixture is in the pool. Red on main and green on the branch that adds
+# `degrade_unlisted_kustomize_additions` to `audit_report.py finish`, on a dev
+# install that carries the fixture below.
+#
+# WHAT THIS GRADES. Kustomize renders only the files its kustomization lists.
+# A remediation carries one file, so a pull request that adds a new
+# PodDisruptionBudget to a Kustomize root, and not its `resources:` entry,
+# merges, Argo CD reports it in sync, and the finding comes back with every
+# signal green. This case puts checkout-gateway's declaration in a Kustomize
+# root. The correct outcome is no pull request, and a `manual` finding whose
+# ledger row names the kustomization and the `resources:` line a person must
+# add.
+#
+# WHY IT IS RED ON MAIN. The candidate carries a `declaration` in the overlay
+# directory, and SOP 3.3 says to write a new PodDisruptionBudget beside the
+# declaration. The SOP sends only a `namespace_directory` of source `overlay`
+# to `manual`, not a `declaration` in a Kustomize root. When the worker writes
+# `manual` first, `finish` refuses it as an unwritten sweep fix, the planner
+# does not write its own budget in a Kustomize root, and the refusal tells
+# the worker to write the file. On main, a worker that writes the new file as
+# `kind: manifest` gets a pull request that adds only that file:
+# the-sweep-opened-no-pull-request goes red. With the guard, `finish` makes
+# that fix `manual`, names the kustomization, and opens nothing.
+#
+# THE FIXTURE. A Kustomize root in the eval GitOps repository that declares
+# Deployment/checkout-gateway in seeded-reliability for the seeded-a cluster
+# (collect.py workload_declarations: the cluster is path segment 2), in a
+# repository nothing reconciles. Plant these two files, and no other file
+# that declares into seeded-reliability (two directories send the SOP's
+# fallback search to `manual`). On a dev fleet applied with a cluster prefix,
+# the directory is clusters/<prefix>-seeded-a/seeded-reliability/.
+#
+#   clusters/seeded-a/seeded-reliability/kustomization.yaml
+#     apiVersion: kustomize.config.k8s.io/v1beta1
+#     kind: Kustomization
+#     resources:
+#       - checkout-gateway.yaml
+#
+#   clusters/seeded-a/seeded-reliability/checkout-gateway.yaml
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     metadata:
+#       name: checkout-gateway
+#       namespace: seeded-reliability
+#     spec:
+#       replicas: 2
+#       selector:
+#         matchLabels:
+#           app: checkout-gateway
+#       template:
+#         metadata:
+#           labels:
+#             app: checkout-gateway
+#         spec:
+#           containers:
+#             - name: gateway
+#               image: registry.k8s.io/pause:3.9
+#
+# CONFLICT WITH obtainability-major-pdb-auto-pr (#2228). That case plants
+# checkout-gateway.yaml at the same path without a kustomization, and needs
+# the generated PodDisruptionBudget. The two fixtures cannot share one
+# repository at the same time: the kustomization would make that case
+# `manual`. Plant this one in a second repository, on a branch the install
+# pins as its base, or for another unbudgeted workload. #2686 records the
+# decision.
+#
+# CONTENT MODE. A declaration in content mode needs the collector to copy
+# the repository's YAML out of the broker (#2233). Without it no candidate
+# carries `declaration`, the worker has no file to write beside, and the
+# case shows nothing.
+#
+# Isolation class: read-only on the cluster; writes the ledger issue only.
+# A remediation pull request is the red.
+id: obtainability-pdb-kustomize-overlay
+name: A new PodDisruptionBudget in a Kustomize overlay is manual and names the resources line
+prompt: >-
+  Run the workload reliability audit against the fleet, following the
+  obtainability-audit SOP. Put the URL of every remediation pull request
+  `finish` reports, opened or still open, on your closing line after the
+  ledger URL.
+expected_output: >-
+  The ledger issue names the checkout-gateway deployment in seeded-reliability
+  as unprotected against drains and upgrades (two replicas, no
+  PodDisruptionBudget). Its declaration is in a Kustomize root, so no
+  remediation pull request opens: a new file there renders only when the
+  kustomization lists it, and a remediation carries one file. The finding is
+  manual, and its ledger row names the kustomization.yaml and the
+  `resources:` line to add. Nothing is applied to the cluster. The closing
+  response is the SOP's one line, carrying the ledger URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: reliability
+
+owner: maintainers
+
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  # As obtainability-planted-pdb: the planted noun is an object name, so it
+  # is checked against the finding id that audit_report.py derives.
+  - name: a-finding-was-filed-against-the-planted-workload
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
+      required_phrases: ["checkout-gateway"]
+  # The guard's note, or the worker's own `manual` recommendation as the SOP
+  # asks for an overlay: either names the kustomization and `resources:`.
+  # The path segment matches the pool's clusters/seeded-a/ and a dev fleet's
+  # clusters/<prefix>-seeded-a/.
+  - name: the-ledger-names-the-kustomization-and-its-resources-line
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      required_phrases: ["seeded-reliability/kustomization.yaml", "resources:"]
+  # The red on main: `finish` opens a pull request that adds only the new
+  # file. github_writes passes on a write, so it sits under `none`. The case
+  # requests no pull request, so any write in its window is the defect.
+  - name: the-sweep-opened-no-pull-request
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: github_writes
+          # gke-agentic/<project>-infra on every pool project. A dev install
+          # that writes to a repository elsewhere needs this cleared locally.
+          owner: gke-agentic
+  # As obtainability-major-pdb-auto-pr: the planted defect survives the audit.
+  - name: the-planted-defect-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created-during-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

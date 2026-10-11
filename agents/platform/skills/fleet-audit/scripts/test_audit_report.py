@@ -23054,7 +23054,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     `Declared-intent search:` line every declaring stream's bodies carry. The JSON line
     carries `publish_s`, the time `finish` used to publish. It reads a real clock, so the
     transcripts record it as a token. No transcript has `inspect_s` or `collect_s`: these
-    runs have no in-flight note and no manifest. Nothing else moved.
+    runs have no in-flight note and no manifest. The Kustomize pass is recorded
+    the same way: for each `manifest` fix, `finish` asks git in one `ls-tree`
+    if the file and each possible kustomization are at the audited commit.
+    That adds two git calls to the findings transcript, one for each of its
+    `manifest` fixes. Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
@@ -24046,6 +24050,321 @@ class TestPhaseTimers(HarnessTestCase):
         )
         self.assertEqual((envelope["inspect_s"], envelope["publish_s"]), (812.4, 21.0))
         self.assertNotIn("collect_s", envelope)
+
+
+# --------------------------------------------------------------------------- #
+# Kustomize: a new file its kustomization does not list renders nothing
+# --------------------------------------------------------------------------- #
+
+
+def kustomize_fix(path, fid="pdb-fix"):
+    """A finding whose `manifest` fix is the new file at `path`."""
+    return make_finding(
+        fid=fid,
+        remediation={"kind": "manifest", "path": path, "note": "Add a PodDisruptionBudget."},
+    )
+
+
+class FakeBrokerWorkspace:
+    """The broker's view of the base: `list` and `read_text` over `files`.
+
+    `fail` names the paths whose read raises, and `list_fails` the prefixes
+    whose listing raises, as a broker that does not answer would."""
+
+    def __init__(self, files, fail=(), list_fails=()):
+        self.files = dict(files)
+        self.fail = set(fail)
+        self.list_fails = set(list_fails)
+
+    def list(self, prefix=None):
+        if prefix in self.list_fails:
+            raise RuntimeError("listing failed")
+        return [{"path": path} for path in self.files if prefix is None or path.startswith(prefix)]
+
+    def read_text(self, path):
+        if path in self.fail or path not in self.files:
+            raise RuntimeError(f"cannot read {path}")
+        return self.files[path]
+
+
+class TestUnlistedKustomizeAdditions(BaseTestCase):
+    """`degrade_unlisted_kustomize_additions` makes a `manifest` fix `manual`
+    when it adds a file that its Kustomize root does not list."""
+
+    OVERLAY = "clusters/prod/apps/checkout-gateway"
+    KUSTOMIZATION = f"{OVERLAY}/kustomization.yaml"
+    PDB = f"{OVERLAY}/checkout-gateway-pdb.yaml"
+
+    # --- directory mode: a real clone, the worker's file untracked --------- #
+
+    def clone(self, committed):
+        """A git clone at a commit that holds `committed`, path to text."""
+        git = shutil.which("git")
+        if git is None:  # pragma: no cover - git is present locally and in CI
+            self.skipTest("git not on PATH")
+        root = self.tmp_path / "clone"
+        root.mkdir()
+
+        def run(*args):
+            subprocess.run([git, *args], cwd=root, check=True, capture_output=True, text=True)
+
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "audit@example.invalid")
+        run("config", "user.name", "audit")
+        for path, text in committed.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        return root
+
+    def write(self, root, path, text="kind: PodDisruptionBudget\n"):
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def degrade(self, root, findings):
+        probe = audit_report._RepositoryProbe("acme/fleet", root)
+        with contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions(findings, probe)
+
+    def overlay(self, resources="- deployment.yaml\n"):
+        return {
+            f"{self.OVERLAY}/deployment.yaml": "kind: Deployment\n",
+            self.KUSTOMIZATION: "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n" + resources,
+        }
+
+    def test_a_new_unlisted_file_in_an_overlay_is_manual_and_names_the_line(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        remediation = finding["remediation"]
+        self.assertEqual((remediation["kind"], remediation["path"]), ("manual", ""))
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", remediation["note"])
+        self.assertIn("`- checkout-gateway-pdb.yaml` under `resources:`", remediation["note"])
+        # The worker's own note stays in front.
+        self.assertTrue(remediation["note"].startswith("Add a PodDisruptionBudget."))
+
+    def test_a_listed_file_is_kept(self):
+        for entry in ("checkout-gateway-pdb.yaml", "./checkout-gateway-pdb.yaml", "'checkout-gateway-pdb.yaml'"):
+            with self.subTest(entry=entry):
+                shutil.rmtree(self.tmp_path / "clone", ignore_errors=True)
+                root = self.clone(self.overlay(f"- deployment.yaml\n- {entry}\n"))
+                self.write(root, self.PDB)
+                finding = kustomize_fix(self.PDB)
+                self.assertEqual(self.degrade(root, [finding]), [])
+                self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_longer_name_that_contains_the_file_name_does_not_list_it(self):
+        root = self.clone(self.overlay("- deployment.yaml\n- old-checkout-gateway-pdb.yaml\n"))
+        self.write(root, self.PDB)
+        self.assertEqual(self.degrade(root, [kustomize_fix(self.PDB)]), ["pdb-fix"])
+
+    def test_an_edit_to_a_file_at_the_audited_commit_is_kept(self):
+        """An existing file is not an addition, listed or not."""
+        files = self.overlay()
+        files[self.PDB] = "kind: PodDisruptionBudget\n"
+        root = self.clone(files)
+        self.write(root, self.PDB, "kind: PodDisruptionBudget\nspec: {}\n")
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_file_outside_any_kustomize_root_is_kept(self):
+        root = self.clone({"clusters/prod/apps/web/deployment.yaml": "kind: Deployment\n"})
+        path = "clusters/prod/apps/web/web-pdb.yaml"
+        self.write(root, path)
+        self.assertEqual(self.degrade(root, [kustomize_fix(path)]), [])
+
+    def test_the_nearest_kustomization_is_the_one_that_must_list_the_file(self):
+        """A parent kustomization that names the file does not render it when
+        a nearer one is between them; a file in a plain subdirectory of the
+        root is listed by its path from the root."""
+        nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"
+        files = self.overlay()
+        files["clusters/prod/kustomization.yaml"] = "resources:\n- apps/checkout-gateway/extra/checkout-gateway-pdb.yaml\n"
+        root = self.clone(files)
+        self.write(root, nested)
+        finding = kustomize_fix(nested)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}`", finding["remediation"]["note"])
+        self.assertIn("`- extra/checkout-gateway-pdb.yaml`", finding["remediation"]["note"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone(self.overlay("- deployment.yaml\n- extra/checkout-gateway-pdb.yaml\n"))
+        self.write(root, nested)
+        self.assertEqual(self.degrade(root, [kustomize_fix(nested)]), [])
+
+    def test_a_new_kustomization_is_listed_by_its_directory(self):
+        sub = f"{self.OVERLAY}/budgets/kustomization.yaml"
+        root = self.clone(self.overlay())
+        self.write(root, sub, "resources:\n- pdb.yaml\n")
+        finding = kustomize_fix(sub)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn("`- budgets`", finding["remediation"]["note"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone(self.overlay("- deployment.yaml\n- budgets/\n"))
+        self.write(root, sub, "resources:\n- pdb.yaml\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(sub)]), [])
+
+    def test_the_worker_tree_does_not_count(self):
+        """A pull request carries one file, so the kustomization is read at
+        the audited commit: the worker's edit to it does not ship, and a
+        kustomization the worker wrote does not make a root."""
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        self.write(root, self.KUSTOMIZATION, "resources:\n- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(self.PDB)]), ["pdb-fix"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone({"clusters/prod/apps/web/deployment.yaml": "kind: Deployment\n"})
+        self.write(root, "clusters/prod/apps/web/kustomization.yaml", "resources: []\n")
+        self.write(root, "clusters/prod/apps/web/web-pdb.yaml")
+        self.assertEqual(self.degrade(root, [kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")]), [])
+
+    def test_an_unreadable_kustomization_degrades_and_says_so(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        real = audit_report.git
+
+        def failing_show(args, **kwargs):
+            if args[:1] == ["show"]:
+                return CompletedProcess(args, 128, "", "fatal: bad object")
+            return real(args, **kwargs)
+
+        self.patch_attr("git", failing_show)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not check whether `{self.KUSTOMIZATION}` lists the file", note)
+        self.assertIn("exit 128", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_a_failed_git_listing_degrades_and_says_so(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        self.patch_attr("git", lambda args, **kwargs: CompletedProcess(args, 128, "", "fatal"))
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn("could not check", finding["remediation"]["note"])
+
+    def test_other_remediation_kinds_are_left_alone(self):
+        root = self.clone(self.overlay())
+        finding = make_finding(remediation={"kind": "manual", "note": "by hand"})
+        self.assertEqual(self.degrade(root, [finding]), [])
+        self.assertEqual(finding["remediation"], {"kind": "manual", "note": "by hand"})
+
+    # --- content mode: the broker holds the base ---------------------------- #
+
+    def degrade_via_broker(self, files, findings, **failures):
+        workspace = FakeBrokerWorkspace(files, **failures)
+        session = mock.MagicMock()
+        session.__enter__.return_value = workspace
+        module = mock.MagicMock()
+        module.Workspace.open.return_value = session
+        self.patch_attr("content_mode", lambda: True)
+        # Content mode runs no git; a call here would be a bug.
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}), contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions(findings, probe, "merge request")
+
+    def test_content_mode_degrades_an_unlisted_new_file(self):
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn("did not open a merge request", note)
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_content_mode_keeps_a_listed_file(self):
+        finding = kustomize_fix(self.PDB)
+        files = self.overlay("- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
+        self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_content_mode_keeps_a_file_on_the_base(self):
+        files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+
+    def test_content_mode_reads_the_nearest_of_nested_roots(self):
+        nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"
+        files = {**self.overlay(), "clusters/prod/kustomization.yaml": "resources:\n- apps/checkout-gateway/extra/checkout-gateway-pdb.yaml\n"}
+        finding = kustomize_fix(nested)
+        self.assertEqual(self.degrade_via_broker(files, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}`", finding["remediation"]["note"])
+
+    def test_content_mode_degrades_an_unreadable_kustomization_and_says_so(self):
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], fail={self.KUSTOMIZATION}), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn("could not check", note)
+        self.assertIn(f"cannot read {self.KUSTOMIZATION}", note)
+
+    def test_content_mode_degrades_when_the_listing_of_the_file_fails(self):
+        """The broker could not say if the file is new; the overlay does not
+        list it, so the fix degrades with the reason."""
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], list_fails={self.PDB}), ["pdb-fix"])
+        self.assertIn("listing failed", finding["remediation"]["note"])
+
+    def test_content_mode_keeps_a_file_outside_any_root(self):
+        finding = kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")
+        self.assertEqual(self.degrade_via_broker({"clusters/prod/apps/web/deployment.yaml": "x"}, [finding]), [])
+
+
+class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
+    """`finish` and `remediate` run the Kustomize pass: no pull request for a
+    file that renders nothing, and no refusal that asks for it again."""
+
+    KUSTOMIZATION = "clusters/prod-us-east/kustomization.yaml"
+    PATH = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def overlay(self, resources="- deployment.yaml\n"):
+        # What the recorder answers for `git ls-tree` and `git show HEAD:`.
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "ls-tree": f"{self.KUSTOMIZATION}\n",
+            f"show HEAD:{self.KUSTOMIZATION}": "resources:\n" + resources,
+        }
+        self.touch(self.PATH)
+
+    def test_finish_publishes_the_unlisted_fix_as_manual_with_the_line(self):
+        self.overlay()
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", body)
+        self.assertIn("`- payments-netpol.yaml`", body)
+        self.assertNotIn("their fix is not written", self.err)
+
+    def test_finish_opens_the_pull_request_for_a_listed_fix(self):
+        self.overlay("- deployment.yaml\n- payments-netpol.yaml\n")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_remediate_refuses_the_unlisted_fix_by_name(self):
+        self.overlay()
+        path = self.write_findings(make_doc())
+        fid = derived_id()
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {fid}", self.err)
+        self.assertIn("`- payments-netpol.yaml`", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_dry_run_warns_and_runs_no_git(self):
+        self.touch(self.PATH)
+        (self.workspace / self.KUSTOMIZATION).write_text("resources:\n- deployment.yaml\n", encoding="utf-8")
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=["--dry-run"]), 0, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertIn("kustomization does not list it", self.err)
+        # A warning only: the preview still shows the pull request.
+        self.assertIn("WOULD OPEN", self.err)
 
 
 if __name__ == "__main__":
