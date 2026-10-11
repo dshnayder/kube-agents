@@ -932,6 +932,15 @@ FINDING_MARKER_RE = re.compile(
 # `FINDING_MARKER_RE` matching it. Model text cannot forge it: every free-text
 # field passes through `publishable_text`, which escapes every comment opener.
 NEW_MARKER = "<!-- finding-new -->"
+# The first line of the banner that a clean close puts at the top of the
+# ledger body (`close_ledger_reads_clean`). A later clean close finds it and
+# adds no second banner. Model text cannot forge it, for the reason given
+# above for `NEW_MARKER`.
+CLEAN_CLOSE_MARKER = "<!-- audit-clean-closed -->"
+# Matches a title that `coverage_issue_title` makes, and no title that
+# `issue_title` makes. `refresh_coverage_ledger` rewrites only a ledger with
+# such a title, so it never rewrites a body that lists findings.
+COVERAGE_TITLE_RE = re.compile(r" — coverage incomplete \(\d+ gaps?, 0 findings\)$")
 # How a finding's heading line starts (`_finding_identity_lines`); the marker
 # goes on the line after it.
 FINDING_HEADING = "#### "
@@ -6991,6 +7000,39 @@ def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
     )
 
 
+def coverage_changed(gaps: list[str], memory: dict | None) -> bool:
+    """Whether this run's coverage gaps are news, compared with the last run.
+
+    A gap that stays the same from run to run is not news after the first
+    run. Before this rule, a gap made every scheduled run speak: the drift
+    stream spoke on 14 runs of 14 with 0 new and 0 resolved findings, because
+    one cluster had no `environment` label. With this rule, it spoke once.
+
+    The answer is True (speak) when:
+
+    - this run has gaps and there is no trusted stored record (`memory` is
+      None: a first run, or a store this run cannot trust);
+    - the stored record does not say which gaps it had (a record seeded from
+      the ledger's hidden block has no `coverage_gaps`);
+    - the set of gaps is not the same as the stored record's set.
+
+    The answer is False when this run has no gaps. A gap that cleared is
+    good news about coverage, but it was silent before this rule too.
+
+    The comparison uses sets, so a change of order is not a change. The gap
+    stays visible where it was before: in the ledger, in `coverage_gaps` on
+    the JSON line and in the stored record, and in the `COVERAGE GAP:` lines
+    of the run log.
+    """
+    if not gaps:
+        return False
+    if memory is None or "coverage_gaps" not in memory:
+        return True
+    return {str(gap) for gap in gaps} != {
+        str(gap) for gap in (memory.get("coverage_gaps") or [])
+    }
+
+
 def delta_block(ids: list[str]) -> str:
     """The hidden, machine-read block that carries this run's finding ids.
 
@@ -11490,6 +11532,123 @@ def fetch_issue_url(repo: str, number: int) -> str | None:
     return (issue.get("url") or None) if isinstance(issue, dict) else None
 
 
+def fetch_issue_title(repo: str, number: int) -> str | None:
+    """The ledger's current title, or None when it could not be read."""
+    answer = try_forge("issue-view", repo, {"number": number})
+    issue = (answer or {}).get("issue")
+    return str(issue.get("title") or "") if isinstance(issue, dict) else None
+
+
+def refresh_coverage_ledger(
+    repo: str,
+    number: int,
+    audit_id: str,
+    gaps: list[str],
+    data: dict,
+    now: datetime,
+    *,
+    live_body: str | None,
+    noun: str,
+) -> str | None:
+    """Rewrite the title and body of an open coverage ledger from this run.
+
+    Returns the body that the forge accepted, or None when this did not
+    rewrite the body. The caller stores the body that the issue really shows,
+    so it must know which one that is (the store's `body_untouched` rule).
+
+    A clean run with a coverage gap keeps its ledger open. Before this
+    function, it only added a comment, so a ledger that a coverage gap opened
+    kept its first title and body for ever. One ledger showed "5 gaps" over a
+    body that was weeks old and that named a cluster deleted since.
+
+    This rewrites only a ledger that a coverage gap opened, for two reasons
+    that must both be true:
+
+    - the title is one that `coverage_issue_title` makes (`COVERAGE_TITLE_RE`);
+    - the live body lists no finding id in its hidden block.
+
+    A ledger that a findings run wrote keeps its body. A rewrite from a run
+    with zero findings would remove findings that this run could not vouch
+    for. A failed read or a failed edit is not fatal: the ledger keeps the
+    previous body, and the caller stores that body.
+    """
+    if live_body is None or parse_delta_block(live_body):
+        return None
+    title = fetch_issue_title(repo, number)
+    if title is None or not COVERAGE_TITLE_RE.search(title):
+        return None
+    body = render_issue_body(
+        data, generated_at=now, audit_id=audit_id, gaps=gaps, noun=noun
+    ).body
+    wanted = coverage_issue_title(audit_id, gaps)
+    # Dropped before the edit, as before every other edit that rewrites the
+    # ledger body (see the note in `_finish`). The caller writes the store
+    # again after this, whatever the edit's result.
+    invalidate_report_memory(audit_id, repo)
+    if try_forge("issue-update", repo, {"number": number, "title": wanted, "body": body}) is None:
+        log(
+            f"WARNING: could not refresh coverage ledger #{number}; it still shows "
+            "the body of an earlier run."
+        )
+        return None
+    log(f"Refreshed coverage ledger #{number}: {wanted}")
+    return body
+
+
+def clean_close_banner(audit_id: str, generated_at: datetime) -> str:
+    """The paragraph at the top of a ledger that a clean run closes.
+
+    Without it, the closed issue shows the body of the last run that had
+    findings: a table where each finding is `open`, under a title that counts
+    them. The closing comment says that the fleet is clean, but it is below
+    the full body, so the first thing a reader sees is wrong.
+
+    The banner goes above the old body and does not replace it. A body from
+    a run with zero findings would be empty, and the closed ledger is the
+    record of what the stream found and what was fixed.
+
+    The banner does not say that a later run reopens this issue. A later run
+    with findings finds no open ledger (`find_existing_issue` lists open
+    issues only), so it opens a new one.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"{CLEAN_CLOSE_MARKER}\n"
+        f"> **Closed as clean on {stamp}.** The `{audit_id}` audit ran again and "
+        "found none of the findings below, so all of them are resolved. The rows "
+        "below still show the state from the last run that had findings. They "
+        "stay as the record of what the audit found. The closing comment lists "
+        "the clusters that this run checked. If a finding comes back, the next "
+        "run opens a new ledger issue."
+    )
+
+
+def close_ledger_reads_clean(
+    repo: str, number: int, audit_id: str, live_body: str | None, now: datetime
+) -> bool:
+    """Give a ledger a `0 findings` title and the clean-close banner.
+
+    The caller does this before it closes the issue. Returns whether the edit
+    was done. A failure is not fatal: the closing comment is posted and the
+    issue closes in either case. If the close then fails, the next run finds
+    the banner (`CLEAN_CLOSE_MARKER`) and adds no second one.
+
+    `live_body` is the body that `find_existing_issue` read, so this needs no
+    read of its own. When it is None, or when the banner would make the body
+    too long for the forge, only the title changes.
+    """
+    payload: dict = {"number": number, "title": issue_title(audit_id, [])}
+    if live_body is not None:
+        body = (
+            live_body
+            if CLEAN_CLOSE_MARKER in live_body
+            else f"{clean_close_banner(audit_id, now)}\n\n{live_body}"
+        )
+        if len(body) <= MAX_BODY_CHARS:
+            payload["body"] = body
+    return try_forge("issue-update", repo, payload) is not None
+
+
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
     """Comments on the ledger, for `/remediate` parsing. Empty on failure.
 
@@ -15696,6 +15855,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     elif memory_lost and not findings:
         gaps.append(LOST_MEMORY_UNGUARDED_GAP)
         log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
+    # Whether the coverage gaps changed since the stored run. Both silence
+    # verdicts below use it instead of the gaps themselves: a gap that did
+    # not change is not news on its fourteenth run (`coverage_changed`).
+    # Calculated once, after the last gap is added, so the two branches
+    # agree. A lost-memory gap always makes it True, because `memory` is None.
+    coverage_moved = coverage_changed(gaps, memory)
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -15779,9 +15944,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     write_generated_fixes(findings, planned, root)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
-    # opens -- and just after the clean close, not here. A close leaves the
-    # body untouched, so the stored memory stays exactly true until it lands,
-    # and a failure on that path (a transient `issue-close`, a terminal
+    # opens, the refresh of an open coverage ledger -- and just after the
+    # clean close, not here. A close adds only a banner above the body and
+    # keeps its id block, so the stored memory stays exactly true until it
+    # lands, and a failure on that path (a transient `issue-close`, a terminal
     # timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
@@ -15956,6 +16122,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
         opened_issue: int | None = None
         opened_body = ""
+        # The body `refresh_coverage_ledger` wrote, when it wrote one.
+        refreshed_body: str | None = None
         held_unread = bool(existing_issue and conversation_unread)
         if held_unread and not gaps and not unaccounted:
             # A clean run that could not read the ledger's conversation cannot
@@ -15990,12 +16158,37 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     ),
                     what="held-open comment over partial coverage",
                 )
-            else:
+            elif (
+                coverage_moved
+                or prs_closed
+                or (memory or {}).get("status") != "CLEAN"
+            ):
                 post_comment(
                     repo,
                     existing_issue,
                     render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun, closed_prs=prs_closed),
                     what="partial all-clear comment",
+                )
+            else:
+                # The stored run was clean too, with the same gaps, so it
+                # already said this on the issue. The same comment on every
+                # run is noise, for the reason `coverage_changed` gives. The
+                # body below shows this run's date and gaps.
+                log(
+                    f"Audit {audit_id}: the coverage gaps are the same as on the "
+                    f"stored clean run, so no partial all-clear comment is posted "
+                    f"on issue #{existing_issue} again."
+                )
+            if not unaccounted and not memory_lost:
+                refreshed_body = refresh_coverage_ledger(
+                    repo,
+                    existing_issue,
+                    audit_id,
+                    gaps,
+                    data,
+                    now,
+                    live_body=existing_body,
+                    noun=noun,
                 )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
@@ -16038,6 +16231,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun),
                 what="all-clear comment",
             )
+            # Before the close, make the title and the top of the body agree
+            # with the close. Without this, the closed issue still counts the
+            # findings in its title and shows each one as `open`.
+            if not close_ledger_reads_clean(repo, existing_issue, audit_id, existing_body, now):
+                log(
+                    f"WARNING: could not change the title and body of issue "
+                    f"#{existing_issue} before the close; it still shows its findings "
+                    "as open. The all-clear comment is posted in either case."
+                )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
             forge(
@@ -16117,10 +16319,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # there. A clean run is the *usual* silent one, but not
             # unconditionally: `resolved > 0` is the fleet getting
             # better and is the best news this audit ever delivers, and
-            # a gap means it could not look rather than found nothing.
+            # a new or changed gap means it could not look rather than
+            # found nothing. A gap that did not change since the stored
+            # run was said on the run that got it (`coverage_changed`).
             "silent_ok": not (
                 clean_resolved
-                or gaps
+                or coverage_moved
                 or prs_closed
                 or unaccounted
                 or held_unread
@@ -16153,7 +16357,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
         # next run's trust check fails as a lost memory should.
-        body_untouched = bool(existing_issue) and bool(gaps or unaccounted or held_unread)
+        body_untouched = (
+            bool(existing_issue)
+            and bool(gaps or unaccounted or held_unread)
+            and refreshed_body is None
+        )
         # `document` stays this run's: it is what a reader asking "what did the
         # last run check, which clusters did it skip" is answered from. The
         # document the untouched body renders rides alongside as
@@ -16171,6 +16379,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 carried = (memory or {}).get("document")
             if isinstance(carried, dict):
                 ledger_document = carried
+        elif refreshed_body is not None:
+            # `refresh_coverage_ledger` rewrote the open ledger from this
+            # run's document, so the body is this run's and lists no ids.
+            # Only the edit's result says this; the store must not assume it.
+            stored_issue = existing_issue
+            stored_body, stored_ids = refreshed_body, []
         else:
             # Either the ledger was just closed or none was open. A closed
             # ledger names no issue in the store: reopened by hand, it is not
@@ -16584,11 +16798,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # them would never be announced. It is not a coverage gap -- the
         # audit looked -- so `partial` stays false and stale pull requests
         # still close; only the verdict refuses to call it quiet.
+        #
+        # A coverage gap is news only when it is new or changed since the
+        # stored run (`coverage_changed`). A gap that stays the same is said
+        # on the run that gets it, and stays in the ledger and on this line.
         "silent_ok": not (
             not delta_known
             or reported_new
             or reported_resolved
-            or gaps
+            or coverage_moved
             or prs_opened
             or prs_closed
             or collector_speaks

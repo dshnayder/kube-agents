@@ -508,14 +508,16 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
-  naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
+  naming the gaps (not again on the next clean run if the gaps did not change). `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
   nor prevents (see [The clean run](#the-clean-run)). A coverage gap self-heals the day the fleet
   is fully readable again; a lost store record does not, and clears only on a run that reports
   findings or when a maintainer who has checked them closes the ledger.
 
-A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
-and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
+A partial run with a new or changed gap is never `[SILENT]` — `finish` returns `silent_ok: false`
+for it. A gap that is the same as on the stored previous run does not stop `silent_ok` on its own.
+Report the issue URL and say which clusters were not covered. See [The clean run](#the-clean-run)
+for the full rule.
 
 ## The findings document
 
@@ -1176,14 +1178,20 @@ closes every remediation pull request still open for the stream. The answers com
 deliberately: a reply posted after the close would land on an issue nobody is watching. The table
 is there because a clean run does not rewrite the body: the comment is the only place the commands
 behind an all-clear are published, and an all-clear nobody can re-run is one nobody can audit
-after the fact.
+after the fact. Before the close, the harness changes the title to `0 findings` and puts a banner
+above the old body. The banner says that the run found none of the findings below, so the closed
+issue does not show them as open. The findings below the banner stay as the record. A later run
+with findings opens a new ledger issue; it does not reopen this one.
 
-**Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
-no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
+**Zero findings plus a coverage gap is not a clean run, and a run with a new or changed gap is not
+silent, even on a stream with no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
 rather than the all-clear phrasing — so the run leaves a durable artifact saying what it could not
 see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
-happened to have a ledger open from the day before.
+happened to have a ledger open from the day before. A later clean run with a gap rewrites the
+title and body of a ledger that a gap opened, so the gap count and the Scope table are this run's.
+It does not rewrite a ledger that a findings run wrote. If the gaps are the same as on the stored
+previous clean run, it posts no second partial all-clear comment.
 
 **Zero findings over a finding the run checked again is not a clean run either.** Before it
 closes, `finish` reads the previous run's stored report — the same findings `start` handed you as `carried`. For
@@ -1220,7 +1228,7 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, no held close, no remediation pull request opened or
+> new, nothing resolved, no new or changed coverage gap, no held close, no remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -1240,8 +1248,11 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
   swallowing this one would leave the operator hearing only bad news.
-- **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
-  nothing" and "I could not look" must not arrive as the same silence.
+- **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
+  fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
+  that is the same as on the stored previous run was said on the run that got it, and is still in
+  the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
+  stored record, every gap counts as new.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same

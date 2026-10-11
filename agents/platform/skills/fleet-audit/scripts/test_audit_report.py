@@ -30,7 +30,7 @@ import threading
 import time
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from unittest import mock
@@ -1031,8 +1031,11 @@ class HarnessTestCase(BaseTestCase):
         """The store directory `finish` keeps for `audit` on `repo`."""
         return self.reports_dir / audit / repo
 
-    def seed_report(self, body, issue=42, repo="acme/fleet", audit=None):
-        """Leave the report store a previous run would have, rendering `body` on `issue`."""
+    def seed_report(self, body, issue=42, repo="acme/fleet", audit=None, **extra):
+        """Leave the report store a previous run would have, rendering `body` on `issue`.
+
+        `extra` adds envelope keys, for example `coverage_gaps` and `status`.
+        """
         audit = audit or self._audit_in_flight or AUDIT
         directory = self.store_dir(audit, repo)
         directory.mkdir(parents=True, exist_ok=True)
@@ -1044,6 +1047,7 @@ class HarnessTestCase(BaseTestCase):
             "current_ids": audit_report.parse_delta_block(body),
             "id_scheme": audit_report.parse_id_scheme(body),
             "document": getattr(self, "previous_document", None) or {"findings": []},
+            **extra,
         }
         (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
 
@@ -15141,6 +15145,238 @@ class TestSilentVerdict(HarnessTestCase):
                 )
 
 
+class TestStandingCoverageGap(HarnessTestCase):
+    """A coverage gap that did not change since the stored run is not news.
+
+    Before this rule, any gap made a scheduled run speak. The drift stream
+    spoke on 14 runs of 14 with nothing new, because one cluster had no
+    `environment` label. A new or changed gap, or a run with no trusted
+    stored record, still speaks.
+    """
+
+    PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+    OTHER = [{"cluster": "dr-east", "reason": "control plane unreachable"}]
+
+    def seed(self, doc, skipped, status="CLEAN", findings_body=None):
+        """Store a previous run that had the gaps `skipped` makes."""
+        body = findings_body or published_body(
+            make_doc(findings=[], skipped=skipped), generated_at=NOW
+        )
+        gaps = audit_report.coverage_gaps(make_doc(findings=[], skipped=skipped))
+        self.seed_report(body, coverage_gaps=gaps, status=status)
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def test_coverage_changed_compares_the_sets(self):
+        self.assertFalse(audit_report.coverage_changed([], None))
+        self.assertTrue(audit_report.coverage_changed(["a"], None))
+        self.assertTrue(audit_report.coverage_changed(["a"], {"status": "CLEAN"}))
+        self.assertFalse(
+            audit_report.coverage_changed(["a", "b"], {"coverage_gaps": ["b", "a"]})
+        )
+        self.assertTrue(audit_report.coverage_changed(["a"], {"coverage_gaps": ["b"]}))
+        self.assertFalse(audit_report.coverage_changed([], {"coverage_gaps": ["b"]}))
+
+    def test_an_unchanged_gap_on_a_clean_run_is_silent(self):
+        self.seed(None, self.PARTIAL)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        out = self.stdout_json()
+        self.assertTrue(out["partial"])
+        self.assertTrue(out["silent_ok"])
+
+    def test_a_changed_gap_on_a_clean_run_speaks(self):
+        self.seed(None, self.OTHER)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
+    def test_a_stored_record_without_gaps_speaks(self):
+        body = published_body(make_doc(findings=[], skipped=self.PARTIAL), generated_at=NOW)
+        self.seed_report(body)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
+    def test_an_unchanged_gap_on_a_findings_run_is_silent(self):
+        # `major` is below the automatic floor, so no pull request is opened.
+        finding = make_finding(fid="a", severity="major")
+        previous = published_body(
+            make_doc(findings=[finding], skipped=self.PARTIAL), generated_at=NOW
+        )
+        self.seed(None, self.PARTIAL, status="UPDATED", findings_body=previous)
+        self.run_finish(make_doc(findings=[finding], skipped=self.PARTIAL))
+        out = self.stdout_json()
+        self.assertEqual((out["status"], out["new"], out["partial"]), ("UPDATED", 0, True))
+        self.assertTrue(out["silent_ok"])
+
+    def test_a_changed_gap_on_a_findings_run_speaks(self):
+        finding = make_finding(fid="a", severity="major")
+        previous = published_body(
+            make_doc(findings=[finding], skipped=self.OTHER), generated_at=NOW
+        )
+        self.seed(None, self.OTHER, status="UPDATED", findings_body=previous)
+        self.run_finish(make_doc(findings=[finding], skipped=self.PARTIAL))
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
+    def test_an_unchanged_gap_posts_no_second_partial_all_clear(self):
+        self.seed(None, self.PARTIAL)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self.harness.forge_calls("issue-comment", number=42), [])
+        self.assertIn("no partial all-clear comment is posted", self.err)
+
+    def test_a_changed_gap_posts_the_partial_all_clear(self):
+        self.seed(None, self.OTHER)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(len(self.harness.forge_calls("issue-comment", number=42)), 1)
+
+    def test_the_first_clean_run_after_findings_posts_the_partial_all_clear(self):
+        # The stored run had findings, so it never said "found nothing".
+        finding = make_finding(fid="a", severity="major")
+        previous = published_body(
+            make_doc(findings=[finding], skipped=self.PARTIAL), generated_at=NOW
+        )
+        self.seed(None, self.PARTIAL, status="UPDATED", findings_body=previous)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(len(self.harness.forge_calls("issue-comment", number=42)), 1)
+
+
+class TestCoverageLedgerRefresh(HarnessTestCase):
+    """A clean run with a gap rewrites the title and body of a coverage ledger.
+
+    Before this, a ledger that a coverage gap opened kept its first title
+    and body for ever, and showed a gap count over a scope table weeks old.
+    """
+
+    PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+    TITLE_KEY = "issue-view !comments number=42"
+
+    def coverage_ledger(self, title=None):
+        """An open ledger that a clean run with one gap opened a week ago."""
+        old_doc = make_doc(findings=[], skipped=self.PARTIAL)
+        body = published_body(old_doc, generated_at=NOW - timedelta(days=7))
+        self.seed_report(
+            body, coverage_gaps=audit_report.coverage_gaps(old_doc), status="CLEAN"
+        )
+        gaps = audit_report.coverage_gaps(old_doc)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            self.TITLE_KEY: issue_view(
+                {"body": body, "title": title or audit_report.coverage_issue_title(AUDIT, gaps)}
+            ),
+        }
+        return body
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def test_the_title_pattern_matches_only_a_coverage_title(self):
+        pattern = audit_report.COVERAGE_TITLE_RE
+        self.assertTrue(pattern.search(audit_report.coverage_issue_title(AUDIT, ["a"])))
+        self.assertTrue(pattern.search(audit_report.coverage_issue_title(AUDIT, ["a", "b"])))
+        self.assertFalse(pattern.search(audit_report.issue_title(AUDIT, [])))
+        self.assertFalse(pattern.search(audit_report.issue_title(AUDIT, [make_finding()])))
+
+    def test_a_coverage_ledger_gets_this_runs_title_and_body(self):
+        old_body = self.coverage_ledger()
+        two_gaps = self.PARTIAL + [{"cluster": "dr-east", "reason": "control plane unreachable"}]
+        doc = make_doc(findings=[], skipped=two_gaps)
+        self.run_finish(doc)
+        edits = [p for p in self.harness.forge_calls("issue-update", number=42) if "body" in p]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(
+            edits[0]["title"],
+            audit_report.coverage_issue_title(AUDIT, audit_report.coverage_gaps(doc)),
+        )
+        self.assertNotEqual(edits[0]["body"], old_body)
+        # The scope table is this run's: it names the gap the old body lacks.
+        self.assertNotIn("dr-east", old_body)
+        self.assertIn("| `dr-east` | control plane unreachable |", edits[0]["body"])
+
+    def test_the_store_records_the_body_the_refresh_wrote(self):
+        self.coverage_ledger()
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        written = self.harness.bodies_for("issue-update")
+        envelope = self.stored()
+        self.assertEqual(envelope["ledger_body"], written[-1])
+        self.assertEqual(envelope["issue_number"], 42)
+        self.assertFalse(envelope["ledger_held_open"])
+        self.assertEqual(envelope["current_ids"], [])
+
+    def test_a_failed_refresh_keeps_the_previous_body_in_the_store(self):
+        old_body = self.coverage_ledger()
+        self.harness.failures = {"issue-update": 1}
+        self.assertEqual(self.run_finish(make_doc(findings=[], skipped=self.PARTIAL)), 0)
+        envelope = self.stored()
+        self.assertEqual(envelope["ledger_body"], old_body)
+        self.assertTrue(envelope["ledger_held_open"])
+        self.assertIn("could not refresh coverage ledger #42", self.err)
+
+    def test_a_findings_title_is_not_refreshed(self):
+        self.coverage_ledger(title=audit_report.issue_title(AUDIT, [make_finding()]))
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self.harness.bodies_for("issue-update"), [])
+
+    def test_a_body_that_lists_findings_is_not_refreshed(self):
+        previous = published_body(make_doc(findings=[make_finding()]), generated_at=NOW)
+        self.seed_report(previous, status="UPDATED", coverage_gaps=[])
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            self.TITLE_KEY: issue_view(
+                {"body": previous, "title": audit_report.coverage_issue_title(AUDIT, ["a"])}
+            ),
+        }
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self.harness.bodies_for("issue-update"), [])
+
+
+class TestCleanCloseBanner(HarnessTestCase):
+    """A clean close makes the closed ledger say that it is clean.
+
+    Before this, the closed issue kept a title that counted the findings and a
+    table that showed each one as `open`.
+    """
+
+    def close_over(self, previous_body):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
+
+    def test_the_close_changes_the_title_and_adds_the_banner_first(self):
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        self.close_over(previous)
+        verbs = [call[1] for call in self.harness.calls if call[0] == "forge"]
+        self.assertLess(verbs.index("issue-update"), verbs.index("issue-close"))
+        edit = self.harness.forge_calls("issue-update", number=42)[0]
+        self.assertEqual(edit["title"], audit_report.issue_title(AUDIT, []))
+        self.assertTrue(edit["body"].startswith(audit_report.CLEAN_CLOSE_MARKER))
+        self.assertTrue(edit["body"].endswith(previous))
+        self.assertIn("Closed as clean on", edit["body"])
+
+    def test_the_banner_does_not_promise_a_reopen(self):
+        # A later run with findings opens a new ledger: the open-ledger search
+        # lists open issues only.
+        banner = audit_report.clean_close_banner(AUDIT, NOW)
+        self.assertNotIn("reopen", banner)
+        self.assertIn("opens a new ledger", banner)
+
+    def test_a_body_with_the_banner_gets_no_second_one(self):
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        bannered = f"{audit_report.clean_close_banner(AUDIT, NOW)}\n\n{previous}"
+        self.close_over(bannered)
+        edit = self.harness.forge_calls("issue-update", number=42)[0]
+        self.assertEqual(edit["body"], bannered)
+        self.assertEqual(edit["body"].count(audit_report.CLEAN_CLOSE_MARKER), 1)
+
+    def test_a_failed_edit_still_closes_the_ledger(self):
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        self.harness.failures = {"issue-update": 1}
+        self.close_over(previous)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        self.assertIn("could not change the title and body of issue #42", self.err)
+
+
 class TestDispatchAndHandover(unittest.TestCase):
     """The ledger URL has to survive the hop from worker to requester.
 
@@ -23054,7 +23290,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     `Declared-intent search:` line every declaring stream's bodies carry. The JSON line
     carries `publish_s`, the time `finish` used to publish. It reads a real clock, so the
     transcripts record it as a token. No transcript has `inspect_s` or `collect_s`: these
-    runs have no in-flight note and no manifest. Nothing else moved.
+    runs have no in-flight note and no manifest. The clean close now sends one
+    `issue-update` before `issue-close`: it changes the title to `0 findings`
+    and puts the clean-close banner above the old body (`close_ledger_reads_clean`).
+    Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
