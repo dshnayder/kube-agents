@@ -937,6 +937,8 @@ NEW_MARKER = "<!-- finding-new -->"
 # adds no second banner. Model text cannot forge it, for the reason given
 # above for `NEW_MARKER`.
 CLEAN_CLOSE_MARKER = "<!-- audit-clean-closed -->"
+# How a date and time shows in a ledger's text, for example in the banner.
+LEDGER_STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # Matches a title that `coverage_issue_title` makes, and no title that
 # `issue_title` makes. `refresh_coverage_ledger` rewrites only a ledger with
 # such a title, so it never rewrites a body that lists findings.
@@ -1143,6 +1145,11 @@ POSTURES_WITHHELD_KEY = "postures_withheld"
 # reported nor explained (`unaccounted_previous_findings`). Non-empty only on
 # a `HELD` result; carried on every JSON line so the field is never absent.
 UNACCOUNTED_KEY = "unaccounted"
+# The ids of findings the stored run listed and this run does not publish,
+# on a run with a coverage gap. A gap holds `resolved` at 0, so without this
+# key a finding could leave the ledger and nothing would say so. On the JSON
+# line only when it is not empty.
+UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -11595,7 +11602,9 @@ def refresh_coverage_ledger(
     return body
 
 
-def clean_close_banner(audit_id: str, generated_at: datetime) -> str:
+def clean_close_banner(
+    audit_id: str, generated_at: datetime, *, had_findings: bool = True
+) -> str:
     """The paragraph at the top of a ledger that a clean run closes.
 
     Without it, the closed issue shows the body of the last run that had
@@ -11607,11 +11616,23 @@ def clean_close_banner(audit_id: str, generated_at: datetime) -> str:
     a run with zero findings would be empty, and the closed ledger is the
     record of what the stream found and what was fixed.
 
+    `had_findings` is False for a ledger whose body lists no finding id: a
+    ledger that a coverage gap opened. Its banner talks about the gap, because
+    there are no findings below it.
+
     The banner does not say that a later run reopens this issue. A later run
     with findings finds no open ledger (`find_existing_issue` lists open
     issues only), so it opens a new one.
     """
-    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    stamp = generated_at.strftime(LEDGER_STAMP_FORMAT)
+    if not had_findings:
+        return (
+            f"{CLEAN_CLOSE_MARKER}\n"
+            f"> **Closed as clean on {stamp}.** This ledger opened for a coverage gap. "
+            f"A complete run of the `{audit_id}` audit found no findings and no "
+            "gap. The closing comment lists the clusters that this run "
+            "checked. If a finding comes back, the next run opens a new ledger issue."
+        )
     return (
         f"{CLEAN_CLOSE_MARKER}\n"
         f"> **Closed as clean on {stamp}.** The `{audit_id}` audit ran again and "
@@ -11642,7 +11663,10 @@ def close_ledger_reads_clean(
         body = (
             live_body
             if CLEAN_CLOSE_MARKER in live_body
-            else f"{clean_close_banner(audit_id, now)}\n\n{live_body}"
+            else (
+                f"{clean_close_banner(audit_id, now, had_findings=bool(parse_delta_block(live_body)))}"
+                f"\n\n{live_body}"
+            )
         )
         if len(body) <= MAX_BODY_CHARS:
             payload["body"] = body
@@ -15861,6 +15885,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Calculated once, after the last gap is added, so the two branches
     # agree. A lost-memory gap always makes it True, because `memory` is None.
     coverage_moved = coverage_changed(gaps, memory)
+    # A gap holds `resolved` at 0, so a finding that the stored run listed
+    # and this run does not publish would leave the ledger with nothing said.
+    # Such a run speaks, also when its gaps did not change. Published means
+    # this run's findings, the postures it withheld, and the held ids. A clean
+    # run after a stored run that was held open is the exception: the stored
+    # run already reported that it found none of the ids the body carries.
+    stored_ledger_ids = set(previous_ids)
+    if not findings and (memory or {}).get("ledger_held_open"):
+        stored_ledger_ids = set()
+    unreported_under_gap = (
+        sorted(stored_ledger_ids - held_exclude - held_ids) if gaps else []
+    )
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -16325,6 +16361,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "silent_ok": not (
                 clean_resolved
                 or coverage_moved
+                or unreported_under_gap
                 or prs_closed
                 or unaccounted
                 or held_unread
@@ -16346,6 +16383,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # their ledger ids; the comment on the issue names each
             # one with the check this run says it ran.
             UNACCOUNTED_KEY: [entry["id"] for entry in unaccounted],
+            # Only when not empty, so a run without it prints the line it
+            # printed before.
+            **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -16807,6 +16847,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             or reported_new
             or reported_resolved
             or coverage_moved
+            or unreported_under_gap
             or prs_opened
             or prs_closed
             or collector_speaks
@@ -16837,6 +16878,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # Only a clean run can be refused its close, so this is always
         # empty here; carried so the line has one shape.
         UNACCOUNTED_KEY: [],
+        # Same key as the CLEAN branch; see the note there.
+        **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }

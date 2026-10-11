@@ -1180,7 +1180,9 @@ is there because a clean run does not rewrite the body: the comment is the only 
 behind an all-clear are published, and an all-clear nobody can re-run is one nobody can audit
 after the fact. Before the close, the harness changes the title to `0 findings` and puts a banner
 above the old body. The banner says that the run found none of the findings below, so the closed
-issue does not show them as open. The findings below the banner stay as the record. A later run
+issue does not show them as open. The findings below the banner are not rewritten; they stay as the
+record. On a ledger that a coverage gap opened, the banner says that a complete run found no
+findings and no gap. A later run
 with findings opens a new ledger issue; it does not reopen this one.
 
 **Zero findings plus a coverage gap is not a clean run, and a run with a new or changed gap is not
@@ -1191,7 +1193,8 @@ notice: four streams did exactly that on 2026-08-03, and the only reason it surf
 happened to have a ledger open from the day before. A later clean run with a gap rewrites the
 title and body of a ledger that a gap opened, so the gap count and the Scope table are this run's.
 It does not rewrite a ledger that a findings run wrote. If the gaps are the same as on the stored
-previous clean run, it posts no second partial all-clear comment.
+previous clean run, it posts no second partial all-clear comment, unless it closed a remediation
+pull request. After a stored run that was not `CLEAN`, it posts the comment.
 
 **Zero findings over a finding the run checked again is not a clean run either.** Before it
 closes, `finish` reads the previous run's stored report — the same findings `start` handed you as `carried`. For
@@ -1253,6 +1256,10 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   that is the same as on the stored previous run was said on the run that got it, and is still in
   the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
   stored record, every gap counts as new.
+- **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
+  this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
+  still speaks. Say in your one line that this many findings are no longer reported while a
+  coverage gap stays, with the issue URL. Do not call them resolved.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same
@@ -1270,8 +1277,10 @@ run's findings are unknowable, so the run announces nothing rather than declarin
 new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
 that rewrites the body deletes the record just before the rewrite, and a clean close deletes it just
 after the close lands, so that a record older than the issue is never trusted; a `finish` that fails
-after either delete leaves the run after it one of these. A held-open run only comments, so a failed
-store write there keeps the record, which still describes the body. It holds nothing it
+after either delete leaves the run after it one of these. A held-open run that only comments keeps
+the record when its store write fails, because the record still describes the body. A held-open run
+that refreshes a coverage ledger rewrites the body: it deletes the record before the edit, and
+stores the body the edit wrote, or the previous body when the edit failed. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
 trusted record. A clean run never closes the ledger (the shield's close of a shared-account pull request aside): the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a

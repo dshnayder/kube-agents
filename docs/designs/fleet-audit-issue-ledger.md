@@ -964,7 +964,8 @@ coverage, and nothing else:
 - Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back. When the stored previous
-  run was also clean and had the same gaps, the comment is not posted again. On a ledger that a gap
+  run was also clean and had the same gaps, the comment is not posted again. It is still posted when
+  the run closed a remediation PR, or when the stored run was not `CLEAN`. On a ledger that a gap
   opened (its title is the `coverage incomplete` title and its id block is empty), the run also
   rewrites the title and body from this run's document, so the gap count and the Scope table are
   current. A ledger that a findings run wrote keeps its body: a rewrite from zero findings would
@@ -974,7 +975,11 @@ coverage, and nothing else:
   "I found nothing" and "I could not look" must not arrive in chat as the same silence. A gap is new
   or changed when no trusted stored record exists, when the record does not list its gaps, or when
   the set of gaps differs from the record's `coverage_gaps`. A gap that did not change does not make
-  the run speak again.
+  the run speak again, unless a finding id that the stored run listed is not in this run's published
+  set (its findings, the postures it withheld, and the held ids). A gap holds `resolved` at 0, so
+  that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
+  those ids under `unreported_under_gap`. A clean run after a stored run that held the ledger open is
+  the exception: that stored run already said it found none of the ids the body carries.
 
 The rule first said that a partial run is never silent, with no exception. That rule made a gap
 that does not go away speak on every scheduled run. Measured over one installation's streams, the
