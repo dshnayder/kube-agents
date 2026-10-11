@@ -109,7 +109,7 @@ def stale_document(audit_report, audit_id):
 
 def seed(audit_report, audit_id, repo, now):
     """Open the stale ledger and store its record. Returns the issue URL."""
-    number, _, _ = audit_report.find_existing_issue(repo, audit_id)
+    number, *_ = audit_report.find_existing_issue(repo, audit_id)
     if number is not None:
         sys.exit(
             f"ERROR: {audit_id} already has open ledger #{number} in {repo}. The harness "

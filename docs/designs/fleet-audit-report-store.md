@@ -70,9 +70,10 @@ it from a fresh one. For the same reason `finish` deletes `latest.json` just bef
 rewrites the ledger: the findings rewrite, the coverage issue a clean run opens, and the refresh of
 an open coverage ledger. A run killed
 between that call and writing the store leaves no envelope rather than one describing the run before.
-The clean close is the exception, and `finish` deletes the file just after it: the close adds a
-banner and a new title and keeps the id block, so until it lands the stored memory still matches the
-open ledger, and a close that fails leaves the memory in place. A run killed between the close and the delete, or a close that
+The clean close is the exception, and `finish` deletes the file just after it: the close leaves the
+body as it was, so until it lands the stored memory is still exactly the open ledger, and a close
+that fails leaves the memory in place. After the close, `finish` adds a banner and a new title to
+the closed issue and keeps the id block. A run killed between the close and the delete, or a close that
 lands on GitHub but reports failure, leaves a record naming an issue that is now closed. A later run
 does not trust it while that issue stays closed, since the trust check needs it to be the open
 ledger; a reader quoting it shows the last findings run as latest until the next run rewrites it.

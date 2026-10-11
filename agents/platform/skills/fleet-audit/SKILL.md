@@ -1178,7 +1178,7 @@ closes every remediation pull request still open for the stream. The answers com
 deliberately: a reply posted after the close would land on an issue nobody is watching. The table
 is there because a clean run does not rewrite the body: the comment is the only place the commands
 behind an all-clear are published, and an all-clear nobody can re-run is one nobody can audit
-after the fact. Before the close, the harness changes the title to `0 findings` and puts a banner
+after the fact. After the close, the harness changes the title to `0 findings` and puts a banner
 above the old body. The banner says that the run found none of the findings below, so the closed
 issue does not show them as open. The findings below the banner are not rewritten; they stay as the
 record. On a ledger that a coverage gap opened, the banner says that a complete run found no
@@ -1255,7 +1255,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
   that is the same as on the stored previous run was said on the run that got it, and is still in
   the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
-  stored record, every gap counts as new.
+  stored record, every gap counts as new. `finish` cannot tell a scheduled run from an on-demand
+  one, so a gap first seen on an on-demand run is not reported again by the next scheduled run.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a

@@ -62,8 +62,9 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   `resolved_because` (#1683) — or, on a run that passed `--manifest-file`, whose candidate the
   collector still emits and the document has not moved under `declared`
   ([collector design §3.3](fleet-audit-collector-manifest.md)). `start` hands the worker the
-  carried findings so it can. Just before the close, the run changes the title to `0 findings` and
-  puts a banner above the old body, so the closed issue does not show its findings as open. The old
+  carried findings so it can. After the close, the run changes the title to `0 findings` and puts a
+  banner above the old body, so the closed issue does not show its findings as open. After and not
+  before: if the close fails, an open ledger must not show an all-clear. The old
   body stays below the banner as the record. A later run with findings opens a new ledger, because
   the open-ledger search lists open issues only.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
@@ -979,7 +980,10 @@ coverage, and nothing else:
   set (its findings, the postures it withheld, and the held ids). A gap holds `resolved` at 0, so
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
   those ids under `unreported_under_gap`. A clean run after a stored run that held the ledger open is
-  the exception: that stored run already said it found none of the ids the body carries.
+  the exception: that stored run already said it found none of the ids the body carries. `finish`
+  cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
+  of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
+  channel, and the next scheduled run with the same gaps does not report it.
 
 The rule first said that a partial run is never silent, with no exception. That rule made a gap
 that does not go away speak on every scheduled run. Measured over one installation's streams, the
@@ -1314,8 +1318,9 @@ for by `checks_not_applicable` does not; a partial clean run leaves the ledger o
 comment, closes no PR, and reports `resolved: 0`; a complete clean run does all four of the opposite
 things. A clean run whose gaps are the same as the stored clean run's posts no second gap comment; a
 clean run with a gap rewrites a coverage ledger's title and body and stores that body, and leaves a
-findings ledger's body alone; a clean close changes the title and adds the banner before the close,
-adds no second banner, and still closes when the edit fails.
+findings ledger's body alone; a clean close changes the title and adds the banner after the close,
+makes no edit when the close fails, adds no second banner, and keeps the old body when the edit
+fails.
 
 **Silence cases** (§7.5): `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
 `false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, or a

@@ -8,11 +8,12 @@ refuses the blocks, falling back to :func:`headline_fallback` when the fetch or
 the parse fails. The caller must fetch only issues in repositories it manages:
 :func:`ledger_ref` takes the repository from the report's own URL. An issue
 not labelled ``agent:audit`` does not parse. A clean run closes its ledger
-without rewriting the title, so a closed issue's counts are the last run's,
-not this one's: a closed ledger is the clean card ("<Name>: clean. Ledger
-closed."), unless the report's line counts a finding; a zero-finding run that could not read the
-whole fleet, or did not account for a carried finding, leaves the ledger open
-over the same old title, so a finding total in the report's line that
+and then retitles it to 0 findings, but its body still lists the last run's
+findings, so the state decides: a closed ledger is the clean card ("<Name>:
+clean. Ledger closed."), unless the report's line counts a finding; a
+zero-finding run that could not read the whole fleet, or did not account for a
+carried finding, leaves the ledger open over the same old title (or a
+refreshed coverage title), so a finding total in the report's line that
 disagrees with the title also falls back, as does a line with no total that
 counts nothing non-zero or calls the run clean, held or carried; a report that
 is only the link keeps the title. The text goes out through

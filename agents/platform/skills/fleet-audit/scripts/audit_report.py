@@ -2890,8 +2890,9 @@ def invalidate_report_memory(audit_id: str, repo: str) -> None:
     after it edits the issue — the terminal's timeout is enough — would leave
     a trusted envelope describing the run before. Gone, it is a lost memory,
     which holds the ledger open rather than miscounting. The clean close calls
-    it just after, because a close leaves the body as it was. The ring is left
-    alone.
+    it just after the close, because the close leaves the body as it was; the
+    banner and the new title that follow keep the id block, and the closed
+    issue is never trusted again anyway. The ring is left alone.
     """
     try:
         (reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME).unlink()
@@ -11457,12 +11458,13 @@ class GitHubLookupError(RuntimeError):
 
 def find_existing_issue(
     repo: str, audit_id: str
-) -> tuple[int | None, str | None, str | None]:
-    """The audit's single open ledger issue, if any: (number, url, body).
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """The audit's single open ledger issue, if any: (number, url, body, title).
 
     Highest number wins. The body rides along in the same listing so the report
     store's memory can be checked against it (`memory_matches_ledger`); it is
-    None when the listing carried none.
+    None when the listing carried none. The title rides along too, for
+    `refresh_coverage_ledger`; it is None when the listing carried none.
 
     Raises rather than reporting "none" when the lookup itself fails. The old
     code returned (None, None) on a non-zero exit, which made a forge outage
@@ -11505,7 +11507,7 @@ def find_existing_issue(
             "issue was found; merge or close the remediation backlog on this label"
         )
     if not issues:
-        return None, None, None
+        return None, None, None, None
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -11517,7 +11519,13 @@ def find_existing_issue(
             "it cannot prove it opened."
         )
     body = chosen.get("body")
-    return int(chosen["number"]), chosen.get("url"), body if isinstance(body, str) else None
+    title = chosen.get("title")
+    return (
+        int(chosen["number"]),
+        chosen.get("url"),
+        body if isinstance(body, str) else None,
+        title if isinstance(title, str) else None,
+    )
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -11539,13 +11547,6 @@ def fetch_issue_url(repo: str, number: int) -> str | None:
     return (issue.get("url") or None) if isinstance(issue, dict) else None
 
 
-def fetch_issue_title(repo: str, number: int) -> str | None:
-    """The ledger's current title, or None when it could not be read."""
-    answer = try_forge("issue-view", repo, {"number": number})
-    issue = (answer or {}).get("issue")
-    return str(issue.get("title") or "") if isinstance(issue, dict) else None
-
-
 def refresh_coverage_ledger(
     repo: str,
     number: int,
@@ -11555,6 +11556,7 @@ def refresh_coverage_ledger(
     now: datetime,
     *,
     live_body: str | None,
+    live_title: str | None,
     noun: str,
 ) -> str | None:
     """Rewrite the title and body of an open coverage ledger from this run.
@@ -11571,8 +11573,11 @@ def refresh_coverage_ledger(
     This rewrites only a ledger that a coverage gap opened, for two reasons
     that must both be true:
 
-    - the title is one that `coverage_issue_title` makes (`COVERAGE_TITLE_RE`);
+    - the live title is one that `coverage_issue_title` makes (`COVERAGE_TITLE_RE`);
     - the live body lists no finding id in its hidden block.
+
+    Both come from the listing that `find_existing_issue` read, so this needs
+    no read of its own.
 
     A ledger that a findings run wrote keeps its body. A rewrite from a run
     with zero findings would remove findings that this run could not vouch
@@ -11581,8 +11586,7 @@ def refresh_coverage_ledger(
     """
     if live_body is None or parse_delta_block(live_body):
         return None
-    title = fetch_issue_title(repo, number)
-    if title is None or not COVERAGE_TITLE_RE.search(title):
+    if live_title is None or not COVERAGE_TITLE_RE.search(live_title):
         return None
     body = render_issue_body(
         data, generated_at=now, audit_id=audit_id, gaps=gaps, noun=noun
@@ -11649,10 +11653,11 @@ def close_ledger_reads_clean(
 ) -> bool:
     """Give a ledger a `0 findings` title and the clean-close banner.
 
-    The caller does this before it closes the issue. Returns whether the edit
-    was done. A failure is not fatal: the closing comment is posted and the
-    issue closes in either case. If the close then fails, the next run finds
-    the banner (`CLEAN_CLOSE_MARKER`) and adds no second one.
+    The caller does this after the close has landed, so an open ledger never
+    shows an all-clear. Returns whether the edit was done. A failure is not
+    fatal: the closing comment is posted and the issue is closed in either
+    case. A body that already has the banner (`CLEAN_CLOSE_MARKER`, from a
+    ledger closed clean and then reopened by hand) gets no second one.
 
     `live_body` is the body that `find_existing_issue` read, so this needs no
     read of its own. When it is None, or when the banner would make the body
@@ -14280,7 +14285,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
 
     # No branch is created or reset here. The report branch is gone: the ledger
     # is an issue, and each remediation pull request branches off main on demand.
-    existing_issue, _, existing_body = find_existing_issue(repo, audit_id)
+    existing_issue, _, existing_body, _ = find_existing_issue(repo, audit_id)
 
     pending: list[str] = []
     carried: list[dict[str, str]] = []
@@ -15326,7 +15331,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
     issue_number = args.issue
     if issue_number is None:
-        issue_number, _, _ = find_existing_issue(repo, audit_id)
+        issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
     pr_by_finding, _ = reconcile_remediation_prs(
         audit_id, findings, list_remediation_prs(repo, audit_id)
@@ -15759,7 +15764,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"({len(group['objects'])} object(s)){claimed}. {', '.join(group['objects'])}"
         )
 
-    existing_issue, existing_url, existing_body = find_existing_issue(repo, audit_id)
+    existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
+        repo, audit_id
+    )
     # The previous run's memory is the body it published, as the report store
     # kept it, not the issue body fetched back from GitHub: the store is the
     # harness's own record of what it wrote, and a public body is one anyone
@@ -15981,10 +15988,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens, the refresh of an open coverage ledger -- and just after the
-    # clean close, not here. A close adds only a banner above the body and
-    # keeps its id block, so the stored memory stays exactly true until it
-    # lands, and a failure on that path (a transient `issue-close`, a terminal
-    # timeout) must not cost the next run it.
+    # clean close, not here. The close leaves the body as it was (the banner
+    # and the new title come after the close), so the stored memory stays
+    # exactly true until it lands, and a failure on that path (a transient
+    # `issue-close`, a terminal timeout) must not cost the next run it.
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
@@ -16224,6 +16231,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                     data,
                     now,
                     live_body=existing_body,
+                    live_title=existing_title,
                     noun=noun,
                 )
             log(
@@ -16267,15 +16275,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 render_clean_comment(audit_id, data, now, gaps=gaps, noun=noun),
                 what="all-clear comment",
             )
-            # Before the close, make the title and the top of the body agree
-            # with the close. Without this, the closed issue still counts the
-            # findings in its title and shows each one as `open`.
-            if not close_ledger_reads_clean(repo, existing_issue, audit_id, existing_body, now):
-                log(
-                    f"WARNING: could not change the title and body of issue "
-                    f"#{existing_issue} before the close; it still shows its findings "
-                    "as open. The all-clear comment is posted in either case."
-                )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
             forge(
@@ -16283,10 +16282,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 repo,
                 {"number": existing_issue, "reason": "completed"},
             )
-            # Dropped only once the close has landed: the close leaves the body
-            # as it was, so until it succeeds the stored memory is still exactly
-            # the open ledger, and a failed close must not cost the next run it.
+            # Dropped only once the close has landed: the close itself leaves
+            # the body as it was, so until it succeeds the stored memory is still
+            # exactly the open ledger, and a failed close must not cost the next
+            # run it.
             invalidate_report_memory(audit_id, repo)
+            # After the close, make the title and the top of the body agree
+            # with it. Without this, the closed issue still counts the findings
+            # in its title and shows each one as `open`. After and not before:
+            # if the close fails, an open ledger must not show an all-clear.
+            if not close_ledger_reads_clean(repo, existing_issue, audit_id, existing_body, now):
+                log(
+                    f"WARNING: issue #{existing_issue} is closed, but its title and body "
+                    "could not be changed; it still shows its findings as open. The "
+                    "all-clear comment is posted in either case."
+                )
             log(f"Audit {audit_id} is clean; closed issue #{existing_issue}.")
         elif gaps:
             # Zero findings, incomplete coverage, and no ledger to say so on.

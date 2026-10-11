@@ -2,7 +2,7 @@
 # default home for a new case. A full audit, tofu-provisioned, the same shape
 # and cost band as ai-security-planted-model-audit.
 #
-# WHAT THIS GRADES. A clean run closes the stream's ledger. Before the close,
+# WHAT THIS GRADES. A clean run closes the stream's ledger. After the close,
 # `finish` changes the title to `0 findings` and puts a banner above the old
 # body (`close_ledger_reads_clean` in audit_report.py), so the closed issue
 # does not show its findings as open. Without it, the closed issue keeps the
@@ -45,7 +45,7 @@ prompt: >-
   Run the AI workload security audit, following the ai-security-audit SOP.
 expected_output: >-
   The audit finds no AI workload findings on the fleet and closes the open
-  ledger as clean. Before the close, the ledger's title says 0 findings and a
+  ledger as clean. After the close, the ledger's title says 0 findings and a
   banner at the top of its body says that none of the findings below
   reproduce. The closing response is the SOP's one line, carrying the ledger
   URL in full.

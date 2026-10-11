@@ -13952,7 +13952,7 @@ class TestFindExistingIssue(HarnessTestCase):
                 ]
             )
         }
-        number, url, body = self.find()
+        number, url, body, _ = self.find()
         self.assertEqual(number, 42)
         self.assertTrue(url.endswith("/42"))
         self.assertEqual(body, "forty-two")
@@ -13965,7 +13965,7 @@ class TestFindExistingIssue(HarnessTestCase):
 
     def test_no_ledger_is_not_an_error(self):
         self.harness.replies = {"issue-list": {"issues": []}}
-        self.assertEqual(self.find(), (None, None, None))
+        self.assertEqual(self.find(), (None, None, None, None))
 
     def test_an_outage_raises_rather_than_reporting_no_ledger(self):
         self.harness.failures = {"issue-list": 1}
@@ -15269,6 +15269,19 @@ class TestStandingCoverageGap(HarnessTestCase):
         self.assertTrue(out["silent_ok"])
         self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
 
+    def test_a_shield_close_under_an_unchanged_gap_posts_the_partial_all_clear(self):
+        # The comment lists the pull request the shield closed, so it is news.
+        url = "https://github.com/acme/fleet/pull/9"
+        self.patch_attr(
+            "join_harness_declarations", lambda *a, **k: ([], [], {"payments"})
+        )
+        self.patch_attr("close_stale_remediation_prs", lambda *a, **k: [url])
+        self.seed(None, self.PARTIAL)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        comments = self.harness.bodies_for("issue-comment")
+        self.assertEqual(len(comments), 1)
+        self.assertIn(url, comments[0])
+
     def test_an_unchanged_gap_posts_no_second_partial_all_clear(self):
         self.seed(None, self.PARTIAL)
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
@@ -15299,7 +15312,12 @@ class TestCoverageLedgerRefresh(HarnessTestCase):
     """
 
     PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
-    TITLE_KEY = "issue-view !comments number=42"
+
+    def titled_list(self, title):
+        """The issue listing, with the title the forge returns beside each issue."""
+        listing = self.issue_list()
+        listing["issues"][0]["title"] = title
+        return listing
 
     def coverage_ledger(self, title=None):
         """An open ledger that a clean run with one gap opened a week ago."""
@@ -15310,10 +15328,7 @@ class TestCoverageLedgerRefresh(HarnessTestCase):
         )
         gaps = audit_report.coverage_gaps(old_doc)
         self.harness.replies = {
-            "issue-list": self.issue_list(),
-            self.TITLE_KEY: issue_view(
-                {"body": body, "title": title or audit_report.coverage_issue_title(AUDIT, gaps)}
-            ),
+            "issue-list": self.titled_list(title or audit_report.coverage_issue_title(AUDIT, gaps)),
         }
         return body
 
@@ -15362,6 +15377,13 @@ class TestCoverageLedgerRefresh(HarnessTestCase):
         self.assertTrue(envelope["ledger_held_open"])
         self.assertIn("could not refresh coverage ledger #42", self.err)
 
+    def test_the_refresh_reads_no_issue_of_its_own(self):
+        # The title and body come from the listing `find_existing_issue` read.
+        self.coverage_ledger()
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        reads = [p for p in self.harness.forge_calls("issue-view") if not p.get("comments")]
+        self.assertEqual(reads, [])
+
     def test_a_findings_title_is_not_refreshed(self):
         self.coverage_ledger(title=audit_report.issue_title(AUDIT, [make_finding()]))
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
@@ -15371,10 +15393,7 @@ class TestCoverageLedgerRefresh(HarnessTestCase):
         previous = published_body(make_doc(findings=[make_finding()]), generated_at=NOW)
         self.seed_report(previous, status="UPDATED", coverage_gaps=[])
         self.harness.replies = {
-            "issue-list": self.issue_list(),
-            self.TITLE_KEY: issue_view(
-                {"body": previous, "title": audit_report.coverage_issue_title(AUDIT, ["a"])}
-            ),
+            "issue-list": self.titled_list(audit_report.coverage_issue_title(AUDIT, ["a"])),
         }
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
         self.assertEqual(self.harness.bodies_for("issue-update"), [])
@@ -15396,11 +15415,11 @@ class TestCleanCloseBanner(HarnessTestCase):
         doc["resolved_because"] = resolved_for(previous_body)
         self.assertEqual(self.run_finish(doc), 0)
 
-    def test_the_close_changes_the_title_and_adds_the_banner_first(self):
+    def test_the_close_lands_first_then_the_title_and_banner_change(self):
         previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
         self.close_over(previous)
         verbs = [call[1] for call in self.harness.calls if call[0] == "forge"]
-        self.assertLess(verbs.index("issue-update"), verbs.index("issue-close"))
+        self.assertLess(verbs.index("issue-close"), verbs.index("issue-update"))
         edit = self.harness.forge_calls("issue-update", number=42)[0]
         self.assertEqual(edit["title"], audit_report.issue_title(AUDIT, []))
         self.assertTrue(edit["body"].startswith(audit_report.CLEAN_CLOSE_MARKER))
@@ -15433,12 +15452,34 @@ class TestCleanCloseBanner(HarnessTestCase):
         self.assertEqual(edit["body"], bannered)
         self.assertEqual(edit["body"].count(audit_report.CLEAN_CLOSE_MARKER), 1)
 
-    def test_a_failed_edit_still_closes_the_ledger(self):
+    def test_a_failed_edit_leaves_the_closed_issue_as_it_was(self):
         previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
         self.harness.failures = {"issue-update": 1}
         self.close_over(previous)
         self.assertTrue(self.harness.forge_calls("issue-close", number=42))
-        self.assertIn("could not change the title and body of issue #42", self.err)
+        self.assertIn("issue #42 is closed, but its title and body could not be changed", self.err)
+
+    def test_a_failed_close_makes_no_edit(self):
+        # An open ledger must not show the all-clear title and banner.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+        }
+        self.harness.failures = {"issue-close": 1}
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertNotEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.harness.forge_calls("issue-update", title=...), [])
+
+    def test_a_body_too_long_for_the_banner_gets_only_the_title(self):
+        long_body = "x" * (audit_report.MAX_BODY_CHARS - 10)
+        self.assertTrue(
+            audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, long_body, NOW)
+        )
+        edit = self.harness.forge_calls("issue-update", number=42)[0]
+        self.assertEqual(edit["title"], audit_report.issue_title(AUDIT, []))
+        self.assertNotIn("body", edit)
 
 
 class TestDispatchAndHandover(unittest.TestCase):
@@ -23355,7 +23396,7 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     carries `publish_s`, the time `finish` used to publish. It reads a real clock, so the
     transcripts record it as a token. No transcript has `inspect_s` or `collect_s`: these
     runs have no in-flight note and no manifest. The clean close now sends one
-    `issue-update` before `issue-close`: it changes the title to `0 findings`
+    `issue-update` after `issue-close`: it changes the title to `0 findings`
     and puts the clean-close banner above the old body (`close_ledger_reads_clean`).
     The clean-over-a-gap run's JSON line now carries `unreported_under_gap`: the
     previous ledger listed a finding and this run, with a gap, does not publish it.
