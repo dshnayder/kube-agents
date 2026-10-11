@@ -484,9 +484,13 @@ SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 MANIFEST_REMEDIATION_KIND = "manifest"
 MANUAL_REMEDIATION_KIND = "manual"
-# The fields `carry_unchanged_findings` copies from the previous run. Severity
-# is not in the list: the collector calculates it, so it is not wording.
-CARRIED_FINDING_FIELDS = ("title", "impact", "recommendation")
+# The fields `carry_unchanged_findings` always copies from the previous run.
+# Severity is not in the list: the collector calculates it, so it is not
+# wording. `recommendation` and `remediation` carry together when
+# `_remediation_may_carry` accepts the pair, so the Recommendation line and
+# Remediation block never come from different runs.
+CARRIED_FINDING_FIELDS = ("title", "impact")
+CARRIED_REMEDIATION_FIELDS = ("recommendation", "remediation")
 
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
@@ -2887,6 +2891,23 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
+def _envelope_document(envelope: object, key: str) -> dict | None:
+    """The findings document `envelope` carries for `key`, or None."""
+    if not isinstance(envelope, dict):
+        return None
+    if _ledger_key(envelope.get("repo")) != key:
+        return None
+    if envelope.get("id_scheme") != ID_SCHEME:
+        return None
+    document = envelope.get("ledger_document")
+    if isinstance(document, dict):
+        return document
+    if envelope.get("ledger_held_open"):
+        return None
+    document = envelope.get("document")
+    return document if isinstance(document, dict) else None
+
+
 def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     """The document that the previous run of this stream stored for `repo`, or None.
 
@@ -2894,7 +2915,11 @@ def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     dry-run split, so that a dry run shows the same wording as the real run.
     It reads `ledger_document` when the previous run held the open ledger
     without rewriting its body, so a held-open zero-finding run does not
-    replace the live ledger's wording with an empty document.
+    replace the live ledger's wording with an empty document. When a held-open
+    `latest.json` has no `ledger_document` (because `previous_run_memory` was
+    lost on that run) or `latest.json` is absent, it walks the `runs/` ring
+    from newest to oldest for the last envelope that carries a findings
+    document.
     It does not do the issue checks of `read_report_memory`. Those checks
     keep the delta correct: a store for a different issue makes the wrong
     ids new or resolved. The carry does not count ids. It copies wording only
@@ -2907,20 +2932,24 @@ def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     if not repo:
         return None
     try:
-        path = reports_dir_for(audit_id, repo) / REPORT_LATEST_NAME
-        envelope = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
         return None
-    if not isinstance(envelope, dict):
-        return None
-    if _ledger_key(envelope.get("repo")) != _ledger_key(repo):
-        return None
-    if envelope.get("id_scheme") != ID_SCHEME:
-        return None
-    document = envelope.get("ledger_document")
-    if not isinstance(document, dict):
-        document = envelope.get("document")
-    return document if isinstance(document, dict) else None
+    key = _ledger_key(repo)
+    candidates = [directory / REPORT_LATEST_NAME]
+    try:
+        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+    except OSError:
+        pass
+    for path in candidates:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        document = _envelope_document(envelope, key)
+        if document is not None:
+            return document
+    return None
 
 
 def invalidate_report_memory(audit_id: str, repo: str) -> None:
@@ -5538,7 +5567,8 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
     and 83 got a new remediation. Two of the changes were wrong. One turned a
     `gcloud` command into a `manual` note. One proposed a zone list without
     the only zone that had nodes. So this pass keeps `CARRIED_FINDING_FIELDS`,
-    and the remediation when `_remediation_may_carry` allows it.
+    and keeps `CARRIED_REMEDIATION_FIELDS` (`recommendation` and `remediation`)
+    together when `_remediation_may_carry` allows it.
 
     "Evidence did not change" is a full comparison of the `evidence` object,
     command and excerpt. `adopt_collector_evidence` runs first and puts the
@@ -5572,7 +5602,7 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
             continue
         fields = list(CARRIED_FINDING_FIELDS)
         if _remediation_may_carry(before.get("remediation"), finding.get("remediation")):
-            fields.append("remediation")
+            fields.extend(CARRIED_REMEDIATION_FIELDS)
         changed = False
         for field in fields:
             if field in before and before[field] != finding.get(field):

@@ -14855,33 +14855,39 @@ class TestCarryUnchangedFindings(unittest.TestCase):
 
     def test_a_new_gcloud_command_is_not_replaced_by_a_previous_manual_note(self):
         mine = {"kind": "gcloud", "note": "gcloud container clusters update c --location=l"}
+        my_rec = {"action": "Run gcloud container clusters update c --location=l."}
         ids, out = self.carry(
             self.before(remediation={"kind": "manual", "note": "Work it out."}),
-            self.before(title="reworded", remediation=mine),
+            self.before(title="reworded", recommendation=my_rec, remediation=mine),
         )
         self.assertEqual(out["remediation"], mine)
-        # The prose still carries. Only the remediation stays as written.
+        self.assertEqual(out["recommendation"], my_rec)
+        # The prose still carries. The recommendation and remediation stay as a pair.
         self.assertEqual(out["title"], "spot-pool is locked to a single zone")
         self.assertEqual(ids, [self.FID])
 
     def test_a_new_manifest_is_not_replaced_by_a_previous_manual_note(self):
         mine = {"kind": "manifest", "path": "clusters/spot/pool.yaml", "note": "n"}
+        my_rec = {"action": "Apply clusters/spot/pool.yaml."}
         ids, out = self.carry(
             self.before(remediation={"kind": "manual", "note": "by hand"}),
-            self.before(title="reworded", remediation=mine),
+            self.before(title="reworded", recommendation=my_rec, remediation=mine),
         )
         self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["recommendation"], my_rec)
         self.assertEqual(out["title"], "spot-pool is locked to a single zone")
         self.assertEqual(ids, [self.FID])
 
     def test_a_previous_manifest_is_not_carried_over_a_manual_note(self):
         # The previous path names a file that this run did not write.
         mine = {"kind": "manual", "note": "by hand"}
+        my_rec = {"action": "Update the node pool by hand."}
         _, out = self.carry(
             self.before(remediation={"kind": "manifest", "path": "clusters/a.yaml", "note": "n"}),
-            self.before(remediation=mine),
+            self.before(recommendation=my_rec, remediation=mine),
         )
         self.assertEqual(out["remediation"], mine)
+        self.assertEqual(out["recommendation"], my_rec)
 
     def test_a_note_that_finish_wrote_is_not_carried(self):
         degraded = {
@@ -15002,7 +15008,15 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
             remediation={"kind": "manual", "note": "Apply a default-deny NetworkPolicy."},
         )
 
-    def store(self, document, repo="acme/fleet", scheme=None, ledger_document=None):
+    def store(
+        self,
+        document,
+        repo="acme/fleet",
+        scheme=None,
+        ledger_document=None,
+        ledger_held_open=False,
+        ring_name=None,
+    ):
         directory = self.store_dir(AUDIT, repo)
         directory.mkdir(parents=True, exist_ok=True)
         envelope = {
@@ -15012,10 +15026,16 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
             "ledger_body": "",
             "current_ids": [],
             "id_scheme": audit_report.ID_SCHEME if scheme is None else scheme,
+            "ledger_held_open": ledger_held_open,
             "document": document,
             **({"ledger_document": ledger_document} if ledger_document is not None else {}),
         }
-        (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+        if ring_name is not None:
+            runs = directory / audit_report.REPORT_RUNS_DIR
+            runs.mkdir(parents=True, exist_ok=True)
+            (runs / ring_name).write_text(json.dumps(envelope), encoding="utf-8")
+        else:
+            (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
 
     def previous(self, **kwargs):
         finding = self.finding(self.OLD_TITLE, **kwargs)
@@ -15031,7 +15051,22 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
         self.assertIn("wording is carried forward", self.err)
 
     def test_a_held_open_run_still_carries_the_ledger_document_wording(self):
-        self.store({"findings": []}, ledger_document=self.previous())
+        self.store({"findings": []}, ledger_document=self.previous(), ledger_held_open=True)
+        rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertNotIn(self.NEW_TITLE, self.out)
+
+    def test_a_held_open_run_without_ledger_document_falls_back_to_the_ring_or_none(self):
+        # When a clean run held the open ledger while memory was lost,
+        # `latest.json` has `ledger_held_open: True` and no `ledger_document`.
+        # With no ring entry carrying a findings document, `previous_run_document`
+        # returns `None` instead of the held-open run's empty `document`.
+        self.store({"findings": []}, ledger_held_open=True)
+        self.store({"findings": []}, ledger_held_open=True, ring_name="2026-08-02T090000Z.json")
+        self.assertIsNone(audit_report.previous_run_document(AUDIT, "acme/fleet"))
+        # With an earlier findings envelope in `runs/`, it carries from that ring entry.
+        self.store(self.previous(), ring_name="2026-08-01T090000Z.json")
         rc = self.run_finish(make_doc(findings=[self.finding(self.NEW_TITLE)]), ["--dry-run"])
         self.assertEqual(rc, 0)
         self.assertIn(self.OLD_TITLE, self.out)

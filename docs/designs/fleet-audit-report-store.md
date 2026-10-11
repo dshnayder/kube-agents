@@ -166,13 +166,14 @@ is how a divergence becomes undetectable.
 `start` joins against the same memory for the `carried` list it hands the model, seed included.
 
 `finish` also reads that stored document (`ledger_document` where the body was carried, `document`
-otherwise) one time before the dry-run split, to keep the previous wording of a finding whose
-evidence did not change ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md)
-§3.2). That read checks only the envelope's `repo` and `id_scheme`, not the issue. The issue checks
-above keep the delta correct, and the carry counts no ids: it copies words only to a finding with
-the same id, evidence and severity. A dry run does not ask the forge for the open issue, and the
-preview must show the same words as the real run. A missing or unreadable store keeps the model's
-words.
+otherwise, or the newest `runs/` ring envelope with a findings document when a held-open
+`latest.json` carries no `ledger_document`) one time before the dry-run split, to keep the previous
+wording of a finding whose evidence did not change
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.2). That read checks
+only the envelope's `repo` and `id_scheme`, not the issue. The issue checks above keep the delta
+correct, and the carry counts no ids: it copies words only to a finding with the same id, evidence
+and severity. A dry run does not ask the forge for the open issue, and the preview must show the
+same words as the real run. A missing or unreadable store keeps the model's words.
 
 The issue body is used as the memory once, where the store has never held this ledger (every run
 still reads it, but only for the check above): no directory for the stream
