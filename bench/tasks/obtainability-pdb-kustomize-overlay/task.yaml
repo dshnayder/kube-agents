@@ -62,8 +62,14 @@
 # checkout-gateway.yaml at the same path without a kustomization, and needs
 # the generated PodDisruptionBudget. The two fixtures cannot share one
 # repository at the same time: the kustomization would make that case
-# `manual`. Plant this one in a second repository, on a branch the install
-# pins as its base, or for another unbudgeted workload. #2686 records the
+# `manual`. No other seeded workload can take this case. In bench/tf/fleet,
+# the only Deployments with two or more replicas and no PodDisruptionBudget
+# are checkout-gateway and notification-relay (seeded-intent). A repository
+# declaration covers notification-relay, so the collector produces no
+# finding for it, and obtainability-declared-intent-no-finding needs it that
+# way. Every other multi-replica workload has a budget. So plant this
+# fixture in a second repository, or on a branch the install pins as its
+# base, or add an unbudgeted workload to the fleet. #2686 records the
 # decision.
 #
 # CONTENT MODE. A declaration in content mode needs the collector to copy
