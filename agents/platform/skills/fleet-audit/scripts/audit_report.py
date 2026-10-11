@@ -1359,6 +1359,8 @@ ROUTE_NOTE_PATTERN = re.compile(
     "(?:" + "|".join(re.escape(lede) for lede in ROUTE_NOTE_LEDES) + r").*?"
     + re.escape(ROUTE_NOTE_END)
 )
+# The same, with the spaces before it, so that a removal keeps the newlines.
+ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
 # The `renderer` values `collect.release_declarations` writes, copied because
 # this script does not import the collector, and the noun the release note
 # uses for each. A Kustomize overlay has no values file, so "the chart
@@ -1389,14 +1391,31 @@ DECLARATION_DENIAL_NEGATED_RE = re.compile(
     re.I,
 )
 DECLARATION_DENIAL_SUBJECT_RE = re.compile(r"\b(?:repo|repository|GitOps)\b", re.I)
-# A clause is one sentence, or one part of a sentence between semicolons. A
-# comma does not end a clause: "not declared in the repository, so no pull
-# request can carry it" is a claim and its result, and a cut at the comma
-# keeps the result without its cause.
-CLAUSE_SPLIT_RE = re.compile(r"(?<=[.;])\s+")
+# A clause is one sentence, one part of a sentence between semicolons, or one
+# line. A comma does not end a clause: "not declared in the repository, so no
+# pull request can carry it" is a claim and its result, and a cut at the
+# comma keeps the result without its cause. The separator is captured, so the
+# text is joined again with its own spaces and newlines.
+CLAUSE_SPLIT_RE = re.compile(r"((?<=[.;])[ \t]+|[ \t]*\n\s*)")
 # The fields a denial was seen in, as (section, field). `action` is not here:
-# it carries commands, and a cut at a full stop can break one.
+# it carries commands, and a cut at a full stop can break one. The note is
+# read only on a `manual` remediation, and never when it holds a code fence.
 DECLARATION_DENIAL_FIELDS = (("remediation", "note"), ("recommendation", "rationale"))
+CODE_FENCE = "```"
+# The words for the finding's own object, besides its kind and name.
+OWN_OBJECT_WORDS = ("object", "workload", "resource")
+# Kinds a clause can deny a declaration of that are not the finding's own
+# object: "No PodDisruptionBudget is declared in the repository for this
+# Deployment" is true and is about the budget. A clause that names one of
+# these, other than the finding's own kind, is never removed.
+OTHER_KIND_WORDS = (
+    "PodDisruptionBudget", "PDB", "budget", "HorizontalPodAutoscaler", "HPA", "autoscaler",
+    "NetworkPolicy", "network policy", "policy", "ServiceAccount", "service account",
+    "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding", "binding", "ConfigMap",
+    "Secret", "Service", "Ingress", "Gateway", "HTTPRoute", "Deployment", "StatefulSet",
+    "DaemonSet", "CronJob", "Job", "Pod", "Namespace", "ComputeClass", "NodePool",
+    "values key", "probe", "quota", "ResourceQuota", "LimitRange",
+)
 SENTENCE_END = "."
 DANGLING_PUNCTUATION = (";", ",")
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
@@ -13245,6 +13264,7 @@ def unwritten_sweep_fixes(
     degraded: list[str],
     audit_id: str,
     prs: list[dict],
+    log_prefix: str = "",
 ) -> dict[str, UnwrittenFix]:
     """Finding id to where its fix belongs, for each fix the sweep would
     open if only it had been written.
@@ -13310,7 +13330,7 @@ def unwritten_sweep_fixes(
             continue
         # Either shape: a promised file for a withheld budget is the same budget.
         if derive_finding_id(finding) in withheld:
-            log(f"{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
+            log(f"{log_prefix}{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
             continue
         if fid in degraded_set and promised.get(fid):
             as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
@@ -13371,39 +13391,71 @@ def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
     return evidence
 
 
-def _denies_declaration(clause: str) -> bool:
-    """Whether one clause says that the repository does not declare the object."""
-    if DECLARATION_DENIAL_SELF_SUFFICIENT_RE.search(clause):
-        return True
-    return bool(DECLARATION_DENIAL_NEGATED_RE.search(clause) and DECLARATION_DENIAL_SUBJECT_RE.search(clause))
+def _object_words(obj: str) -> tuple[re.Pattern, re.Pattern | None]:
+    """Patterns for the finding's own object, and for any other kind.
 
-
-def _drop_declaration_denials(text: str) -> str:
-    """`text` without the clauses that deny the declaration.
-
-    A route note this script wrote is kept. The text comes back unchanged when
-    no clause is a denial, so that a caller that compares the two sees no
-    change from whitespace alone. It also comes back unchanged when every
-    clause is a denial: an empty rationale is a worse ledger row than one
-    the note below it corrects.
+    The first matches the object's name, or "this" or "the" before its kind
+    or before a word in `OWN_OBJECT_WORDS`. The second matches a kind in
+    `OTHER_KIND_WORDS` that is not the object's own kind, and is None when
+    there is none.
     """
-    if not text:
+    kind, _, name = obj.partition("/")
+    own = [re.escape(name)] if name else []
+    nouns = [re.escape(kind)] if kind else []
+    nouns += [re.escape(word) for word in OWN_OBJECT_WORDS]
+    own.append(r"\b(?:this|the)\s+(?:" + "|".join(nouns) + r")")
+    others = [re.escape(word) for word in OTHER_KIND_WORDS if word.lower() != kind.lower()]
+    own_re = re.compile(r"(?<![\w-])(?:" + "|".join(own) + r")(?![\w-])", re.I)
+    other_re = re.compile(r"(?<![\w-])(?:" + "|".join(others) + r")s?(?![\w-])", re.I) if others else None
+    return own_re, other_re
+
+
+def _denies_declaration(clause: str, own_re: re.Pattern, other_re: re.Pattern | None) -> bool:
+    """Whether one clause says that the repository does not declare the
+    finding's own object.
+
+    Three things must be true. The clause denies a declaration: a negation
+    near a form of "declare" with the repository named, or "no file
+    declares", or "declared nowhere". It names the object: its name, or
+    "this" or "the" before its kind. And it names no other kind, so a true
+    clause about a missing budget or policy stays.
+    """
+    if any(lede in clause for lede in ROUTE_NOTE_LEDES):
+        return False
+    denies = bool(DECLARATION_DENIAL_SELF_SUFFICIENT_RE.search(clause)) or bool(
+        DECLARATION_DENIAL_NEGATED_RE.search(clause) and DECLARATION_DENIAL_SUBJECT_RE.search(clause)
+    )
+    if not denies or not own_re.search(clause):
+        return False
+    return other_re is None or not other_re.search(own_re.sub(" ", clause))
+
+
+def _drop_declaration_denials(text: str, obj: str) -> str:
+    """`text` without the clauses that deny the declaration of `obj`.
+
+    Each clause is removed in place, with the separator after it, so the
+    spaces and newlines of the rest stay as they were. A route note this
+    script wrote is kept. The text comes back unchanged when no clause is a
+    denial, and also when every clause is one: an empty rationale is a worse
+    ledger row than one the note below it corrects.
+    """
+    if not text or CODE_FENCE in text:
         return text
-    kept: list[str] = []
+    own_re, other_re = _object_words(obj)
+    parts = CLAUSE_SPLIT_RE.split(text)
+    clauses, separators = parts[0::2], parts[1::2] + [""]
+    kept: list[tuple[str, str]] = []
     dropped = False
-    for clause in CLAUSE_SPLIT_RE.split(text):
-        clause = clause.strip()
-        if not clause:
-            continue
-        if not any(lede in clause for lede in ROUTE_NOTE_LEDES) and _denies_declaration(clause):
+    for clause, separator in zip(clauses, separators):
+        if clause.strip() and _denies_declaration(clause, own_re, other_re):
             dropped = True
-            if kept and kept[-1].endswith(DANGLING_PUNCTUATION):
-                kept[-1] = kept[-1][:-1] + SENTENCE_END
+            if kept and kept[-1][0].endswith(DANGLING_PUNCTUATION):
+                kept[-1] = (kept[-1][0][:-1] + SENTENCE_END, kept[-1][1])
             continue
-        kept.append(clause)
-    if not dropped or not kept:
+        kept.append((clause, separator))
+    if not dropped or not any(clause.strip() for clause, _ in kept):
         return text
-    return " ".join(kept)
+    return "".join(clause + separator for clause, separator in kept).strip()
 
 
 def retract_contradicted_declaration_denials(
@@ -13425,10 +13477,17 @@ def retract_contradicted_declaration_denials(
     `namespace_directory` is not evidence: it says where a new object goes,
     and the object itself can be undeclared, so the denial can be true.
 
+    A clause is removed only when it is about the finding's own object, by
+    name or as "this <kind>", and names no other kind. "No
+    PodDisruptionBudget is declared in the repository for this Deployment" is
+    true and stays. A clause that says "it" is not removed either, because
+    the pass cannot tell what "it" is.
+
     The pass removes clauses and writes nothing in their place. The route note
     that `disclose_manual_remediation_routes` appends states the fact. It
-    reads `remediation.note` and `recommendation.rationale`, on a finding of
-    any kind, and leaves alone a finding in `skip`.
+    reads `recommendation.rationale`, and `remediation.note` only on a
+    `manual` remediation, never a text that holds a code fence, and leaves
+    alone a finding in `skip`.
     """
     evidence = route_evidence(manifest)
     retracted: list[str] = []
@@ -13442,8 +13501,11 @@ def retract_contradicted_declaration_denials(
             block = finding.get(section)
             if not isinstance(block, dict):
                 continue
+            if section == "remediation" and block.get("kind") != "manual":
+                # A `gcloud` note is a command, rendered as a code block.
+                continue
             before = str(block.get(field) or "")
-            after = _drop_declaration_denials(before)
+            after = _drop_declaration_denials(before, str(finding.get("object") or ""))
             if after != before:
                 block[field] = after
                 edited = True
@@ -13529,7 +13591,7 @@ def disclose_manual_remediation_routes(
         original = str(remediation.get("note") or "")
         worker_note = original.strip()
         if ROUTE_NOTE_PATTERN.search(worker_note):
-            worker_note = NOTE_SEPARATOR.join(ROUTE_NOTE_PATTERN.sub("", worker_note).split())
+            worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
         added = NOTE_SEPARATOR.join(_route_notes(found, worker_note))
         budget = MAX_NOTE_CHARS - len(added) - len(NOTE_SEPARATOR)
         if added and len(worker_note) > budget:
@@ -14888,12 +14950,17 @@ def _handle_finish_dry_run(
             f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
             "Connector declaration holds; it degrades to manual, naming the file."
         )
-    # The same notes the real run adds. The preview reads no pull request, so
-    # it leaves alone every fix the real run would refuse, write or decline.
+    # The notes the real run adds. The preview reads no pull request, so it
+    # leaves alone every fix the refusal would list, also one that a pull
+    # request already carries and the real run gives a note.
     disclose_manual_routes_and_log(
         findings,
         manifest,
-        set(unwritten_sweep_fixes(findings, manifest, promised_preview, degraded, audit_id, []))
+        set(
+            unwritten_sweep_fixes(
+                findings, manifest, promised_preview, degraded, audit_id, [], log_prefix="DRY RUN: "
+            )
+        )
         if findings and manifest is not None
         else set(),
         prefix="DRY RUN: ",

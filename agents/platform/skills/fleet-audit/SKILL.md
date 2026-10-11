@@ -760,9 +760,12 @@ field, and publishes nothing:
   It names the `declaration` file, or else the `release_declaration` file (a patch to the live
   object is reverted), or else the `namespace_directory` for a new object. It also names the
   `reconciler` that reverts a change made by hand. It writes no note for a candidate without these
-  fields, and none for a fix that the refusal below wrote, declined, or found in a pull request. It
-  removes a clause that says the repository does not declare the object when the candidate carries
-  `declaration` or `release_declaration`. Do not copy these notes into your `note`.
+  fields, and none for a fix that "Write every `manifest` remediation file" below wrote, declined,
+  or found in a pull request. When the candidate carries `declaration` or `release_declaration`, it
+  removes a clause that says the repository does not declare the finding's own object, named by
+  its name or as "this <kind>", if the clause names no other kind (a PodDisruptionBudget, an HPA, a
+  NetworkPolicy). It does not edit a `gcloud` note or a text with a code fence. Do not copy these
+  notes into your `note`.
 
 ### Scope, skipped, and limitations
 

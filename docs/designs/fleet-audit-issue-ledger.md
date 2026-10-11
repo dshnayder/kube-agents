@@ -623,9 +623,14 @@ A note whose path the worker's note already names is not written. A candidate wi
 gets no note, because a missing `declaration` is not a claim that no file declares the object. A
 fix that the refusal path wrote, declined, or found in a pull request keeps the text that path
 gave it. Where the candidate carries `declaration` or `release_declaration`, `finish` also removes
-the worker's clauses that say the repository does not declare the object, from the note and from
-`recommendation.rationale`. The worker's note is cut first when the total is longer than the note
-cap, so the route notes stay in the rendered row. The dry run shows the same notes.
+the worker's clauses that say the repository does not declare the finding's own object, from
+`recommendation.rationale` and from the note of a `manual` remediation. A clause is removed only
+when it names the object, by its name or as "this <kind>", and names no other kind: "No
+PodDisruptionBudget is declared in the repository for this Deployment" is true and stays. A `gcloud`
+note and a text with a code fence are not edited, and the rest of a text keeps its newlines. The
+worker's note is cut first when the total is longer than the note cap, so the route notes stay in
+the rendered row. The dry run adds the same notes with one difference: it reads no pull request,
+so it also leaves alone a fix that the refusal would list and that a pull request already carries.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the

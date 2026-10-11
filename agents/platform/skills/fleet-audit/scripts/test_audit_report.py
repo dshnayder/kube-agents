@@ -18519,7 +18519,7 @@ class TestManualRemediationRoutes(unittest.TestCase):
     def test_a_denial_that_may_be_true_is_kept(self):
         """A namespace directory says where a new object goes, not that this
         object is declared; and a candidate with no field says nothing."""
-        denial = "It runs fine. The repository does not declare this Deployment."
+        denial = "It runs fine. The repository does not declare this Deployment."  # names the object
         for name, fields in {
             "a namespace directory only": {"namespace_directory": {"path": "clusters/c1"}},
             "a reconciler only": {"reconciler": "`flux`"},
@@ -18543,13 +18543,65 @@ class TestManualRemediationRoutes(unittest.TestCase):
 
     def test_the_retraction_keeps_the_harness_notes(self):
         manifest = self.manifest(declaration={"path": "apps/web/a.yaml"})
-        finding = self.manual(note="Not declared in the GitOps repository; add a probe.")
+        finding = self.manual(note="This Deployment is not declared in the GitOps repository; add a probe.")
         audit_report.disclose_manual_routes_and_log([finding], manifest, set())
         audit_report.disclose_manual_routes_and_log([finding], manifest, set())
         self.assertEqual(
             self.note(finding),
             "add a probe. " + audit_report.DECLARED_NOTE.format(path="apps/web/a.yaml"),
         )
+
+    def retract(self, finding, **fields):
+        fields = fields or {"declaration": {"path": "apps/web/a.yaml"}}
+        return audit_report.retract_contradicted_declaration_denials([finding], self.manifest(**fields))
+
+    def test_a_true_clause_about_another_object_is_kept(self):
+        """The review's examples: each denies a declaration of a budget, an
+        autoscaler or a policy, which can be true while the Deployment itself
+        is declared. Each text has a second clause, because a text that is
+        only a denial is kept whatever it says."""
+        for text in (
+            "Add a probe. No PodDisruptionBudget is declared in the repository for this Deployment.",
+            "Add a probe. The repository declares no HPA for Deployment a, so scaling stays manual.",
+            "Add a probe. No NetworkPolicy for the workload is declared in the GitOps repository.",
+        ):
+            with self.subTest(text=text):
+                finding = self.manual(note=text, rationale=text)
+                self.assertEqual(self.retract(finding), [])
+                self.assertEqual(self.note(finding), text)
+                self.assertEqual(finding["recommendation"]["rationale"], text)
+
+    def test_a_clause_that_does_not_name_the_object_is_kept(self):
+        text = "Add a probe. It is not declared in the repository."
+        finding = self.manual(note=text)
+        self.assertEqual(self.retract(finding), [])
+        self.assertEqual(self.note(finding), text)
+
+    def test_the_object_by_name_is_matched(self):
+        finding = self.manual(note="Add a probe. Deployment a is not declared in the GitOps repo.")
+        self.assertEqual(self.retract(finding), ["a"])
+        self.assertEqual(self.note(finding), "Add a probe.")
+
+    def test_a_command_is_never_edited(self):
+        command = "# this Deployment is not declared in the repository\ngcloud container clusters update c1 --x"
+        finding = self.manual()
+        finding["remediation"] = {"kind": "gcloud", "note": command}
+        self.assertEqual(self.retract(finding, release_declaration={"path": "x.yaml"}), [])
+        self.assertEqual(self.note(finding), command)
+        fenced = "Run this.\n\n```bash\n# this Deployment is not declared in the repository\nkubectl get deploy a\n```"
+        finding = self.manual(note=fenced)
+        self.assertEqual(self.retract(finding), [])
+        self.assertEqual(self.note(finding), fenced)
+
+    def test_the_newlines_of_a_manual_note_are_kept(self):
+        note = "Step one: pick a probe.\nThis Deployment is not declared in the repository.\nStep two: ask the owner."
+        finding = self.manual(note=note)
+        self.assertEqual(self.retract(finding), ["a"])
+        self.assertEqual(self.note(finding), "Step one: pick a probe.\nStep two: ask the owner.")
+        stale = audit_report.DECLARED_NOTE.format(path="apps/old/a.yaml")
+        copied = self.manual(note=f"Line one.\nLine two. {stale}")
+        self.disclose(copied, self.manifest(declaration={"path": "apps/new/a.yaml"}))
+        self.assertTrue(self.note(copied).startswith("Line one.\nLine two. _(Declared"))
 
 
 class TestManualRemediationRoutesInFinish(HarnessTestCase):
@@ -18601,6 +18653,18 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
         rc = self.run_finish(self.manual_doc(), ["--dry-run", "--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         self.assertIn(self.RELEASE_NOTE_FRAGMENT, self.out)
+
+    def test_the_dry_runs_refusal_check_logs_as_the_dry_run(self):
+        check, obj = "unbound-sa-automount", "Deployment/api"
+        finding = make_finding(check=check, obj=obj, remediation={"kind": "manual", "note": "x"})
+        manifest = _full_manifest(
+            candidates=[self.candidate(check=check, object=obj, pod_selector_withheld="other pods match")]
+        )
+        rc = self.run_finish(make_doc(findings=[finding]), ["--dry-run", "--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        lines = [line for line in self.err.splitlines() if "not refused, and stays manual" in line]
+        self.assertTrue(lines)
+        self.assertTrue(all("DRY RUN: " in line for line in lines), lines)
 
     def test_a_declined_fix_keeps_the_decline_and_gets_no_route_note(self):
         """A declared `manual` fix the sweep would open is refused until it is
