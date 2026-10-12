@@ -15282,6 +15282,19 @@ class TestStandingCoverageGap(HarnessTestCase):
         self.assertEqual(len(comments), 1)
         self.assertIn(url, comments[0])
 
+    def test_a_findings_run_after_a_held_open_ledger_does_not_repeat_the_ids(self):
+        # The held-open stored run already reported "a" as no longer found.
+        old = make_finding(fid="a", severity="major")
+        new = make_finding(fid="c", severity="major", obj="Namespace/c")
+        previous = published_body(
+            make_doc(findings=[old], skipped=self.PARTIAL), generated_at=NOW
+        )
+        gaps = audit_report.coverage_gaps(make_doc(findings=[], skipped=self.PARTIAL))
+        self.seed_report(previous, coverage_gaps=gaps, status="CLEAN", ledger_held_open=True)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.run_finish(make_doc(findings=[new], skipped=self.PARTIAL))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, self.stdout_json())
+
     def test_an_unchanged_gap_posts_no_second_partial_all_clear(self):
         self.seed(None, self.PARTIAL)
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))

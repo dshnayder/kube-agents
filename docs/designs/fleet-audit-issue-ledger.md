@@ -979,7 +979,7 @@ coverage, and nothing else:
   the run speak again, unless a finding id that the stored run listed is not in this run's published
   set (its findings, the postures it withheld, and the held ids). A gap holds `resolved` at 0, so
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
-  those ids under `unreported_under_gap`. A clean run after a stored run that held the ledger open is
+  those ids under `unreported_under_gap`. A run after a stored run that held the ledger open is
   the exception: that stored run already said it found none of the ids the body carries. `finish`
   cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
   of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
@@ -993,7 +993,7 @@ reason. A channel that hears the same gap every morning learns to ignore the str
 the same runs, the rule above made the drift stream speak once and the networking stream once. The
 gap is still said on the run that gets it and on every run that changes it, and it stays in the
 ledger, in `coverage_gaps` on the JSON line and the stored record, and in the run log. A scheduled
-run's report also has a destination now (the cron report relay, §7.5), so a verdict that is loud
+run's report also has a destination (the cron report relay, §7.5), so a verdict that is loud
 every day has a cost.
 
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are

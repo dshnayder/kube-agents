@@ -436,8 +436,9 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     ``report`` is the relayed report: its whole ledger line is read for
     gaps and checked against the title. A closed issue, one without the
     ledger label, a zero-finding title and a body listing no finding do not
-    parse: a clean run closes the ledger over its old title
-    (:func:`_clean_name`), and the fallback posts the report's own line.
+    parse: a clean run closes the ledger, then retitles it to 0 findings over
+    the old body (:func:`_clean_name` reads it), and the fallback posts the
+    report's own line.
     Nor does one whose title disagrees with the line's own finding total, or
     one whose line states no total and no non-zero count, or calls the run
     clean, held or carried: a zero-finding partial or held run leaves the old

@@ -10382,7 +10382,7 @@ def _comment_resolved(data: dict) -> list[str]:
 def _comment_declared(data: dict) -> list[str]:
     """The declared postures, with their `repo:path` pointers, for a comment.
 
-    A clean run closes the ledger without rewriting it, so this comment is
+    A clean run closes the ledger and adds only a banner and a title, so this comment is
     the last place a declared posture is published on the issue tracker:
     once the ledger is closed, a clean run with declarations opens nothing
     (see the CLEAN branch of `handle_finish`), and the record is the
@@ -15895,11 +15895,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
-    # this run's findings, the postures it withheld, and the held ids. A clean
-    # run after a stored run that was held open is the exception: the stored
-    # run already reported that it found none of the ids the body carries.
+    # this run's findings, the postures it withheld, and the held ids. A run
+    # after a stored run that was held open is the exception: the stored run
+    # already reported that it found none of the ids the body carries, so a
+    # second report of the same ids would repeat it.
     stored_ledger_ids = set(previous_ids)
-    if not findings and (memory or {}).get("ledger_held_open"):
+    if (memory or {}).get("ledger_held_open"):
         stored_ledger_ids = set()
     unreported_under_gap = (
         sorted(stored_ledger_ids - held_exclude - held_ids) if gaps else []
