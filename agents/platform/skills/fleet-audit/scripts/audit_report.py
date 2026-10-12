@@ -1372,52 +1372,14 @@ RELEASE_RENDERER_NOUNS = {
 RELEASE_RENDERER_FALLBACK_NOUN = "the release"
 # What a worker note is cut with when the route notes need its space.
 ROUTE_NOTE_TRUNCATED = " …(truncated)"
-# What joins the worker's note and each route note.
+# What joins two route notes, and what puts the route notes on their own
+# paragraph after the worker's note. A paragraph of its own is outside any
+# code block the worker's note ends with.
 NOTE_SEPARATOR = " "
-# The worker's own words that say the repository does not declare the object.
-# A clause matches the first pattern alone ("no file declares", "declared
-# nowhere"), or the second and the third together: a negation near a form of
-# "declare", and the repository named in the same clause. Both are necessary
-# for the second form: "the chart does not expose a values key" is a negation
-# and no denial, and "declared in this repository at `x`" names the
-# repository and says the opposite.
-DECLARATION_DENIAL_SELF_SUFFICIENT_RE = re.compile(
-    r"\bno\s+(?:file|files|manifest|manifests)\b[^.;]{0,40}?\bdeclar\w*"
-    r"|\bdeclar\w*\b[^.;]{0,40}?\bnowhere\b",
-    re.I,
-)
-DECLARATION_DENIAL_NEGATED_RE = re.compile(
-    r"\b(?:not|never|no|nothing|neither)\b[^.;]{0,40}?\bdeclar\w*",
-    re.I,
-)
-DECLARATION_DENIAL_SUBJECT_RE = re.compile(r"\b(?:repo|repository|GitOps)\b", re.I)
-# A clause is one sentence, one part of a sentence between semicolons, or one
-# line. A comma does not end a clause: "not declared in the repository, so no
-# pull request can carry it" is a claim and its result, and a cut at the
-# comma keeps the result without its cause. The separator is captured, so the
-# text is joined again with its own spaces and newlines.
-CLAUSE_SPLIT_RE = re.compile(r"((?<=[.;])[ \t]+|[ \t]*\n\s*)")
-# The fields a denial was seen in, as (section, field). `action` is not here:
-# it carries commands, and a cut at a full stop can break one. The note is
-# read only on a `manual` remediation, and never when it holds a code fence.
-DECLARATION_DENIAL_FIELDS = (("remediation", "note"), ("recommendation", "rationale"))
+ROUTE_PARAGRAPH_BREAK = "\n\n"
 CODE_FENCE = "```"
-# The words for the finding's own object, besides its kind and name.
-OWN_OBJECT_WORDS = ("object", "workload", "resource")
-# Kinds a clause can deny a declaration of that are not the finding's own
-# object: "No PodDisruptionBudget is declared in the repository for this
-# Deployment" is true and is about the budget. A clause that names one of
-# these, other than the finding's own kind, is never removed.
-OTHER_KIND_WORDS = (
-    "PodDisruptionBudget", "PDB", "budget", "HorizontalPodAutoscaler", "HPA", "autoscaler",
-    "NetworkPolicy", "network policy", "policy", "ServiceAccount", "service account",
-    "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding", "binding", "ConfigMap",
-    "Secret", "Service", "Ingress", "Gateway", "HTTPRoute", "Deployment", "StatefulSet",
-    "DaemonSet", "CronJob", "Job", "Pod", "Namespace", "ComputeClass", "NodePool",
-    "values key", "probe", "quota", "ResourceQuota", "LimitRange",
-)
-SENTENCE_END = "."
-DANGLING_PUNCTUATION = (";", ",")
+# What closes a code fence that the worker's note leaves open.
+CODE_FENCE_CLOSE = "\n```"
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -13257,6 +13219,19 @@ class UnwrittenFix(NamedTuple):
     declared: bool
 
 
+def promised_paths(findings: list[dict]) -> dict[str, str]:
+    """Finding id to the path each `manifest` remediation names.
+
+    Taken before `degrade_missing_remediations`, which blanks the path of a
+    fix that was not written, for `unwritten_sweep_fixes` to read.
+    """
+    return {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
+
+
 def unwritten_sweep_fixes(
     findings: list[dict],
     manifest: dict | None,
@@ -13391,127 +13366,9 @@ def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
     return evidence
 
 
-def _object_words(obj: str) -> tuple[re.Pattern, re.Pattern | None]:
-    """Patterns for the finding's own object, and for any other kind.
-
-    The first matches the object's name, or "this" or "the" before its kind
-    or before a word in `OWN_OBJECT_WORDS`. The second matches a kind in
-    `OTHER_KIND_WORDS` that is not the object's own kind, and is None when
-    there is none.
-    """
-    kind, _, name = obj.partition("/")
-    own = [re.escape(name)] if name else []
-    nouns = [re.escape(kind)] if kind else []
-    nouns += [re.escape(word) for word in OWN_OBJECT_WORDS]
-    own.append(r"\b(?:this|the)\s+(?:" + "|".join(nouns) + r")")
-    others = [re.escape(word) for word in OTHER_KIND_WORDS if word.lower() != kind.lower()]
-    own_re = re.compile(r"(?<![\w-])(?:" + "|".join(own) + r")(?![\w-])", re.I)
-    other_re = re.compile(r"(?<![\w-])(?:" + "|".join(others) + r")s?(?![\w-])", re.I) if others else None
-    return own_re, other_re
-
-
-def _denies_declaration(clause: str, own_re: re.Pattern, other_re: re.Pattern | None) -> bool:
-    """Whether one clause says that the repository does not declare the
-    finding's own object.
-
-    Three things must be true. The clause denies a declaration: a negation
-    near a form of "declare" with the repository named, or "no file
-    declares", or "declared nowhere". It names the object: its name, or
-    "this" or "the" before its kind. And it names no other kind, so a true
-    clause about a missing budget or policy stays.
-    """
-    if any(lede in clause for lede in ROUTE_NOTE_LEDES):
-        return False
-    denies = bool(DECLARATION_DENIAL_SELF_SUFFICIENT_RE.search(clause)) or bool(
-        DECLARATION_DENIAL_NEGATED_RE.search(clause) and DECLARATION_DENIAL_SUBJECT_RE.search(clause)
-    )
-    if not denies or not own_re.search(clause):
-        return False
-    return other_re is None or not other_re.search(own_re.sub(" ", clause))
-
-
-def _drop_declaration_denials(text: str, obj: str) -> str:
-    """`text` without the clauses that deny the declaration of `obj`.
-
-    Each clause is removed in place, with the separator after it, so the
-    spaces and newlines of the rest stay as they were. A route note this
-    script wrote is kept. The text comes back unchanged when no clause is a
-    denial, and also when every clause is one: an empty rationale is a worse
-    ledger row than one the note below it corrects.
-    """
-    if not text or CODE_FENCE in text:
-        return text
-    own_re, other_re = _object_words(obj)
-    parts = CLAUSE_SPLIT_RE.split(text)
-    clauses, separators = parts[0::2], parts[1::2] + [""]
-    kept: list[tuple[str, str]] = []
-    dropped = False
-    for clause, separator in zip(clauses, separators):
-        if clause.strip() and _denies_declaration(clause, own_re, other_re):
-            dropped = True
-            if kept and kept[-1][0].endswith(DANGLING_PUNCTUATION):
-                kept[-1] = (kept[-1][0][:-1] + SENTENCE_END, kept[-1][1])
-            continue
-        kept.append((clause, separator))
-    if not dropped or not any(clause.strip() for clause, _ in kept):
-        return text
-    return "".join(clause + separator for clause, separator in kept).strip()
-
-
-def retract_contradicted_declaration_denials(
-    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str] = frozenset()
-) -> list[str]:
-    """Remove the worker's claim that the repository does not declare the
-    object, where the collector found the declaration. Returns the ids changed.
-
-    The SOPs tell the worker not to deny a `declaration` or a
-    `release_declaration` that its candidate carries, and the worker still
-    writes the denial. The ledger then shows the denial next to the note that
-    names the file, and the reader cannot tell which one the run measured.
-    The collector parsed the repository, so its field is the measured fact.
-
-    Two fields are evidence. `declaration` is the file that declares the
-    object. `release_declaration` is the chart release or overlay that renders
-    it, and an object that something renders has no file of its own, so "no
-    file declares it" is also false there in the sense the reader needs.
-    `namespace_directory` is not evidence: it says where a new object goes,
-    and the object itself can be undeclared, so the denial can be true.
-
-    A clause is removed only when it is about the finding's own object, by
-    name or as "this <kind>", and names no other kind. "No
-    PodDisruptionBudget is declared in the repository for this Deployment" is
-    true and stays. A clause that says "it" is not removed either, because
-    the pass cannot tell what "it" is.
-
-    The pass removes clauses and writes nothing in their place. The route note
-    that `disclose_manual_remediation_routes` appends states the fact. It
-    reads `recommendation.rationale`, and `remediation.note` only on a
-    `manual` remediation, never a text that holds a code fence, and leaves
-    alone a finding in `skip`.
-    """
-    evidence = route_evidence(manifest)
-    retracted: list[str] = []
-    for finding in findings:
-        fid = str(finding.get("id", ""))
-        found = evidence.get(derive_finding_id(finding))
-        if fid in skip or found is None or not (found.declaration or found.release):
-            continue
-        edited = False
-        for section, field in DECLARATION_DENIAL_FIELDS:
-            block = finding.get(section)
-            if not isinstance(block, dict):
-                continue
-            if section == "remediation" and block.get("kind") != "manual":
-                # A `gcloud` note is a command, rendered as a code block.
-                continue
-            before = str(block.get(field) or "")
-            after = _drop_declaration_denials(before, str(finding.get("object") or ""))
-            if after != before:
-                block[field] = after
-                edited = True
-        if edited:
-            retracted.append(fid)
-    return retracted
+def _names_path(text: str, path: str) -> bool:
+    """Whether `text` names `path` as a whole path, not as part of a longer one."""
+    return bool(re.search(r"(?<![\w./-])" + re.escape(path) + r"(?!\.?[\w/-])", text))
 
 
 def _route_notes(found: RouteEvidence, worker_note: str) -> list[str]:
@@ -13534,11 +13391,37 @@ def _route_notes(found: RouteEvidence, worker_note: str) -> list[str]:
         note = NAMESPACE_DIRECTORY_NOTE.format(path=found.namespace_directory)
     else:
         location, note = "", ""
-    if note and location not in worker_note:
+    if note and not _names_path(worker_note, location):
         notes.append(note)
     if found.reconciler:
         notes.append(RECONCILED_NOTE.format(reconciler=found.reconciler))
     return notes
+
+
+def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
+    """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
+
+    A worker note that leaves a code fence open gets the fence closed, so the
+    route notes after it are prose. A cut never goes inside a code block: a
+    worker note with a fence is cut only before its first fence, and when
+    that does not give enough space the route notes are left out.
+    """
+    if not added:
+        return worker_note, added
+    if worker_note.count(CODE_FENCE) % 2:
+        worker_note += CODE_FENCE_CLOSE
+    budget = MAX_NOTE_CHARS - len(added) - len(ROUTE_PARAGRAPH_BREAK)
+    if len(worker_note) <= budget:
+        return worker_note, added
+    room = budget - len(ROUTE_NOTE_TRUNCATED)
+    if CODE_FENCE in worker_note:
+        head = worker_note[: worker_note.index(CODE_FENCE)].rstrip()
+        if head and len(head) <= room:
+            return head + ROUTE_NOTE_TRUNCATED, added
+        return worker_note, ""
+    if room <= 0:
+        return "", added
+    return worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED, added
 
 
 def disclose_manual_remediation_routes(
@@ -13574,9 +13457,14 @@ def disclose_manual_remediation_routes(
 
     The pass first removes the route notes that the text already carries,
     which a worker that copies the previous ledger brings back, and then
-    writes them again from this run's manifest. The worker's note is cut
-    first when the total is over `MAX_NOTE_CHARS`, because the renderer cuts
-    from the end and the route notes are at the end.
+    writes them again from this run's manifest. It removes them also when
+    this run's candidate carries no field. The route notes go in a paragraph
+    of their own after the worker's note. The worker's note is cut first when
+    the total is over `MAX_NOTE_CHARS`, because the renderer cuts from the
+    end and the route notes are at the end (`_fit_route_notes`).
+
+    The pass does not edit the worker's own words. A worker clause that
+    contradicts a note stays, and the note beside it is the correction.
     """
     evidence = route_evidence(manifest)
     disclosed: list[str] = []
@@ -13585,19 +13473,14 @@ def disclose_manual_remediation_routes(
         remediation = finding.get("remediation")
         if fid in skip or not isinstance(remediation, dict) or remediation.get("kind") != "manual":
             continue
-        found = evidence.get(derive_finding_id(finding))
-        if found is None:
-            continue
         original = str(remediation.get("note") or "")
         worker_note = original.strip()
         if ROUTE_NOTE_PATTERN.search(worker_note):
             worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
-        added = NOTE_SEPARATOR.join(_route_notes(found, worker_note))
-        budget = MAX_NOTE_CHARS - len(added) - len(NOTE_SEPARATOR)
-        if added and len(worker_note) > budget:
-            cut = max(budget - len(ROUTE_NOTE_TRUNCATED), 0)
-            worker_note = (worker_note[:cut].rstrip() + ROUTE_NOTE_TRUNCATED) if cut else ""
-        note = NOTE_SEPARATOR.join(part for part in (worker_note, added) if part)
+        found = evidence.get(derive_finding_id(finding))
+        added = NOTE_SEPARATOR.join(_route_notes(found, worker_note)) if found else ""
+        worker_note, added = _fit_route_notes(worker_note, added)
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (worker_note, added) if part)
         if note != original.strip():
             remediation["note"] = note
             disclosed.append(fid)
@@ -13607,20 +13490,9 @@ def disclose_manual_remediation_routes(
 def disclose_manual_routes_and_log(
     findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str], prefix: str = ""
 ) -> None:
-    """Run the retraction, then the disclosure, and log what each changed.
-
-    The retraction runs first: the disclosure appends the note that proves the
-    removed clause false, and a retraction after it would have to read past
-    that note.
-    """
+    """Add the route notes, and log each finding that changed."""
     if manifest is None:
         return
-    for fid in retract_contradicted_declaration_denials(findings, manifest, skip):
-        log(
-            f"{prefix}{fid}: its text said that the repository does not declare the "
-            "object, but the collector found its declaration or its release; that "
-            "clause was removed."
-        )
     for fid in disclose_manual_remediation_routes(findings, manifest, skip):
         log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
 
@@ -14928,11 +14800,7 @@ def _handle_finish_dry_run(
     # step below therefore sees the post-degradation findings, exactly as
     # `handle_finish` does. What each fix promised is kept first, because the
     # degrade blanks the path and the route notes below need it.
-    promised_preview = {
-        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
-        for f in findings
-        if (f.get("remediation") or {}).get("kind") == "manifest"
-    }
+    promised_preview = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -14950,9 +14818,9 @@ def _handle_finish_dry_run(
             f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
             "Connector declaration holds; it degrades to manual, naming the file."
         )
-    # The notes the real run adds. The preview reads no pull request, so it
-    # leaves alone every fix the refusal would list, also one that a pull
-    # request already carries and the real run gives a note.
+    # The notes the real run adds. The preview reads no pull request and no
+    # `--decline-fix`, so it leaves alone every fix the refusal would list,
+    # and it can leave out a note the real run adds.
     disclose_manual_routes_and_log(
         findings,
         manifest,
@@ -15833,11 +15701,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report. What each promised is kept for
     # `unwritten_sweep_fixes`, since the degrade blanks the path.
-    promised = {
-        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
-        for f in findings
-        if (f.get("remediation") or {}).get("kind") == "manifest"
-    }
+    promised = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(

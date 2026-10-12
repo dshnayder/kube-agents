@@ -84,7 +84,12 @@ verification_spec:
       required_phrases:
         - "Reconciled by the Helm release `eval-orders` in eval-reconciled-service. A change made by hand to the live object is reverted"
   # These two tell a red from a broken run: the finding was filed, against
-  # the plant, by the check this case reads.
+  # the plant, by the check this case reads. The ledger shortens an id over
+  # MAX_FINDING_ID (100) characters from its longest segments, so each phrase
+  # is a prefix that survives the shortening: checked with
+  # audit_report.published_id for the host cluster `platform-agent-host` and
+  # for cluster names up to `kube-agents-evals-10-platform-agent-host`, where
+  # the id is `service-selects-nothing.kube-agents-evals-10-pl.eval-reconciled-servic.service-eval-orders-ap-24d609`.
   - name: a-finding-was-filed-against-the-planted-service
     role: objective
     mode: assert
@@ -92,7 +97,7 @@ verification_spec:
       type: ledger_issue_contains
       audit: obtainability-audit
       scope: finding_ids
-      required_phrases: ["eval-reconciled-service.service-eval-orders-api"]
+      required_phrases: ["eval-reconciled", "eval-orders-ap"]
   - name: the-empty-selector-check-filed-it
     role: objective
     mode: assert

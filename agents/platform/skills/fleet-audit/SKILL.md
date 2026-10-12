@@ -759,13 +759,11 @@ field, and publishes nothing:
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (a patch to the live
   object is reverted), or else the `namespace_directory` for a new object. It also names the
-  `reconciler` that reverts a change made by hand. It writes no note for a candidate without these
-  fields, and none for a fix that "Write every `manifest` remediation file" below wrote, declined,
-  or found in a pull request. When the candidate carries `declaration` or `release_declaration`, it
-  removes a clause that says the repository does not declare the finding's own object, named by
-  its name or as "this <kind>", if the clause names no other kind (a PodDisruptionBudget, an HPA, a
-  NetworkPolicy). It does not edit a `gcloud` note or a text with a code fence. Do not copy these
-  notes into your `note`.
+  `reconciler` that reverts a change made by hand. The notes go in a paragraph of their own after
+  your note. It writes no note for a candidate without these fields, and none for a fix that "Write
+  every `manifest` remediation file" below wrote, declined, or found in a pull request. It does not
+  change your words. A `--dry-run` can leave out a note the real run adds. Do not copy these notes
+  into your `note`.
 
 ### Scope, skipped, and limitations
 

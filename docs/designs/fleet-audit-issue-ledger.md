@@ -619,18 +619,17 @@ the fix belongs. The note comes only from the collector's candidate for the same
 is one location note at most: the `declaration` file, or else the `release_declaration` file with
 the fact that the release reverts a patch to the live object, or else the `namespace_directory`
 where a new object belongs. A `reconciler` adds a second note: a change made by hand is reverted.
-A note whose path the worker's note already names is not written. A candidate without these fields
-gets no note, because a missing `declaration` is not a claim that no file declares the object. A
-fix that the refusal path wrote, declined, or found in a pull request keeps the text that path
-gave it. Where the candidate carries `declaration` or `release_declaration`, `finish` also removes
-the worker's clauses that say the repository does not declare the finding's own object, from
-`recommendation.rationale` and from the note of a `manual` remediation. A clause is removed only
-when it names the object, by its name or as "this <kind>", and names no other kind: "No
-PodDisruptionBudget is declared in the repository for this Deployment" is true and stays. A `gcloud`
-note and a text with a code fence are not edited, and the rest of a text keeps its newlines. The
-worker's note is cut first when the total is longer than the note cap, so the route notes stay in
-the rendered row. The dry run adds the same notes with one difference: it reads no pull request,
-so it also leaves alone a fix that the refusal would list and that a pull request already carries.
+The notes go in a paragraph of their own after the worker's note, and a code fence that the
+worker's note leaves open is closed first. A note whose path the worker's note already names as a
+whole path is not written. A candidate without these fields gets no note, because a missing
+`declaration` is not a claim that no file declares the object. A route note copied from an earlier
+ledger is removed before the notes are written again. A fix that the refusal path wrote, declined,
+or found in a pull request keeps the text that path gave it. The notes give the location; a worker
+clause that contradicts them stays, and the note beside it is the correction. The worker's note is
+cut first when the total is longer than the note cap, so the route notes stay in the rendered row,
+and the cut is never inside a code block: a note with a fence is cut only before the fence, or the
+route notes are left out. The dry run can leave out notes the real run adds, because it reads no
+pull request and no `--decline-fix`, and so skips every fix the refusal would list.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
