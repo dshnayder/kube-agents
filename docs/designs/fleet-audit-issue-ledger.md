@@ -642,17 +642,18 @@ block, because in content mode that file exists only in the scratch tree. The bl
 worker's own note, and it gets only the room that the note's own text leaves under the renderer's
 note clip: it keeps at most a fixed number of lines, ends in a truncation line when it keeps less,
 and is left out when no room is left. So the clip cuts the worker's text and never the closing
-fence. When git or the broker cannot answer (a broker that refuses the open included), or the
-kustomization cannot be read, the fix degrades too, and the note says what could not be checked: the
-audit does not publish a pull request it cannot show will render. When the probe saw no
-kustomization, the note names none. A broker that does not answer the open at all is an outage: the
-pass raises `BROKER UNAVAILABLE`, nothing is published, and the worker runs the command again, as
-for an outage at publish. `finish` does not refuse these fixes as unwritten, because the worker
-cannot correct them in one file, and `remediate` refuses them by name. The dry run does not ask git
-about the audited commit, so it cannot tell a new file from an existing one, and it reads the
-kustomization in the working tree. It takes each file as new, ignores a kustomization that a finding
-names as its fix, as the real run ignores every kustomization the worker wrote, warns, and does not
-change the body.
+fence. When git cannot answer, the broker refuses a question (a 4xx status, at the open included),
+or the kustomization cannot be read, the fix degrades too, and the note says what could not be
+checked: the audit does not publish a pull request it cannot show will render. When the probe saw no
+kustomization, the note names none. A broker outage is not a refusal: no answer at all, or a server
+error or too-many-requests status, at the open or at a later call. Then the pass raises
+`BrokerUnavailable` (the log line says `BROKER UNAVAILABLE`), nothing is published, and the worker
+runs the command again, as for an outage at publish. `finish` does not refuse these fixes as
+unwritten, because the worker cannot correct them in one file, and `remediate` refuses them by name.
+The dry run does not ask git about the audited commit, so it cannot tell a new file from an existing
+one, and it reads the kustomization in the working tree. It takes each file as new, ignores a
+kustomization that a finding names as its fix, as the real run ignores every kustomization the
+worker wrote, warns, and does not change the body.
 
 Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
 incidental. The agent writes its remediation manifests into the clone _between_ `start` and

@@ -1104,7 +1104,8 @@ agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
 all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. A
 target is also refused when its fix adds a new file that its kustomization does not list, or the
-audit could not check that; its `REFUSED` line names the `resources:` line to add. The
+audit could not check that. Its `REFUSED` line names the `resources:` line to add when the audit saw
+the kustomization, and says what it could not check otherwise. The
 other targets still open — `/remediate all` expands to every **manifest-remediation** id in the
 document, and failing the batch over one unwritten file would answer a request for many fixes with
 none. Say which were refused when you acknowledge the command.
@@ -1312,7 +1313,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   `kind: manifest` and `path`, and run `finish` again. A declared `no-pdb` finding is the exception:
   `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, and a
   `--decline-fix` for it is ignored unless its reason carries the URL (`https://…/pull/<n>`) of the
-  pull request already carrying it:
+  pull request already carrying it. That URL rule applies only to a budget `finish` writes itself; in
+  a Kustomize root it writes none, so a decline that names the kustomization stands:
   leave it `manual`, and never name its declaration's file. One
   whose candidate carries `pod_selector_withheld` (its selector also reaches a DaemonSet's, Job's or
   CronJob's pods) is neither written nor refused: that budget would permit no evictions. A finding the SOP itself makes `manual`, or
@@ -1337,9 +1339,9 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
   repeats. Where the file is not in the repository and the nearest kustomization above it (in its
   directory or a parent) does not name it, `finish` degrades the finding to `manual`. The note names
   the kustomization and the `resources:` line to add, and holds your file as a YAML block, capped in
-  lines and in characters. It also degrades the finding, and says so, when git or the broker cannot
-  answer or the kustomization cannot be read. A broker that does not answer at all stops `finish`
-  with `BROKER UNAVAILABLE`, as at publish. It does not refuse the run for these, and `remediate`
+  lines and in characters. It also degrades the finding, and says so, when git cannot answer, the broker
+  refuses a question, or the kustomization cannot be read. A broker outage (no answer, a server
+  error, or too many requests) stops `finish` with `BROKER UNAVAILABLE`, as at publish. It does not refuse the run for these, and `remediate`
   refuses them by name. `finish --dry-run` only warns, only in directory mode, and reads the
   kustomization in the working tree, where the real run reads it at the audited commit.
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what

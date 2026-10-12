@@ -1320,6 +1320,10 @@ KUSTOMIZE_ENTRY_AFTER = r"/?(?![\w./-])"
 # The audited commit in directory mode. `start` resets the clone to the base
 # branch, and the worker's fixes stay untracked until a branch stages them.
 AUDITED_REF = "HEAD"
+# Broker statuses that say "try again", not "no": a server error, and
+# too many requests. At the Kustomize pass they stop the command as an outage.
+HTTP_SERVER_ERROR_FLOOR = 500
+HTTP_TOO_MANY_REQUESTS = 429
 # How many lines of a worker's file the Kustomize pass copies into the
 # `manual` note, so a person can add it by hand. The characters are capped
 # by the room MAX_NOTE_CHARS leaves after the note's own text.
@@ -12644,6 +12648,28 @@ def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
     return name, text
 
 
+def _broker_outage(exc: BaseException) -> bool:
+    """Whether a broker error says "try again" rather than "no".
+
+    True for no answer at all (`broker_lost`), and for a server error or a
+    too-many-requests status anywhere in the cause chain. False for any
+    other status, which is the broker refusing the question."""
+    try:
+        if broker_lost(exc):
+            return True
+    except Exception:  # noqa: BLE001 -- a check that fails proves no outage
+        pass
+    seen: BaseException | None = exc
+    while seen is not None:
+        status = getattr(seen, "status", None)
+        if not isinstance(status, int):
+            status = getattr(seen, "code", None)
+        if isinstance(status, int) and (status >= HTTP_SERVER_ERROR_FLOOR or status == HTTP_TOO_MANY_REQUESTS):
+            return True
+        seen = seen.__cause__
+    return False
+
+
 class _RepositoryProbe:
     """What the repository already holds, for the fixes `finish` writes.
 
@@ -12657,9 +12683,11 @@ class _RepositoryProbe:
         self.repo, self.root = repo, root
         self._session = None
         self._workspace = None
-        # Why the broker could not be asked, once it could not, and the error.
+        # Why the broker could not be asked, once it could not.
         self.unavailable = ""
-        self.open_error: BaseException | None = None
+        # The first broker error that was an outage rather than a refusal:
+        # no answer, or a status that says to try again (`_broker_outage`).
+        self.outage: BaseException | None = None
         # Why the last answer was a yes nobody saw: a call that failed or a
         # listing that stopped short. Read and cleared by `take_unanswered`.
         self.unanswered = ""
@@ -12689,23 +12717,31 @@ class _RepositoryProbe:
                 self._workspace = self._session.__enter__()
             except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
                 self.unavailable = f"{type(exc).__name__}: {exc}"
-                self.open_error = exc
+                self.note_outage(exc)
                 log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
         return self._workspace
 
-    def raise_if_lost(self, what: str) -> None:
-        """Raise `BrokerUnavailable` when the broker did not answer the open at all.
+    def note_outage(self, exc: BaseException) -> None:
+        """Keep `exc` for `raise_if_lost` when it is an outage, not a refusal."""
+        if self.outage is None and _broker_outage(exc):
+            self.outage = exc
 
-        A refusal (an HTTP status) is an answer, and the caller treats it as
-        an unanswered question. A lost broker stops the command with the
-        outage line, as a lost broker does at publish, so the worker runs
-        `finish` again and no fix is published or degraded on an outage."""
-        if content_mode() and self._workspace is None and self.open_error is not None and broker_lost(self.open_error):
+    def raise_if_lost(self, what: str) -> None:
+        """Raise `BrokerUnavailable` when the broker had an outage in this run.
+
+        An outage is no answer at all, or a server error or a too-many-requests
+        status, at the open or at a later call. A 4xx refusal is an answer,
+        and the caller treats it as an unanswered question. An outage stops
+        the command with the outage line, as an outage at publish does, so
+        the worker runs `finish` again and no fix is published or degraded
+        because of it."""
+        if content_mode() and self.outage is not None:
             raise BrokerUnavailable(
-                f"{what}: the broker at {proxy_endpoint()} did not answer ({self.unavailable}). "
-                "This sandbox has no other way to check the repository; check the "
-                "credential-proxy pod and re-run this command."
-            ) from self.open_error
+                f"{what}: the broker at {proxy_endpoint()} did not answer "
+                f"({type(self.outage).__name__}: {self.outage}). This sandbox has no "
+                "other way to check the repository; check the credential-proxy pod "
+                "and re-run this command."
+            ) from self.outage
 
     def take_unanswered(self) -> str:
         """Why the broker could not answer since the last call, then forget it."""
@@ -12731,6 +12767,7 @@ class _RepositoryProbe:
             listing = workspace.list(prefix=path)
         except Exception as exc:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
             self.unanswered = f"listing {path}: {type(exc).__name__}: {exc}"
+            self.note_outage(exc)
             return True
         if getattr(listing, "truncated", False):
             self.unanswered = f"listing {path} was truncated"
@@ -12796,6 +12833,7 @@ class _RepositoryProbe:
             return workspace.read_text(path)
         except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
             self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
+            self.note_outage(exc)
             return None
 
     def mentions(self, name: str, prefix: str = "") -> bool:
@@ -13385,7 +13423,8 @@ def degrade_unlisted_kustomize_additions(
     When the probe cannot answer -- git fails, the broker refuses or does not
     answer a question, or the kustomization cannot be read -- the fix
     degrades too, with a note that says what could not be checked. A broker
-    that does not answer the open at all is an outage: the pass raises
+    outage -- no answer at all, or a server error or too-many-requests status,
+    at the open or a later call -- is not a refusal: the pass raises
     `BrokerUnavailable`, so nothing is published and the worker runs the
     command again, as for an outage at publish. This is the direction
     `degrade_missing_remediations` takes: a fix the audit cannot prove it can
@@ -13413,11 +13452,13 @@ def degrade_unlisted_kustomize_additions(
             continue
         unchecked_new = probe.unanswered
         nearest = _nearest_kustomization(path, probe)
+        probe.raise_if_lost(f"checking whether a kustomization lists {path}")
         if nearest is None:
             continue
         directory, kustomization, unseen = nearest
         entry = _kustomize_entry(path, directory)
         text = None if unseen else probe.read_committed(kustomization)
+        probe.raise_if_lost(f"reading {kustomization}")
         unread = probe.unanswered if text is None and not unseen else ""
         listed = text is not None and re.search(
             KUSTOMIZE_ENTRY_BEFORE + re.escape(entry) + KUSTOMIZE_ENTRY_AFTER, text

@@ -15998,6 +15998,29 @@ class ContentModeTestCase(BaseTestCase):
         self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertNotIn("FATAL", self.err)
 
+    def test_a_busy_broker_at_the_kustomize_check_is_the_same_refusal(self):
+        """A 503 at the probe's open is an outage: `finish` exits 2 with the
+        outage line and opens nothing, so the worker runs it again, and no fix
+        is degraded because the broker was busy."""
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+
+        def busy(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(503, {"error": "busy"})
+
+        with patch.object(credential_proxy_client.Workspace, "open", busy):
+            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertIn("checking whether a kustomization lists", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertEqual(self.harness.forge_calls("issue-create"), [])
+
     def test_a_broker_dropped_mid_answer_under_the_workspace_is_the_same_refusal(self):
         """Review finding: a broker evicted after taking the request surfaces
         from the response read, raw and not as a `URLError`, and exited 1."""
@@ -24265,6 +24288,29 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertIn("WorkspaceRequestError", note)
         self.assertNotIn("kustomization.yaml", note)
         self.assertNotIn("Kustomization`", note)
+
+    def test_a_server_error_at_the_open_stops_the_command(self):
+        """A 503 or 429 says "try again", so it is an outage, not a refusal."""
+        for status in (503, 429):
+            with self.subTest(status=status):
+
+                def busy(*_args, **_kwargs):
+                    raise credential_proxy_client.WorkspaceRequestError(status, {"error": "busy"})
+
+                with self.assertRaises(audit_report.BrokerUnavailable):
+                    self.degrade_with_open(busy)
+
+    def test_a_lost_broker_after_a_good_open_stops_the_command(self):
+        import urllib.error
+
+        class Lost(FakeBrokerWorkspace):
+            def list(self, prefix=None):
+                raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        session = mock.MagicMock()
+        session.__enter__.return_value = Lost(self.overlay())
+        with self.assertRaises(audit_report.BrokerUnavailable):
+            self.degrade_with_open(lambda *_a, **_k: session)
 
     def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
