@@ -756,9 +756,10 @@
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
 
-# The obtainability stream's route-note case (#2686): the orphan-service
-# plant again, in its own namespace, with Helm release markers on the
-# Service. Graded on the note `finish` adds to the manual remediation of a
-# reconciled object (audit_report.disclose_manual_remediation_routes). Priced
-# with the 900s audit band.
-./tasks/obtainability-manual-names-reconciler/task.yaml
+# The ai-security stream's route-note case (#2686): prebuilt/ai-reconciled-model
+# plants one zero-replica model server on a floating tag with Helm release
+# markers, so its manual `model-image-floating-tag` finding is the only one
+# on the stream and renders in the ledger body. Graded on the note `finish`
+# adds to it (audit_report.disclose_manual_remediation_routes). Priced with
+# ai-security-planted-model-audit's 1450s hint.
+./tasks/ai-security-manual-names-reconciler/task.yaml

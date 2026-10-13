@@ -9313,6 +9313,53 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
 
+    def test_the_reconciled_model_plant_files_one_manual_candidate_with_its_reconciler(self):
+        """The object `bench/tf/prebuilt/ai-reconciled-model` plants, as the
+        dump reads it: a zero-replica model server on a floating tag with the
+        two Helm release annotations. It must give exactly one candidate,
+        `model-image-floating-tag`, carrying the reconciler that
+        `audit_report.disclose_manual_remediation_routes` names. Change the
+        stack and change this test."""
+        planted = {
+            "kind": "Deployment",
+            "metadata": {
+                "name": "eval-reconciled-model",
+                "namespace": "eval-ai-reconciled",
+                "labels": {"app": "eval-reconciled-model"},
+                "annotations": {
+                    "meta.helm.sh/release-name": "eval-model-release",
+                    "meta.helm.sh/release-namespace": "eval-ai-reconciled",
+                },
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": "eval-reconciled-model"}},
+                "template": {
+                    "metadata": {"labels": {"app": "eval-reconciled-model"}},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "containers": [
+                            {
+                                "name": "server",
+                                "image": "registry.invalid/vllm/vllm-openai:latest",
+                                "resources": {
+                                    "requests": {"cpu": "10m", "memory": "16Mi"},
+                                    "limits": {"memory": "32Mi"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        result = self.run_with(workload_items=[planted])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual([c["check"] for c in result["candidates"]], ["model-image-floating-tag"])
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["object"], "Deployment/eval-reconciled-model")
+        self.assertEqual(candidate["reconciler"], "the Helm release `eval-model-release` in eval-ai-reconciled")
+        self.assertNotIn("declaration", candidate)
+
     def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
         """The one stream where an empty scope is *not* declared inapplicable.
 
