@@ -262,7 +262,9 @@ Rules for the agent:
   the operator creates the Secrets, as
   [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
   shows.
-- Before the install, check the token and, on a cluster that already exists, the network path. After
+- Before the install, check the token. On a cluster that already exists, also check the network
+  path before the install, in the `default` namespace, because `kubeagents-system` does not exist
+  yet. On a new cluster, check the network path after the install. After
   the install, check the connection. [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
   gives the commands. It also has the network, DNS, certificate, token expiry and rotation rules,
   the `install.env` keys, and what the install declares.

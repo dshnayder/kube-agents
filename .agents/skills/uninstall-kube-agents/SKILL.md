@@ -23,11 +23,18 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-region="<REGION>"
 ```
 
-On a GitLab install, the installer creates the token Secret (`gitlab-forge-token`), and the CA
-Secret (`gitlab-forge-ca`) if there is one, outside the Helm release. A teardown that deletes the
-cluster deletes them too. On a cluster that the teardown keeps, tell the operator that they stay,
-and give the command:
-`kubectl delete secret gitlab-forge-token gitlab-forge-ca -n kubeagents-system --ignore-not-found=true`. Also tell the operator to revoke the token in GitLab.
+On a GitLab install, the installer creates the token Secret, and the CA Secret for a private CA,
+outside the Helm release. A teardown that deletes the cluster deletes them too. On a cluster that
+the teardown keeps, tell the operator that the Secrets stay. Read their names and the namespace
+from the install's `install.env`, and give the command:
+
+```bash
+eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET|GITOPS_CA_SECRET)=' /path/to/install.env)"
+kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ${GITOPS_CA_SECRET:+"$GITOPS_CA_SECRET"} \
+  -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+```
+
+Also tell the operator to revoke the token in GitLab.
 
 The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run against the
 install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix

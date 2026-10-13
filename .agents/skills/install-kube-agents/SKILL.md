@@ -449,7 +449,8 @@ Rules for the agent:
 - The dry run checks only that the token source is readable. It does not read the token, and
   `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
 - On a cluster that already exists, have the operator run the network-path test from the GitLab
-  page before stage 3. On a new cluster, run it after stage 3. After stage 3, run the connection
+  page before stage 3, in the `default` namespace: `kubeagents-system` does not exist yet. On a
+  new cluster, run it after stage 3, in `kubeagents-system`. After stage 3, run the connection
   check from the same page.
 
 The command below is a stage 2 dry run. Apply through stage 3 once the operator confirms:
