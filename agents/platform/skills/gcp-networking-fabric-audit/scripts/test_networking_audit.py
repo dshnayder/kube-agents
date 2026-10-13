@@ -2381,5 +2381,88 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 
+class SubnetsListedMarkTest(unittest.TestCase):
+    """`subnets_listed: 0` on a `project/<id>` entry: a project with no subnet
+    to measure is not a project whose subnets the run lost.
+
+    Without the mark, a fleet with no countable subnet reported "no subnet
+    targets were audited" on every run and stayed partial. The mark goes on a
+    project whose subnet listing completed with no countable subnet, and never
+    on one whose listing failed.
+    """
+
+    AUDIT = "gcp-networking-fabric-audit"
+    KEY = networking_audit.SUBNETS_LISTED_KEY
+
+    def setUp(self):
+        sys.path.insert(0, FLEET_AUDIT_SCRIPTS)
+        self.addCleanup(sys.path.remove, FLEET_AUDIT_SCRIPTS)
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+
+    def fleet(self, per_project, check=networking_audit.CHECK_ALL):
+        with patch.object(networking_audit, "get_target_projects", return_value=list(per_project)), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet(check=check)
+        return manifest, {e["name"]: e for e in manifest["clusters"]}
+
+    def gaps(self, manifest):
+        import audit_report
+
+        doc = audit_report.draft_findings(manifest, self.AUDIT)
+        audit_report.validate_findings(doc, self.AUDIT)
+        audit_report.cross_check_manifest(doc, manifest)
+        return audit_report.coverage_gaps(doc)
+
+    def test_an_empty_subnet_list_marks_the_project_and_lifts_the_gap(self):
+        manifest, by_name = self.fleet({"p1": project_answers()})
+        self.assertEqual(by_name["project/p1"][self.KEY], 0)
+        self.assertEqual(self.gaps(manifest), [])
+
+    def test_a_list_of_only_uncounted_subnets_marks_the_project(self):
+        # SOP 2.1: a proxy-only subnet is not measured and is not a gap.
+        proxy = subnet("proxy", "10.9.0.0/23", purpose="REGIONAL_MANAGED_PROXY")
+        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": [proxy]})})
+        self.assertEqual(by_name["project/p1"][self.KEY], 0)
+        self.assertEqual(self.gaps(manifest), [])
+
+    def test_a_disabled_api_on_the_subnet_list_marks_the_project(self):
+        refused = (1, "ERROR: Compute Engine API has not been used in project p1 before. SERVICE_DISABLED")
+        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": refused})})
+        self.assertEqual(by_name["project/p1"][self.KEY], 0)
+        self.assertEqual(self.gaps(manifest), [])
+
+    def test_a_failed_subnet_list_gets_no_mark_and_the_gap_stays(self):
+        failed = (1, "ERROR: PERMISSION_DENIED")
+        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": failed})})
+        self.assertNotIn(self.KEY, by_name["project/p1"])
+        gaps = self.gaps(manifest)
+        self.assertTrue(any("p1/UNENUMERATED_SUBNETS" in gap for gap in gaps), gaps)
+        self.assertTrue(any("no subnet targets were audited" in gap for gap in gaps), gaps)
+
+    def test_one_failed_project_keeps_the_gap_for_the_fleet(self):
+        failed = (1, "ERROR: PERMISSION_DENIED")
+        manifest, by_name = self.fleet({
+            "p1": project_answers(),
+            "p2": project_answers(**{"subnets list": failed}),
+        })
+        self.assertEqual(by_name["project/p1"][self.KEY], 0)
+        self.assertNotIn(self.KEY, by_name["project/p2"])
+        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_a_project_with_a_counted_subnet_gets_no_mark(self):
+        answers = project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24")]})
+        manifest, by_name = self.fleet({"p1": answers})
+        self.assertNotIn(self.KEY, by_name["project/p1"])
+        self.assertIn("p1/us-central1/small", by_name)
+        self.assertEqual(self.gaps(manifest), [])
+
+    def test_a_run_without_the_subnet_sweep_marks_nothing(self):
+        manifest, by_name = self.fleet({"p1": project_answers()}, check=networking_audit.PROJECT_CHECKS_CHOICE)
+        self.assertNotIn(self.KEY, by_name["project/p1"])
+        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+
 if __name__ == "__main__":
     unittest.main()
