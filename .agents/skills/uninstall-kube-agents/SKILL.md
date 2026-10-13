@@ -29,10 +29,17 @@ the teardown keeps, tell the operator that the Secrets stay. Read their names an
 from the install's `install.env`, and give the command:
 
 ```bash
-eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET|GITOPS_CA_SECRET)=' /path/to/install.env)"
-kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ${GITOPS_CA_SECRET:+"$GITOPS_CA_SECRET"} \
-  -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+ENV_FILE=/path/to/install.env   # the install's install.env
+(
+  unset NAMESPACE GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET|GITOPS_CA_SECRET)=' "$ENV_FILE")"
+  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ${GITOPS_CA_SECRET:+"$GITOPS_CA_SECRET"} \
+    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+)
 ```
+
+The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
+in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).
 
 Also tell the operator to revoke the token in GitLab.
 

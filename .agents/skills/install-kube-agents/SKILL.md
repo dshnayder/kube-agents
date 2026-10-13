@@ -424,8 +424,9 @@ Rules for the agent:
 - `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
   its `https://` URL on that host. Put the host in `--gitops-host`, not in the path. Leave
   `--gitops-host` out for gitlab.com.
-- The credential broker uses the token only for the declared repositories, inside their groups
-  and subgroups. Another project in the group gets no token. Tell the operator to use the token with the smallest reach. That is a project access
+- The broker uses the token only for the declared repositories. Another project in the
+  same group gets no token; `inspect-repository` reads it without one, so only a public project
+  is readable. A project outside those groups is refused. Tell the operator to use the token with the smallest reach. That is a project access
   token on the GitOps project, or a group access token on the project's own group. For
   `platform/infra/gitops`, that group is `platform/infra`, not `platform`. Tell the operator to
   record the token's expiry date, and to check the token before the install, as the GitLab page

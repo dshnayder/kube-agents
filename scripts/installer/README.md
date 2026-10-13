@@ -323,6 +323,8 @@ which used to replace the Secret and restart every pod holding it.
 | `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
 
 The token, and the paths of the token file and the CA file, are never recorded.
+`GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment are the same as `--gitlab-token-file`
+and `--gitops-ca-file` for one run, and are never recorded either.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
