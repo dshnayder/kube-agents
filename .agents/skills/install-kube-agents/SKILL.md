@@ -239,11 +239,12 @@ In `--generate-only` mode, the installer:
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
 On a GitLab install, step 2 skips the GitOps organization check: there is no GitHub organization.
-Generate-only never creates the GitLab token Secret. On a first install it writes the GitLab keys
-into `install.env`. Over an existing `install.env` it does not change them: have the operator set
-`GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO` and `GITLAB_TOKEN_SECRET` there before
+Generate-only never creates the Secrets (the token Secret, and the CA Secret for a private CA). On a
+first install it writes the GitLab keys into `install.env`. Over an existing `install.env` it does
+not change them: have the operator set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
+`GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` there before
 `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After
-`lifecycle.sh apply`, the operator creates the Secret, as
+`lifecycle.sh apply`, the operator creates the Secrets, as
 [Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
 shows.
 
@@ -441,6 +442,12 @@ Rules for the agent:
     lines, use `<(pass show gitlab/agent-token | head -n1)`. The operator unlocks `gpg-agent`
     before the run. Do not use `/dev/stdin` under `curl … | bash`, because standard input is the
     script there.
+- Only when a private CA signed the instance's certificate, add `--gitops-ca-file` to the dry run
+  and to the stage 3 run. Do not give it for gitlab.com or for a public CA. Ask the operator
+  for the CA certificates (public; never a private key) as a regular PEM file: the root CA, and the
+  intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
+  substitution for the CA. The installer refuses the flag without a self-managed `--gitops-host`.
+  Use a release whose `install.sh --help` lists `--gitops-ca-file`.
 - The dry run checks only that the token source is readable. It does not read the token, and
   `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
 - On a cluster that already exists, have the operator run the network-path test from the GitLab
@@ -512,6 +519,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gitops-host=HOST`                    | Self-managed GitLab hostname, with no scheme, port or path. A GitHub hostname is refused. Only with `--gitops-forge=gitlab`                                                                                                                                                                                                         | gitlab.com                                                                                                                                         |
 | `--gitlab-token-file=PATH`              | File, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret                                                     | _unset_                                                                                                                                            |
 | `--gitlab-token-secret=NAME`            | Kubernetes Secret that holds the GitLab token                                                                                                                                                                                                                                                                                       | `gitlab-forge-token`                                                                                                                               |
+| `--gitops-ca-file=PATH`                 | Regular PEM file with the CA certificates of a self-managed GitLab behind a private CA. Stored in Secret `gitlab-forge-ca` and trusted by the credential broker for that host only. Needs `--gitops-forge=gitlab` and a self-managed `--gitops-host`                                                                                | _unset_                                                                                                                                            |
 | `--github-app-id=ID`                    | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                          | _unset_                                                                                                                                            |
 | `--github-pem-path=PATH`                | Path to downloaded GitHub App private key (`.pem`) for initial Cloud KMS import                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--kms-keyring=NAME`                    | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                    | `installer_common.sh` `DEFAULT_KMS_KEYRING`                                                                                                        |

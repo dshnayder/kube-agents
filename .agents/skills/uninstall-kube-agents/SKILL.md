@@ -23,12 +23,12 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-region="<REGION>"
 ```
 
-On a GitLab install, the installer creates the token Secret outside the Helm release. A teardown
-that deletes the cluster deletes it too. On a cluster that the teardown keeps, tell the operator
-that the Secret stays, and give the command in step 2 of the site's uninstall page
-(`docs/site/src/content/docs/install/uninstall.md`). That command sources the install's
-`install.env` in a subshell, the same way the installer reads it, so a renamed Secret or a
-non-default namespace is found. Then tell the operator to revoke the token in GitLab.
+On a GitLab install, the installer creates the token Secret, and the CA Secret for a private CA,
+outside the Helm release. A teardown that deletes the cluster deletes them too. On a cluster that
+the teardown keeps, tell the operator that the Secrets stay, and give the command in step 2 of the
+site's uninstall page (`docs/site/src/content/docs/install/uninstall.md`). That command sources
+the install's `install.env` in a subshell, the same way the installer reads it, so renamed Secrets
+or a non-default namespace are found. Then tell the operator to revoke the token in GitLab.
 
 The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
 in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).

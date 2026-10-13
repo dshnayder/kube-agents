@@ -314,15 +314,18 @@ which used to replace the Secret and restart every pod holding it.
 
 `GITOPS_FORGE` is `github` (the default) or `gitlab`. A GitLab install records these keys:
 
-| Key                   | Value                                                                      |
-| --------------------- | -------------------------------------------------------------------------- |
-| `GITOPS_FORGE`        | `gitlab`                                                                   |
-| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                 |
-| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                         |
-| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`) |
+| Key                   | Value                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`        | `gitlab`                                                                                                     |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                                                   |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                                                           |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`)                                   |
+| `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
 
-The token, and the path of the file it came from, are never recorded. `GITLAB_TOKEN_FILE` in
-the environment is the same as `--gitlab-token-file` for one run, and is never recorded either.
+The token, and the paths of the token file and the CA file, are never recorded.
+`GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment act like `--gitlab-token-file` and
+`--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
+the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
@@ -330,8 +333,8 @@ the environment is the same as `--gitlab-token-file` for one run, and is never r
   file.
 - A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`. A switch back to
   GitHub drops the GitLab keys.
-- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST` or
-  `GITLAB_TOKEN_SECRET` exported in the shell. Use the flags.
+- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
+  `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 
 ### Projects, folders, organisations and selectors in scope
 

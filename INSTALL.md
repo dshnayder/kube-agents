@@ -247,12 +247,21 @@ Rules for the agent:
     too. The source must hold only the token. A `pass` entry with more lines needs `| head -n1`.
     The operator unlocks `gpg-agent` before the run. `/dev/stdin` works only with `./install.sh`
     from an unpacked release: under `curl … | bash`, standard input is the script itself.
+- Only when a private CA signed the instance's certificate, add
+  `--gitops-ca-file="$HOME/secure/internal-ca.pem"` to the command above. Do not give it for
+  gitlab.com or for a certificate from a public CA. The installer refuses it without a
+  self-managed `--gitops-host`. It is a regular PEM file with the root CA, and also the
+  intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
+  substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the
+  credential broker trusts the CA, and only for that host. Use a release whose
+  `install.sh --help` lists `--gitops-ca-file`.
 - `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
-  the token. `--generate-only` never creates the token Secret. On a first install it writes the
-  GitLab keys into `install.env`. Over an existing `install.env`, it does not change them, so set
-  `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO` and `GITLAB_TOKEN_SECRET` in that file before
+  the token. They check the content of a regular CA file. `--generate-only` never creates the
+  Secrets. On a first install it writes the GitLab keys into `install.env`. Over an existing
+  `install.env`, it does not change them, so set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
+  `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` in that file before
   `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After the apply,
-  the operator creates the Secret, as
+  the operator creates the Secrets, as
   [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
   shows.
 - Before the install, check the token. On a cluster that already exists, also check the network
@@ -480,9 +489,10 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 
 - **GitOps on GitLab**: set `gitops_forge = "gitlab"`, `gitlab_repo` (the project's full path, with
   nested groups), `gitops_host` for a self-managed instance (empty means gitlab.com), and
-  `gitlab_token_secret_name` (default `gitlab-forge-token`). Leave `github_repo` and
-  `enable_github_minter` unset: a GitLab install has no token minter. Terraform names the token
-  Secret and does not create it. Create it in the agent's namespace after the apply, as
+  `gitlab_token_secret_name` (default `gitlab-forge-token`). For an instance behind a private CA,
+  also set `gitlab_ca_secret_name`. Leave `github_repo` and `enable_github_minter` unset: a GitLab
+  install has no token minter. Terraform names the Secrets and does not create them. Create them in
+  the agent's namespace after the apply, as
   [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) shows, so that the token
   never enters `terraform.tfvars` or the Terraform state.
 
@@ -960,6 +970,9 @@ spec:
         host: gitlab.example.com # omit for gitlab.com
         credentialsRef:
           name: gitlab-forge-token # the Secret with the key `token`
+        # For an instance behind a private CA only: the Secret with the key `ca.crt`.
+        caBundleRef:
+          name: gitlab-forge-ca
     repositories:
       - forge: gitlab # required: the forge's name
         repository: platform/infra/gitops # required: the project's full path

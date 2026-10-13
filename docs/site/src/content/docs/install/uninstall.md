@@ -46,16 +46,16 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
 
    `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
 
-   **GitLab token Secret.** A GitLab install has a token Secret that the installer creates outside the Helm release, so no uninstall step deletes it. A teardown that deletes the cluster deletes it too. On a cluster that the teardown keeps, delete it with this command. It reads the Secret name and the namespace from the install's `install.env`, the same way the installer reads that file:
+   **GitLab Secrets.** A GitLab install has a token Secret, and for a private CA a CA Secret. The installer creates them outside the Helm release, so no uninstall step deletes them. A teardown that deletes the cluster deletes them too. On a cluster that the teardown keeps, delete them with this command. It reads the Secret names and the namespace from the install's `install.env`, the same way the installer reads that file:
 
    ```bash
    # The install's install.env: beside install.sh for an install from an unpacked release or
    # a checkout, or $HOME/kube-agents/install.env under curl | bash.
    ENV_FILE="$HOME/kube-agents/install.env"
    (
-     unset NAMESPACE GITLAB_TOKEN_SECRET
+     unset NAMESPACE GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
      set -a; . "$ENV_FILE"; set +a
-     kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
+     kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ${GITOPS_CA_SECRET:+"$GITOPS_CA_SECRET"} \
        -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
    )
    ```
