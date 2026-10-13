@@ -239,7 +239,7 @@ In `--generate-only` mode, the installer:
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
 On a GitLab install, step 2 skips the GitOps organization check: there is no GitHub organization.
-Generate-only never creates the GitLab token Secret. On a first install it writes the GitLab keys
+Generate-only never creates the GitLab token Secret or the CA Secret. On a first install it writes the GitLab keys
 into `install.env`, and over an existing `install.env` it does not change them. After
 `lifecycle.sh apply`, the operator creates the Secret, as
 [Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
@@ -435,6 +435,11 @@ Rules for the agent:
     newlines inside it too. Thus the source must hold only the token: for a `pass` entry with more
     lines, use `<(pass show gitlab/agent-token | head -n1)`. Do not use `/dev/stdin` under
     `curl … | bash`, because standard input is the script there.
+- Add `--gitops-ca-file` only when a private CA signed the instance's certificate. Ask the operator
+  for the CA certificates (public; never a private key) as a regular PEM file: the root CA, and the
+  intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
+  substitution for the CA. The installer refuses the flag without a self-managed `--gitops-host`.
+  This release has the flag; an older release may not have it, so check with `--help`.
 - The dry run checks only that the token source is readable. It does not read the token, and
   `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
 - Before stage 3, have the operator run the reachability test from the GitLab page. After stage 3,
@@ -450,8 +455,11 @@ The command below is a stage 2 dry run. Apply through stage 3 once the operator 
   --model-provider="gemini" \
   --gitops-forge=gitlab \
   --gitops-host="gitlab.example.com" \
-  --gitops-repo="platform/infra/gitops"
+  --gitops-repo="platform/infra/gitops" \
+  --gitops-ca-file="$HOME/secure/internal-ca.pem"
 ```
+
+Leave out `--gitops-ca-file` for gitlab.com and for a certificate from a public CA.
 
 ## Supported Command-Line Flags
 
@@ -500,11 +508,11 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gitops-host=HOST`                    | Self-managed GitLab hostname, with no scheme, port or path. A GitHub hostname is refused. Only with `--gitops-forge=gitlab`                                                                                                                                                                                                         | gitlab.com                                                                                                                                         |
 | `--gitlab-token-file=PATH`              | File, `/dev/stdin` or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret                                                                                  | _unset_                                                                                                                                            |
 | `--gitlab-token-secret=NAME`            | Kubernetes Secret that holds the GitLab token                                                                                                                                                                                                                                                                                       | `gitlab-forge-token`                                                                                                                               |
+| `--gitops-ca-file=PATH`                 | Regular PEM file with the CA certificates of a self-managed GitLab behind a private CA. Stored in Secret `gitlab-forge-ca` and trusted by the credential broker for that host only. Needs `--gitops-forge=gitlab` and a self-managed `--gitops-host`                                                                                | _unset_                                                                                                                                            |
 | `--github-app-id=ID`                    | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                          | _unset_                                                                                                                                            |
 | `--github-pem-path=PATH`                | Path to downloaded GitHub App private key (`.pem`) for initial Cloud KMS import                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--kms-keyring=NAME`                    | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                    | `installer_common.sh` `DEFAULT_KMS_KEYRING`                                                                                                        |
 | `--kms-key=NAME`                        | Cloud KMS CryptoKey name for the token minter signing key                                                                                                                                                                                                                                                                           | `installer_common.sh` `DEFAULT_KMS_KEY`                                                                                                            |
-| `--gitops-ca-file=PATH`                 | CA certificate (PEM) of a self-managed GitLab behind a private CA: a file, `/dev/stdin` or `<(command)`. Stored in Secret `gitlab-forge-ca` and trusted by the credential broker for that host only. Needs `--gitops-forge=gitlab` and a self-managed `--gitops-host`                                                               | _unset_                                                                                                                                            |
 | `--enable-google-chat`                  | Enable the Google Chat integration                                                                                                                                                                                                                                                                                                  | `false`                                                                                                                                            |
 | `--google-chat-allowed-users=EMAILS`    | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                                                                                                        | _unset_                                                                                                                                            |
 | `--enable-slack[=true\|false]`          | Enable the Slack socket-mode relay (non-interactive runs require `--slack-bot-token` and `--slack-app-token`)                                                                                                                                                                                                                       | `false`                                                                                                                                            |
@@ -521,11 +529,3 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--accept-no-network-policy`            | The other answer: install without modifying the cluster. Every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included; recorded in the report and on the `PlatformAgent`. The owner decides; never pass it unasked                                                                                             | `false`                                                                                                                                            |
 | `--memory=MODE`                         | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                                                                                                       | `file`                                                                                                                                             |
 | `-h, --help, -?`                        | Output CLI usage banner and parameter details                                                                                                                                                                                                                                                                                       | `N/A`                                                                                                                                              |
-
-### Self-managed GitLab behind a private CA
-
-When a private CA signs the GitLab instance's certificate, ask the operator for the CA
-certificate (PEM, public; never a private key) and add `--gitops-ca-file` to the dry run and the
-apply. The installer refuses it without a self-managed `--gitops-host`, and refuses a file that has
-no certificate or that holds a private key. The procedure is in
-[A self-managed GitLab with a private CA](https://gke-labs.github.io/kube-agents/install/gitlab/#a-self-managed-gitlab-with-a-private-ca).

@@ -4579,7 +4579,7 @@ validate_gitops_forge_flags() {
       [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
       return 1
     fi
-    # A regular file is checked now, before the apply records the ConfigMap's
+    # A regular file is checked now, before the apply records the Secret's
     # name in install.env, the tfvars and the CR. /dev/stdin and a process
     # substitution can be read only once, so they are checked when they are
     # read, after the apply.

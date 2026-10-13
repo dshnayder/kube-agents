@@ -314,14 +314,15 @@ which used to replace the Secret and restart every pod holding it.
 
 `GITOPS_FORGE` is `github` (the default) or `gitlab`. A GitLab install records these keys:
 
-| Key                   | Value                                                                      |
-| --------------------- | -------------------------------------------------------------------------- |
-| `GITOPS_FORGE`        | `gitlab`                                                                   |
-| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                 |
-| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                         |
-| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`) |
+| Key                   | Value                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`        | `gitlab`                                                                                                     |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                                                   |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                                                           |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`)                                   |
+| `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
 
-The token, and the path of the file it came from, are never recorded.
+The token, and the paths of the token file and the CA file, are never recorded.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.

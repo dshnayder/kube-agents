@@ -49,13 +49,22 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 
   An answer of `401 Unauthorized` or a version object shows that DNS, the route and TLS work.
   A DNS, timeout or certificate error shows which part does not.
+  For an instance behind a private CA, send the CA file to the Pod and give it to `curl`:
+
+  ```bash
+  kubectl run gitlab-reach --rm -i --restart=Never --image=curlimages/curl --command -- \
+    sh -c 'cat > /tmp/ca.pem && curl -sS --cacert /tmp/ca.pem https://gitlab.example.com/api/v4/version' \
+    < "$HOME/secure/internal-ca.pem"
+  ```
 
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it
   needs no route to the GitLab host and no trust for its certificate.
-- **The certificate.** On a self-managed instance, the certificate must chain to a CA that
-  the broker image trusts: a public CA, or a proxy that terminates TLS with such a
-  certificate. No release has a setting for a private CA yet. To check a release, run its
-  `--help` (as in the release item above) and look for `--gitops-ca-file`.
+- **The certificate.** On a self-managed instance, the broker must trust the certificate.
+  A certificate from a public CA needs nothing. If a private CA signed it, give the CA with
+  `--gitops-ca-file`, as
+  [A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca)
+  shows. This release has that flag. An older release may not have it: run its `--help` (as in
+  the release item above) and look for `--gitops-ca-file`.
 - **`gh`.** The installer checks for the GitHub CLI on every install, and installs it when it
   is missing (a dry run stops instead). A GitLab install does not use it to reach GitLab.
 
@@ -131,8 +140,9 @@ It prints one JSON object with the token's user name. Other answers:
 
 - `FORGE_CREDENTIAL_UNAVAILABLE`: the Secret does not exist, or has no `token` key.
 - `FORGE_UNAUTHENTICATED`: GitLab refused the token. It expired, or someone revoked it.
-- A message that the forge's TLS certificate failed verification: the broker does not trust
-  the instance's certificate (see [Before you start](#before-you-start)).
+- `FORGE_TLS_UNTRUSTED`: the broker does not trust the instance's certificate, or the CA
+  Secret is missing. The message names the cause. See
+  [A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca).
 
 The PlatformAgent status does not report these, so this check is the way to see them. The
 broker also logs `version control enabled … forges=github,gitlab` when it starts.
@@ -196,7 +206,15 @@ A private CA is for a self-managed host only. `--gitops-ca-file` needs a
 `--gitops-host` that is not gitlab.com: gitlab.com presents a certificate that
 the public CAs sign, and a private CA must never vouch for it.
 
-Give the installer the CA certificate in PEM format:
+Put the CA certificates in one PEM file: the root CA, and also the intermediate
+CAs if the server does not send them in its chain. A file can hold more than one
+`-----BEGIN CERTIFICATE-----` block. Use a regular file, because a CA certificate
+is public. Do not use `/dev/stdin` or a process substitution for the CA: the
+installer can check those sources only after the apply. If the content is bad
+then, the install completes with no CA Secret, and every GitLab call answers
+`FORGE_TLS_UNTRUSTED` until you create the Secret.
+
+Give the installer the CA file:
 
 ```bash
 ./install.sh -y \
@@ -209,10 +227,10 @@ Give the installer the CA certificate in PEM format:
 
 The installer then does these steps:
 
-1. It reads the file once, after the apply. The file can also be `/dev/stdin` or
-   a process substitution.
-2. It refuses a file that holds no `-----BEGIN CERTIFICATE-----` block, and a
-   file that holds a private key.
+1. It checks the file before the apply, and in a dry run too. It refuses a file
+   that holds no `-----BEGIN CERTIFICATE-----` block, and a file that holds a
+   private key.
+2. It reads the file again after the apply.
 3. It writes the certificates into the Secret `gitlab-forge-ca` (type generic),
    under the key `ca.crt`, with a server-side apply, so no copy is kept in an
    annotation. A CA certificate is public, but whoever can change it chooses
@@ -272,12 +290,13 @@ Notes:
 
 ## Upgrade and uninstall
 
-- `upgrade.sh` reads the forge, host, project and Secret name from `install.env`. It needs no
-  token, and it keeps the token Secret.
-- The token Secret is not part of the Helm release. Deleting the PlatformAgent or uninstalling
-  the release leaves it. A full teardown that deletes the cluster deletes it too. On a cluster
-  that the teardown keeps, delete it yourself:
-  `kubectl delete secret gitlab-forge-token -n kubeagents-system --ignore-not-found=true`.
+- `upgrade.sh` reads the forge, host, project and Secret names from `install.env`. It needs no
+  token and no CA file, and it keeps both Secrets.
+- The token Secret, and the CA Secret if there is one, are not part of the Helm release.
+  Deleting the PlatformAgent or uninstalling the release leaves them. A full teardown that
+  deletes the cluster deletes them too. On a cluster that the teardown keeps, delete them
+  yourself:
+  `kubectl delete secret gitlab-forge-token gitlab-forge-ca -n kubeagents-system --ignore-not-found=true`.
 
 ## Limits
 

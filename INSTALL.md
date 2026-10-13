@@ -215,7 +215,8 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gitops-forge=gitlab \
   --gitops-host="gitlab.example.com" \
   --gitops-repo="platform/infra/gitops" \
-  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1) \
+  --gitops-ca-file="$HOME/secure/internal-ca.pem"
 ```
 
 Rules for the agent:
@@ -245,8 +246,16 @@ Rules for the agent:
     `| head -n1`. The file descriptor of a process substitution stays open for the whole run, and
     the installer reads it after the apply. `/dev/stdin` works only with `./install.sh` from an
     unpacked release: under `curl … | bash`, standard input is the script itself.
+- Give `--gitops-ca-file` only when a private CA signed the instance's certificate. Leave it out
+  for gitlab.com and for a certificate from a public CA. The installer refuses it without a
+  self-managed `--gitops-host`. It is a regular PEM file with the root CA, and also the intermediate
+  CAs if the server does not send them. Do not use `/dev/stdin` or a process substitution for it.
+  The installer stores it in the Secret `gitlab-forge-ca`. Only the credential broker trusts the
+  CA, and only for that host. This release has the flag; an older release may not have it, so
+  check with `--help`.
 - `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
-  the token. `--generate-only` never creates the token Secret. On a first install it writes the
+  the token. They check the content of a regular CA file. `--generate-only` never creates the
+  token Secret or the CA Secret. On a first install it writes the
   GitLab keys into `install.env`, and over an existing `install.env` it does not change them. After
   `lifecycle.sh apply`, the operator creates the Secret, as
   [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only) shows.
