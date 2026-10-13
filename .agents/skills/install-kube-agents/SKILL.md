@@ -244,7 +244,8 @@ first install it writes the GitLab keys into `install.env`. Over an existing `in
 not change them: have the operator set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
 `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` there before
 `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After
-`lifecycle.sh apply`, the operator creates the Secrets, as
+`lifecycle.sh apply`, the person who runs the install creates the Secrets by hand (Terraform only
+names them), as
 [Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
 shows.
 

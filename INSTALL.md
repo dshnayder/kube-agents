@@ -261,7 +261,7 @@ Rules for the agent:
   `install.env`, it does not change them, so set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
   `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` in that file before
   `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After the apply,
-  the operator creates the Secrets, as
+  the person who runs the install creates the Secrets by hand (Terraform only names them), as
   [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
   shows.
 - Before the install, check the token. On a cluster that already exists, also check the network
