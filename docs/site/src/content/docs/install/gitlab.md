@@ -17,8 +17,9 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   release, run
   `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- --help | grep -- --gitops-forge`,
   or `./install.sh --help | grep -- --gitops-forge` in an unpacked release.
-- **The GitLab version.** Tested with GitLab 19.4, and with GitLab 16.11 except for the diff
-  of a merge request.
+- **The GitLab version.** GitLab 16.11 or later. Tested with 16.11 and 19.4. On GitLab 16.x,
+  the diff of a merge request fails until
+  [#2801](https://github.com/gke-labs/kube-agents/pull/2801) merges.
 - **The project.** Create the GitOps project first. The installer does not create it. Note its
   full path with its nested groups, for example `platform/infra/gitops`. The project needs a
   default branch with at least one commit: the agent opens its merge requests against it.
@@ -30,7 +31,10 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   scopes and the Developer role. On a GitLab tier without group or project access tokens, use
   a personal access token of a dedicated account that is a Developer member of the project.
   Do not use a person's own token. The Developer role is enough: the agent pushes its own
-  branches and opens merge requests, and it never merges or pushes to a protected branch. Two
+  branches and opens merge requests, and it never merges or pushes to a protected branch. The
+  agent's branch names start with `platform-agent/`. A GitLab
+  [push rule](https://docs.gitlab.com/user/project/repository/push_rules/) or a protected-branch
+  wildcard that matches these names blocks the agent. Two
   limits apply:
   - The broker uses the token only for the declared repositories. Another project in the
     same group gets no token; `inspect-repository` reads it without one, so only a public
@@ -50,19 +54,34 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   cluster DNS. For a private hostname on GKE, a Cloud DNS private zone that is attached to the
   cluster's VPC works. A name in an on-premises DNS needs a Cloud DNS
   [forwarding zone or peering](https://cloud.google.com/dns/docs/zones/zones-overview) to that
-  DNS. The VPC firewall must let the cluster's node and Pod ranges reach the
+  DNS. The on-premises DNS must accept queries from Cloud DNS's source range
+  `35.199.192.0/19`, with a route back over the Cloud VPN or Cloud Interconnect
+  ([forwarding zones](https://cloud.google.com/dns/docs/zones/forwarding-zones)). The VPC firewall must let the cluster's node and Pod ranges reach the
   host on 443. For a public instance, the cluster also needs Cloud NAT or public IP addresses.
   A route to a private network outside the VPC (Cloud VPN or Cloud Interconnect) must carry the
   Pod range: advertise that range with
   [Cloud Router custom advertisements](https://cloud.google.com/network-connectivity/docs/router/how-to/advertising-overview),
   or masquerade it with
   [the IP masquerade agent](https://cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
+- **An HTTPS proxy.** If the cluster reaches GitLab through an HTTPS proxy, set `HTTPS_PROXY`,
+  and `NO_PROXY` with the cluster's own addresses (for example `.svc,.cluster.local` and the
+  Kubernetes API address), in the PlatformAgent's `spec.deployment.env`. These variables reach
+  the credential broker container: its GitLab API client and the git commands that it runs use
+  them.
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it needs
   no route to the GitLab host and no trust for its certificate.
 - **The certificate.** On a self-managed instance, the broker must trust the certificate. A
   certificate from a public CA, or from a proxy that terminates TLS with such a certificate,
-  needs nothing. For a private CA, use a release whose `install.sh --help` lists
-  `--gitops-ca-file`.
+  needs nothing. A public CA cannot issue a certificate for an internal-only name such as
+  `gitlab.corp.internal`, so such an instance normally has a private CA. For a private CA, use
+  a release whose `install.sh --help` lists `--gitops-ca-file`. The certificate must name the
+  host in its subjectAltName. To see it, run this from a machine with a route to the host:
+
+  ```bash
+  openssl s_client -connect gitlab.example.com:443 -servername gitlab.example.com </dev/null |
+    openssl x509 -noout -ext subjectAltName
+  ```
+
 - **`gh`.** The installer checks for the GitHub CLI on every install, and installs it when it
   is missing (a dry run stops instead). A GitLab install does not use it to connect to GitLab.
 
@@ -286,7 +305,8 @@ only), and stores nothing.
   `install.env`:
 
   ```bash
-  # The install's install.env. See "The install.env keys" for where it is.
+  # The install's install.env: beside install.sh for an install from an unpacked release or
+  # a checkout, or $HOME/kube-agents/install.env under curl | bash. See "The install.env keys".
   ENV_FILE="$HOME/kube-agents/install.env"
   (
     unset NAMESPACE GITLAB_TOKEN_SECRET
