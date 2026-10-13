@@ -1,273 +1,185 @@
-# Decision memory: remembering why, and learning from what the agent fixed
+# Decision Memory
 
 ## Summary
 
-An organisation that cannot find the reason behind an infrastructure setting will eventually
-undo it, and the outage it prevented comes back. That is the problem enterprise pilot feedback describes:
-its engineers cannot work out why past infrastructure decisions were made, so previous outages
-and misconfigurations keep coming back.
+Engineers and AI agents often change Kubernetes manifests without the context of past incidents.
+When they revert a protective setting or repeat a failed fix, previous outages return.
 
-The memory we ship ([`memory.md`](memory.md)) does not answer this. It learns from chat only:
-automatic capture is personal, and anything shared gets there only because the model chose to
-call `memory_retain` in a conversation. The loop where the agent does real work never reaches
-memory at all. That loop is: diagnose an issue, open a fix PR, a human merges it, the issue goes
-away. `submit-suggestion` keeps no state about the PRs it opens. The fleet-audit ledger works out
-`resolved-merged`, a merged fix that worked, but neither renders it nor emits it. Nothing watches
-a merge in general, and the agent reviews no PR it did not write.
+Conversational memory ([`memory.md`](memory.md)) learns only from chat turns.
+It does not observe the operational loop where the agent diagnoses an issue, opens a pull request, and resolves the incident.
 
-This document proposes **decision memory**:
+Decision memory records infrastructure rationale and operational lessons as structured files in the GitOps repository:
 
-- **Records in git are the source of truth.** Decisions and lessons live as reviewed OKF records
-  in the GitOps repository: `knowledge/decisions/*.md` and `knowledge/lessons/*.md`, markdown with
-  YAML frontmatter. Each record says what it governs and may carry a **guard**, an assertion a
-  machine can check against the tree.
-- **Lessons are learned from outcomes.** A lesson is written when a fix PR is merged and the issue
-  is verified gone. It is never written from what the agent intended to do.
-- **Records are read at the two places changes come in:**
-  - every change the agent proposes is checked against the records before it is submitted;
-  - human PRs are reviewed against the same records.
-  - "Why is this configured like this?" is answered from the records, with citations.
-- **A Hindsight bank (`kube-agents-decisions`) is an index built from git.** It adds semantic
-  recall and pages the model synthesises. It can be thrown away and rebuilt.
-- **Dreams** are a nightly pass that keeps records current. It checks every active record against
-  the repository, detects reverts, supersessions, recurrence and changes no record covers, and
-  re-indexes. Any change to a record goes back through a PR.
+- **Git is the source of truth.** Decisions (`knowledge/decisions/*.md`) and lessons (`knowledge/lessons/*.md`) are Operational Knowledge Format (OKF) files with YAML frontmatter. Each record defines its scope and an optional machine-checked **guard**.
+- **Outcomes create lessons.** The system drafts a lesson after a fix merges and verification confirms the resolution. It also drafts a negative lesson when a fix fails or a reviewer rejects it.
+- **Tool paths prevent regressions.** The `decision-memory` tool checks every agent proposal and human pull request against active guards before merge.
+- **Hindsight serves as a rebuildable index.** A dedicated Hindsight bank (`kube-agents-decisions`) stores verbatim records for semantic recall and synthesis.
+- **Nightly dreams keep memory accurate.** A scheduled job verifies guards against the repository, detects reverts and conflicts, identifies uncovered changes, and refreshes the index.
 
-Nothing here depends on Hermes. Records are files in git. The index is Hindsight's REST API, not
-the Hermes memory provider. The agent reaches it through a skill script and an MCP surface that
-both Hermes and the `mode: next` worker can load. Scheduling is a script that runs the same way
-from a Hermes `no_agent` cron entry or a Kubernetes CronJob.
+The architecture is harness-neutral.
+It operates identically on the default runtime and under `spec.mode: next` ([`spec-mode-switch.md`](spec-mode-switch.md)).
 
-**Status:** proposal plus a working prototype of the record model, the guard evaluator, `check`,
-`why`, `from-outcome`, the deterministic phases of `dream`, and the Hindsight indexer. Each was
-validated against a live Hindsight 0.10.2: [Prototype](#prototype). The outcome recorder, the
-review sweep and the CI action are designed here and not built.
+## How to read this document
 
-| Layer                    | Where it lives                                                                                                                                    |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Records (truth)          | `knowledge/decisions/`, `knowledge/lessons/` in the customer's GitOps repository ([06 §5](../architecture/06-api-and-data-contracts.md))          |
-| Tool                     | [`agents/platform/skills/decision-memory/`](../../agents/platform/skills/decision-memory/SKILL.md), `scripts/decision_memory.py`, standard library + PyYAML |
-| Index                    | Hindsight bank `kube-agents-decisions` on the existing `hindsight-api` ([memory.md, The two pods](memory.md#the-two-pods))                        |
-| Relation to chat memory  | Separate bank, separate write paths; [`memory.md`](memory.md) is unchanged                                                                        |
+| Section | Audience | Question answered |
+| --- | --- | --- |
+| [Why](#why) | Engineering leads, product managers, senior engineers | What failure modes does decision memory prevent, and why is chat memory insufficient? |
+| [Background](#background) | Engineers familiar with `kube-agents` | How do existing memory, audit, and GitOps components interact today? |
+| [Decision](#decision) | Architects and tech leads | What are the core architectural choices and rejected alternatives? |
+| [Design](#design) | Implementers and AI agents | What are the exact schemas, CLI contracts, write flows, prevention hooks, and dream phases? |
+| [Experiment](#experiment) | Evaluators and operators | How does the system behave against Hindsight 0.10.2, and how do benchmarks measure quality? |
 
 ---
 
-## The problem, concretely
+## Why
 
-### What the pilot feedback describes
+### Problem statement
 
-Two failure modes, both about rationale:
+Platform teams suffer from two recurring failure modes when infrastructure rationale is lost:
 
-1. **Undoing a fix.** Someone tunes a value for cost or tidiness: a memory request, a PDB, a
-   quota, a node pool's max surge. That value was the fix for an incident nobody on today's
-   team remembers, so the incident comes back.
-2. **Repeating a fix that did not work.** An approach was tried, reviewed and found wrong, for
-   example raising a quota rather than restoring an inflated request. Nobody remembers that it
-   was tried, so it gets proposed again.
+1. **Engineers or agents undo a past fix.** A team changes a memory request, `PodDisruptionBudget`, quota, or node pool setting to reduce cost. Because no record links that value to a past incident, the original outage returns.
+2. **Engineers or agents repeat a failed fix.** A team or agent proposes an approach that reviewers previously rejected or that failed in production. Without a record of the negative outcome, the team wastes time on the same broken change.
 
-Both are cheap to prevent if, at the moment of change, someone sees the record of what was decided
-and why. Both are expensive later, because the cost is an outage.
+In the [GitOps fix cycle evaluation](gitops-fix-cycle.md#findings-from-the-runs-2026-09-09-2026-09-10-and-2026-09-15), the platform agent repeated the same invalid fix across four separate runs.
+The agent diagnosed namespace quota exhaustion (`b-0011`) and raised the `payments` namespace `ResourceQuota` instead of lowering an inflated `64Mi` pod request.
+Prompt instructions failed to stop the behavior.
+A recorded decision with a deterministic guard on the quota file stops the invalid proposal inside the tool path.
 
-### We have reproduced it on our own agent
+### Why conversational memory is insufficient
 
-The [GitOps fix cycle pilot](gitops-fix-cycle.md#findings-from-the-runs-2026-09-09-2026-09-10-and-2026-09-15)
-contains the second failure mode four times over. In runs 7, 13, 15 and 16 the agent diagnosed
-b-0011's quota exhaustion correctly. Each time it then fixed it by raising the payments quota
-rather than restoring the inflated 64Mi request, and each time the task's `quota-cap-held`
-safeguard fired. Nothing carried "raising the quota is the wrong fix here" from one run to the
-next. The pilot's own conclusion applies: the prompt sentence that tried to steer it was "a
-mitigation, not a control". A recorded decision with a `warn` guard on the quota file is a
-control.
+The conversational memory system ([`memory.md`](memory.md)) cannot solve this problem for five reasons:
 
-### What the current machinery does not do
-
-| Needed                                       | Today                                                                                                                                           |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Remember a fix the agent made                | `submit-suggestion` records nothing; "nothing dedupes it and nothing ever closes it" (`skills/submit-suggestion/SKILL.md`)                        |
-| Know the fix worked                          | fleet-audit computes `resolved-merged` and renders/emits nothing ([ledger §4](fleet-audit-issue-ledger.md#4-finding-lifecycle)); findings-queue `pr_state` "needs someone to notice a merge" ([findings queue](inventory-findings-queue.md)) |
-| Remember a fix that did not work             | `pr-merged-persists` and `refused` exist in the ledger, and nothing turns them into knowledge                                                       |
-| Check a new change against the past          | Nothing; the platform worker can `memory_recall` shared chat memory, and nothing asks it to before a PR                                          |
-| Review a human PR                            | Out of scope ([pr-comment-conversation §7](pr-comment-conversation.md#7-out-of-scope)); `is_agent_pull_request` filters to the agent's own PRs  |
-| Answer "why" with a source                   | Shared chat memory paraphrases, and drops identifiers in 37 of 82 units ([memory.md](memory.md#what-survives-if-honcho-gets-the-wrapper)); per-unit provenance is not built |
-| Survive a reinstall                          | Deleting the Hindsight PVC is "a complete, safe reset of memory" ([memory.md](memory.md#bank-provisioning-is-lazy)), which is the opposite of what a decision log needs |
-| Work under `mode: next`                      | No Hindsight integration exists under next; `kube_agents_memory` is a Hermes `MemoryProvider`                                                   |
-
-## Requirements
-
-- **R1 Rationale is answerable.** "Why is X like this?" returns the decision or lesson that
-  governs X, with its id, its PR and who approved it. If no record exists, the answer says that
-  plainly instead of inventing a reason from the history.
-- **R2 Learn from outcomes, not intentions.** A lesson exists only for a change that was merged
-  and verified to have resolved the issue. A merged fix that did not resolve it, or a fix a person
-  refused, is also an outcome, and it is recorded as "this does not work".
-- **R3 Prevent recurrence where changes come in.** That means the agent's own proposals
-  (submit-suggestion, fleet-audit remediation, manifest generation) and human pull requests. The
-  check is deterministic and runs inside the tool path, so the model cannot skip it.
-- **R4 Stay current.** Records that have been superseded, reverted, or have lost their files
-  are found and flagged without anyone having to remember to look. Changes to governed
-  infrastructure that no record covers are surfaced for harvesting.
-- **R5 Harness-neutral.** It works the same on today's Hermes stack and under `mode: next`, and
-  nothing in the design calls a Hermes API.
-- **R6 Attributable and reviewed.** Every record carries who decided and which PR proves it. No
-  model writes organisational knowledge on its own: every change to a record is a PR a person
-  merges. This is the [four-property test](../architecture/02-agent-personas.md) (durable,
-  attributable, …) applied to knowledge.
-- **R7 Degrades gracefully.** Without Hindsight, `check`, `why` and `dream` still work from git
-  alone. The index only adds recall.
-- **R8 Precedence is written down, not ranked.** Two PRs can make the same change, with one
-  accepted and one rejected. A newer decision can contradict an older one. When that happens,
-  which is "the fact going forward" is decided by explicit rules ([Precedence](#precedence-what-becomes-the-fact))
-  and recorded as `supersedes`. A similarity score must never decide it.
-- **R9 Relevance over recall.** A memory system that keeps resurfacing irrelevant memories is
-  worse than none. Records surface only when they are scoped to the change or the question in
-  front of the agent. The decisions bank is not injected into every turn. Irrelevant recall is
-  measured as an eval dimension ([Validation before enabling](#validation-before-enabling)).
-- **R10 Sources beyond the forge.** Some organisations keep architectural decisions in a `/docs`
-  directory in the same repository. Others keep them in a separate document store (a wiki, a
-  Confluence space, a second repository). Harvesting reads all of these. Records can live in a
-  separate knowledge repository.
-- **R11 No telemetry egress.** Outcomes, records and metrics stay inside the customer's install.
-  The agent can see PR outcomes and the vendor cannot, and the design does not change that. Any
-  sharing is opt-in and initiated by the user, for example in a `/feedback` bundle.
-
-**Non-goals:**
-
-- Replacing conversational memory, which [`memory.md`](memory.md) keeps doing unchanged.
-- Admission-time enforcement. Recurring lessons are _proposed_ for `policy/`, and policy is what
-  enforces.
-- Storing incident timelines. A record links to the postmortem; it does not contain it.
+- **Chat-only capture.** Conversational memory captures user chat turns. It does not observe pull request merges, review rejections, or post-merge cluster health.
+- **Lossy paraphrase.** Conversational consolidation rewrites text and drops exact resource names, quantities, and pull request URLs.
+- **No human review gate.** A model writes shared chat facts directly during a turn. Infrastructure rules require peer review in git.
+- **Ephemeral storage.** Deleting the Hindsight PersistentVolumeClaim resets conversational memory. An organization's decision log must survive cluster reinstalls and storage resets.
+- **Harness coupling.** The conversational plugin uses a runtime-specific `MemoryProvider` interface that does not exist under `spec.mode: next`.
 
 ---
 
-## Design overview
+## Background
+
+`kube-agents` already contains four building blocks that decision memory connects:
+
+- **Operational Knowledge Format (OKF).** The architecture ([02 §2.3](../architecture/02-agent-personas.md), [05 C9](../architecture/05-system-architecture.md), [06 §5](../architecture/06-api-and-data-contracts.md)) defines `knowledge/` in git for curated and attributable knowledge.
+- **Fleet audit ledger.** The fleet audit skill ([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md#4-finding-lifecycle)) tracks finding fingerprints across runs and computes lifecycle states: `resolved-merged`, `pr-merged-persists`, and `refused`.
+- **GitOps proposal tools.** The `submit-suggestion` skill and fleet audit `remediate` command open pull requests on `platform-agent/*` branches through the credential broker.
+- **Hindsight service.** The cluster runs `hindsight-api` backed by PostgreSQL with `pgvector` ([`memory.md`](memory.md#the-two-pods)). A single `hindsight-api` deployment can host multiple isolated memory banks with independent extraction strategies.
+
+---
+
+## Decision
+
+| Area | Decision | Rationale |
+| --- | --- | --- |
+| System of record | Store decisions and lessons as OKF Markdown files in `knowledge/decisions/` and `knowledge/lessons/` in git. | Git provides peer review, blame history, revert detection, and durability across cluster reinstalls. |
+| Semantic index | Index active and superseded records in a dedicated Hindsight bank named `kube-agents-decisions`. | `retain_extraction_mode: chunks` and `enable_observations: false` preserve exact text and identifiers without LLM paraphrasing. |
+| Write trigger | Generate lesson drafts from verified pull request outcomes (`resolved-merged`, `pr-merged-persists`, `refused`), historical triage, or explicit chat statements. | Learning from verified outcomes prevents the agent from recording unverified intentions as facts. |
+| Human control | Require a human to merge every new record, status change, or supersession via pull request. | Human merge approval satisfies the attributable knowledge requirement and blocks prompt injection from untrusted text. |
+| Prevention | Run `decision_memory.py check` deterministically inside the submission tool path and in CI checks. | Deterministic tool-path checks cannot be skipped by the model. |
+| Maintenance | Run a nightly `dream` job that audits records against git HEAD and refreshes Hindsight mental models. | Automated verification detects silent reverts, deleted files, conflicting guards, and unrecorded changes. |
+| Harness interface | Expose all operations through the standalone `decision_memory.py` CLI and Hindsight's native REST/MCP endpoints. | Standard CLI and MCP interfaces work identically across the default runtime, `spec.mode: next`, and CI runners. |
+
+### Non-goals
+
+- **Replacing conversational memory.** Personal and session context remains in `kube-agents-memory` ([`memory.md`](memory.md)).
+- **Replacing Kubernetes admission webhooks.** Decision memory checks changes before merge and proposes admission policies for recurring lessons; the Kubernetes API server enforces deployed policies.
+- **Storing full incident timelines.** Records store the root cause, the guard, and links to evidence.
+
+### Alternatives rejected
+
+- **Write lessons directly to Hindsight without git files.** Rejected. Unreviewed writes skip human control, consolidation drops identifiers, PVC resets erase records, and CI jobs cannot read cluster storage.
+- **Store records in the existing `kube-agents-memory` bank.** Rejected because conversational memory enables background observation synthesis and shares the ephemeral PVC reset lifecycle.
+- **Use policy-as-code (`policy/`) for all rationale.** Rejected because many architectural decisions explain trade-offs or negative lessons that cannot be expressed as admission rules.
+- **Use a single `DECISIONS.md` file.** Rejected because a single file exceeds context token budgets and cannot be scoped per file path or Kubernetes resource.
+
+---
+
+## Design
+
+### System architecture
 
 ```mermaid
 flowchart LR
-  subgraph Sources
-    O["Outcome: fix PR merged + issue verified gone"]
-    N["Negative outcome: fix refused, or merged and still reproduces"]
-    H["History harvest: past PRs, ADRs, postmortems"]
-    C["Decision stated in chat"]
+  subgraph Sources["1. Write Sources"]
+    O["Verified Outcome (resolved-merged)"]
+    N["Negative Outcome (refused / persists)"]
+    H["History Harvest (PRs, ADRs, Docs)"]
+    C["Explicit Chat Statement"]
   end
-  subgraph Truth["GitOps repo — knowledge/ (reviewed)"]
-    R["decisions/*.md, lessons/*.md (frontmatter: scope, guard, evidence, status)"]
+  subgraph Truth["2. GitOps Repository (Source of Truth)"]
+    R["knowledge/decisions/*.md\nknowledge/lessons/*.md"]
   end
-  subgraph Index["Hindsight bank kube-agents-decisions (derived)"]
-    I["one document per record, verbatim, tagged"]
-    M["mental models / knowledge pages"]
+  subgraph Index["3. Hindsight Bank: kube-agents-decisions"]
+    I["Verbatim Document Chunks"]
+    M["Tag-Scoped Mental Models"]
   end
-  subgraph Use
-    P["Agent proposals: check before submit"]
-    V["Human PRs: review sweep or CI check"]
-    W["why / chat questions"]
+  subgraph Prevention["4. Read and Prevention Paths"]
+    P["Agent Proposal Check (submit / remediate)"]
+    V["Human PR Check (CI / Review Sweep)"]
+    W["Rationale Lookup (why CLI / MCP)"]
   end
-  O --> D1["draft lesson"] -->|PR, human merges| R
+  O --> D1["Outcome Recorder"] -->|Draft PR| R
   N --> D1
-  H --> D2["draft decisions"] -->|batched PR, human curates| R
-  C --> D2
-  R -->|indexer| I --> M
+  H --> D2["Incremental Harvester"] -->|Batched PR| R
+  C -->|Draft PR| R
+  R -->|decision_memory.py index| I --> M
   R --> P
   R --> V
+  R --> W
   I --> P
   I --> V
   I --> W
-  R --> W
-  Dream(("Dream, nightly")) -->|verify, supersede, recur, cover| R
-  Dream -->|reconcile, refresh| I
+  Dream(("Nightly Dream")) -->|Verify, Supersede, Cover| R
+  Dream -->|Reconcile, Refresh| I
 ```
 
-There are three roles, and they are kept apart on purpose:
+### Component locations
 
-- **Writers produce drafts.** Every draft becomes a record through a pull request. No path writes
-  a record directly.
-- **Git holds the truth.** A record is active because a person merged it, and it stops being
-  active the same way.
-- **The index serves reads.** It is built from git's default branch and from nothing else, so
-  rebuilding it from scratch is a correct recovery.
+| Layer | Location |
+| --- | --- |
+| Truth records | `knowledge/decisions/*.md` and `knowledge/lessons/*.md` in the GitOps repository (or a dedicated knowledge repository) |
+| Skill and CLI | [`agents/platform/skills/decision-memory/SKILL.md`](../../agents/platform/skills/decision-memory/SKILL.md) and [`scripts/decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py) |
+| Derived index | Hindsight bank `kube-agents-decisions` on the `hindsight-api` service |
 
-### Why git is the source of truth and Hindsight is the index
+### Record schema and lifecycle
 
-1. **It is the architecture we already decided.** Curated, durable, shareable knowledge is
-   OKF in git under `knowledge/`, and agents propose updates by PR
-   ([02 §2.3](../architecture/02-agent-personas.md), [05 C9](../architecture/05-system-architecture.md),
-   [06 §5](../architecture/06-api-and-data-contracts.md)). Audits already read `declares:`
-   entries from `knowledge/` to reclassify findings that are intentional. Decisions and lessons
-   are two more OKF types.
-2. **Rationale needs review and provenance more than recall.** A decision record is something
-   people sign up to, and the PR that merges it is the signature. Shared chat memory has no review
-   step, and its consolidation is built to paraphrase. That suits conversational facts and is
-   exactly wrong for "the request must stay ≥ 256Mi because of PR #31".
-3. **It must outlive the agent.** An organisation's decision log has to survive an uninstall, a PVC wipe, a
-   change of memory provider, and the day they stop using kube-agents. Git does all four.
-4. **Reverts can be seen.** If a fix is reverted, git shows it. The dream reads that, and a
-   memory store cannot.
-5. **It is harness-neutral for free.** Every harness, every CI system and every engineer can read
-   a markdown file.
+Decision memory defines two record types that share one YAML frontmatter schema:
 
-What Hindsight adds on top is what git cannot do:
-
-- semantic recall over prose, for changes no record's scope covers yet and for questions
-  phrased in someone's own words;
-- budget-bounded injection into a turn;
-- tag-scoped synthesis in the form of mental models and knowledge pages.
-
-### Why a separate bank
-
-`kube-agents-decisions` sits next to `kube-agents-memory` on the same `hindsight-api` pod. Four
-settings make it different, and the [live probe](#prototype) confirmed each one:
-
-| Setting                                    | Why                                                                                                        |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| `retain_default_strategy: record`, a strategy pinning `retain_extraction_mode: chunks` | `chunks` runs no LLM ([memory.md, bounding the bank](memory.md#bounding-the-bank--built-deferred-and-not-urgent)): the record's text, id and PR link are stored verbatim. Probe: 2 records gave 2 `world` units, each containing its id. |
-| `enable_observations: false`               | No background paraphrase layer. Synthesis is the dream's job, done on purpose and from active records only. |
-| `document_id = okf:<repo>:<path>`, `update_mode: replace` | Re-indexing a changed record replaces it in place. Probe: superseding a record left 3 documents and 3 units, with no duplicates. |
-| Every unit tagged `scope:shared`           | Under `any_strict`, an untagged unit is invisible ([memory.md pinned setting 1](memory.md#the-four-pinned-settings)). The bank holds no personal data, so the user-isolation problem `kube_agents_memory` solves does not arise. |
-
-Putting records in the existing bank under a `kind:` tag was considered. It would mean sharing
-the conversational bank's consolidation, which `consolidation_strategies` (new in 0.10.2) could
-switch off per scope. But it would also tie the index to that bank's lifecycle, including the
-"delete the PVC to reset memory" advice. Deleting a derived index loses nothing; deleting
-the conversational bank loses facts that exist nowhere else. Keeping them in separate banks keeps
-that distinction clear.
-
----
-
-## The record model
-
-There are two types, and they share one schema:
-
-- **decision** (`DEC-YYYY-NNN`): a choice and its reason, forward-looking. For example: "the
-  payments quota is a capacity cap; fix the over-request instead".
-- **lesson** (`LES-YYYY-NNN`): what an outcome taught, backward-looking, always tied to a merged
-  PR. For example: "checkout OOM-kills below 256Mi".
+- **`decision` (`DEC-YYYY-NNN`)**: A forward-looking architectural choice and its rationale.
+- **`lesson` (`LES-YYYY-NNN`)**: A backward-looking operational rule derived from a verified pull request outcome.
 
 ```yaml
 ---
-type: lesson
-id: LES-2026-001
-title: checkout OOM-kills below 256Mi under the JVM's off-heap growth
-status: active # proposed | active | superseded | retired
+type: lesson                                   # decision | lesson
+id: LES-2026-001                               # DEC-YYYY-NNN | LES-YYYY-NNN
+title: checkout OOM-kills below 256Mi under JVM off-heap growth
+status: active                                 # proposed | active | superseded | retired
 date: 2026-09-10
-scope: # what this record governs; at least one key
+scope:                                         # required; at least one key must be non-empty
   paths: ["clusters/*/payments/checkout.yaml"]
-  resources: ["Deployment/payments/checkout"] # kind/namespace/name, globs allowed
+  resources: ["Deployment/payments/checkout"]  # kind/namespace/name (globs allowed)
   clusters: [prod-eu]
-  checks: [oom-kill] # fleet-audit check ids, the join key to findings
-guard: # optional; makes the record enforceable
-  rule: Keep checkout's memory request at or above 256Mi.
-  severity: block # block | warn | info
+  checks: [oom-kill]                           # fleet-audit check identifiers
+guard:                                         # optional machine-checked invariant
+  rule: Keep checkout memory request at or above 256Mi.
+  severity: block                              # block | warn | info
   expect:
     file: "clusters/*/payments/checkout.yaml"
     path: "spec.template.spec.containers[name=app].resources.requests.memory"
-    op: ">=" # == != >= > <= <, Kubernetes quantities understood
-    value: 256Mi
-evidence:
+    op: ">="                                   # == | != | >= | > | <= | < | in | contains
+    value: 256Mi                               # supports Kubernetes resource quantities
+evidence:                                      # pull_request is required for type: lesson
   pull_request: https://github.com/acme/gitops/pull/31
   commit: 1a2b3c4
   merged_by: alice
-  finding_id: oom-kill.prod-eu.payments.checkout # derive_finding_id
-  resolution: { verified_by: fleet-audit, at: 2026-09-11T02:00:00Z }
-supersedes: []
+  finding_id: oom-kill.prod-eu.payments.checkout
+  outcome: resolved-merged                     # resolved-merged | pr-merged-persists | refused
+  resolution:
+    verified_by: fleet-audit
+    at: 2026-09-11T02:00:00Z
+supersedes: []                                 # list of record IDs this record replaces
+superseded_by: null                            # record ID that replaced this record
 ---
 ## What happened
 ## What fixed it
@@ -275,522 +187,236 @@ supersedes: []
 ## Prevent it next time
 ```
 
-The design choices behind it:
+#### Schema invariants
 
-- **Scope is what makes a record usable at all.** An unscoped record can never be matched to a
-  change, so validation rejects it. Paths catch edits to the file the record names. Resources
-  catch the same object moved or copied to another file: the prototype matches a checkout
-  Deployment copied into `clusters/prod-us/` by `kind/namespace/name` even though no path glob
-  covers it.
-- **Guards are optional, and they are the difference between a reminder and a control.** A
-  record without a guard still appears on every matching change as `related`. A guard turns it
-  into `violates` / `consistent`. The expression language is deliberately small: a file glob, a
-  YAML path with list selectors, one comparison. Anything richer belongs in `policy/`, which is
-  where [recurring lessons graduate](#p4-graduation-to-policy).
-- **Evidence is mandatory for a lesson.** A lesson with no merged PR behind it is an opinion.
-- **Status changes go through PRs.** `superseded` requires `superseded_by`. A record is never
-  deleted while anything refers to it; it is `retired` instead.
+1. **Mandatory scope.** Every record must declare at least one `scope` key (`paths`, `resources`, `clusters`, or `checks`). `paths` match edited file paths. `resources` match Kubernetes manifests by `kind/namespace/name` even when a workload moves to a new file or cluster directory.
+2. **Deterministic guards.** A `guard` evaluates `expect.path` against candidate YAML documents matching `expect.file`. Dots inside YAML keys use backslash escaping (for example, `spec.hard.requests\.memory`). Comparisons parse Kubernetes quantities (`Ki`, `Mi`, `Gi`, `m`) into canonical values.
+3. **Mandatory lesson evidence.** Validation rejects any `lesson` record that lacks `evidence.pull_request`.
+4. **Explicit lifecycle transitions.** Every record follows a four-state lifecycle managed through pull requests:
 
 ```mermaid
 stateDiagram-v2
-  [*] --> proposed: drafted (outcome, harvest, chat)
-  proposed --> active: PR merged and, for a lesson, resolution verified
-  proposed --> [*]: PR closed
-  active --> superseded: a newer record supersedes it
-  active --> retired: governed paths gone, or explicitly retired
+  [*] --> proposed: Draft created (outcome, harvest, or chat)
+  proposed --> active: Human merges PR (and resolution verified for positive lessons)
+  proposed --> [*]: Human closes PR without merge
+  active --> superseded: Newer active record declares supersedes
+  active --> retired: Governed files removed or record explicitly retired
   superseded --> [*]
   retired --> [*]
 ```
 
----
+### Precedence rules for contradictory history
 
-## How records are written
+Repository history often contains contradictory changes, such as a setting that was raised, reverted, and raised again.
+Vector similarity scores must never decide which record is currently authoritative.
+The tool resolves precedence using five deterministic rules in strict order:
 
-There are three write paths. None of them is a model writing to memory: each produces a draft,
-and a person merges it. That is the rule [`memory.md`](memory.md#nominating-a-finding-the-card-is-the-write-path)
-already applies to shared memory ("the person … is the control"), moved to a place where the
-person is reviewing a diff, not approving a sentence in chat.
+1. **Explicit supersession wins.** If active record `B` lists `supersedes: [A]`, record `A` transitions to `status: superseded` with `superseded_by: B`.
+2. **Git HEAD state flags at-risk records.** If an active guard fails against the current `HEAD` tree, the record is not silently ignored. The dream job marks the record **at-risk** and cites the breaking commit so a human either reverts the breaking change or supersedes the record.
+3. **Merged beats rejected, and newer beats older.** For two unlinked records on the same field, a merged pull request outranks a closed one. Between two merged pull requests, the later merge date wins. Rejected pull requests remain active as negative lessons ("do not apply X") unless a later merged pull request explicitly supersedes them.
+4. **Narrower scope beats broader scope.** A record scoped to a single cluster (`clusters: [prod-eu]`) overrides a fleet-wide record (`clusters: []`) for changes in `prod-eu`.
+5. **Unresolved ties become explicit conflicts.** Two active records may guard the same file and YAML path with incompatible expectations. If rules 1–4 do not separate them, `dream` reports a `conflicts` entry and proposes superseding the older ID.
 
-### W1 — Outcomes: the agent's own fixes (R2)
+### Hindsight index configuration
 
-This is the "troubleshoot → PR → merge → resolved" loop.
+The indexer provisions the `kube-agents-decisions` bank on `hindsight-api` with four settings:
+
+| Setting | Value | Purpose |
+| --- | --- | --- |
+| `retain_default_strategy` | `record` (`retain_extraction_mode: chunks`) | Stores record text, IDs, and URLs verbatim without LLM extraction or paraphrasing. |
+| `enable_observations` | `false` | Disables background observation synthesis so Hindsight never paraphrases authoritative records. |
+| `document_id` and `update_mode` | `okf:<repo>:<path>`, `replace` | Replaces existing units in place when a record changes status or content. |
+| Unit tags | `scope:shared`, `kind:<type>`, `status:<status>`, `id:<id>`, `cluster:<c>`, `check:<k>` | Supports strict tag filtering (`all_strict`) during active recall and historical queries. |
+
+### Write paths
+
+No agent or background job writes directly to the default branch.
+All three write paths create pull requests containing record drafts.
+
+#### W1 — Learn from verified outcomes
+
+The outcome loop captures both successful fixes and failed attempts.
 
 ```mermaid
 sequenceDiagram
-  participant A as Agent (any harness)
-  participant G as GitOps repo
-  participant OR as Outcome recorder (job)
-  participant V as Verifier signals
-  A->>G: fix PR (patch + "Lesson draft" section, optionally knowledge/lessons/LES-….md status: proposed)
-  Note over G: human reviews and merges (approves the fix and the lesson together)
-  OR->>G: sweep merged/closed agent PRs (platform-agent/* branches)
-  OR->>V: was the issue resolved?
-  V-->>OR: fleet-audit resolved-merged / watcher quiet N h / Argo Synced+Healthy at merge SHA
-  OR->>OR: outcome JSON {pr, commit, files, finding_id, cluster, check, verified_by}
-  OR->>G: PR: activate the proposed lesson (or draft one via from-outcome)
-  Note over G: human merges; indexer and dream pick it up
+  participant A as Agent
+  participant G as GitOps Repository
+  participant OR as Outcome Recorder
+  participant V as Verification Signals
+  A->>G: Open fix PR (includes proposed lesson draft)
+  Note over G: Human reviews and merges (or closes) PR
+  OR->>G: Sweep closed/merged platform-agent/* PRs
+  OR->>V: Query post-merge verification status
+  V-->>OR: resolved-merged | pr-merged-persists | refused
+  OR->>OR: Run decision_memory.py from-outcome
+  OR->>G: Open PR to activate positive lesson or record negative lesson
 ```
 
-**When the PR is proposed.** `submit-suggestion` and fleet-audit `remediate` add a
-**Lesson draft** section to the PR body. They may also add the record file itself, with
-`status: proposed`, so that one review covers the fix and its rationale and both land in the same
-commit. If the fix is reverted, the lesson goes with it, and the dream notices. The content comes
-from what the agent already has:
+1. **Draft at proposal time.** `submit-suggestion` and fleet audit `remediate` add a `Lesson draft` section to the fix pull request. They can also include `knowledge/lessons/LES-YYYY-NNN.md` with `status: proposed` in the same branch.
+2. **Verify post-merge outcome.** The outcome recorder evaluates closed and merged `platform-agent/*` pull requests against four verification signals, ordered from strongest to weakest:
+   - **Fleet audit `resolved-merged`**: `audit_report.py finish` confirms that a complete audit run no longer reproduces the finding targeted by the merged pull request.
+   - **Incident event silence**: `intercepted_events` shows zero occurrences of the failure reason for $N$ hours (default 24) after the merge.
+   - **GitOps controller health**: Argo CD or Flux reports `Synced` at or after the merge commit SHA and `Healthy` for the target application.
+   - **Findings queue verification**: `findings_queue.py` transitions `pr_state` to `merged` and confirms the finding is absent.
+3. **Record negative outcomes.** The fleet audit ledger records `pr-merged-persists` when a merged fix fails and `refused` when a reviewer closes a PR. In both cases, the outcome recorder runs `from-outcome` to draft a negative lesson. The negative lesson records why the approach failed and attaches a `warn` or `block` guard to prevent repeat proposals.
 
-- the Cluster Agent's `root_cause` and `proposed_patch` (kanban metadata on Hermes, the task
-  artifact under next);
-- the incident thread;
-- the finding id.
+#### W2 — Harvest historical decisions at scale
 
-**After the merge, the issue has to be verified gone.** These are the signals, strongest first.
-Each is harness-neutral and reads state that already exists.
+Organizations adopting decision memory have years of unrecorded rationale in past pull requests and documents.
+The harvester processes this backlog incrementally:
 
-| Signal | Source | Exists today? |
+1. **Multi-source ingestion.** The harvester reads the GitOps repository, `context_repos`, in-repo docs (`docs/adr/`, `docs/decisions/`, `/docs`), and Markdown exports from external wikis.
+2. **Watermark and bounded slices.** Large fleets have thousands of historical pull requests. The harvester stores the last processed pull request number or commit SHA as a watermark. Forward runs process only newly merged changes. Backfill runs walk history newest-first in bounded batches (for example, 100 pull requests per run, capped at 10 drafted records per area per week).
+3. **Five-way triage.** Before drafting files, the harvester classifies each historical candidate:
+
+| Triage class | Condition | Harvester action |
 | --- | --- | --- |
-| `resolved-merged`: a complete audit run no longer reproduces a finding that a merged remediation PR claims | `audit_report.py finish`. It has `resolved_ids` (complete runs only) and the merged `audit:remediation` PRs from the `gh pr list` it already makes | Computed and discarded. Needs `finish` to emit it ([ledger §4](fleet-audit-issue-ledger.md#4-finding-lifecycle)) |
-| The workload's incident reason has not recurred for N hours since the merge | `intercepted_events` in the Session KV store (cluster, namespace, workload, reason) | Data exists; needs a query |
-| GitOps controller `Synced` at the merge SHA and `Healthy` | Argo/Flux status, the predicate [gitops-fix-cycle](gitops-fix-cycle.md#how-the-pr-is-found-and-what-done-means) built in the bench | Bench only |
-| Findings-queue row `pr_state=merged`, then re-verified | `findings_queue.py` | Merge watcher not built ([findings queue](inventory-findings-queue.md)) |
+| `current` | The value or resource set by the historical PR still exists at `HEAD`. | Draft a `decision` record with `status: proposed` (to become `active` on merge). |
+| `superseded` | A later merged PR modified the same field or resource. | Draft with `status: superseded` and link `superseded_by` to preserve the historical chain. |
+| `rejected` | A reviewer closed the PR unmerged with an explanation. | Draft a negative `lesson` capturing the rejected approach and reviewer rationale. |
+| `anachronistic` | The target cluster, API version, or workload no longer exists at `HEAD`. | Exclude from drafts; list in the PR summary table for human confirmation. |
+| `noise` | Dependency bumps, formatting edits, or changes without rationale. | Ignore. |
 
-**Negative outcomes are recorded too.** A fix that does not work, or that a reviewer rejects,
-teaches as much as one that does. The ledger already has both states:
+4. **Priority ordering.** Inside each curation pull request, the harvester orders drafts by operational impact:
+   - First: paths with active or historical incident findings.
+   - Second: guarded fields modified more than once in git history.
+   - Third: most recent merge date.
 
-- `pr-merged-persists`: the fix merged and the finding still reproduces;
-- `refused`: a person closed the PR unmerged.
+#### W3 — Capture decisions stated in chat
 
-Either becomes a draft lesson of the form "approach X does not fix Y". It carries the reviewer's
-closing comment as evidence and, where possible, a `warn` guard. This is the record that would
-have stopped the quota raises in the pilot.
+When an engineer states an infrastructure decision in chat, the Chat Agent offers to draft a `DEC-YYYY-NNN.md` pull request.
+This pull request complements or replaces `memory_retain(scope="shared")`.
+In accordance with `SOUL.md` §1.6, the agent only records explicitly stated decisions and announces the exact record content before opening the pull request.
 
-**The outcome recorder is a deterministic job, not an agent turn.** It joins PR ↔ finding ↔
-verification, emits an outcome JSON, and runs `decision_memory.py from-outcome` to draft the
-record. A model is used only to tidy the prose of the draft, never to decide whether something
-was resolved. It runs:
+### Read and prevention paths
 
-- **today:** as a third sweep in `github_scan_gate.py`'s `SWEEPS` registry (merged/closed
-  `platform-agent/*` proposals), next to the PR-comment sweep;
-- **under next:** as the consumer of an `a2a.topics.shared.outcomes` journal topic that
-  fleet-audit `finish` and the sweep publish to. See
-  [Harness neutrality](#harness-neutrality).
+#### P1 — Check agent proposals in the tool path
 
-### W2 — Harvest: the decisions nobody wrote down (the backlog)
+`decision_memory.py check --base <base> --semantic --markdown` runs directly inside `submit_suggestion.py submit` and `audit_report.py remediate` before the tool pushes a branch or opens a pull request.
 
-For an organisation adopting this, the immediate pain is history, not tomorrow. The harvester mines what already exists:
-
-- merged PRs that touched governed infrastructure paths, with their discussions and linked
-  issues;
-- commit messages, especially reverts;
-- ADRs, postmortems and runbook pages already in the repository or exported from a wiki.
-
-For each area (a namespace, a node pool, a cluster family) it drafts `DEC` records with
-`status: proposed` and full evidence links. It groups them into one PR per area, with a weekly
-cap, so a team curates a dozen records at a time instead of a hundred.
-
-The dream feeds the harvester continuously through `uncovered_changes`: commits to governed
-paths with no record and no record of their own in the same change. `why` feeds it on demand:
-"no record governs this; here is the history; shall I draft one?"
-
-Harvested text is untrusted input. A PR body or an issue comment is someone's claim, not a
-decision. That is why harvested records always start `proposed` and become `active` only when a
-person merges them.
-
-**Triage before drafting.** Pilot feedback asked for exactly this: scan all PRs and decide what
-is relevant, what is front and centre, and what is anachronistic. So the harvester classifies
-every candidate before it drafts anything, and the curation PR is grouped by class:
-
-| Class | Meaning | Becomes |
+| Verdict | Meaning | Tool behavior |
 | --- | --- | --- |
-| current | the change is still in effect at HEAD (the governed value or file still matches what the PR set) | an `active` decision draft |
-| superseded | a later merged PR changed the same field or file again | a draft with `status: superseded` and `superseded_by`, kept for the "why did it change" chain |
-| rejected | a PR proposing the change was closed unmerged with a reviewer's reason | a negative lesson draft ("this was tried and refused because…") |
-| anachronistic | refers to resources, APIs, versions or clusters that no longer exist at HEAD | not drafted; listed so a human can confirm it is history |
-| noise | formatting, bumps, generated files, no stated rationale | not drafted |
+| `violates` (`severity: block`) | The diff breaks an active `block` guard or deletes a guarded file. | The tool aborts with exit code `2` and prints the violated record ID, rule, and evidence URL. The agent must revise the patch or ask the user. |
+| `violates` (`severity: warn`) | The diff breaks an active `warn` guard. | The tool proceeds only if the PR body includes the generated **Prior decisions and lessons** Markdown section explaining why the change is safe. |
+| `related` / `consistent` | The diff touches a governed path or satisfies the guard. | The tool appends the **Prior decisions and lessons** section to the PR body for reviewer context. |
+| `semantic` | The Hindsight index returned semantically similar active records outside the file's explicit scope. | The tool lists the records under **Possibly related — verify** in the PR body. |
 
-"Front and centre" is an ordering inside the PR, not a class:
+During manifest drafting (`gke-manifest-generation` and `gke-golden-path`), skills also invoke `decision_memory.py why <path>` so the agent reads existing constraints before generating YAML.
 
-1. records governing paths that carry incidents or audit findings;
-2. then guarded fields that changed more than once;
-3. then recency.
+#### P2 — Check human pull requests
 
-**Scale.** A fleet with tens of mega clusters and thousands of workloads has a correspondingly
-long PR history, so a single pass over all of it is not bounded. The harvester is incremental:
+Organizations can enable either or both human pull request checks:
 
-- it keeps a watermark (the last merged PR it processed) and works forward from it;
-- it caps each run's work;
-- it backfills history newest-first in bounded slices.
+1. **Agentless CI check.** A GitHub Actions or GitLab CI job executes `decision_memory.py check --base $BASE_SHA --head $HEAD_SHA --markdown` on every pull request. The job posts or updates a sticky comment with the findings and exits with code `2` on any `block` violation. Marking this job as a required status check enforces lessons as a merge gate without running an agent.
+2. **Opt-in agent review sweep.** Adding the `agent:review` label (or enabling repository-wide review in the scan gate) triggers the platform review worker. The worker runs `decision_memory.py check`, queries the Hindsight index for semantic implications, and posts a single idempotent review comment citing record IDs and historical pull requests. The worker never approves, merges, or closes a pull request.
 
-**Sources.** The harvester reads these sources through one interface:
+**Human override flow.** To override a `block` guard, a human adds the `decision-override:<RECORD-ID>` label and explains the reason in the PR body.
+Once merged, the nightly dream detects the override label and opens a pull request to supersede `<RECORD-ID>` with the new decision.
 
-- the GitOps repository;
-- every registered `context_repos` repository;
-- in-repo decision directories (`docs/adr/`, `docs/decisions/`, `/docs`);
-- exports from an external document store (a wiki or Confluence space dumped to markdown by the
-  customer's own tooling).
+#### P3 — Answer "why" questions with citations
 
-kube-agents does not need credentials for the document store. The customer decides what to
-export. Each record's `evidence` links back to the original document.
+Running `decision_memory.py why <path>` returns a structured JSON object containing:
 
-### W3 — Chat: a decision stated in conversation
+- `records`: Active and superseded records whose `scope.paths` or `scope.resources` match `<path>`.
+- `history`: Recent `git log` commits that modified `<path>`.
+- `history_without_record`: Commits that modified `<path>` without an associated record in `knowledge/`.
+- `note`: Instructions enforcing accurate reporting when `records` is empty.
 
-"We pin node pool max-surge to 1 in prod-eu because of the licence-server quorum" is a decision.
-When someone says something like this, the Chat Agent offers to draft a `DEC` record PR, as well
-as or instead of `memory_retain(scope="shared")`. The rule in `SOUL.md` §1.6 (stated, not
-inferred; the agent says out loud what it is writing org-wide) carries over unchanged. The only
-difference is that the write is a reviewable file.
+When `records` is empty, the agent must report *"No recorded decision governs this path"* and show the git commit history.
+The agent must never invent rationale from commit messages or claim that no decision exists.
 
----
+#### P4 — Graduate recurring lessons to policy
 
-## How records are used
+`dream` checks whether $K$ or more active lessons (default $K = 2$) share a `check` ID or guarded YAML path across clusters.
+When they do, `dream` proposes graduating the lesson into `policy/`.
+The graduation pull request drafts a fleet-wide `DEC-YYYY-NNN.md` record.
+It also drafts a `ValidatingAdmissionPolicy`, Gatekeeper constraint, or Kyverno policy that links to the decision record ID.
 
-### P1 — The agent's own proposals (R3)
+### Nightly dreams
 
-`decision_memory.py check --base <base>` runs **inside the tool path**:
+The `dream` command (`decision_memory.py dream`) runs nightly and after merges to `knowledge/`.
+It executes eight phases to keep git records and the Hindsight index synchronized:
 
-- in `submit_suggestion.py submit`, before the push;
-- in `audit_report.py remediate`, before it opens the PR.
-
-It does not run as a step in a skill's prose. The pilot showed the agent will not reliably follow
-a prompt sentence, and a control the model can skip is a mitigation.
-
-| Verdict | Effect |
-| --- | --- |
-| `violates`, `block` | `submit` refuses, naming the record and its guard. The agent changes the patch or asks the human. |
-| `violates`, `warn` | `submit` proceeds only if the PR body has a **Prior decisions and lessons** section that addresses the record id. The check generates that section (`--markdown`). |
-| `related` / `consistent` | The section is still generated, so the reviewer sees which past decisions the change touches. |
-| `semantic` | Records related by meaning, not by scope, listed as "possibly related — verify". Requires the index. |
-
-Recall also happens earlier, when the agent is _designing_ the change:
-
-- `gke-manifest-generation` "Tooling & Grounding";
-- `gke-golden-path` rule 4, "Document decisions and rationale";
-- fleet-audit before `remediate`.
-
-These are prose steps calling `why` or `check --files`. They make for a better first draft; the
-hard check stays in the tool path.
-
-### P2 — Human pull requests (R3)
-
-There are two variants, and the customer can run either or both.
-
-- **The CI-native check, which needs no agent.** A GitHub Actions (or GitLab CI) job runs
-  `decision_memory.py check --base $BASE --head $HEAD --markdown` on every PR that touches the
-  repository, posts the markdown as a sticky comment, and fails on `block`. Making it a required
-  check turns a lesson into a merge gate. This is the most harness-neutral form there is, because
-  no agent is in the loop, and it is what we would recommend turning on first.
-- **The agent review sweep.** An opt-in `agent:review` label, or a per-repository setting,
-  widens the scan gate past `is_agent_pull_request`. A review worker then:
-  1. runs `check`, which is deterministic;
-  2. uses semantic recall plus the diff to look for implications that no guard encodes;
-  3. posts **one** comment citing record ids and the PRs they were learned in;
-  4. never approves, merges or closes, as pr-conversation already forbids.
-
-  It reuses [pr-comment-conversation](pr-comment-conversation.md)'s marker bookkeeping to stay
-  idempotent.
-
-A human who disagrees with a `block` overrides it in the PR itself: a `decision-override:<id>`
-label plus a sentence of justification. The dream sees the override after merge and proposes
-superseding the record. So the disagreement becomes a new decision instead of a silent
-erosion.
-
-### P3 — Questions
-
-`why <path>` returns:
-
-- the records that govern the path, active first;
-- the path's git history, with PR numbers;
-- `history_without_record`, the commits that changed it with no record behind them;
-- a note telling the model how to talk about absence.
-
-"No recorded decision" must never become "no decision exists". This is the same failure
-[`memory.md`](memory.md#a-read-names-its-outcome) fixed for recall, and the same rule is stated
-in the skill. Free-text questions go to recall over the index, filtered to
-`scope:shared AND status:active` with `tag_groups`.
-
-### P4 — Graduation to policy
-
-A lesson that recurs (same `check`, or same guarded field, across clusters) should not stay a
-lesson. The dream proposes a fleet-wide decision plus a `policy/` change, for example a
-ValidatingAdmissionPolicy or a Gatekeeper/Kyverno constraint. That moves the protection from
-"the agent and CI will warn you" to "the API server refuses". The record stays as the rationale
-the policy links back to. Graduation is always propose-only, because a policy narrows what is
-allowed.
-
----
-
-## Dreams: keeping it current (R4)
-
-A dream is a scheduled pass, nightly and again after any merge to `knowledge/`, that keeps the
-records and the index truthful.
-
-**What a dream may write.** Changes to records go into **one** PR per run, labelled
-`knowledge:dream`. The index is rebuilt, but it is derived, not authored. The chat report is
-silent when nothing changed. The [learning policy](capability-delivery-vehicle.md#r5--self-learning)
-the capability vehicle defines applies as written:
-
-| Class of change | Default |
-| --- | --- |
-| Adding context or links | apply and report |
-| Superseding or retiring a record | propose only |
-| Promoting to policy | propose only |
-
-| Phase | What it does | Deterministic? | Prototype |
+| Phase | Operation | Uses LLM? | Output action |
 | --- | --- | --- | --- |
-| 1. Reconcile index | Upsert each valid record by `document_id`, delete documents whose record is gone | yes | built (`index`) |
-| 2. Verify against the tree | For each active record: do its paths still exist (else **obsolete**), does its guard still hold at HEAD (else **at-risk**, with the commit/PR that broke it), was its fix commit reverted (**reverted**) | yes | built |
-| 3. Verify against the clusters | Optional, read-only: does the live value match the record (GitOps drift, or a hand edit)? Mismatches go to the fleet-audit drift stream as findings, not into knowledge | yes | designed |
-| 4. Supersession and conflicts | A record that `supersedes` another must be mirrored by `superseded_by` on the old one; two active records guarding the same field differently, with no link, are a conflict resolved by [Precedence](#precedence-what-becomes-the-fact) | yes | built |
-| 5. Recurrence | Lessons sharing a `check` or a guarded field, at or above a threshold, across clusters: propose a fleet-wide decision and a policy | yes | built (detection) |
-| 6. Coverage | Commits to governed paths since the last run with no record and no record in the same change: harvest queue. Merged PRs carrying `decision-override:<id>`: propose superseding | yes | built (coverage) |
-| 7. Synthesis | Refresh Hindsight mental models / knowledge pages, tag-scoped to `scope:shared` + `status:active` (+ area), e.g. "Decision log: payments", "Recurring failure modes this quarter" | no (LLM) | designed |
-| 8. Report | A "dream diary" posted to the chat relay or ledger: at-risk records first, then proposals. Silent when there is nothing new, like fleet-audit's `silent_ok` | yes | built (`silent`) |
+| 1. Reconcile index | Upsert valid records into `kube-agents-decisions` by `document_id`; delete removed documents. | No | Updates Hindsight bank directly. |
+| 2. Verify against git tree | Check every active record at `HEAD`: verify governed files exist (`obsolete`), evaluate guards (`at_risk` with breaking commit SHA), and scan commit logs for `Revert` of the evidence commit (`reverted`). | No | Opens a `knowledge:dream` PR or flags `at_risk` in the dream report. |
+| 3. Verify against clusters | Optional read-only check comparing live cluster resources against guarded values to detect out-of-band edits. | No | Emits drift findings to the fleet audit ledger. |
+| 4. Supersession and conflicts | Ensure `supersedes` links have matching `superseded_by` fields; detect active guards that conflict on the same file and YAML path. | No | Proposes frontmatter updates in the `knowledge:dream` PR (`--apply`). |
+| 5. Recurrence detection | Group active lessons by `scope.checks` and `guard.expect.path` across clusters to find graduation candidates. | No | Proposes fleet-wide decision and `policy/` draft. |
+| 6. Coverage gap scan | Find commits to governed directories (`clusters/`, `apps/`, `base/`, `infrastructure/`, `manifests/`) that lack a governing record, plus merged PRs with `decision-override:<id>`. | No | Enqueues uncovered commits for the harvester; proposes supersession for overrides. |
+| 7. Synthesis refresh | Refresh tag-scoped Hindsight mental models (`[scope:shared, kind:decision, area:<name>]`) via `trigger.refresh_cron`. | Yes | Refreshes summary pages in Hindsight. |
+| 8. Dream diary report | Format findings (`at_risk` first, then `conflicts`, `obsolete`, `recurrences`, and `uncovered_changes`). Suppress output when all lists are empty (`silent: true`). | No | Posts summary to the platform chat space when non-empty. |
 
-Phase 2 is what an adopting team needs most from a dream. It catches the moment a lesson is being unlearned,
-for example a cost pass that took checkout back to 128Mi, and names the PR that did it, the
-morning after it merged, before the incident repeats.
+### Harness neutrality (`today` vs `spec.mode: next`)
 
-Phase 7 uses Hindsight's own scheduling instead of building any: a mental model created with a
-`trigger.refresh_cron` and tags `[scope:shared, kind:decision, area:<x>]` (default
-`all_strict`) refreshes itself. Hindsight 0.10.2 scopes mental models by tag on reflect. That
-makes the claim in `kube_agents_memory/client.py` and [`memory.md`](memory.md#the-four-pinned-settings)
-that mental models are "bank-level and not tag-scoped" out of date. It does not matter here,
-because the decisions bank holds only shared records.
+Decision memory contains zero imports from the agent harness.
 
-Hermes has no built-in "dream" in the pinned base (`v2026.9.14`). What the web describes as Hermes
-dreaming is an out-of-core plugin, and it consolidates the file memory. This design uses neither,
-and that is deliberate.
-
----
-
-## Precedence: what becomes the fact
-
-History is contradictory. The same change can be proposed twice, accepted once and rejected
-once. A decision from three years ago can be quietly reversed by a PR last month. Retrieval
-cannot settle which one holds now: it returns whatever is most similar to the question. The
-rules are therefore explicit, applied in this order, and the outcome is written into the records
-as `supersedes`/`superseded_by`.
-
-1. **An explicit link wins.** If a record names `supersedes: [X]`, X is no longer the fact, and
-   no rule below overrides that.
-2. **What the tree says beats what a record says.** If a guard no longer holds at HEAD, the
-   record is not silently superseded: it becomes **at-risk**. Either the change that broke it was
-   a mistake (revert it) or it was a new decision (record it and supersede). A human chooses; the
-   dream only asks.
-3. **Merged beats rejected, and newer beats older.** Of two otherwise equal records about the
-   same field, the one backed by a merged PR outranks the one backed by a closed PR. Among merged
-   ones, the newer merge outranks the older. A rejection is not discarded: it stays as a negative
-   lesson, because "we tried raising the quota and it was refused" is exactly what prevents the
-   next attempt.
-4. **A narrower scope beats a broader one.** A cluster-specific exception outranks the
-   fleet-wide rule it contradicts, for that cluster only. This is the exception pattern the
-   [memory experiment](memory.md#the-fleet-the-memory-has-to-serve) found in 55 of its records.
-5. **Anything left unresolved is a conflict.** Two active records that guard the same field with
-   different expectations, where none of the rules above separates them, are flagged by the dream
-   (prototype: `conflicts`). The proposal names the newest one, and a person confirms it.
-
-Recall respects the result. Active recall filters on `status:active`, and a superseded record is
-only returned when someone asks for history ("why did this change?"). The live probe confirms
-both directions.
-
-## Validation before enabling
-
-Memory that keeps surfacing irrelevant or stale memories makes the agent worse and erodes
-trust, so decision memory ships **off by default**. It is enabled per install only after an
-eval shows it helps. The bar is the one the skills process already uses: run the same cases
-with and without the feature and compare.
-
-| Dimension | Measured as |
-| --- | --- |
-| Pass rate | bench cases with a planted "known wrong fix" (b-0011's quota raise is the template), with and without the relevant lesson recorded |
-| Latency | wall time per case; `check` is deterministic and local, so this should not move except where semantic recall is on |
-| Tokens | input tokens per case. Scoped matching injects a handful of records, never the bank |
-| Irrelevant recall | share of surfaced records a grader marks unrelated to the change. This dimension is specific to memory and is the one most likely to regress |
-| Stale recall | share of surfaced records that are superseded or at-risk, which should be 0 for active recall |
-
-A negative control is part of the suite: a change that _looks_ like a recorded lesson but is
-actually fine. It checks that the agent does not refuse good changes on a shallow match.
-
-## Telemetry stays home
-
-An install can see its PR outcomes (merged, refused, verified resolved). The vendor cannot, and
-customers typically block outbound telemetry from these environments. Decision memory works
-within that constraint:
-
-- the outcome recorder, the records, the index and the dream all run inside the install;
-- the metrics in [Rolling it out](#rolling-it-out-in-an-organisation) are computed locally and appear in the
-  dream diary;
-- if a customer wants to share outcomes, they do it explicitly. For example, a `/feedback`
-  command can bundle an anonymised outcome summary (counts of guard hits, repeat rate, lessons
-  added) into a message the user reviews and sends. Nothing leaves the install automatically.
-
----
-
-## Harness neutrality
-
-| Component | Today (Hermes) | `mode: next` | Hermes-specific? |
-| --- | --- | --- | --- |
-| Records | `knowledge/` in the GitOps repo | same | no |
-| Tool | `decision_memory.py` in a platform skill; runs where a clone exists (broker-side clone / GitOps workspace) | same script; the skill is plain `SKILL.md` + script | no |
-| Agent read surface | the skill's CLI; optionally an MCP server listed in the profile's `mcp_servers` | the same MCP server passed to the worker's `--mcp-config` (the worker-adapter runs `--strict-mcp-config`, so the gateway has to vet and add it) | no |
-| Index | Hindsight REST, bank `kube-agents-decisions` | same | no. It does **not** go through `kube_agents_memory`, the Hermes `MemoryProvider` |
-| Read-only MCP over the index | Hindsight's built-in per-bank endpoint `/mcp/kube-agents-decisions/`, limited with `mcp_enabled_tools` to recall/reflect/list/get. Safe here because the bank is shared-only (it would not be safe on the conversational bank, where tags are the isolation boundary) | same | no |
-| Scheduling | `no_agent: true` entry in `agents/platform/cron/jobs.json` running `dream` | Kubernetes CronJob, or a stage-4 submission to `platform` | the script is not; only the trigger differs |
-| Outcome events | new `github_scan_gate` sweep plus fleet-audit `finish` | the same producers publish `topic-update` artifacts to a provisioned journal topic `a2a.topics.shared.outcomes` (subject list, provision grant and writer grant in the operator; a read-only durable consumer for the recorder) | no |
-| Join keys | PR URL, commit SHA, `derive_finding_id`, branch `platform-agent/*` | same, plus `correlationId` from question to PR | no. Kanban `metadata` (`root_cause`, `proposed_patch`) is optional enrichment, never a key |
-| CI check (P2) | GitHub Action / GitLab job | same | no agent at all |
-
-The Chat Agent's `kube_agents_memory` provider is unchanged. It may later add the decisions bank
-to its per-turn prefetch, but nothing in this design requires it to.
-
----
-
-## Security and trust
-
-- **Untrusted text never becomes truth on its own.** Harvested PR bodies, issue comments and
-  reviewer remarks only ever produce `proposed` drafts. The index is built from the default
-  branch alone. Recalled records reach the model as quoted data with their id, status and PR, so
-  a planted instruction arrives labelled as a record's content, not as an instruction.
-- **A `block` guard is a merge gate, so its authorship matters.** Guard `CODEOWNERS` on
-  `knowledge/` to the platform owners. A guard can only come from a merged record, and an override
-  is a labelled, justified, visible act that the dream turns into a supersession proposal.
-- **No new write access.** The agent stays read-only on clusters and keeps proposing by PR
-  through Minty. The outcome recorder and the dream need the same repository scope fleet-audit
-  already has.
-- **No isolation surface.** The bank is shared-only and holds nothing personal, so a wrong tag
-  can at worst hide a record. It cannot leak someone's memory. The Hindsight MCP endpoint is
-  exposed with read tools only.
-- **Index loss is harmless.** Wiping `kube-agents-decisions` loses nothing, because the next
-  `index` run rebuilds it from git.
-
----
-
-## Rolling it out in an organisation
-
-1. **Week 0–2: make the past answerable.**
-   - Scaffold `knowledge/decisions|lessons` with `CODEOWNERS`.
-   - Run the harvester over the last 12 months of merged PRs and postmortems in the 3–5 areas with
-     the most repeat incidents.
-   - Curate the drafts.
-   - Turn on the CI check in comment-only mode.
-2. **Week 2–6: learn from outcomes.**
-   - Have fleet-audit `finish` emit `resolved-merged`, `pr-merged-persists` and `refused`.
-   - Build the outcome-recorder sweep.
-   - Have `submit-suggestion` / `remediate` generate the lesson draft and run `check` in the tool
-     path.
-3. **Week 6–10: prevent.**
-   - Make the CI check required for `block`.
-   - Offer the opt-in agent review sweep.
-   - Run dreams nightly with the diary posted to the platform team's space.
-4. **Then: graduate.** Promote recurring lessons to `policy/`, and publish mental-model pages per
-   area as the team's living decision log.
-
-**What to measure:**
-
-- **Repeat rate:** incidents or findings with the same `check` and resource after a lesson for
-  them exists. This is the number adopters care about.
-- Guard hits: changes stopped or amended, split into agent and human.
-- Coverage: the share of changes to governed paths that have a record.
-- Time from merge to an active lesson.
-- `why` answers backed by a record versus history alone.
-- Records flagged at-risk or obsolete per week.
-
----
-
-## Alternatives considered
-
-- **Write lessons straight into shared Hindsight memory from the outcome recorder.** Rejected
-  because:
-  - there is no review step, which breaks R6;
-  - consolidation paraphrases the record and drops identifiers;
-  - a PVC wipe destroys the lessons;
-  - humans and CI cannot see them;
-  - the write path runs through a Hermes provider, which breaks R5.
-- **Reuse `kube_agents_memory`'s `scope:shared` with a `kind:` tag.** It is a reasonable bridge
-  for chat recall. As the source of truth it fails for the same reasons as the first alternative.
-- **Policy-as-code only.** Too rigid as a starting point: most decisions are judgement plus a
-  reason, not an admission rule, and a policy carries no rationale. Lessons graduate into policy
-  instead.
-- **Hindsight mental models as the record.** They are synthesised, so they are not
-  reviewed and not reproducible. They are good as derived pages, not as truth.
-- **One big `DECISIONS.md`.** Every argument [`memory.md`](memory.md#a-file-store-is-bounded-or-it-eats-the-window)
-  makes against a single injected file applies, and it cannot be scoped per path.
-
-## Open questions
-
-- **Short-, long- and mixed-term memory.** Pilot feedback pointed at memory systems that split
-  memory into short-term, long-term and mixed types (Mem0 among them). This design maps onto that
-  split as follows:
-  - conversational memory ([`memory.md`](memory.md)) is the short-term and personal layer;
-  - decision memory is the long-term, curated layer;
-  - the dream is the step that promotes from one to the other.
-
-  Whether a third, mixed layer is needed (for example episodic incident timelines with a TTL) is
-  open. Answer it with the [validation](#validation-before-enabling) suite, not up front.
-- **Pre-merge validation.** A later step could check the knowledge a PR depends on before it
-  deploys, by replaying the change against a mimicked environment rather than only against the
-  records. This is out of scope here; the guard and `check` are the deterministic first step.
-
-- **A separate knowledge repository.** Should `knowledge/` live in its own repository for a
-  multi-repo customer? The tool already takes `--knowledge-repo`. The outcome recorder would then
-  open its PRs in a different repository from the fix, and whether reviewers accept that split is
-  unknown.
-- **How long to wait before declaring a fix verified.** The watcher signal needs N hours of
-  quiet, and the right N differs by failure class. Start at 24h with a fleet-audit run as the
-  stronger signal.
-- **Guard language.** Is one comparison per guard enough before graduating to `policy/`? The
-  pilot cases and the examples from pilot feedback so far fit. Multi-field invariants are the first likely gap.
-- **Hindsight 1.0.0 (released 2026-10-13).** It rejects tag-scoped callers on bank-wide
-  operations. That does not affect a shared-only bank, but needs checking before any upgrade.
-- **GitLab parity.** The forge layer already has the three-state proposal. The CI check and the
-  sweep each need a GitLab variant.
-
----
-
-## Prototype
-
-`agents/platform/skills/decision-memory/` on this branch:
-
-| Command | What it does | Tests |
+| Component | Default runtime (`spec.mode: today`) | Next runtime (`spec.mode: next`) |
 | --- | --- | --- |
-| `validate` | Schema checks: id format, scope present, lessons carry a PR, superseded names its successor, references resolve | 2 |
-| `check` | Matches a diff (`--base/--head`) or a file list against records by path glob and by `kind/ns/name`, evaluates guards on the new content, flags deleted guarded files, ignores superseded records; optional semantic recall from the index; exit 2 on `block` | 8 |
-| `why` | Governing records + history + changes without a record + an absence note | 2 |
-| `from-outcome` | Drafts a valid lesson from an outcome JSON | 1 |
-| `dream` | Phases 1, 2, 4 (incl. conflicts), 5, 6, 8; `--apply` writes the proposed edits into the working tree for a PR | 8 |
-| `index` | Provisions the bank (`chunks` strategy, observations off), upserts by `document_id`, deletes removed records | 2 (fake server) + 1 live |
+| CLI & Skill | `agents/platform/skills/decision-memory/scripts/decision_memory.py` executed in the GitOps workspace clone. | Identical `SKILL.md` and Python script executed by the `next` worker pod. |
+| Index API | Direct HTTP REST calls to `hindsight-api` (`/v1/default/banks/kube-agents-decisions/...`). | Identical HTTP REST calls; does not use the Hermes `MemoryProvider` class. |
+| Read-only MCP | Hindsight native per-bank MCP endpoint `/mcp/kube-agents-decisions/` restricted to read tools (`recall`, `reflect`, `list`, `get`). | Identical MCP endpoint injected via the worker adapter's vetted `--mcp-config`. |
+| Scheduled runs | `no_agent: true` cron job in `agents/platform/cron/jobs.json`. | Kubernetes `CronJob` or stage-4 scheduled task submission to the `platform` worker. |
+| Outcome events | `github_scan_gate.py` sweep joined with `audit_report.py finish`. | Producers publish `topic-update` artifacts to the `a2a.topics.shared.outcomes` journal topic; the outcome recorder consumes the topic. |
 
-`python3 -m unittest test_decision_memory`: 27 tests, all passing, with no network and no model.
-The live test runs only when `DECISION_MEMORY_LIVE_URL` is set.
+### Security, trust, and local telemetry
 
-### Live validation
+- **Untrusted input isolation.** Text harvested from pull requests, issues, or comments only produces `status: proposed` drafts in a pull request. The indexer indexes only records on the repository's default branch. Recalled records include explicit IDs and pull request URLs so the model treats them as data rather than instructions.
+- **Protected authorship.** Repository `CODEOWNERS` restricts merges under `knowledge/` to platform owners.
+- **No additional cluster privileges.** The CLI, harvester, outcome recorder, and dream job require only GitOps repository access and read-only Hindsight access.
+- **No outbound telemetry.** All outcome detection, record storage, Hindsight indexing, and metrics calculation run strictly inside the local installation. No pull request outcomes or decision records leave the environment unless a user explicitly runs an opt-in export command such as `/feedback`.
 
-The prototype was validated against `ghcr.io/vectorize-io/hindsight-api:0.10.2` with
-`pgvector 0.8.6-pg15`, the same images `images.json` pins, running locally with **no LLM
-configured**. That is itself a finding: the whole index path needs no model call.
+---
 
-| Property the design relies on | Observed |
+## Experiment
+
+### Verification against Hindsight 0.10.2
+
+We validated [`scripts/decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py) using a 27-test unit test suite ([`scripts/test_decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/test_decision_memory.py)) and a live `ghcr.io/vectorize-io/hindsight-api:0.10.2` container backed by `pgvector/pgvector:0.8.6-pg15`.
+The live container ran with no LLM configured, verifying that the indexing and tag-filtered recall path requires zero LLM calls.
+
+| Tested capability | Observed result on Hindsight 0.10.2 |
 | --- | --- |
-| Bank config applies (`enable_observations: false`, default strategy `record`) | yes |
-| One document per record, `chunks` keeps the text verbatim | 2 records → 2 documents, 2 `world` units, each containing its id and PR link |
-| Recall with `tag_groups` `[scope:shared all_strict] AND [status:active all_strict]` ranks the relevant record first | "can I lower checkout memory?" → `LES-2026-001`, then `DEC-2026-001` |
-| Re-indexing a status change replaces in place | superseding `DEC-2026-001`: 3 documents, 3 units, no duplicates |
-| Superseded records drop out of active recall and stay reachable on purpose | active-only: `DEC-2026-002`, `LES-2026-001`; superseded-only: `DEC-2026-001` |
-| The `dream` → `--apply` → `index` loop converges | the supersession edit applied, validated, re-indexed (`upserted: [DEC-2026-001]`) |
+| Bank provisioning (`enable_observations: false`, `chunks` extraction) | Provisioned bank `kube-agents-decisions` without LLM credentials. |
+| Verbatim document indexing | Indexing 2 records created 2 documents and 2 `world` memory units preserving exact record IDs and pull request URLs. |
+| Scoped active recall | Querying *"can I lower checkout memory?"* with `tag_groups: [scope:shared, status:active]` (`all_strict`) ranked `LES-2026-001` first and `DEC-2026-001` second. |
+| In-place document replacement | Superseding `DEC-2026-001` with `DEC-2026-002` and re-indexing updated `DEC-2026-001` in place (3 documents, 3 units, 0 duplicates). |
+| Status-isolated recall | Active recall returned only `DEC-2026-002` and `LES-2026-001`; historical recall (`status:superseded`) returned `DEC-2026-001`. |
+| End-to-end dream convergence | Running `dream --apply` followed by `validate` and `index` converged with zero unlinked supersessions and zero errors. |
 
-A full end-to-end run with the agent on a GKE install (submit-suggestion refusing a `block`
-change, and a dream diary posted to chat) has not been done yet.
+### Evaluation gates before default activation
 
-## Related
+Decision memory ships disabled by default and is enabled per installation after passing an A/B benchmark suite (`with-decision-memory` vs `without-decision-memory`):
 
-- [`memory.md`](memory.md): conversational memory, which this complements.
-- [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md): finding identity and the
-  `resolved-merged` state the outcome recorder needs emitted.
-- [`gitops-fix-cycle.md`](gitops-fix-cycle.md): the verified-fix predicate, and the repeated
-  quota raise this would have stopped.
-- [`pr-comment-conversation.md`](pr-comment-conversation.md): the sweep and marker pattern the
-  review sweep reuses.
-- [`capability-delivery-vehicle.md`](capability-delivery-vehicle.md): the learning policy the
-  dream follows.
-- [`spec-mode-switch.md`](spec-mode-switch.md): `mode: next`, the reason nothing here may depend
-  on Hermes.
-- Architecture [02 §2.3](../architecture/02-agent-personas.md),
-  [06 §5](../architecture/06-api-and-data-contracts.md): OKF as the curated-knowledge layer.
+| Benchmark dimension | Metric and target |
+| --- | --- |
+| **Repeat-failure prevention (Pass rate)** | Re-run the `b-0011` quota exhaustion benchmark with `DEC-2026-001` (quota cap decision) active. Target: 0 invalid quota-increase pull requests across 3 consecutive runs. |
+| **Negative control accuracy** | Run a benign change touching a governed namespace where the guard remains satisfied. Target: 100% pass rate with zero false-positive `block` verdicts. |
+| **Latency overhead** | Measure wall-clock time per task. Deterministic `check` adds $< 200\text{ ms}$; optional semantic recall adds $< 1\text{ s}$. |
+| **Token budget** | Measure input token delta per turn. Scoped matching injects only matching records, keeping overhead under 500 tokens per check. |
+| **Irrelevant recall rate** | Measure the fraction of surfaced `semantic` records graded unrelated to the diff. Target: $< 10\%$. |
+| **Stale recall rate** | Measure the fraction of active recall results with `status: superseded` or `status: retired`. Target: $0\%$. |
+
+### Operational metrics
+
+Installations track six local metrics in the nightly dream diary:
+
+1. **Repeat incident rate:** Findings matching the same `check` and resource after an active lesson exists.
+2. **Guard interceptions:** Proposed changes blocked or modified by a guard, split by agent vs human author.
+3. **Decision coverage:** Percentage of commits to governed paths that match an active record.
+4. **Time to active lesson:** Elapsed time from pull request merge to an active `LES-YYYY-NNN` record.
+5. **Backed rationale rate:** Fraction of `why` queries answered by an active record vs raw git history alone.
+6. **At-risk rate:** Number of active records flagged `at_risk` or `obsolete` per week.
+
+---
+
+## Related documents
+
+- [`memory.md`](memory.md): Conversational memory architecture (`kube-agents-memory`).
+- [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md): Finding identity and lifecycle states (`resolved-merged`, `pr-merged-persists`, `refused`).
+- [`gitops-fix-cycle.md`](gitops-fix-cycle.md): Post-merge verification predicates and pilot failure analysis.
+- [`pr-comment-conversation.md`](pr-comment-conversation.md): Pull request sweep and idempotent comment markers.
+- [`capability-delivery-vehicle.md`](capability-delivery-vehicle.md): Self-learning safety boundaries (`apply` vs `propose`).
+- [`spec-mode-switch.md`](spec-mode-switch.md): `spec.mode: next` runtime architecture.
+- [Architecture 02 §2.3](../architecture/02-agent-personas.md) and [06 §5](../architecture/06-api-and-data-contracts.md): Operational Knowledge Format (OKF) specification.

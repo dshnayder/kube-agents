@@ -1,77 +1,72 @@
 ---
 name: decision-memory
-description: Recall, check and explain recorded infrastructure decisions and lessons learned (knowledge/decisions, knowledge/lessons in the GitOps repository) before proposing a change, when reviewing someone else's change, or when asked why something is configured the way it is. Drafts a lesson from a merged, verified fix. PROTOTYPE — see docs/designs/decision-memory.md.
+description: Check, recall, and explain infrastructure decisions and lessons in the GitOps repository. Validate changes against guards, explain configuration rationale, and draft lessons from verified outcomes.
 ---
 
-# decision-memory — what we decided, what we learned, and what not to undo
+# decision-memory
 
-The GitOps repository carries the organisation's infrastructure decisions and the lessons
-learned from incidents as reviewed records under `knowledge/decisions/` and
-`knowledge/lessons/` (markdown + YAML frontmatter, the OKF contract in
-`docs/architecture/06-api-and-data-contracts.md` §5). This skill is how you read them before
-you act. It never writes to a cluster and never writes memory directly: a record only changes
-through a pull request a human merges.
+The GitOps repository stores infrastructure decisions and operational lessons as reviewed records under `knowledge/decisions/` and `knowledge/lessons/` (`docs/architecture/06-api-and-data-contracts.md` §5).
+Use this skill to check those records before you modify a file or review a change.
+Every record update requires a pull request that a human merges.
 
-All commands print JSON (or markdown with `--markdown`) and need a checkout of the GitOps
-repository — the clone the GitOps workspace or the credential broker gives you, not this
-pod's filesystem. `scripts/decision_memory.py` imports nothing from the agent harness.
+All commands output JSON (or Markdown with `--markdown`) and run against a local GitOps repository checkout.
+`scripts/decision_memory.py` does not import any agent harness packages.
 
 ## When to use
 
-| Situation | Command | What you must do with the result |
+| Scenario | Command | Required action |
 | --- | --- | --- |
-| You are about to propose a change (submit-suggestion, fleet-audit remediation, manifest generation) | `check --base <base> --semantic` after your edit, before `submit` | A `violates` finding with severity `block` stops the proposal: change the patch or ask the human. Paste `markdown` into the PR body under **Prior decisions and lessons**. |
-| You are reviewing a pull request someone else opened | `check --base <base> --head <pr-head>` | Comment on each `violates` finding citing the record id and the PR it was learned in. Do not approve or merge. |
-| Someone asks "why is X configured like this?" | `why <path>` | Cite record ids. If `records` is empty, say no decision is recorded, show `history`, and offer to draft one — never invent a rationale from the history. |
-| A fix you proposed was merged and the finding is gone | `from-outcome <outcome.json>` | Put the drafted record in a pull request for a human to merge, or include it in the fix PR before it merges. |
+| Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic` | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body. |
+| Review a pull request | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR. |
+| Answer "why is X configured this way?" | `why <path>` | Cite matching record IDs. If `records` is empty, state that no decision is recorded, show `history`, and offer to draft a record. Never invent a reason from commit logs. |
+| Record a verified fix or rejected PR | `from-outcome <outcome.json>` | Open a pull request with the drafted lesson record for human review. |
 
-## Reading the verdicts
+## Verdicts
 
-- `violates` — the change breaks a recorded guard (a machine-checked expectation such as
-  "memory request ≥ 256Mi"). `block` means do not propose it as is; `warn` means you may
-  propose it only if the PR body says why the decision no longer applies.
-- `related` — the change touches what a record governs but no guard was evaluated. Read the
-  record and say in the PR how the change relates to it.
-- `consistent` — the guard was evaluated and holds.
-- `semantic` — records that look related by meaning but are not scoped to these files. Treat
-  as leads, not facts.
+- `violates`: The change breaks a recorded guard. `block` means abort the proposal. `warn` means proceed only if the PR body explains why the previous decision no longer applies.
+- `related`: The change modifies a governed path or resource without a guard violation. Explain in the PR body how the change relates to the record.
+- `consistent`: The change satisfies the evaluated guard.
+- `semantic`: The Hindsight index returned similar records outside the explicit file scope. Verify whether they apply.
 
-`no_match` is not evidence that nothing was ever decided — only that no record is scoped to
-these paths. Say "no recorded decision", never "no decision exists".
+When `check` returns `no_match`, report *"No recorded decision governs these paths"*.
+Never claim that no decision exists.
 
-## Record shape
+## Record schema
 
 ```yaml
 ---
-type: lesson            # or decision
-id: LES-2026-001        # DEC-YYYY-NNN for decisions
+type: lesson            # decision | lesson
+id: LES-2026-001        # DEC-YYYY-NNN | LES-YYYY-NNN
 title: checkout OOM-kills below 256Mi
 status: active          # proposed | active | superseded | retired
 date: 2026-09-10
-scope:                  # what the record governs — at least one of these
+scope:                  # include at least one key
   paths: ["clusters/*/payments/checkout.yaml"]
   resources: ["Deployment/payments/checkout"]
   clusters: [prod-eu]
-  checks: [oom-kill]    # fleet-audit check ids
-guard:                  # optional, machine-checkable
-  rule: Keep checkout's memory request at or above 256Mi.
+  checks: [oom-kill]
+guard:                  # optional machine-checked rule
+  rule: Keep checkout memory request at or above 256Mi.
   severity: block       # block | warn | info
   expect:
     file: "clusters/*/payments/checkout.yaml"
     path: "spec.template.spec.containers[name=app].resources.requests.memory"
-    op: ">="            # == != >= > <= <  (Kubernetes quantities understood)
+    op: ">="            # == != >= > <= < in contains
     value: 256Mi
 evidence:
   pull_request: https://github.com/acme/gitops/pull/31
-  commit: 1a2b3c
+  commit: 1a2b3c4
   merged_by: alice
   finding_id: oom-kill.prod-eu.payments.checkout
-supersedes: []          # ids this record replaces
+supersedes: []
 ---
-## What happened / What fixed it / How we know it worked / Prevent it next time
+## What happened
+## What fixed it
+## How we know it worked
+## Prevent it next time
 ```
 
-A dot inside a key is escaped: `spec.hard.requests\.memory`.
+Escape literal dots inside YAML keys with a backslash: `spec.hard.requests\.memory`.
 
 ## Commands
 
@@ -80,9 +75,9 @@ python3 scripts/decision_memory.py --repo <clone> validate
 python3 scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
 python3 scripts/decision_memory.py --repo <clone> why clusters/prod-eu/payments/quota.yaml
 python3 scripts/decision_memory.py --repo <clone> from-outcome outcome.json
-python3 scripts/decision_memory.py --repo <clone> dream          # scheduled, not interactive
-python3 scripts/decision_memory.py --repo <clone> index          # scheduled, not interactive
+python3 scripts/decision_memory.py --repo <clone> dream
+python3 scripts/decision_memory.py --repo <clone> index
 ```
 
-`--hindsight-url` (or `HINDSIGHT_API_URL`) enables semantic recall against the
-`kube-agents-decisions` bank. Without it, `check` and `why` still work from git alone.
+Pass `--hindsight-url` (or set `HINDSIGHT_API_URL`) to query the `kube-agents-decisions` Hindsight bank.
+Without Hindsight, `check`, `why`, and `dream` operate from git alone.
