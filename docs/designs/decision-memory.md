@@ -3,7 +3,7 @@
 ## Summary
 
 An organisation that cannot find the reason behind an infrastructure setting will eventually
-undo it, and the outage it prevented comes back. That is the problem a customer (SAP) brought us:
+undo it, and the outage it prevented comes back. That is the problem enterprise pilot feedback describes:
 its engineers cannot work out why past infrastructure decisions were made, so previous outages
 and misconfigurations keep coming back.
 
@@ -54,7 +54,7 @@ review sweep and the CI action are designed here and not built.
 
 ## The problem, concretely
 
-### What SAP is describing
+### What the pilot feedback describes
 
 Two failure modes, both about rationale:
 
@@ -114,6 +114,21 @@ control.
   attributable, …) applied to knowledge.
 - **R7 Degrades gracefully.** Without Hindsight, `check`, `why` and `dream` still work from git
   alone. The index only adds recall.
+- **R8 Precedence is written down, not ranked.** Two PRs can make the same change, with one
+  accepted and one rejected. A newer decision can contradict an older one. When that happens,
+  which is "the fact going forward" is decided by explicit rules ([Precedence](#precedence-what-becomes-the-fact))
+  and recorded as `supersedes`. A similarity score must never decide it.
+- **R9 Relevance over recall.** A memory system that keeps resurfacing irrelevant memories is
+  worse than none. Records surface only when they are scoped to the change or the question in
+  front of the agent. The decisions bank is not injected into every turn. Irrelevant recall is
+  measured as an eval dimension ([Validation before enabling](#validation-before-enabling)).
+- **R10 Sources beyond the forge.** Some organisations keep architectural decisions in a `/docs`
+  directory in the same repository. Others keep them in a separate document store (a wiki, a
+  Confluence space, a second repository). Harvesting reads all of these. Records can live in a
+  separate knowledge repository.
+- **R11 No telemetry egress.** Outcomes, records and metrics stay inside the customer's install.
+  The agent can see PR outcomes and the vendor cannot, and the design does not change that. Any
+  sharing is opt-in and initiated by the user, for example in a `/feedback` bundle.
 
 **Non-goals:**
 
@@ -182,7 +197,7 @@ There are three roles, and they are kept apart on purpose:
    people sign up to, and the PR that merges it is the signature. Shared chat memory has no review
    step, and its consolidation is built to paraphrase. That suits conversational facts and is
    exactly wrong for "the request must stay ≥ 256Mi because of PR #31".
-3. **It must outlive the agent.** SAP's decision log has to survive an uninstall, a PVC wipe, a
+3. **It must outlive the agent.** An organisation's decision log has to survive an uninstall, a PVC wipe, a
    change of memory provider, and the day they stop using kube-agents. Git does all four.
 4. **Reverts can be seen.** If a fix is reverted, git shows it. The dream reads that, and a
    memory store cannot.
@@ -358,9 +373,9 @@ was resolved. It runs:
   fleet-audit `finish` and the sweep publish to. See
   [Harness neutrality](#harness-neutrality).
 
-### W2 — Harvest: the decisions nobody wrote down (SAP's backlog)
+### W2 — Harvest: the decisions nobody wrote down (the backlog)
 
-SAP's immediate pain is history, not tomorrow. The harvester mines what already exists:
+For an organisation adopting this, the immediate pain is history, not tomorrow. The harvester mines what already exists:
 
 - merged PRs that touched governed infrastructure paths, with their discussions and linked
   issues;
@@ -378,6 +393,42 @@ paths with no record and no record of their own in the same change. `why` feeds 
 Harvested text is untrusted input. A PR body or an issue comment is someone's claim, not a
 decision. That is why harvested records always start `proposed` and become `active` only when a
 person merges them.
+
+**Triage before drafting.** Pilot feedback asked for exactly this: scan all PRs and decide what
+is relevant, what is front and centre, and what is anachronistic. So the harvester classifies
+every candidate before it drafts anything, and the curation PR is grouped by class:
+
+| Class | Meaning | Becomes |
+| --- | --- | --- |
+| current | the change is still in effect at HEAD (the governed value or file still matches what the PR set) | an `active` decision draft |
+| superseded | a later merged PR changed the same field or file again | a draft with `status: superseded` and `superseded_by`, kept for the "why did it change" chain |
+| rejected | a PR proposing the change was closed unmerged with a reviewer's reason | a negative lesson draft ("this was tried and refused because…") |
+| anachronistic | refers to resources, APIs, versions or clusters that no longer exist at HEAD | not drafted; listed so a human can confirm it is history |
+| noise | formatting, bumps, generated files, no stated rationale | not drafted |
+
+"Front and centre" is an ordering inside the PR, not a class:
+
+1. records governing paths that carry incidents or audit findings;
+2. then guarded fields that changed more than once;
+3. then recency.
+
+**Scale.** A fleet with tens of mega clusters and thousands of workloads has a correspondingly
+long PR history, so a single pass over all of it is not bounded. The harvester is incremental:
+
+- it keeps a watermark (the last merged PR it processed) and works forward from it;
+- it caps each run's work;
+- it backfills history newest-first in bounded slices.
+
+**Sources.** The harvester reads these sources through one interface:
+
+- the GitOps repository;
+- every registered `context_repos` repository;
+- in-repo decision directories (`docs/adr/`, `docs/decisions/`, `/docs`);
+- exports from an external document store (a wiki or Confluence space dumped to markdown by the
+  customer's own tooling).
+
+kube-agents does not need credentials for the document store. The customer decides what to
+export. Each record's `evidence` links back to the original document.
 
 ### W3 — Chat: a decision stated in conversation
 
@@ -425,7 +476,7 @@ There are two variants, and the customer can run either or both.
   `decision_memory.py check --base $BASE --head $HEAD --markdown` on every PR that touches the
   repository, posts the markdown as a sticky comment, and fails on `block`. Making it a required
   check turns a lesson into a merge gate. This is the most harness-neutral form there is, because
-  no agent is in the loop, and it is what we would recommend SAP turn on first.
+  no agent is in the loop, and it is what we would recommend turning on first.
 - **The agent review sweep.** An opt-in `agent:review` label, or a per-repository setting,
   widens the scan gate past `is_agent_pull_request`. A review worker then:
   1. runs `check`, which is deterministic;
@@ -487,13 +538,13 @@ the capability vehicle defines applies as written:
 | 1. Reconcile index | Upsert each valid record by `document_id`, delete documents whose record is gone | yes | built (`index`) |
 | 2. Verify against the tree | For each active record: do its paths still exist (else **obsolete**), does its guard still hold at HEAD (else **at-risk**, with the commit/PR that broke it), was its fix commit reverted (**reverted**) | yes | built |
 | 3. Verify against the clusters | Optional, read-only: does the live value match the record (GitOps drift, or a hand edit)? Mismatches go to the fleet-audit drift stream as findings, not into knowledge | yes | designed |
-| 4. Supersession hygiene | A record that `supersedes` another must be mirrored by `superseded_by` on the old one; propose the edit | yes | built |
+| 4. Supersession and conflicts | A record that `supersedes` another must be mirrored by `superseded_by` on the old one; two active records guarding the same field differently, with no link, are a conflict resolved by [Precedence](#precedence-what-becomes-the-fact) | yes | built |
 | 5. Recurrence | Lessons sharing a `check` or a guarded field, at or above a threshold, across clusters: propose a fleet-wide decision and a policy | yes | built (detection) |
 | 6. Coverage | Commits to governed paths since the last run with no record and no record in the same change: harvest queue. Merged PRs carrying `decision-override:<id>`: propose superseding | yes | built (coverage) |
 | 7. Synthesis | Refresh Hindsight mental models / knowledge pages, tag-scoped to `scope:shared` + `status:active` (+ area), e.g. "Decision log: payments", "Recurring failure modes this quarter" | no (LLM) | designed |
 | 8. Report | A "dream diary" posted to the chat relay or ledger: at-risk records first, then proposals. Silent when there is nothing new, like fleet-audit's `silent_ok` | yes | built (`silent`) |
 
-Phase 2 is what SAP most needs from a dream. It catches the moment a lesson is being unlearned,
+Phase 2 is what an adopting team needs most from a dream. It catches the moment a lesson is being unlearned,
 for example a cost pass that took checkout back to 128Mi, and names the PR that did it, the
 morning after it merged, before the incident repeats.
 
@@ -507,6 +558,69 @@ because the decisions bank holds only shared records.
 Hermes has no built-in "dream" in the pinned base (`v2026.9.14`). What the web describes as Hermes
 dreaming is an out-of-core plugin, and it consolidates the file memory. This design uses neither,
 and that is deliberate.
+
+---
+
+## Precedence: what becomes the fact
+
+History is contradictory. The same change can be proposed twice, accepted once and rejected
+once. A decision from three years ago can be quietly reversed by a PR last month. Retrieval
+cannot settle which one holds now: it returns whatever is most similar to the question. The
+rules are therefore explicit, applied in this order, and the outcome is written into the records
+as `supersedes`/`superseded_by`.
+
+1. **An explicit link wins.** If a record names `supersedes: [X]`, X is no longer the fact, and
+   no rule below overrides that.
+2. **What the tree says beats what a record says.** If a guard no longer holds at HEAD, the
+   record is not silently superseded: it becomes **at-risk**. Either the change that broke it was
+   a mistake (revert it) or it was a new decision (record it and supersede). A human chooses; the
+   dream only asks.
+3. **Merged beats rejected, and newer beats older.** Of two otherwise equal records about the
+   same field, the one backed by a merged PR outranks the one backed by a closed PR. Among merged
+   ones, the newer merge outranks the older. A rejection is not discarded: it stays as a negative
+   lesson, because "we tried raising the quota and it was refused" is exactly what prevents the
+   next attempt.
+4. **A narrower scope beats a broader one.** A cluster-specific exception outranks the
+   fleet-wide rule it contradicts, for that cluster only. This is the exception pattern the
+   [memory experiment](memory.md#the-fleet-the-memory-has-to-serve) found in 55 of its records.
+5. **Anything left unresolved is a conflict.** Two active records that guard the same field with
+   different expectations, where none of the rules above separates them, are flagged by the dream
+   (prototype: `conflicts`). The proposal names the newest one, and a person confirms it.
+
+Recall respects the result. Active recall filters on `status:active`, and a superseded record is
+only returned when someone asks for history ("why did this change?"). The live probe confirms
+both directions.
+
+## Validation before enabling
+
+Memory that keeps surfacing irrelevant or stale memories makes the agent worse and erodes
+trust, so decision memory ships **off by default**. It is enabled per install only after an
+eval shows it helps. The bar is the one the skills process already uses: run the same cases
+with and without the feature and compare.
+
+| Dimension | Measured as |
+| --- | --- |
+| Pass rate | bench cases with a planted "known wrong fix" (b-0011's quota raise is the template), with and without the relevant lesson recorded |
+| Latency | wall time per case; `check` is deterministic and local, so this should not move except where semantic recall is on |
+| Tokens | input tokens per case. Scoped matching injects a handful of records, never the bank |
+| Irrelevant recall | share of surfaced records a grader marks unrelated to the change. This dimension is specific to memory and is the one most likely to regress |
+| Stale recall | share of surfaced records that are superseded or at-risk, which should be 0 for active recall |
+
+A negative control is part of the suite: a change that _looks_ like a recorded lesson but is
+actually fine. It checks that the agent does not refuse good changes on a shallow match.
+
+## Telemetry stays home
+
+An install can see its PR outcomes (merged, refused, verified resolved). The vendor cannot, and
+customers typically block outbound telemetry from these environments. Decision memory works
+within that constraint:
+
+- the outcome recorder, the records, the index and the dream all run inside the install;
+- the metrics in [Rolling it out](#rolling-it-out-in-an-organisation) are computed locally and appear in the
+  dream diary;
+- if a customer wants to share outcomes, they do it explicitly. For example, a `/feedback`
+  command can bundle an anonymised outcome summary (counts of guard hits, repeat rate, lessons
+  added) into a message the user reviews and sends. Nothing leaves the install automatically.
 
 ---
 
@@ -549,7 +663,7 @@ to its per-turn prefetch, but nothing in this design requires it to.
 
 ---
 
-## Rolling it out at SAP
+## Rolling it out in an organisation
 
 1. **Week 0–2: make the past answerable.**
    - Scaffold `knowledge/decisions|lessons` with `CODEOWNERS`.
@@ -572,7 +686,7 @@ to its per-turn prefetch, but nothing in this design requires it to.
 **What to measure:**
 
 - **Repeat rate:** incidents or findings with the same `check` and resource after a lesson for
-  them exists. This is the number SAP cares about.
+  them exists. This is the number adopters care about.
 - Guard hits: changes stopped or amended, split into agent and human.
 - Coverage: the share of changes to governed paths that have a record.
 - Time from merge to an active lesson.
@@ -602,6 +716,19 @@ to its per-turn prefetch, but nothing in this design requires it to.
 
 ## Open questions
 
+- **Short-, long- and mixed-term memory.** Pilot feedback pointed at memory systems that split
+  memory into short-term, long-term and mixed types (Mem0 among them). This design maps onto that
+  split as follows:
+  - conversational memory ([`memory.md`](memory.md)) is the short-term and personal layer;
+  - decision memory is the long-term, curated layer;
+  - the dream is the step that promotes from one to the other.
+
+  Whether a third, mixed layer is needed (for example episodic incident timelines with a TTL) is
+  open. Answer it with the [validation](#validation-before-enabling) suite, not up front.
+- **Pre-merge validation.** A later step could check the knowledge a PR depends on before it
+  deploys, by replaying the change against a mimicked environment rather than only against the
+  records. This is out of scope here; the guard and `check` are the deterministic first step.
+
 - **A separate knowledge repository.** Should `knowledge/` live in its own repository for a
   multi-repo customer? The tool already takes `--knowledge-repo`. The outcome recorder would then
   open its PRs in a different repository from the fix, and whether reviewers accept that split is
@@ -610,7 +737,7 @@ to its per-turn prefetch, but nothing in this design requires it to.
   quiet, and the right N differs by failure class. Start at 24h with a fleet-audit run as the
   stronger signal.
 - **Guard language.** Is one comparison per guard enough before graduating to `policy/`? The
-  pilot cases and the SAP examples so far fit. Multi-field invariants are the first likely gap.
+  pilot cases and the examples from pilot feedback so far fit. Multi-field invariants are the first likely gap.
 - **Hindsight 1.0.0 (released 2026-10-13).** It rejects tag-scoped callers on bank-wide
   operations. That does not affect a shared-only bank, but needs checking before any upgrade.
 - **GitLab parity.** The forge layer already has the three-state proposal. The CI check and the
@@ -628,10 +755,10 @@ to its per-turn prefetch, but nothing in this design requires it to.
 | `check` | Matches a diff (`--base/--head`) or a file list against records by path glob and by `kind/ns/name`, evaluates guards on the new content, flags deleted guarded files, ignores superseded records; optional semantic recall from the index; exit 2 on `block` | 8 |
 | `why` | Governing records + history + changes without a record + an absence note | 2 |
 | `from-outcome` | Drafts a valid lesson from an outcome JSON | 1 |
-| `dream` | Phases 1, 2, 4, 5, 6, 8; `--apply` writes the proposed edits into the working tree for a PR | 7 |
+| `dream` | Phases 1, 2, 4 (incl. conflicts), 5, 6, 8; `--apply` writes the proposed edits into the working tree for a PR | 8 |
 | `index` | Provisions the bank (`chunks` strategy, observations off), upserts by `document_id`, deletes removed records | 2 (fake server) + 1 live |
 
-`python3 -m unittest test_decision_memory`: 26 tests, all passing, with no network and no model.
+`python3 -m unittest test_decision_memory`: 27 tests, all passing, with no network and no model.
 The live test runs only when `DECISION_MEMORY_LIVE_URL` is set.
 
 ### Live validation

@@ -709,7 +709,7 @@ def cmd_dream(a) -> Dict[str, Any]:
     all_files = git(repo, "ls-files").splitlines()
     report: Dict[str, Any] = {"date": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
                               "verified": [], "at_risk": [], "obsolete": [], "reverted": [],
-                              "supersession": [], "recurring": [], "uncovered_changes": [],
+                              "supersession": [], "conflicts": [], "recurring": [], "uncovered_changes": [],
                               "proposed_edits": []}
     for rec in records:
         if rec.status != "active" or validate_record(rec):
@@ -743,6 +743,26 @@ def cmd_dream(a) -> Dict[str, Any]:
                 report["proposed_edits"].append({"id": old, "path": o.path,
                                                  "set": {"status": "superseded", "superseded_by": rec.id},
                                                  "why": f"{rec.id} declares it supersedes {old}"})
+    # Conflicts: two active records guarding the same field with different
+    # expectations, neither superseding the other. Recall ranking must never be
+    # what decides which one is "the fact" — precedence has to be written down.
+    guarded: Dict[Tuple[str, str], List[Record]] = {}
+    for rec in records:
+        exp = rec.guard.get("expect")
+        if rec.status == "active" and exp:
+            guarded.setdefault((exp["file"], exp["path"]), []).append(rec)
+    for (fglob, fpath), recs in sorted(guarded.items()):
+        exps = {(r.guard["expect"]["op"], str(r.guard["expect"]["value"])) for r in recs}
+        if len(recs) > 1 and len(exps) > 1:
+            linked = any(o.id in (r.meta.get("supersedes") or []) for r in recs for o in recs)
+            if not linked:
+                newest = max(recs, key=lambda r: str(r.meta.get("date", "")))
+                report["conflicts"].append({
+                    "file": fglob, "path": fpath,
+                    "records": [{"id": r.id, "date": str(r.meta.get("date", "")),
+                                 "expect": f"{r.guard['expect']['op']} {r.guard['expect']['value']}"}
+                                for r in recs],
+                    "proposal": f"newest is {newest.id}; propose it supersede the others, or narrow their scopes"})
     groups: Dict[str, List[Record]] = {}
     for rec in records:
         if rec.type != "lesson":
@@ -788,7 +808,7 @@ def cmd_dream(a) -> Dict[str, Any]:
         except (urllib.error.URLError, OSError) as e:
             report["index"] = {"error": f"unreachable: {e}"}
     report["silent"] = not any(report[k] for k in ("at_risk", "obsolete", "reverted", "supersession",
-                                                   "recurring", "uncovered_changes"))
+                                                   "conflicts", "recurring", "uncovered_changes"))
     return report
 
 

@@ -367,6 +367,19 @@ class DreamTests(unittest.TestCase):
         rc, out = self.r.run("dream")
         self.assertEqual([c["pull_request"] for c in out["uncovered_changes"]], ["81"])
 
+    def test_conflicting_active_records_are_flagged(self):
+        # An accepted change and a later contradicting decision, with no
+        # supersedes link: which one is the fact must be decided, not ranked.
+        rival = DECISION.replace("DEC-2026-001", "DEC-2026-003").replace(
+            "date: 2026-08-01", "date: 2026-10-01").replace("832Mi", "1200Mi")
+        self.r.write("knowledge/decisions/DEC-2026-003-payments-quota-raise.md", rival)
+        self.r.commit("knowledge: DEC-2026-003 (#95)")
+        rc, out = self.r.run("dream")
+        c = out["conflicts"][0]
+        self.assertEqual(sorted(x["id"] for x in c["records"]), ["DEC-2026-001", "DEC-2026-003"])
+        self.assertIn("newest is DEC-2026-003", c["proposal"])
+        self.assertFalse(out["silent"])
+
     def test_obsolete_when_paths_disappear(self):
         os.remove(self.r.path / "clusters/prod-eu/payments/quota.yaml")
         self.r.commit("payments: quota moved to fleet/ (#90)")
