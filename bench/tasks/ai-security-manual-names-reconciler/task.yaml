@@ -5,8 +5,8 @@
 # ai-security-planted-model-audit does.
 #
 # WHAT THIS GRADES. That a `manual` finding on an object a controller
-# reconciles tells the reader, in the ledger, that a change made by hand is
-# reverted. The collector reads the reconciler off the object's own markers
+# reconciles tells the reader, in the ledger, that its next sync or upgrade
+# can revert a change made by hand. The collector reads the reconciler off the object's own markers
 # and puts it on the candidate as `reconciler`; `finish` then adds a fixed
 # note to the manual remediation. The SOP also tells the worker about the
 # reconciler, but the worker's prose varies from run to run. The graded
@@ -44,15 +44,15 @@
 # Expected cost bracket: the full-audit shape, as
 # ai-security-planted-model-audit.
 id: ai-security-manual-names-reconciler
-name: A manual AI security finding on a Helm-reconciled workload says a change by hand is reverted
+name: A manual AI security finding on a Helm-reconciled workload says a change by hand can be reverted
 prompt: >-
   Run the AI workload security audit, following the ai-security-audit SOP.
 expected_output: >-
   The ledger issue carries one finding, model-image-floating-tag against the
   eval-reconciled-model Deployment in eval-ai-reconciled, with a manual
   remediation. Its note says that the Helm release eval-model-release
-  reconciles the Deployment and that a change made by hand to the live object
-  is reverted. Nothing on the cluster is changed. The closing response is the
+  reconciles the Deployment and that its next sync or upgrade can revert a
+  change made by hand to the live object. Nothing on the cluster is changed. The closing response is the
   SOP's one line, carrying the ledger URL in full.
 infrastructure:
   deployer: "tofu"
@@ -84,7 +84,7 @@ verification_spec:
   # The deciding check. The phrase is the reconciler as the collector spells
   # it, followed by the first sentence of `finish`'s note
   # (audit_report.RECONCILED_NOTE). Only that note joins the two.
-  - name: the-manual-remediation-says-the-release-reverts-a-change-by-hand
+  - name: the-manual-remediation-says-the-release-can-revert-a-change-by-hand
     role: objective
     mode: assert
     check:
@@ -92,7 +92,7 @@ verification_spec:
       audit: ai-security-audit
       scope: body
       required_phrases:
-        - "Reconciled by the Helm release `eval-model-release` in eval-ai-reconciled. A change made by hand to the live object is reverted"
+        - "Reconciled by the Helm release `eval-model-release` in eval-ai-reconciled. The next sync or upgrade can revert a change made by hand to the live object"
   # These two tell a red from a broken run: the finding was filed, against
   # the plant, by the check this case reads. The ledger shortens an id over
   # MAX_FINDING_ID (100) characters from its longest segments, so each phrase

@@ -1358,14 +1358,14 @@ DECLARED_NOTE = (
 RELEASE_NOTE_LEDE = "_(Rendered by "
 RELEASE_NOTE = (
     RELEASE_NOTE_LEDE + "{noun} declared at `{path}`. Make the change in that file: "
-    "the release reverts a patch to the live object.)_"
+    "the next sync or upgrade of the release can revert a patch to the live object.)_"
 )
 NAMESPACE_DIRECTORY_NOTE_LEDE = "_(A new object for this namespace belongs under "
 NAMESPACE_DIRECTORY_NOTE = NAMESPACE_DIRECTORY_NOTE_LEDE + "`{path}`.)_"
 RECONCILED_NOTE_LEDE = "_(Reconciled by "
 RECONCILED_NOTE = (
-    RECONCILED_NOTE_LEDE + "{reconciler}. A change made by hand to the live object is "
-    "reverted; make the change where that reconciler gets its configuration.)_"
+    RECONCILED_NOTE_LEDE + "{reconciler}. The next sync or upgrade can revert a change made "
+    "by hand to the live object; make the change where that reconciler gets its configuration.)_"
 )
 ROUTE_NOTE_END = ".)_"
 ROUTE_NOTE_LEDES = (
@@ -13760,7 +13760,9 @@ def disclose_manual_remediation_routes(
     A `manual` remediation is prose that asks a person to make a change by
     hand. It does not say where to make it, and on most objects the obvious
     place, the live object, is the wrong one: the repository declares the
-    object, or a chart release renders it, or a controller reverts a patch.
+    object, or a chart release renders it, or a controller can revert a patch
+    at its next sync or upgrade. A plain `helm install` release reverts a
+    field that the chart sets at the next `helm upgrade`, not before.
     The collector resolved each of these against the repository and the live
     object, and the SOPs tell the worker to use them, but the ledger showed
     the fields only when the worker wrote them into its note.
@@ -13769,10 +13771,11 @@ def disclose_manual_remediation_routes(
 
     - `declaration`: the file that declares the object;
     - `release_declaration`: the chart release or Kustomize overlay that
-      renders it, and that the release reverts a patch to the live object;
+      renders it, and that the next sync or upgrade of the release can revert
+      a patch to the live object;
     - `namespace_directory`: the directory where a new object belongs;
-    - `reconciler`: what reasserts the object's spec, and that a change made
-      by hand is reverted.
+    - `reconciler`: what reasserts the object's spec, and that its next sync
+      or upgrade can revert a change made by hand.
 
     There is no note for a candidate without these fields. A missing
     `declaration` is not a claim that no file declares the object, so a note

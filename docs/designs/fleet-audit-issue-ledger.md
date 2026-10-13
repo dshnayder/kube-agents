@@ -649,8 +649,11 @@ only when its reason carries the URL of the pull request already carrying it. Th
 After these passes, `finish` adds to each `manual` remediation a note that tells the reader where
 the fix belongs. The note comes only from the collector's candidate for the same finding id. There
 is one location note at most: the `declaration` file, or else the `release_declaration` file with
-the fact that the release reverts a patch to the live object, or else the `namespace_directory`
-where a new object belongs. A `reconciler` adds a second note: a change made by hand is reverted.
+the fact that the next sync or upgrade of the release can revert a patch to the live object, or
+else the `namespace_directory` where a new object belongs. A `reconciler` adds a second note: its
+next sync or upgrade can revert a change made by hand. A plain `helm install` release reverts a
+field that the chart sets only at the next `helm upgrade`, so the notes say "can revert", not "is
+reverted".
 The notes go in a paragraph of their own after the worker's note, and a code fence that the
 worker's note leaves open is closed first. A note whose path the worker's note already names as a
 whole path is not written. A candidate without these fields gets no note, because a missing

@@ -758,9 +758,9 @@ field, and publishes nothing:
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
   then returns next run as `pr-merged-persists`, where neither documented explanation fits.
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
-  It names the `declaration` file, or else the `release_declaration` file (a patch to the live
-  object is reverted), or else the `namespace_directory` for a new object. It also names the
-  `reconciler` that reverts a change made by hand. The notes go in a paragraph of their own after
+  It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
+  can revert a patch to the live object), or else the `namespace_directory` for a new object. It
+  also names the `reconciler`, whose next sync or upgrade can revert a change made by hand. The notes go in a paragraph of their own after
   your note. It writes no note for a candidate without these fields, and none for a fix that "Write
   every `manifest` remediation file" below wrote, declined, or found in a pull request. It does not
   change your words. A `--dry-run` can leave out a note the real run adds. Do not copy these notes

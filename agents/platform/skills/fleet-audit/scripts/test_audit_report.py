@@ -18785,13 +18785,13 @@ class TestManualRemediationRoutes(unittest.TestCase):
             "Make the change in the repository, not on the live object.)_",
         )
 
-    def test_a_chart_rendered_object_names_the_release_file_and_says_a_patch_is_reverted(self):
+    def test_a_chart_rendered_object_names_the_release_file_and_says_a_patch_can_be_reverted(self):
         finding = self.manual()
         manifest = self.manifest(release_declaration={"path": "argocd/apps/web.yaml", "renderer": "helm"})
         self.assertEqual(self.disclose(finding, manifest), ["a"])
         self.assertIn(
             "_(Rendered by the chart release declared at `argocd/apps/web.yaml`. Make the change "
-            "in that file: the release reverts a patch to the live object.)_",
+            "in that file: the next sync or upgrade of the release can revert a patch to the live object.)_",
             self.note(finding),
         )
 
@@ -18811,13 +18811,13 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertEqual(self.disclose(finding, manifest), ["a"])
         self.assertIn("_(A new object for this namespace belongs under `clusters/c1/web`.)_", self.note(finding))
 
-    def test_a_reconciled_object_says_a_change_by_hand_is_reverted(self):
+    def test_a_reconciled_object_says_a_change_by_hand_can_be_reverted(self):
         for reconciler in ("the Argo CD Application `web`", "the Helm release `web` in web", "`flux`"):
             with self.subTest(reconciler=reconciler):
                 finding = self.manual()
                 self.assertEqual(self.disclose(finding, self.manifest(reconciler=reconciler)), ["a"])
                 self.assertIn(
-                    f"_(Reconciled by {reconciler}. A change made by hand to the live object is reverted",
+                    f"_(Reconciled by {reconciler}. The next sync or upgrade can revert a change made by hand",
                     self.note(finding),
                 )
 
@@ -18892,9 +18892,9 @@ class TestManualRemediationRoutes(unittest.TestCase):
         note = self.note(finding)
         self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
         self.assertIn("…(truncated)", note)
-        self.assertTrue(note.endswith("the release reverts a patch to the live object.)_"))
+        self.assertTrue(note.endswith("the release can revert a patch to the live object.)_"))
         rendered = "\n".join(audit_report.render_finding(finding))
-        self.assertIn("the release reverts a patch to the live object.)_", rendered)
+        self.assertIn("the release can revert a patch to the live object.)_", rendered)
 
     def test_the_worker_words_stay_and_the_note_is_the_correction(self):
         text = "Add a probe. This Deployment is not declared in the GitOps repository."
@@ -18965,7 +18965,9 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
     """The wiring: what reaches the ledger body, in the real run and in the
     preview, and the fix the refusal path handled."""
 
-    RELEASE_NOTE_FRAGMENT = "Make the change in that file: the release reverts a patch to the live object."
+    RELEASE_NOTE_FRAGMENT = (
+        "Make the change in that file: the next sync or upgrade of the release can revert a patch to the live object."
+    )
 
     def manifest_file(self, manifest):
         path = self.tmp_path / "manifest.json"
