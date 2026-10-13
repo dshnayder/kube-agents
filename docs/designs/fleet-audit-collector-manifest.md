@@ -472,8 +472,8 @@ carry it onto `scope.clusters`. The `cluster` kind's gap is lifted only when eve
 target carries it; §3.1 holds each copy to the manifest. The networking collector writes
 `subnets_listed: 0` by the same rule on a `project/<id>` entry whose `subnets list` completed with
 no subnet that `subnet-ip-exhaustion` counts, never on a failed or unreadable one, nor on a project
-whose VM, address, forwarding-rule or cluster reads name a subnet the run did not measure (a Shared
-VPC service project on a host subnet outside the scope). The `subnet` kind's gap is lifted only when every `project/<id>`
+whose VM, address, forwarding-rule or cluster reads failed or name a subnet the run did not measure
+(a Shared VPC service project on a host subnet outside the scope). The `subnet` kind's gap is lifted only when every `project/<id>`
 target carries it.
 
 ## 6. Testing

@@ -2449,6 +2449,31 @@ class SubnetsListedMarkTest(unittest.TestCase):
         self.assertNotIn(self.KEY, by_name["project/svc"])
         self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
 
+    def test_a_failed_usage_read_gets_no_mark_and_the_gap_stays(self):
+        # A failed read cannot say which subnets the project uses.
+        for phrase in ("instances list", "clusters list", "addresses list"):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{phrase: (1, "ERROR: PERMISSION_DENIED")})
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertNotIn(self.KEY, by_name["project/p1"])
+                self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_a_service_project_on_an_unlisted_host_pod_range_gets_no_mark(self):
+        cluster = gke_cluster("svc-c", "shared", "pods", 0.2, [("svc-pool", "pods", 0.2, 24)],
+                              subnet_project="host")
+        _, by_name = self.fleet({"svc": project_answers(**{"clusters list": [cluster]})})
+        self.assertNotIn(self.KEY, by_name["project/svc"])
+        # The Pod range still gets its own subnet entry, measured on the Pod range alone.
+        self.assertIn("host/us-central1/shared", by_name)
+
+    def test_a_project_entry_that_is_not_collected_gets_no_mark(self):
+        failed = {"name": "project/p1", "project": "p1", "location": "global",
+                  "outcome": networking_audit.OUTCOME_GATE_FAILED, "error": "PERMISSION_DENIED"}
+        with patch.object(networking_audit, "collect_project_target", return_value=failed):
+            _, by_name = self.fleet({"p1": project_answers()})
+        self.assertNotIn(self.KEY, by_name["project/p1"])
+
     def test_a_service_project_on_a_measured_host_subnet_is_marked(self):
         nics = [{"name": "vm-2", "networkInterfaces": [
             {"networkIP": "10.0.0.2", "subnetwork": HOST_LINK.format("shared")}]}]

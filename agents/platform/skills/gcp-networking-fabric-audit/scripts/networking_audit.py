@@ -125,7 +125,7 @@ UNENUMERATED_SUBNETS = "UNENUMERATED_SUBNETS"
 UNREAD_SUBNET_USAGE = "UNREAD_SUBNET_USAGE"
 # The mark on a `project/<id>` entry whose subnet listing completed, held no
 # subnet this sweep counts, and whose VM, address, forwarding-rule and cluster
-# reads name no subnet that this sweep did not measure. `audit_report` reads
+# reads all passed and name no subnet that this sweep did not measure. `audit_report` reads
 # it as "no subnet to audit here", so a fleet with no countable subnet does
 # not report a gap for the subnet check. A failed or unreadable listing gets
 # no mark, and so does a Shared VPC service project that uses a subnet of a
@@ -814,10 +814,11 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
     in the fleet.
 
     A caller that gives `listed_empty` gets in it each project whose subnet
-    listing completed with no countable subnet and whose reads name no subnet
-    that this sweep did not evaluate. A failed listing, a listing with an item
-    that is not an object or a countable subnet with a range that does not
-    parse, and a project that uses a subnet nobody measured do not go in.
+    listing completed with no countable subnet and whose usage reads all passed
+    and name no subnet that this sweep did not evaluate. A failed listing, a
+    listing with an item that is not an object or a countable subnet with a
+    range that does not parse, a project with a failed or partial usage read,
+    and a project that uses a subnet nobody measured do not go in.
     """
     limitations = usage["limitations"]
     pods_by_subnet: dict[tuple[str, str, str], dict[str, dict]] = {}
@@ -961,7 +962,9 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
             pod["project"] for (owner, region, subnet_name, _), pod in usage["pod_ranges"].items()
             if (owner, region, subnet_name) not in evaluated
         }
-        listed_empty.update(empty_listings - unmeasured)
+        # A failed or partial usage read could name such a subnet too.
+        unread = {project_id for project_id, notes in limitations.items() if notes}
+        listed_empty.update(empty_listings - unmeasured - unread)
 
     entry_projects = {entry["project"] for entry in active_targets[first_entry:]}
     unlisted_rows = {row["project"]: row for row in skipped_targets

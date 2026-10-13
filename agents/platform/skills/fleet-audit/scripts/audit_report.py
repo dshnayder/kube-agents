@@ -1505,9 +1505,9 @@ UNNAMED_EVIDENCE_TARGET = "(unnamed)"
 CLUSTERS_LISTED_KEY = "clusters_listed"
 # The same mark for subnets. The networking collector sets it on a
 # `project/<id>` entry whose `gcloud compute networks subnets list` completed
-# and held no subnet that the IPAM check counts, and whose address reads name
-# no subnet that the run did not measure. It is never set on a failed or
-# unreadable list.
+# and held no subnet that the IPAM check counts, and whose VM, address,
+# forwarding-rule and cluster reads all passed and name no subnet that the run
+# did not measure. It is never set on a failed or unreadable list.
 SUBNETS_LISTED_KEY = "subnets_listed"
 # Each target kind that has a "listed empty" mark, and the mark. A kind with
 # no target in the run is not a coverage gap when every project target
@@ -1518,7 +1518,8 @@ LISTED_EMPTY_LISTS = {
     CLUSTERS_LISTED_KEY: "cluster list completed empty",
     SUBNETS_LISTED_KEY: (
         "subnet list completed with no subnet that subnet-ip-exhaustion counts, "
-        "and whose address reads name no subnet that the run did not measure"
+        "and whose VM, address, forwarding-rule and cluster reads all passed and "
+        "name no subnet that the run did not measure"
     ),
 }
 # The one manifest `outcome` under which the collector vouches for a cluster's
