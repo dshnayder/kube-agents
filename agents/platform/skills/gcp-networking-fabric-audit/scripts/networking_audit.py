@@ -123,11 +123,13 @@ UNENUMERATED_SUBNETS = "UNENUMERATED_SUBNETS"
 # The skipped-target leaf for a project whose subnet-usage reads failed and
 # which owns no subnet entry its failure could be named on.
 UNREAD_SUBNET_USAGE = "UNREAD_SUBNET_USAGE"
-# The mark on a `project/<id>` entry whose subnet listing completed and held no
-# subnet this sweep counts, or was refused because the project's own Compute
-# Engine API is off. `audit_report` reads it as "no subnet can be audited
-# here", so a fleet with no countable subnet does not report a gap for the
-# subnet check. A failed listing gets no mark.
+# The mark on a `project/<id>` entry whose subnet listing completed, held no
+# subnet this sweep counts, and whose VM, address, forwarding-rule and cluster
+# reads name no subnet that this sweep did not measure. `audit_report` reads
+# it as "no subnet to audit here", so a fleet with no countable subnet does
+# not report a gap for the subnet check. A failed or unreadable listing gets
+# no mark, and so does a Shared VPC service project that uses a subnet of a
+# host project outside the scope.
 SUBNETS_LISTED_KEY = "subnets_listed"
 COMMAND_JOINER = " && "
 LIMITATION_JOINER = "; "
@@ -812,8 +814,10 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
     in the fleet.
 
     A caller that gives `listed_empty` gets in it each project whose subnet
-    listing completed with no countable subnet, or was refused because the
-    project's own Compute Engine API is off. A failed listing does not go in.
+    listing completed with no countable subnet and whose reads name no subnet
+    that this sweep did not evaluate. A failed listing, a listing with an item
+    that is not an object or a countable subnet with a range that does not
+    parse, and a project that uses a subnet nobody measured do not go in.
     """
     limitations = usage["limitations"]
     pods_by_subnet: dict[tuple[str, str, str], dict[str, dict]] = {}
@@ -846,13 +850,13 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
     # Why a project in scope named none of its subnets, for the entries of Pod
     # ranges on them.
     unlisted: dict[str, str] = {}
+    # The projects whose subnet listing completed with no countable subnet.
+    empty_listings: set[str] = set()
     for project_id in projects:
         cmds = subnet_commands(project_id)
         subnets, error = run_gcloud_json(cmds["subnets"])
         if subnets == API_DISABLED:
             unlisted[project_id] = f"the Compute Engine API is disabled in {project_id}"
-            if listed_empty is not None:
-                listed_empty.add(project_id)
             continue
         if error is not None or not isinstance(subnets, list):
             target = f"{project_id}/{UNENUMERATED_SUBNETS}"
@@ -872,8 +876,12 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
         scope_command = command_text(*cmds.values())
         uncounted = []
         counted = 0
+        # An item the sweep could not read means the listing did not say
+        # that the project holds no subnet to measure.
+        unreadable = False
         for subnet in subnets:
             if not isinstance(subnet, dict):
+                unreadable = True
                 continue
             name = subnet.get("name", "")
             purpose = subnet.get("purpose") or ""
@@ -887,6 +895,7 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
                 network = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 uncounted.append(f"{name} (unparsable range {cidr!r})")
+                unreadable = True
                 continue
             _, region, name = key
             target = f"{project_id}/{region}/{name}"
@@ -914,8 +923,8 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
                 for secondary in subnet.get("secondaryIpRanges") or [] if isinstance(secondary, dict)
             }
             findings.extend(pod_findings(target, name, region, key, cidrs))
-        if not counted and listed_empty is not None:
-            listed_empty.add(project_id)
+        if not counted and not unreadable:
+            empty_listings.add(project_id)
         if uncounted:
             sys.stderr.write(
                 f"{project_id}: subnet-ip-exhaustion skipped subnets no read can count: {', '.join(uncounted)}\n"
@@ -939,6 +948,20 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
         active_targets.append(subnet_entry(target, region, owner, clusters_command(fullest),
                                            [note, *limitations.get(owner, []), *unreadable_notes(key)]))
         findings.extend(pod_findings(target, name, region, key, {}))
+
+    if listed_empty is not None:
+        # A project whose reads name a subnet that this sweep did not
+        # evaluate uses address space that nothing measured, for example a
+        # Shared VPC service project on a host subnet outside the scope.
+        unmeasured = {
+            reader
+            for key, reader_set in usage["readers"].items() if key not in evaluated
+            for reader in reader_set
+        } | {
+            pod["project"] for (owner, region, subnet_name, _), pod in usage["pod_ranges"].items()
+            if (owner, region, subnet_name) not in evaluated
+        }
+        listed_empty.update(empty_listings - unmeasured)
 
     entry_projects = {entry["project"] for entry in active_targets[first_entry:]}
     unlisted_rows = {row["project"]: row for row in skipped_targets

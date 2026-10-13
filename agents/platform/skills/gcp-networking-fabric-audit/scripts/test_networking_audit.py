@@ -2427,10 +2427,38 @@ class SubnetsListedMarkTest(unittest.TestCase):
         self.assertEqual(by_name["project/p1"][self.KEY], 0)
         self.assertEqual(self.gaps(manifest), [])
 
-    def test_a_disabled_api_on_the_subnet_list_marks_the_project(self):
-        refused = (1, "ERROR: Compute Engine API has not been used in project p1 before. SERVICE_DISABLED")
-        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": refused})})
-        self.assertEqual(by_name["project/p1"][self.KEY], 0)
+    def test_an_unreadable_listing_gets_no_mark_and_the_gap_stays(self):
+        cases = {
+            "an item that is not an object": ["not-a-subnet"],
+            "a countable subnet with a range that does not parse": [subnet("bad", "10.0.0.0/33")],
+        }
+        for label, listing in cases.items():
+            with self.subTest(case=label):
+                networking_audit.PROJECT_NUMBERS.clear()
+                manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": listing})})
+                self.assertNotIn(self.KEY, by_name["project/p1"])
+                self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_a_service_project_on_an_unmeasured_host_subnet_gets_no_mark(self):
+        # A Shared VPC service project owns no subnet, but its VMs use a
+        # subnet of a host project outside the scope. Nothing measured that
+        # subnet, so the run must stay partial.
+        nics = [{"name": f"vm-{i}", "networkInterfaces": [
+            {"networkIP": f"10.0.0.{i}", "subnetwork": HOST_LINK.format("shared")}]} for i in range(2, 250)]
+        manifest, by_name = self.fleet({"svc": project_answers(**{"instances list": nics})})
+        self.assertNotIn(self.KEY, by_name["project/svc"])
+        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_a_service_project_on_a_measured_host_subnet_is_marked(self):
+        nics = [{"name": "vm-2", "networkInterfaces": [
+            {"networkIP": "10.0.0.2", "subnetwork": HOST_LINK.format("shared")}]}]
+        manifest, by_name = self.fleet({
+            "host": project_answers(**{"subnets list": [subnet("shared", "10.0.0.0/24", project="host")]}),
+            "svc": project_answers(**{"instances list": nics}),
+        })
+        self.assertEqual(by_name["project/svc"][self.KEY], 0)
+        self.assertNotIn(self.KEY, by_name["project/host"])
+        self.assertIn("host/us-central1/shared", by_name)
         self.assertEqual(self.gaps(manifest), [])
 
     def test_a_failed_subnet_list_gets_no_mark_and_the_gap_stays(self):

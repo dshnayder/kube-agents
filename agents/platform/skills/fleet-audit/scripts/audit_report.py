@@ -1505,15 +1505,22 @@ UNNAMED_EVIDENCE_TARGET = "(unnamed)"
 CLUSTERS_LISTED_KEY = "clusters_listed"
 # The same mark for subnets. The networking collector sets it on a
 # `project/<id>` entry whose `gcloud compute networks subnets list` completed
-# and held no subnet that the IPAM check counts, or was refused because that
-# project's own Compute Engine API is off. It is never set on a failed list.
+# and held no subnet that the IPAM check counts, and whose address reads name
+# no subnet that the run did not measure. It is never set on a failed or
+# unreadable list.
 SUBNETS_LISTED_KEY = "subnets_listed"
 # Each target kind that has a "listed empty" mark, and the mark. A kind with
 # no target in the run is not a coverage gap when every project target
 # carries its mark (`_unenumerated_kind_gaps`).
 LISTED_EMPTY_KEYS = {TARGET_KIND_CLUSTER: CLUSTERS_LISTED_KEY, TARGET_KIND_SUBNET: SUBNETS_LISTED_KEY}
-# The list that each mark speaks for, for the error messages.
-LISTED_EMPTY_LISTS = {CLUSTERS_LISTED_KEY: "cluster list", SUBNETS_LISTED_KEY: "subnet list"}
+# What each mark says about its project, for the error messages.
+LISTED_EMPTY_LISTS = {
+    CLUSTERS_LISTED_KEY: "cluster list completed empty",
+    SUBNETS_LISTED_KEY: (
+        "subnet list completed with no subnet that subnet-ip-exhaustion counts, "
+        "and whose address reads name no subnet that the run did not measure"
+    ),
+}
 # The one manifest `outcome` under which the collector vouches for a cluster's
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —
 # except `out-of-scope`, the collector saying the target is not this audit's,
@@ -3677,8 +3684,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 raise ValidationError(
                     f"scope.clusters[{i}].{listed_key}: only a "
                     f"`{PROJECT_TARGET_PREFIX}<id>` entry carries it, and only as "
-                    f"the 0 the collector wrote for a project whose {LISTED_EMPTY_LISTS[listed_key]} "
-                    f"completed empty; copy it from the manifest or leave it out. "
+                    f"the 0 the collector wrote for a project whose {LISTED_EMPTY_LISTS[listed_key]}; "
+                    "copy it from the manifest or leave it out. "
                     f"{_sop_pointer(audit_id)}"
                 )
 
