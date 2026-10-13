@@ -2470,6 +2470,10 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
+    # Not measured yet: the same stream as the case above, plus a stack that
+    # opens the ledger, so it takes that case's hint until its record says
+    # otherwise.
+    fleet-audit-unread-target-keeps-finding) echo 900 ;;
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
@@ -2574,7 +2578,7 @@ unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
-    consistency-no-environment-label) echo 3000 ;;
+    consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;

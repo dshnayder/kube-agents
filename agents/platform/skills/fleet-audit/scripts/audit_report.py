@@ -964,6 +964,17 @@ FINDING_HEADING = "#### "
 # that passed no manifest, so those rows survive a run that cannot re-evaluate
 # them; the identity lines themselves are the same shape as a finding's.
 HELD_SECTION_HEADING = "## Held by the collector"
+# The heading for the previous findings that sit on a target this run did not
+# read or did not check (`unread_held_entries`). They go in the same held span
+# as the collector-held rows, so the hidden block keeps their ids, but not in
+# the held-id list: a run without a manifest carries that list unchanged, and
+# these rows must go away when a run checks their target again. The second
+# spelling is for a body that also has collector-held rows above them.
+UNREAD_HELD_HEADING = "## Not re-checked this run"
+UNREAD_HELD_SUBHEADING = "### Not re-checked this run"
+# The key a held entry carries when it is held because its target was not
+# re-checked. Its value is the reason, which the row shows.
+UNREAD_REASON_KEY = "unread"
 # The renderer brackets the held section with these two comments, and the
 # readers key on them rather than on Markdown headings: a model-written line
 # beginning `## `, or an unbalanced fence, in any free-text field would end a
@@ -1535,11 +1546,13 @@ COLLECTOR_COMMAND_UNRECORDED = "(the collector recorded no command for this chec
 # its identity — anchor, heading, `Where:` line — because that is what the next
 # run reads its location from; only the detail is capped.
 MAX_HELD_DETAIL_ROWS = 50
-# How many collector-held ids a ledger carries at once. The ids are a
+# How many held ids a ledger carries at once: the collector-held ids first,
+# then the ids held because a run did not check their target. The ids are a
 # monotone term in the hidden marker that no SOP-side edit can shrink, so
 # unbounded they could push a body past GitHub's limit on every run; kept in
-# sorted order so which ones survive the cap is deterministic, with the
-# overflow logged and stated in the body.
+# sorted order so which ones survive the cap is deterministic. The
+# collector-held overflow is logged and stated in the body; the other overflow
+# is logged.
 MAX_HELD_IDS = 200
 # The coverage gaps a clean run files when the report store holds no memory of
 # the open ledger. The first when the collector still flags something the
@@ -4883,6 +4896,20 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     what they should have read. One project without it -- or no project
     target at all -- and the gap stands.
     """
+    return [
+        f"no {kind} targets were audited — {len(checks)} check(s) ran "
+        f"against nothing ({', '.join(checks)})"
+        for kind, checks in _stranded_kinds(audit_id, targets)
+    ]
+
+
+def _stranded_kinds(audit_id: str, targets: list) -> list[tuple[str, tuple[str, ...]]]:
+    """Each target kind the run enumerated none of, with the checks that ran nowhere.
+
+    The data behind `_unenumerated_kind_gaps`, which has the rules. Also read
+    by `unread_target_reason`: a previous finding on a target of such a kind
+    was not checked this run, although no entry names its target.
+    """
     spec = AUDITS.get(audit_id)
     if not spec or not spec.scopes or not targets:
         return []
@@ -4899,18 +4926,15 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     # project one, and a run with clusters and no project did not run it
     # "against nothing".
     covered = {check for kind, checks in spec.scopes if kind in seen for check in checks}
-    gaps = []
+    stranded: list[tuple[str, tuple[str, ...]]] = []
     for kind, checks in spec.scopes:
         if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
             continue
         checks = tuple(c for c in checks if c not in covered)
         if not checks:
             continue
-        gaps.append(
-            f"no {kind} targets were audited — {len(checks)} check(s) ran "
-            f"against nothing ({', '.join(checks)})"
-        )
-    return gaps
+        stranded.append((kind, checks))
+    return stranded
 
 
 # --------------------------------------------------------------------------- #
@@ -7552,6 +7576,162 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     return sorted(held, key=lambda entry: entry["id"])
 
 
+def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
+    """Why this run did not check `check` on the target `cluster`, or None if it did.
+
+    The per-target form of `coverage_gaps`, for one previous finding. It
+    gives a reason in these cases:
+
+    - The target is in `scope.skipped`. The run did not read it.
+    - The target is in `scope.clusters`, the check is on its roster, and the
+      check is in neither `checks_run` nor `checks_not_applicable`. This is
+      also the case of a check in the collector's `checks_unevaluated`, which
+      `cross_check_manifest` keeps out of both lists.
+    - No entry names the target, and its first segment names a project
+      target in `scope.skipped`. A project that the run did not read lists
+      none of its subnets or qualified clusters.
+    - No entry names the target, and the run enumerated no target of its
+      kind (`_stranded_kinds`).
+
+    In all other cases the run checked the target, or the target is not in
+    the fleet now. A check declared not applicable is a check the run looked
+    at, and a check that is not on the target's roster (a derived check) is
+    not one that a run "runs". A target that has `limitations` and that ran
+    the check counts as checked: the text does not say which findings it
+    could not see. That target is still a coverage gap, so `resolved` stays
+    at zero.
+    """
+    name = str(cluster or "").strip()
+    if not name:
+        return None
+    scope = data.get("scope") or {}
+    audit_id = str(data.get("audit") or "")
+    key = _id_segment(name)
+    skipped = {
+        _id_segment(str(entry.get("cluster", "")))
+        for entry in scope.get("skipped") or []
+        if isinstance(entry, dict)
+    }
+    if key in skipped:
+        return f"`{_ident(name)}` was not read this run"
+    targets = [target for target in scope.get("clusters") or [] if isinstance(target, dict)]
+    for target in targets:
+        target_name = str(target.get("name", "")).strip()
+        if _id_segment(target_name) != key:
+            continue
+        if check in checks_ran(target) or check in checks_na(target):
+            return None
+        if check not in audit_target_checks(audit_id, target_name):
+            return None
+        return f"`{_ident(check)}` did not run on `{_ident(name)}` this run"
+    if QUALIFIED_TARGET_SEPARATOR in name and not name.startswith(PROJECT_TARGET_PREFIX):
+        project = name.split(QUALIFIED_TARGET_SEPARATOR, 1)[0]
+        if _id_segment(PROJECT_TARGET_PREFIX + project) in skipped:
+            return f"project `{_ident(project)}` was not read this run"
+    spec = AUDITS.get(audit_id)
+    kind = scoped_target_kind(spec, name) if spec else target_kind(name)
+    for stranded, checks in _stranded_kinds(audit_id, targets):
+        if stranded == kind and check in checks:
+            return f"no {kind} target was read this run"
+    return None
+
+
+def _stored_finding_places(memory: dict | None) -> dict[str, dict[str, str]]:
+    """{finding id: title, check, cluster, namespace, object} from the stored documents.
+
+    The stored documents also name the findings that the body budget cut, so
+    they give a place for an id that has no row in the previous body.
+    """
+    places: dict[str, dict[str, str]] = {}
+    for key in ("ledger_document", "document"):
+        document = (memory or {}).get(key)
+        findings = document.get("findings") if isinstance(document, dict) else None
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict) or not finding.get("id"):
+                continue
+            places.setdefault(
+                str(finding["id"]),
+                {
+                    "title": str(finding.get("title") or "").strip(),
+                    "check": str(finding.get("check") or "").strip(),
+                    "cluster": str(finding.get("cluster") or "").strip(),
+                    "namespace": str(finding.get("namespace") or "").strip(),
+                    "object": str(finding.get("object") or "").strip(),
+                },
+            )
+    return places
+
+
+def unread_held_entries(
+    previous_body: str | None,
+    memory: dict | None,
+    data: dict,
+    *,
+    exclude: set[str],
+) -> list[dict]:
+    """The previous findings that sit on a target this run did not check, as held entries.
+
+    A findings run over a coverage gap writes the body again from its own
+    document. Without these entries, a previous finding on a target that the
+    run did not read went off the ledger and out of the hidden block. The
+    next full run then announced it as new if it was still there, and never
+    announced it as resolved if somebody fixed it during the gap. The
+    entries keep each such finding on the ledger, with its id in the hidden
+    block, out of `resolved` and out of the stale-close pass, until a run
+    checks its target again (`unread_target_reason`).
+
+    The candidates are the ids in the previous hidden block, less `exclude`
+    (the document's ids, the withheld postures, the declared entries and the
+    collector-held ids). The place of each comes from its row on the previous
+    body, or else from the stored documents. An id with no known place is
+    held by id alone: the caller calls this only over a coverage gap, and
+    nothing shows that the id is outside it. Under another identity scheme
+    the rows are spelled again (`_respelled_rows`) and an id without a row is
+    lost, as for every hold over a scheme change.
+
+    Each entry has the shape of `collector_held_entries`, plus
+    `UNREAD_REASON_KEY` with the reason the row shows. Sorted by id.
+    """
+    previous_ids = parse_delta_block(previous_body)
+    if not previous_ids:
+        return []
+    stale = parse_id_scheme(previous_body) != ID_SCHEME
+    respelled = _respelled_rows(previous_body) if stale else {}
+    places = _stored_finding_places(memory)
+    for raw, where in parse_finding_locations(previous_body).items():
+        places[raw] = {**where, "check": raw.split(".", 1)[0]}
+    entries: dict[str, dict] = {}
+    for raw in previous_ids:
+        if stale and raw not in respelled:
+            continue
+        fid = respelled.get(raw, raw)
+        if fid in exclude or fid in entries:
+            continue
+        place = places.get(raw)
+        if place is None:
+            entries[fid] = {
+                **held_row_from_id(fid),
+                UNREAD_REASON_KEY: "the previous ledger did not record its target, "
+                "and this run did not read all targets",
+            }
+            continue
+        check = place.get("check") or raw.split(".", 1)[0]
+        reason = unread_target_reason(data, check, place.get("cluster", ""))
+        if reason is None:
+            continue
+        entries[fid] = {
+            "id": fid,
+            "title": place.get("title") or f"{check} on {place.get('object', '')}",
+            "check": check,
+            "cluster": place.get("cluster", ""),
+            "namespace": place.get("namespace", ""),
+            "object": place.get("object", ""),
+            "commands": [COLLECTOR_COMMAND_UNRECORDED],
+            UNREAD_REASON_KEY: reason,
+        }
+    return sorted(entries.values(), key=lambda entry: entry["id"])
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers — remediation grouping
 # --------------------------------------------------------------------------- #
@@ -7936,6 +8116,23 @@ def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str
     )
 
 
+def unread_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
+    """Why a `/remediate` on a finding held over an unchecked target is neither refused nor acted on.
+
+    The sibling of `collector_hold_reason` for a row under _Not re-checked
+    this run_ (`unread_held_entries`): the finding is on the ledger, but this
+    run did not check its target, so there is no finding in the document to
+    act on and no reason to call the id a typo.
+    """
+    return (
+        f"`{target}` stays on this ledger because this run did not read or did not "
+        "check its target, so the run cannot tell if the finding is still there. "
+        f"There is no finding in the document to open a {noun} from. The request "
+        "stands: the first run whose document carries the finding acts on it, and "
+        "one that checks the target and no longer sees the finding says so"
+    )
+
+
 def collector_candidate_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a still-flagged id that was never on the ledger is deferred.
 
@@ -8011,6 +8208,7 @@ def parse_remediate_commands(
     collector_held: set[str] | None = None,
     collector_flagged: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    unread_held: set[str] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -8027,6 +8225,8 @@ def parse_remediate_commands(
     ledger under Declared intent — is refused with that file named, never as
     a typo; the still-flagged set has the declared ids taken out of it
     already (`still_flagged_ids`), so the two never name the same target.
+    `unread_held` is the ids the ledger keeps under _Not re-checked this
+    run_; a target among them is deferred the same way.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -8059,7 +8259,8 @@ def parse_remediate_commands(
     # an owner's standing choice rather than a gap the next run fills.
     covered = declared_by_id(declared)
     held_ids = set(collector_held or ())
-    flagged_ids = set(collector_flagged or ()) - held_ids
+    unread_ids = set(unread_held or ()) - held_ids
+    flagged_ids = set(collector_flagged or ()) - held_ids - unread_ids
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -8160,6 +8361,9 @@ def parse_remediate_commands(
                 continue
             if target in held_ids:
                 deferred.append(collector_hold_reason(target, noun))
+                continue
+            if target in unread_ids:
+                deferred.append(unread_hold_reason(target, noun))
                 continue
             if target in flagged_ids:
                 deferred.append(collector_candidate_reason(target, noun))
@@ -9649,11 +9853,94 @@ def _render_collector_held(
     Kept out of `## Findings` on purpose. These are not this run's findings —
     the document did not carry them — so they are not `new`, the sweep never
     sees them, and the heading says whose word they stand on.
+
+    An entry with `UNREAD_REASON_KEY` is held because this run did not check
+    its target (`unread_held_entries`). These rows come after the others,
+    under their own heading, and show the reason in place of the check line.
     """
     if not held:
         return []
+    unread = [entry for entry in held if entry.get(UNREAD_REASON_KEY)]
+    flagged = [entry for entry in held if not entry.get(UNREAD_REASON_KEY)]
+    out = ["", HELD_SECTION_BEGIN]
+    if flagged:
+        out += _render_flagged_held(
+            flagged, detail=detail, overflow=overflow, preview=preview, carried=carried, noun=noun
+        )
+    if unread:
+        out += _render_unread_held(unread, detail=detail, under_flagged=bool(flagged))
+    return out + _held_span_close(held)
+
+
+def _held_rows_intro(count: int) -> str:
+    """The sentence above the rows of `_render_unread_held` and in `_render_held_note`."""
+    return (
+        f"{count} previous finding(s) are on a target that this run did not read or "
+        "did not check. This run cannot tell if each one is still there, so the ledger "
+        "keeps it and does not show it as resolved. Each stays until a run checks its "
+        "target again; that run reports it again or shows it as resolved."
+    )
+
+
+def _render_unread_held(unread: list[dict], *, detail: bool, under_flagged: bool) -> list[str]:
+    """The rows for the previous findings on a target that this run did not check.
+
+    Each row has the identity lines of a finding, so the next run reads its
+    title and place back. The detail line gives the reason; it is capped and
+    dropped as the rows of `_render_flagged_held` are.
+    """
+    heading = UNREAD_HELD_SUBHEADING if under_flagged else UNREAD_HELD_HEADING
+    intro = (
+        _held_rows_intro(len(unread)) + " The automatic sweep passes over these; a "
+        "`/remediate <finding-id>` on one is held, not refused, until a document "
+        "carries the finding again."
+    )
+    out = ["", heading, "", intro]
+    for index, entry in enumerate(unread):
+        out.append("")
+        out += _held_identity_lines(entry)
+        if not detail or index >= MAX_HELD_DETAIL_ROWS:
+            continue
+        out.append(f"- **Not re-checked:** {entry.get(UNREAD_REASON_KEY)}.")
+        out.append(f"- **Finding id:** `{entry.get('id', '')}`")
+    return out
+
+
+def _held_identity_lines(entry: dict) -> list[str]:
+    """The anchor, heading and `Where:` line of one held row."""
+    fid = str(entry.get("id", ""))
+    if entry.get("location_unrecorded"):
+        # Carried by id alone: the previous body had no row. The heading
+        # keeps the marker reader joined; the location line says what is
+        # missing rather than inventing one from the id's segments.
+        return [
+            f'<a id="{_anchor_id(fid)}"></a>',
+            "",
+            f"#### {clip_text(str(entry.get('title', '')), MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
+            "",
+            "- **Where:** not recorded on the previous ledger; carried by id.",
+        ]
+    return _finding_identity_lines(
+        fid,
+        str(entry.get("title", "")),
+        str(entry.get("cluster", "")),
+        str(entry.get("namespace", "")),
+        str(entry.get("object", "")),
+    )
+
+
+def _render_flagged_held(
+    held: list[dict],
+    *,
+    detail: bool,
+    overflow: int,
+    preview: bool,
+    carried: bool,
+    noun: str,
+) -> list[str]:
+    """The heading, the opening and the rows of the collector-held entries."""
     count_word = "finding" if len(held) == 1 else "findings"
-    out = ["", HELD_SECTION_BEGIN, HELD_SECTION_HEADING, ""]
+    out = [HELD_SECTION_HEADING, ""]
     if carried:
         # No collector ran this run, so nothing here may read as this run's
         # observation: the rows are held from a previous run's manifest, and
@@ -9688,25 +9975,7 @@ def _render_collector_held(
     for index, entry in enumerate(held):
         fid = str(entry.get("id", ""))
         out.append("")
-        if entry.get("location_unrecorded"):
-            # Carried by id alone: the previous body had no row. The heading
-            # keeps the marker reader joined; the location line says what is
-            # missing rather than inventing one from the id's segments.
-            out += [
-                f'<a id="{_anchor_id(fid)}"></a>',
-                "",
-                f"#### {clip_text(str(entry.get('title', '')), MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
-                "",
-                "- **Where:** not recorded on the previous ledger; carried by id.",
-            ]
-        else:
-            out += _finding_identity_lines(
-                fid,
-                str(entry.get("title", "")),
-                str(entry.get("cluster", "")),
-                str(entry.get("namespace", "")),
-                str(entry.get("object", "")),
-            )
+        out += _held_identity_lines(entry)
         if not detail or index >= MAX_HELD_DETAIL_ROWS:
             continue
         commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
@@ -9723,7 +9992,7 @@ def _render_collector_held(
                 "there this run and still flags this object."
             )
         out.append(f"- **Finding id:** `{fid}`")
-    return out + _render_held_overflow(overflow, noun) + _held_span_close(held)
+    return out + _render_held_overflow(overflow, noun)
 
 
 def _render_held_note(
@@ -9753,6 +10022,23 @@ def _render_held_note(
     """
     if not held:
         return []
+    unread = [entry for entry in held if entry.get(UNREAD_REASON_KEY)]
+    held = [entry for entry in held if not entry.get(UNREAD_REASON_KEY)]
+    # The rows of `_render_unread_held` in one sentence. Their ids are in the
+    # hidden block and not in the held-id list (see `UNREAD_HELD_HEADING`).
+    unread_lines = (
+        [
+            "",
+            UNREAD_HELD_SUBHEADING if held else UNREAD_HELD_HEADING,
+            "",
+            _held_rows_intro(len(unread)) + " The body had no room for their rows; "
+            "their ids are in the hidden block below.",
+        ]
+        if unread
+        else []
+    )
+    if not held:
+        return ["", HELD_SECTION_BEGIN] + unread_lines + _held_span_close(unread)
     if carried:
         opening = (
             f"{len(held)} previous finding(s) held from a previous run's manifest; this "
@@ -9783,12 +10069,24 @@ def _render_held_note(
         HELD_SECTION_HEADING,
         "",
         opening,
-    ] + _render_held_overflow(overflow, noun) + _held_span_close(held)
+    ] + _render_held_overflow(overflow, noun) + unread_lines + _held_span_close(held)
 
 
 def _held_span_close(held: list[dict]) -> list[str]:
-    """The held-id list and the closing comment every tier ends with."""
-    return ["", held_ids_comment([str(e.get("id", "")) for e in held]), HELD_SECTION_END]
+    """The held-id list and the closing comment every tier ends with.
+
+    The list leaves out the entries held because this run did not check
+    their target (`UNREAD_REASON_KEY`). A run without a manifest carries the
+    list unchanged, and those entries must go when a run checks the target
+    again. Their ids stay in the hidden block, which the next run reads.
+    """
+    return [
+        "",
+        held_ids_comment(
+            [str(e.get("id", "")) for e in held if not e.get(UNREAD_REASON_KEY)]
+        ),
+        HELD_SECTION_END,
+    ]
 
 
 def _render_held_ids_only(held: list[dict]) -> list[str]:
@@ -10151,7 +10449,9 @@ def render_issue_body(
     cap left out); they render under their own heading and their ids join the
     hidden block, so the next run reads them back — see
     `_render_collector_held`. `rendered_ids` stays the document's own, because
-    that is what `new` is measured against.
+    that is what `new` is measured against. `held` may also hold the previous
+    findings on a target this run did not check (`unread_held_entries`); they
+    render in the same span under their own heading.
 
     Everything but the findings renders and is measured first; whatever is left
     of BODY_BUDGET is the findings budget. The hidden delta block carries the
@@ -16089,6 +16389,38 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             still_flagged = {entry["id"] for entry in held_entries}
     held_overflow = len(held_dropped)
     held_ids = {entry["id"] for entry in held_entries}
+    # The previous findings on a target this run did not read or did not
+    # check. Only the findings branch writes the body again, and it writes it
+    # from this run's document, so without these rows such a finding went off
+    # the ledger and out of the hidden block: the next full run announced it
+    # as new if it was still there, and never announced a fix made during the
+    # gap. They render as held rows (`_render_unread_held`), so their ids stay
+    # in the hidden block, out of `resolved` and out of the stale-close pass.
+    # Only over a gap: a run with no gap checked every target. The clean
+    # branch keeps the previous body as it is over a gap, so it needs none.
+    # They share `MAX_HELD_IDS` with the collector-held entries, which come
+    # first.
+    unread_entries: list[dict] = []
+    if existing_issue and delta_known and gaps:
+        unread_entries = unread_held_entries(
+            previous_body, memory, data, exclude=held_exclude | held_ids | _declared_ids(data)
+        )
+        room = max(MAX_HELD_IDS - len(held_entries), 0)
+        if unread_entries[room:]:
+            log(
+                f"WARNING: the ledger stops tracking {len(unread_entries[room:])} previous "
+                "finding(s) on a target this run did not check — it holds at most "
+                f"{MAX_HELD_IDS} at once: "
+                + ", ".join(entry["id"] for entry in unread_entries[room:])
+            )
+        unread_entries = unread_entries[:room]
+    unread_ids = {entry["id"] for entry in unread_entries}
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is on the ledger and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays on the ledger as not re-checked "
+            "rather than resolved."
+        )
     # The still-flagged ids the ledger does not carry: a `/remediate` on one is
     # deferred too, with wording that points at the JSON line rather than at a
     # section that does not name it.
@@ -16654,7 +16986,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # their own heading and their ids join the hidden block — see
     # `_render_collector_held` — so they are neither `new` nor swept, and the
     # next run reads them back.
-    carried = held_entries
+    carried = held_entries + unread_entries
     # Said here and not before the branch split: only this branch rewrites the
     # marker, so only here does the ledger stop tracking anything. On a clean
     # run the untouched marker still carries every id it had.
@@ -16680,6 +17012,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         collector_held=held_ids,
         collector_flagged=candidate_only,
         noun=noun,
+        unread_held=unread_ids,
     )
     triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
@@ -16783,6 +17116,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Less the withheld postures: those are the document's, held back by the
     # harness for want of a search, and already kept out of `resolved` by the
     # gap they file — naming them here would blame the collector for it.
+    # A finding held because this run did not check its target is not
+    # resolved either. Only a run with a gap holds one, and a gap already
+    # holds `resolved` at zero; this keeps the list true for its readers.
+    resolved_ids = [fid for fid in resolved_ids if fid not in unread_ids]
     contradicted = [fid for fid in resolved_ids if fid in still_flagged - held_exclude]
     if contradicted:
         resolved_ids = [fid for fid in resolved_ids if fid not in still_flagged]
@@ -16859,7 +17196,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # rendered, because a pull request can cover a finding that body
             # never had room for. Its pull request is not stale while the
             # condition is still observed, whatever the document left out.
-            set(current_ids) | still_flagged,
+            # And every finding held because this run did not check its
+            # target: absence there is not evidence of a fix.
+            set(current_ids) | still_flagged | unread_ids,
             previous_titles,
             {},
             now,

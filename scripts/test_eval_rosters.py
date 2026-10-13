@@ -169,6 +169,7 @@ ADDED_AFTER_THE_MOVE = [
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-unread-target-keeps-finding",  # held rows for an unchecked target
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

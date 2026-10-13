@@ -546,7 +546,8 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
    useful to a commenter without write access.
 
 6. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
-   comment when the delta is non-empty.
+   comment when the delta is non-empty. Over a gap, the body keeps each previous finding on a target
+   that this run did not check, under _Not re-checked this run_ (§7.4).
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
@@ -673,7 +674,7 @@ lose and anything present is debris from a run that did not finish.
 | Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
 | Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                |
-| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                                                                        |
+| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3. Rows under _Not re-checked this run_ follow (§7.4).                                                                                                                                                                                                                                                                                                                                    |
 | Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                            |
 | Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -715,7 +716,7 @@ headroom for the trailing marker and for anything a later section appends.
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
   body contains, not the full finding set — and, after them, the collector-held ids the body carries
-  under their own heading (collector design §3.3). Otherwise the next run would see a truncated finding
+  under their own heading (collector design §3.3) and the ids under _Not re-checked this run_ (§7.4). Otherwise the next run would see a truncated finding
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
@@ -1003,6 +1004,25 @@ coverage, and nothing else:
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
 not a failed one.
+
+A findings run over a gap writes the body again from its own document, so a previous finding on a
+target that this run did not check would go off the ledger and out of the hidden marker. The next
+complete run would then call it new if it is still there, and would never call it resolved if
+somebody fixed it during the gap. So `finish` keeps each such finding as a held row under _Not
+re-checked this run_, in the held span below the collector-held rows, with the reason on the row
+(`unread_held_entries`). A target was not checked when it is in `scope.skipped`; when the finding's
+check is on its roster and in neither `checks_run` nor `checks_not_applicable` on it, which includes
+a check the collector lists in `checks_unevaluated`; when no entry names it and its project target is
+in `scope.skipped`; or when the run listed no target of its kind. The place of each finding comes
+from its row on the previous body, or from the stored documents for a finding the body budget cut;
+an id with no known place is kept by id alone. The id stays in the marker, so the next complete run
+joins against it, and it is not in `resolved` and not stale for the stale-close pass. It is not in
+the held-id list that a run without a manifest carries (collector design §3.3), so the row goes away
+on the first run that checks its target. A finding on a target that the run read and checked is not
+kept: the document reports it, or it is gone. A target with a `limitations` note that ran the check
+counts as checked, because the note does not say which findings it could not see. The rule that any
+gap keeps `resolved` at `0` does not change. The clean run needs none of this: over a gap it
+comments and leaves the body as it was.
 
 `partial` is `true` if and only if `coverage_gaps` is non-empty, on both `finish` branches. The
 tempting generalisation — also raising it when the body budget (§7.1) dropped findings from the

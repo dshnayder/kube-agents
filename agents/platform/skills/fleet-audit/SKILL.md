@@ -508,6 +508,13 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
+- keeps each previous finding on a target that this run did not check on the ledger, under
+  _Not re-checked this run_. A target was not checked when it is in `scope.skipped`, when the
+  finding's check is in neither `checks_run` nor `checks_not_applicable` on it, when its project
+  target is in `scope.skipped`, or when the run listed no target of its kind. The id stays in the
+  hidden block, so the next complete run reports the finding again without calling it new, or
+  shows it as resolved. A finding on a target that the run read and checked is not kept: it is in
+  the document, or it is gone;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
@@ -1040,7 +1047,7 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
 - **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
   ([`declared_intent_searched`](#declared_intent_searched)), or an id a collector manifest holds
   that the document does not carry — this run's manifest, or a previous run's when this run passed
-  none and the ledger still carries the row. Two wordings there: an id the ledger's hidden block carries is held until the collector
+  none and the ledger still carries the row, or an id under _Not re-checked this run_. Two wordings there: an id the ledger's hidden block carries is held until the collector
   stops emitting it or a `declared` entry covers it, the model's or the harness's; an id the ledger
   never carried is named only on
   the run's JSON line as an unpublished candidate. Either way there is no finding to open a pull

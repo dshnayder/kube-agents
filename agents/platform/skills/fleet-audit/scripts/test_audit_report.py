@@ -13936,6 +13936,288 @@ class TestPartialCoverageGating(HarnessTestCase):
                 self.assertEqual(bool(out["coverage_gaps"]), out["partial"])
 
 
+class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
+    """A findings run over a gap keeps the previous findings on a target it did not check.
+
+    Before, the body was written again from this run's document alone, so a
+    previous finding on a cluster the run could not read went off the ledger
+    and out of the hidden block. The next full run then announced it as new
+    if it was still there, and never announced a fix made during the gap.
+    """
+
+    SKIPPED = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+    PROD = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+    STAGE = {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}
+
+    def stage_finding(self):
+        return make_finding(
+            fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy"
+        )
+
+    def stage_id(self):
+        return derived_id(cluster="stage-eu", fid="stage")
+
+    def previous_ledger(self, *findings):
+        previous = published_body(make_doc(findings=list(findings)), generated_at=NOW)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+        }
+        return previous
+
+    def written_body(self):
+        return self.harness.bodies_for("issue-update")[-1]
+
+    def test_a_finding_on_a_skipped_cluster_stays_as_a_held_row(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        doc = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn(audit_report.UNREAD_HELD_HEADING, body)
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+        self.assertIn("- **Not re-checked:** `stage-eu` was not read this run.", body)
+        # The row is read back next run like any finding's.
+        self.assertEqual(
+            audit_report.parse_finding_locations(body)[self.stage_id()]["cluster"], "stage-eu"
+        )
+        # Not in the held-id list, so a run without a manifest does not carry it
+        # after its target is read again.
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["new"], 0)
+        self.assertIn(f"HELD: {self.stage_id()}", self.err)
+
+    def test_a_finding_whose_check_did_not_run_on_its_cluster_stays(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        stage = {**self.STAGE, "checks_run": roster, "limitations": "netpol read failed"}
+        doc = make_doc(findings=[make_finding()], clusters=[self.PROD, stage])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn("`netpol-missing` did not run on `stage-eu` this run", body)
+
+    def test_a_finding_on_a_target_that_was_checked_is_not_carried(self):
+        """Read and checked: the finding is reported again or it is gone."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        # The gap is on another cluster; stage-eu ran every check.
+        doc = make_doc(
+            findings=[make_finding()],
+            clusters=[self.PROD, self.STAGE],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertNotIn(audit_report.UNREAD_HELD_HEADING, body)
+
+    def test_a_check_declared_not_applicable_is_not_carried(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        stage = {
+            **self.STAGE,
+            "checks_run": roster,
+            "checks_not_applicable": [{"check": "netpol-missing", "reason": "the cluster has no such resource kind, so the check cannot apply"}],
+        }
+        doc = make_doc(
+            findings=[make_finding()],
+            clusters=[self.PROD, stage],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+
+    def test_a_run_with_no_gap_carries_nothing(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding()])), 0, self.err)
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+
+    def test_the_next_full_run_announces_a_fix_made_during_the_gap(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        # The second run reads the store the first run wrote.
+        del self.harness.replies["issue-view !comments"]
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding()])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        self.assertEqual(payload["new"], 0)
+        comment = self.harness.bodies_for("issue-comment")[-1]
+        self.assertIn(self.stage_id(), comment)
+
+    def test_the_next_full_run_does_not_announce_a_held_finding_as_new(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        both = make_doc(findings=[make_finding(), self.stage_finding()])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["new"], 0)
+        self.assertEqual(payload["resolved"], 0)
+
+    def test_a_second_gap_run_keeps_the_row(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+
+    def test_a_remediate_on_a_held_row_is_deferred_not_refused(self):
+        requests = audit_report.parse_remediate_commands(
+            [
+                {
+                    "id": "c1",
+                    "body": "/remediate stage-id",
+                    "author": {"login": "operator"},
+                    "authorAssociation": "OWNER",
+                }
+            ],
+            [],
+            unread_held={"stage-id"},
+        )
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertTrue(requests.refusals[0].get("deferred"))
+        self.assertIn("did not read or did not check its target", requests.refusals[0]["reasons"][0])
+
+
+class TestUnreadTargetReason(unittest.TestCase):
+    """Which previous findings sit on a target this run did not check."""
+
+    def doc(self, audit, clusters, skipped=()):
+        return {"audit": audit, "scope": {"clusters": clusters, "skipped": list(skipped)}}
+
+    def test_a_subnet_under_a_skipped_project_was_not_read(self):
+        audit = "gcp-networking-fabric-audit"
+        data = self.doc(
+            audit,
+            [{"name": "project/other", "checks_run": []}, {"name": "other/us-east1/a", "checks_run": []}],
+            [{"cluster": "project/acme", "reason": "permission denied"}],
+        )
+        self.assertEqual(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b"),
+            "project `acme` was not read this run",
+        )
+        self.assertIsNone(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "gone/us-east1/b")
+        )
+
+    def test_a_target_of_a_kind_with_no_entry_was_not_read(self):
+        audit = "gcp-networking-fabric-audit"
+        checks = [{"check": c, "command": "gcloud x"} for c in audit_report.audit_target_checks(audit, "project/acme")]
+        data = self.doc(audit, [{"name": "project/acme", "checks_run": checks}])
+        self.assertEqual(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b"),
+            "no subnet target was read this run",
+        )
+
+    def test_a_cluster_that_left_the_fleet_is_not_held(self):
+        data = self.doc(AUDIT, [{"name": "prod-us-east", "checks_run": []}])
+        self.assertIsNone(audit_report.unread_target_reason(data, "netpol-missing", "deleted"))
+
+    def test_an_id_with_no_known_place_is_held_by_id(self):
+        body = audit_report.delta_block(["netpol-missing.x.y.z"])
+        data = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
+        entries = audit_report.unread_held_entries(body, None, data, exclude=set())
+        self.assertEqual([e["id"] for e in entries], ["netpol-missing.x.y.z"])
+        self.assertTrue(entries[0]["location_unrecorded"])
+
+    def test_the_stored_document_places_an_id_the_body_did_not_render(self):
+        body = audit_report.delta_block(["netpol-missing.stage-eu.payments.cut"])
+        memory = {
+            "document": {
+                "findings": [
+                    {
+                        "id": "netpol-missing.stage-eu.payments.cut",
+                        "check": "netpol-missing",
+                        "title": "Cut for room",
+                        "cluster": "stage-eu",
+                        "namespace": "payments",
+                        "object": "Namespace/cut",
+                    }
+                ]
+            }
+        }
+        read = self.doc(AUDIT, [{"name": "stage-eu", "checks_run": [{"check": "netpol-missing", "command": "k"}]}], [{"cluster": "dr", "reason": "x"}])
+        self.assertEqual(audit_report.unread_held_entries(body, memory, read, exclude=set()), [])
+        unread = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
+        [entry] = audit_report.unread_held_entries(body, memory, unread, exclude=set())
+        self.assertEqual(entry["title"], "Cut for room")
+        self.assertEqual(entry["cluster"], "stage-eu")
+
+
+class TestUnreadHeldRendering(unittest.TestCase):
+    """The held rows for an unchecked target, under every tier of the held span."""
+
+    def entries(self):
+        unread = {
+            "id": "netpol-missing.stage-eu.payments.a",
+            "title": "Stage has no policy",
+            "check": "netpol-missing",
+            "cluster": "stage-eu",
+            "namespace": "payments",
+            "object": "Namespace/a",
+            "commands": [audit_report.COLLECTOR_COMMAND_UNRECORDED],
+            audit_report.UNREAD_REASON_KEY: "`stage-eu` was not read this run",
+        }
+        flagged = {
+            "id": "netpol-missing.prod.payments.b",
+            "title": "Prod has no policy",
+            "check": "netpol-missing",
+            "cluster": "prod",
+            "namespace": "payments",
+            "object": "Namespace/b",
+            "commands": ["kubectl get netpol"],
+        }
+        return unread, flagged
+
+    def test_alone_it_has_its_own_heading_and_no_held_id(self):
+        unread, _ = self.entries()
+        for lines in (
+            audit_report._render_collector_held([unread]),
+            audit_report._render_collector_held([unread], detail=False),
+            audit_report._render_held_note([unread]),
+        ):
+            text = "\n".join(lines)
+            with self.subTest(text=text[:60]):
+                self.assertIn(audit_report.UNREAD_HELD_HEADING, text)
+                self.assertNotIn(audit_report.HELD_SECTION_HEADING, text)
+                self.assertEqual(audit_report.parse_held_ids(text), [])
+
+    def test_beside_collector_rows_it_comes_after_them(self):
+        unread, flagged = self.entries()
+        text = "\n".join(audit_report._render_collector_held([flagged, unread]))
+        self.assertLess(text.index(audit_report.HELD_SECTION_HEADING), text.index(audit_report.UNREAD_HELD_SUBHEADING))
+        self.assertEqual(audit_report.parse_held_ids(text), [flagged["id"]])
+        self.assertIn("1 previous finding this run's document did not carry", text)
+        note = "\n".join(audit_report._render_held_note([flagged, unread]))
+        self.assertIn("1 previous finding(s) this run's document did not carry", note)
+        self.assertIn(audit_report.UNREAD_HELD_SUBHEADING, note)
+
+    def test_the_body_keeps_its_id_in_the_hidden_block(self):
+        unread, _ = self.entries()
+        rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread])
+        self.assertIn(unread["id"], audit_report.parse_delta_block(rendered.body))
+        self.assertNotIn(unread["id"], rendered.rendered_ids)
+
+
 # --------------------------------------------------------------------------- #
 # Close semantics — whose close is final
 # --------------------------------------------------------------------------- #
