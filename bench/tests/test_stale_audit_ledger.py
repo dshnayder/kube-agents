@@ -104,7 +104,17 @@ def test_the_seed_opens_one_ledger_with_a_record_finish_trusts(store, monkeypatc
     assert created[0]["title"] == audit_report.issue_title(AUDIT, [{"severity": "minor"}])
     ids = audit_report.parse_delta_block(body)
     assert len(ids) == 1 and ledger.RETIRED_CLUSTER in ids[0]
-    assert audit_report.previous_run_memory(AUDIT, 7, GITOPS, body) is not None
+    latest = audit_report.reports_dir_for(AUDIT, GITOPS) / audit_report.REPORT_LATEST_NAME
+    assert latest.is_file()
+    memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
+    assert memory is not None and not memory.get("seeded_from_ledger")
+
+
+def test_the_seed_fails_when_the_store_write_does_nothing(store, monkeypatch):
+    # `write_report` never fails the run; the seed must notice a lost write.
+    monkeypatch.setattr(audit_report, "write_report", lambda *a, **k: None)
+    with pytest.raises(SystemExit):
+        seeded_body(monkeypatch)
 
 
 def test_the_seed_refuses_over_an_open_ledger(store, monkeypatch):

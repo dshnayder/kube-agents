@@ -52,6 +52,8 @@ STALE_SEVERITY = "minor"
 SEED_STATUS = "OPENED"
 TEARDOWN_REASON = "not-planned"
 MODES = ("seed", "teardown")
+# audit_report's mark on a memory seeded from the ledger, not read from the store.
+SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
 
 
 def stale_document(audit_report, audit_id):
@@ -161,10 +163,16 @@ def seed(audit_report, audit_id, repo, now):
         ),
         now,
     )
-    if audit_report.previous_run_memory(audit_id, number, repo, rendered.body) is None:
+    # `write_report` never fails the run, and `previous_run_memory` seeds a
+    # memory from the ledger when the store has no directory. So check that
+    # the file is there and that the memory is the one written here.
+    latest = audit_report.reports_dir_for(audit_id, repo) / audit_report.REPORT_LATEST_NAME
+    memory = audit_report.previous_run_memory(audit_id, number, repo, rendered.body)
+    if not latest.is_file() or memory is None or memory.get(SEEDED_FROM_LEDGER_KEY):
         sys.exit(
-            f"ERROR: the stored record of #{number} is not one that finish trusts, so the "
-            "run would hold the ledger open over a lost memory instead of closing it."
+            f"ERROR: the stored record of #{number} was not written or is not one that "
+            "finish trusts, so the run would hold the ledger open over a lost memory "
+            "instead of closing it."
         )
     return url
 
