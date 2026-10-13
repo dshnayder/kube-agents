@@ -40,11 +40,27 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
 2. **Delete unmanaged or integration secrets (optional).**
 
    ```bash
-   kubectl delete secret github-app-credentials a2a-slack-principal-map gitlab-forge-token \
+   kubectl delete secret github-app-credentials a2a-slack-principal-map \
      -n kubeagents-system --ignore-not-found=true
    ```
 
-   `github-app-credentials` only exists if you configured the GitHub integration. `gitlab-forge-token` is the GitLab access token of a GitLab install. The installer creates it outside the Helm release, so no uninstall step deletes it. After the uninstall, also revoke the token in GitLab. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
+   `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
+
+   **GitLab token Secret.** A GitLab install has a token Secret that the installer creates outside the Helm release, so no uninstall step deletes it. A teardown that deletes the cluster deletes it too. On a cluster that the teardown keeps, delete it with this command. It reads the Secret name and the namespace from the install's `install.env`, the same way the installer reads that file:
+
+   ```bash
+   # The install's install.env: beside install.sh for an install from an unpacked release or
+   # a checkout, or $HOME/kube-agents/install.env under curl | bash.
+   ENV_FILE="$HOME/kube-agents/install.env"
+   (
+     unset NAMESPACE GITLAB_TOKEN_SECRET
+     set -a; . "$ENV_FILE"; set +a
+     kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
+       -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+   )
+   ```
+
+   The subshell keeps the file's variables out of your shell. After the uninstall, revoke the token in GitLab.
 
    **Note on `platform-agent-secrets`:** If installed via Terraform or with Helm's `platformAgent.credentials.create=true`, the core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations, and Helm will recreate it on the next upgrade. If `platformAgent.credentials.create=false` (the Helm default), the Secret is externally managed and will not be recreated by Helm. To purge credentials without a full teardown, delete it explicitly:
 

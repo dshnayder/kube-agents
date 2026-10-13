@@ -25,18 +25,10 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 On a GitLab install, the installer creates the token Secret outside the Helm release. A teardown
 that deletes the cluster deletes it too. On a cluster that the teardown keeps, tell the operator
-that the Secret stays. Read its name and the namespace from the install's `install.env`, and give
-the command:
-
-```bash
-ENV_FILE=/path/to/install.env   # the install's install.env
-(
-  unset NAMESPACE GITLAB_TOKEN_SECRET
-  eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$ENV_FILE")"
-  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
-    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
-)
-```
+that the Secret stays, and give the command in step 2 of the site's uninstall page
+(`docs/site/src/content/docs/install/uninstall.md`). That command sources the install's
+`install.env` in a subshell, the same way the installer reads it, so a renamed Secret or a
+non-default namespace is found. Then tell the operator to revoke the token in GitLab.
 
 The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
 in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).

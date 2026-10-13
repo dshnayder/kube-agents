@@ -301,21 +301,9 @@ only), and stores nothing.
   token, and it keeps the token Secret.
 - The token Secret is not part of the Helm release. Deleting the PlatformAgent or uninstalling
   the release leaves it. A full teardown that deletes the cluster deletes it too. On a cluster
-  that the teardown keeps, delete it yourself. Take its name and the namespace from
-  `install.env`:
-
-  ```bash
-  # The install's install.env: beside install.sh for an install from an unpacked release or
-  # a checkout, or $HOME/kube-agents/install.env under curl | bash. See "The install.env keys".
-  ENV_FILE="$HOME/kube-agents/install.env"
-  (
-    unset NAMESPACE GITLAB_TOKEN_SECRET
-    eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$ENV_FILE")"
-    kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
-      -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
-  )
-  ```
-
+  that the teardown keeps, delete it with the command in step 2 of
+  [Uninstall](/kube-agents/install/uninstall/). That command reads the Secret name and the
+  namespace from `install.env`.
 - After an uninstall, revoke the token in GitLab.
 
 ## Limits
