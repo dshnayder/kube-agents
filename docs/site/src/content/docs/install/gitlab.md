@@ -39,7 +39,9 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   needs no route to the GitLab host and no trust for its certificate.
 - **The certificate.** On a self-managed instance, the certificate must chain to a CA that
   the broker image trusts: a public CA, or a proxy that terminates TLS with such a
-  certificate. 0.9.0 has no setting for a private CA.
+  certificate. Releases up to and including 0.9.0 have no setting for a private CA. A later
+  release adds `--gitops-ca-file`; to check a release, run
+  `./install.sh --help | grep -- --gitops-ca-file` in it.
 - **`gh`.** The installer checks for the GitHub CLI on every install, and installs it when it
   is missing (a dry run stops instead). A GitLab install does not use it to reach GitLab.
 

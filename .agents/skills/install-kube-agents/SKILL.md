@@ -429,8 +429,10 @@ Rules for the agent:
 - The dry run checks only that the token source is readable; it does not read the token. Only the
   stage 3 run reads it, after the apply. `install.sh` never connects to GitLab.
 - A self-managed instance must present a certificate that the broker image trusts (a public CA, or
-  a proxy that terminates TLS with such a certificate). Only the credential broker pod connects to
-  GitLab, and its egress is open. The GitLab hostname must resolve through the cluster DNS.
+  a proxy that terminates TLS with such a certificate), unless the release has `--gitops-ca-file`
+  (releases up to and including 0.9.0 do not; check with `./install.sh --help`). Only the
+  credential broker pod connects to GitLab, and its egress is open. The GitLab hostname must
+  resolve through the cluster DNS.
 - After stage 3, check the connection: run `vcs.py identity` in the shell sandbox, as the GitLab page
   shows. `FORGE_CREDENTIAL_UNAVAILABLE` means no Secret; `FORGE_UNAUTHENTICATED` means GitLab
   refused the token.

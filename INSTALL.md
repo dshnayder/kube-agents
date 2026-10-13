@@ -223,7 +223,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   private hostname must resolve through the cluster DNS; on GKE, a Cloud DNS private zone
   attached to the cluster's VPC works.
 - A self-managed instance must present a certificate that the broker image trusts: one from a
-  public CA, or from a proxy that terminates TLS with such a certificate.
+  public CA, or from a proxy that terminates TLS with such a certificate. Releases up to and
+  including 0.9.0 have no setting for a private CA. A later release adds `--gitops-ca-file`;
+  check with `./install.sh --help | grep -- --gitops-ca-file`.
 - GitLab access tokens expire. Replace the token before it expires; an expired token gives
   `FORGE_UNAUTHENTICATED` on every GitLab call.
 - After the install, check the connection from the shell sandbox:
