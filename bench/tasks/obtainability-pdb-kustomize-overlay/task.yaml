@@ -13,25 +13,31 @@
 # ledger row names the kustomization and the `resources:` line a person must
 # add.
 #
-# WHY IT IS RED ON MAIN. The candidate carries a `declaration` in the overlay
-# directory, and SOP 3.3 says to write a new PodDisruptionBudget beside the
-# declaration. The SOP sends only a `namespace_directory` of source `overlay`
-# to `manual`, not a `declaration` in a Kustomize root. When the worker writes
-# `manual` first, `finish` refuses it as an unwritten sweep fix, the planner
-# does not write its own budget in a Kustomize root, and the refusal tells
-# the worker to write the file. On main, a worker that writes the new file as
-# `kind: manifest` gets a pull request that adds only that file:
-# the-sweep-opened-no-pull-request goes red. With the guard, `finish` makes
-# that fix `manual`, names the kustomization, and opens nothing. (Main's SOP
-# is the one this describes; the branch's SOP also sends a declaration in a
-# Kustomize root to `manual`.)
+# WHY IT IS RED ON MAIN. The prompt asks for the budget as a file: a
+# `kind: manifest` remediation, a new pdb.yaml beside checkout-gateway's
+# declaration, as the obtainability SOP's rule for a new object beside the
+# declaration of the workload it protects says. So the red does not depend
+# on the worker's own choice between `manifest` and `manual` (on main
+# 1e7845bb, with no such instruction, the worker chose `manual` and the case
+# could not tell main from the branch). The finding is `major` on `no-pdb`,
+# which is in MAJOR_SWEEP_CHECKS, and the collector's candidate vouches for
+# it, so on main the sweep opens a pull request that adds only pdb.yaml,
+# unasked: the-sweep-opened-no-pull-request goes red. On the branch the
+# guard sees a new file that the overlay's kustomization does not list, and
+# makes the fix `manual`: no pull request, green.
 #
-# WHAT DECIDES. Two objectives: a finding id names checkout-gateway (the
-# finding was filed), and no pull request was opened (`none` over
-# github_writes). Red on main is a pull request that adds only the new file;
-# green is no pull request. The ledger body is not graded, because it
-# renders only part of a seeded fleet's findings (see the note in
-# verification_spec).
+# WHAT DECIDES. Three objectives: a finding id names checkout-gateway (the
+# finding was filed); a worker wrote seeded-reliability/pdb.yaml (so a green
+# is the guard's work, not a worker that declined to write the file); and no
+# pull request was opened (`none` over github_writes). Red on main is a pull
+# request that adds only pdb.yaml; green is the file written and no pull
+# request. The branch's SOP says that a fix in a Kustomize root is `manual`;
+# if a worker follows that over the prompt and writes no file,
+# the-worker-wrote-the-budget-file goes red, which is the honest result. The
+# ledger body is not graded, because it renders only part of a seeded
+# fleet's findings (see the note in verification_spec). The sweep is capped
+# at five pull requests a run; the seeded fleet has no other declared
+# manifest fix, so the cap does not hide checkout-gateway's.
 #
 # THE FIXTURE. A Kustomize root in the eval GitOps repository that declares
 # Deployment/checkout-gateway in seeded-reliability for the seeded-a cluster
@@ -92,14 +98,20 @@ id: obtainability-pdb-kustomize-overlay
 name: A new PodDisruptionBudget in a Kustomize overlay is manual and names the resources line
 prompt: >-
   Run the workload reliability audit against the fleet, following the
-  obtainability-audit SOP. Put the URL of every remediation pull request
-  `finish` reports, opened or still open, on your closing line after the
-  ledger URL.
+  obtainability-audit SOP. For the checkout-gateway Deployment in
+  seeded-reliability, which has no PodDisruptionBudget, I want the budget as
+  a file: write the fix as a `kind: manifest` remediation, a new file named
+  pdb.yaml beside the Deployment's declaration in
+  clusters/<cluster>/seeded-reliability/, as the SOP's rule for a new
+  object beside the declaration of the workload it protects says. Put the
+  URL of every remediation pull request `finish` reports, opened or still
+  open, on your closing line after the ledger URL.
 expected_output: >-
   The ledger issue names the checkout-gateway deployment in seeded-reliability
   as unprotected against drains and upgrades (two replicas, no
-  PodDisruptionBudget). Its declaration is in a Kustomize root, so no
-  remediation pull request opens: a new file there renders only when the
+  PodDisruptionBudget). The worker writes pdb.yaml beside the declaration
+  as asked. The declaration is in a Kustomize root, so no remediation pull
+  request opens: a new file there renders only when the
   kustomization lists it, and a remediation carries one file. The finding is
   manual, and its ledger row, where the body renders it, names the
   kustomization.yaml and the `resources:` line to add. Nothing is applied to
@@ -133,6 +145,27 @@ verification_spec:
   # checkout-gateway row is often omitted, on main and on the branch alike.
   # Read the row by hand when it renders: it names
   # seeded-reliability/kustomization.yaml and the `resources:` line.
+  # The worker wrote the file the prompt asks for, through the file tool or
+  # the shell, so a green is the guard's and not a worker that wrote
+  # `manual` instead. The path covers the pool's clusters/seeded-a/ and a
+  # dev fleet's clusters/<prefix>-seeded-a/, in the clone or the scratch
+  # tree.
+  - name: the-worker-wrote-the-budget-file
+    role: objective
+    mode: assert
+    check:
+      type: any
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names: ["write_file", "patch"]
+          arguments:
+            path: '.*clusters/[^/]*seeded-a/seeded-reliability/pdb\.yaml'
+        - type: worker_commands
+          required_patterns:
+            [
+              '(>|\btee\b|\bcp\b|\bmv\b|write_text)[^\n]*clusters/[^/\s]*seeded-a/seeded-reliability/pdb\.yaml',
+            ]
   # The red on main: `finish` opens a pull request that adds only the new
   # file. github_writes passes on a write, so it sits under `none`. The case
   # requests no pull request, so any write in its window is the defect.
