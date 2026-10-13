@@ -97,9 +97,14 @@ in, where the operator sets it.
    `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
    gVisor; the
    [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
-   gives its access path. GitOps pull requests add `--gitops-org`, `--gitops-repo` and
-   `--github-app-id`; see
+   gives its access path.
+5. **Where the GitOps repository lives**, only if the operator wants GitOps pull requests. Ask
+   which forge holds it. On GitHub, pass `--gitops-org`, `--gitops-repo` and `--github-app-id`; see
    [GitOps Repository & GitHub Token Minter Configuration](#gitops-repository--github-token-minter-configuration).
+   On GitLab (gitlab.com or a self-managed instance), pass `--gitops-forge=gitlab`, `--gitops-repo`
+   and, for a self-managed instance, `--gitops-host`; see
+   [GitOps Repository on GitLab](#gitops-repository-on-gitlab). Never combine the GitHub App flags
+   with `--gitops-forge=gitlab`: the installer refuses them.
 
 Leave `--permission-set` at `read-only` unless the operator asks for `custom`. The flags in
 [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns) are
@@ -394,6 +399,55 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
   --github-app-id="YOUR_GITHUB_APP_ID"
 ```
 
+## GitOps Repository on GitLab
+
+A GitLab install has no GitHub App and no token minter. The credential broker holds a GitLab access
+token in a Kubernetes Secret, and the agent and its shell sandbox never get it. The procedure, the
+token's scopes and role, rotation, and the `install.env` keys are in
+[GitLab as the GitOps forge](https://gke-labs.github.io/kube-agents/install/gitlab/). Read it before
+the dry run.
+
+Rules for the agent:
+
+- Use release 0.9.0 or later. An earlier release has no `--gitops-forge` flag.
+- The operator creates the GitOps project first. The installer does not create it.
+- Recommend the token with the smallest reach: a project access token on the GitOps project, or a
+  group access token on the project's own group (for `platform/infra/gitops`, the group
+  `platform/infra`, not `platform`). Tell the operator to record the token's expiry date.
+- `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
+  its `https://` URL on that host. Put the host in `--gitops-host`, not in the path. Leave
+  `--gitops-host` out for gitlab.com.
+- Do not ask the operator to paste the token, and do not put it in a flag, a variable or the
+  transcript. Use one of these:
+  - Leave out `--gitlab-token-file`. The install completes and prints the command that creates the
+    Secret. The operator runs that command. Until then, GitLab calls answer
+    `FORGE_CREDENTIAL_UNAVAILABLE`, and no restart is necessary afterwards.
+  - The operator gives a file path or a password-manager command, which you pass as
+    `--gitlab-token-file=<(…)`. The installer reads the whole source and removes all whitespace,
+    newlines inside it too, so the source must hold only the token. For a `pass` entry with more
+    lines, use `<(pass show gitlab/agent-token | head -n1)`.
+- The dry run checks only that the token source is readable; it does not read the token. Only the
+  stage 3 run reads it, after the apply. `install.sh` never connects to GitLab.
+- A self-managed instance must present a certificate that the broker image trusts (a public CA, or
+  a proxy that terminates TLS with such a certificate). Only the credential broker pod connects to
+  GitLab, and its egress is open. The GitLab hostname must resolve through the cluster DNS.
+- After stage 3, check the connection: run `vcs.py identity` in the shell sandbox, as the GitLab page
+  shows. `FORGE_CREDENTIAL_UNAVAILABLE` means no Secret; `FORGE_UNAUTHENTICATED` means GitLab
+  refused the token.
+
+The command below is a stage 2 dry run. Apply through stage 3 once the operator confirms:
+
+```bash
+./install.sh --dry-run --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --gitops-forge=gitlab \
+  --gitops-host="gitlab.example.com" \
+  --gitops-repo="platform/infra/gitops"
+```
+
 ## Supported Command-Line Flags
 
 Defaults marked "`installer_common.sh`" reach the installer through
@@ -435,8 +489,12 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--scope-exclude-clusters=TRIPLES`      | Clusters to leave unmanaged, each as `project/location/cluster`                                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--scoped-sa-pool-enabled[=BOOL]`       | Arm the scoped service account pool: one reader service account per project the plan lists in scope, created in the install's project; the credential broker selects from them and refuses a cluster in a project with none. Members hold no IAM grant yet, so leave it off. Recorded as `SCOPED_SA_POOL_ENABLED`                   | `false`                                                                                                                                            |
 | `--scoped-sa-pool-max-accounts=N`       | The most pool accounts the plan may create in the install's project, set from its free service-account quota (a whole number of at least 1); a pool past it is refused at plan. Recorded as `SCOPED_SA_POOL_MAX_ACCOUNTS`                                                                                                           | _unset_ (the module's 100)                                                                                                                         |
-| `--gitops-org=ORG`                      | GitHub organization for the GitOps IaC repository                                                                                                                                                                                                                                                                                   | _unset_                                                                                                                                            |
-| `--gitops-repo=REPO`                    | GitOps IaC repository name                                                                                                                                                                                                                                                                                                          | `gke-fleet-iac`                                                                                                                                    |
+| `--gitops-org=ORG`                      | GitHub organization for the GitOps IaC repository. Not used with `--gitops-forge=gitlab`                                                                                                                                                                                                                                            | _unset_                                                                                                                                            |
+| `--gitops-repo=REPO`                    | GitOps IaC repository name. With `--gitops-forge=gitlab`, the project's full path (`group/subgroup/project`) or its `https://` URL on the GitLab host                                                                                                                                                                               | `gke-fleet-iac`                                                                                                                                    |
+| `--gitops-forge=FORGE`                  | Forge that holds the GitOps repository: `github` or `gitlab` (gitlab.com or a self-managed instance). A GitLab install has no GitHub App and no token minter                                                                                                                                                                        | `github`                                                                                                                                           |
+| `--gitops-host=HOST`                    | Self-managed GitLab hostname, with no scheme, port or path. A GitHub hostname is refused. Only with `--gitops-forge=gitlab`                                                                                                                                                                                                         | gitlab.com                                                                                                                                         |
+| `--gitlab-token-file=PATH`              | File, `/dev/stdin` or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret                                                                                  | _unset_                                                                                                                                            |
+| `--gitlab-token-secret=NAME`            | Kubernetes Secret that holds the GitLab token                                                                                                                                                                                                                                                                                       | `gitlab-forge-token`                                                                                                                               |
 | `--github-app-id=ID`                    | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                          | _unset_                                                                                                                                            |
 | `--github-pem-path=PATH`                | Path to downloaded GitHub App private key (`.pem`) for initial Cloud KMS import                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--kms-keyring=NAME`                    | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                    | `installer_common.sh` `DEFAULT_KMS_KEYRING`                                                                                                        |

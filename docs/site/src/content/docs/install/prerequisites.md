@@ -12,7 +12,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **Terraform** — the install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; the installer (`install.sh`) pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository. It is equally the _teardown_ engine, and `./uninstall.sh` installs nothing on your behalf — with an install to tear down and no terraform, it refuses with exit 1, so a machine that has only ever run the installer's auto-install cannot tear the install down. (Against a target with no Terraform state there is nothing to destroy, so it exits 3 without needing terraform at all.)
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
 - **Docker or Podman** — required for manual deployments that build images (`make -C k8s-operator docker-build`, Method 2) and the local development workflow (`make dev-rebuild-agent`, Method 3). Not required for stock installs (Methods 0 & 1).
-- **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned or GitOps is not enabled.
+- **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned, GitOps is not enabled, or the GitOps repository is on GitLab.
 - **Bash** — the installer scripts are bash (including the `/bin/bash` macOS ships).
 - **`jq`, `gh`, `helm`, `git`, `python3`** — the rest of the CLI set the installer pre-flights up front and offers to install when missing.
 - **`gcloud beta` component** — required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). Not required for standard fresh installs.
@@ -215,6 +215,16 @@ The declarative workflow routes infrastructure mutations through pull requests v
   - **Option 2 (Pre-provisioned Ahead-Of-Time):** Pre-provision the KMS key and import the private key upfront following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) (recommended for CI/CD and release pipelines). `install.sh` detects the existing `ENABLED` version and skips `.pem` handling.
 
 See [Deploy → Token minter](/kube-agents/deploy/token-minter/) and the upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter#readme) guide for complete setup details.
+
+## GitOps repo on GitLab
+
+When the GitOps repository is on GitLab (gitlab.com or a self-managed instance), you need none of the GitHub items above: a GitLab install has no GitHub App, no token minter and no Cloud KMS key. Prepare these:
+
+- **GitLab project:** the GitOps project, created before the install. Note its full path, with its nested groups (`group/subgroup/project`).
+- **Access token:** a group or project access token with the `api` and `write_repository` scopes and the Developer role. On a GitLab tier without group or project access tokens, use a personal access token of a dedicated account that is a Developer member of the project.
+- **Network access:** the cluster must reach the GitLab host over HTTPS. A self-managed instance on a private network needs a route from the cluster.
+
+See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) for the installer flags and where the token goes.
 
 ## Ready to install
 

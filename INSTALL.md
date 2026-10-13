@@ -76,7 +76,7 @@ choice is recorded); see the site's
 On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--enable-gvisor=false`.
 Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
 on freshly created clusters (no Terraform field exists) and the GitHub App private-key import into KMS
-(the PEM must not enter Terraform state). The installer sources
+(the PEM must not enter Terraform state). A GitLab install has no GitHub App, so it has no import. The installer sources
 `scripts/installer/installer_common.sh`, which reads `install.defaults.env`, so its defaults
 (region, cluster name, model provider, registry prefix) and its accepted values live in exactly
 one place; see
@@ -174,6 +174,72 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 _(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
 
+When the GitOps repository is on GitLab (gitlab.com or a self-managed instance), give the GitLab
+flags in place of the GitHub App flags. GitLab support starts in release 0.9.0: use 0.9.0 or a
+later release as `<RELEASE_VERSION>`. A GitLab install has no GitHub App and no token minter. The
+installer refuses `--github-app-id` and `--github-pem-path` with `--gitops-forge=gitlab`, and the Go
+and Cloud KMS prerequisites for the PEM import do not apply.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only" \
+  --gitops-forge=gitlab \
+  --gitops-host="gitlab.example.com" \
+  --gitops-repo="platform/infra/gitops" \
+  --gitlab-token-file=<(pass show gitlab/agent-token)
+```
+
+- `--gitops-host`: leave it out for gitlab.com. For a self-managed instance, give the bare hostname,
+  with no scheme, port or path. A GitHub hostname is refused.
+- `--gitops-repo`: the project's full path, with its nested groups (`group/subgroup/project`), or the
+  project's `https://` URL on that host. Do not put the host in the path. `--gitops-org` is not used.
+- The project: create it before the install. The installer does not create it.
+- The token: a group or project access token with the `api` and `write_repository` scopes and the
+  Developer role. On a GitLab tier without group or project access tokens, use a personal access
+  token of a dedicated account that is a Developer member of the project, never a person's own
+  token. The agent can reach every project that the token can reach.
+- `--gitlab-token-file` reads the token from a file, `/dev/stdin`, or a process substitution such as
+  `<(pass show …)`. No flag or variable takes the token itself. The installer reads the whole
+  source and removes all whitespace from it, newlines inside it too, so the source must hold
+  only the token. For a `pass` entry with more lines, use
+  `--gitlab-token-file=<(pass show gitlab/agent-token | head -n1)`. The installer stores the token in
+  the Kubernetes Secret `gitlab-forge-token` (`--gitlab-token-secret` changes the name). Only the
+  credential broker reads it; the agent and its shell sandbox never get it.
+- Without `--gitlab-token-file`, a non-interactive install completes and prints the command that
+  creates the Secret. Until the Secret exists, every GitLab call answers
+  `FORGE_CREDENTIAL_UNAVAILABLE`. The broker reads the Secret on each call, so no restart is
+  necessary after you create it.
+- `--dry-run` and `--generate-only` check only that the token source is readable; they do not
+  read the token. A real run reads it once, after the apply. `--generate-only` never creates the
+  Secret: create it after `lifecycle.sh apply`.
+- `install.sh` never connects to GitLab, so the installer host needs no route to it. Only the
+  credential broker pod (`platform-agent-credential-proxy`) connects to GitLab, on port 443. Its
+  shipped NetworkPolicy limits ingress only, so its egress is open, to private ranges too. A
+  private hostname must resolve through the cluster DNS; on GKE, a Cloud DNS private zone
+  attached to the cluster's VPC works.
+- A self-managed instance must present a certificate that the broker image trusts: one from a
+  public CA, or from a proxy that terminates TLS with such a certificate.
+- GitLab access tokens expire. Replace the token before it expires; an expired token gives
+  `FORGE_UNAUTHENTICATED` on every GitLab call.
+- After the install, check the connection from the shell sandbox:
+
+  ```bash
+  kubectl exec -n kubeagents-system -c shell platform-agent-shell-0 -- \
+    python3 /opt/data/skills/version-control/scripts/vcs.py identity \
+    --repo https://gitlab.example.com/platform/infra/gitops
+  ```
+
+  It prints the token's user name, or `FORGE_CREDENTIAL_UNAVAILABLE` (no Secret) or
+  `FORGE_UNAUTHENTICATED` (the token expired or was revoked).
+
+[GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) has the full procedure:
+the interview, token rotation, the `install.env` keys, and what the install declares.
+
 To run pre-flight checks and output configuration state (`terraform.tfvars` and
 `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
 validates the Terraform configuration, and previews the full resource plan when Application
@@ -212,8 +278,9 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`), and
-   where the model credential comes from:
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`),
+   where the model credential comes from, and, if the operator wants GitOps pull requests, the
+   forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
    ```bash
    gcloud config get-value project
@@ -239,7 +306,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    starting, so the key stays out of the command line and the agent's transcript; `vertex_ai` needs
    no key, and `gemini` can instead read one from the Secret Manager secret
    `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
-   installer only warns, and the agent it installs cannot call a model.
+   installer only warns, and the agent it installs cannot call a model. For a GitOps repository on
+   GitLab, do not ask the operator to paste the GitLab token. Either leave out `--gitlab-token-file`
+   and, after the install, have the operator run the Secret command that the installer prints, or
+   have the operator give a file path or a password-manager command for `--gitlab-token-file`. The
+   flags are in [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode).
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -291,23 +362,23 @@ Before beginning installation, ensure your environment meets the requirements fo
 - **Method 2 (Manual Kubernetes / Kustomize)**: Advanced manual manifest deployment.
 - **Method 3 (Local Development & Testing)**: Building and running operator binaries and container images locally.
 
-| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                                            | Applies To                                       |
-| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
-| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                                                  | **All Methods**                                  |
-| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                           | **All Methods** (GKE)                            |
-| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                               | **All Methods**                                  |
-| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                      | **Methods 0 & 1**                                |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                      | **Methods 0, 1, & 2**                            |
-| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
-| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
-| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
-| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers, its pre-apply scope check, and `upgrade.sh`'s re-tag values filter use it.                                                                                                              | **Methods 0 & 1**                                |
-| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
-| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
-| **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                              | **Method 2 and `upgrade.sh`**                    |
-| **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. | **Methods 2 & 3, or Method 0/1 with PEM import** |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                     | **Methods 2 & 3 only**                           |
+| CLI Tool / Utility              | Required Version                                | Verification Command               | Description                                                                                                                                                                                                                                             | Applies To                                       |
+| :------------------------------ | :---------------------------------------------- | :--------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------------------------------- |
+| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                   | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                                                                                                                                                   | **All Methods**                                  |
+| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                                                            | **All Methods** (GKE)                            |
+| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                                                                | **All Methods**                                  |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                                                       | **Methods 0 & 1**                                |
+| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                                                       | **Methods 0, 1, & 2**                            |
+| **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                                                               | **All Methods**                                  |
+| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation. The installer checks for it on every install, a GitLab install too, and installs it when it is missing.                                                                               | **Methods 0 & 1**                                |
+| **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                                                               | **All Methods**                                  |
+| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers, its pre-apply scope check, and `upgrade.sh`'s re-tag values filter use it.                                                                                                                                               | **Methods 0 & 1**                                |
+| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                                                      | **All Methods**                                  |
+| **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                                                              | **Optional (CMEK / Backup Plan lifecycle)**      |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                                                    | **Method 2 only**                                |
+| **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                                                               | **Method 2 and `upgrade.sh`**                    |
+| **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. A GitLab install imports no key. | **Methods 2 & 3, or Method 0/1 with PEM import** |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                                                      | **Methods 2 & 3 only**                           |
 
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
@@ -400,6 +471,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`)
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
+
+- **GitOps on GitLab**: set `gitops_forge = "gitlab"`, `gitlab_repo` (the project's full path, with
+  nested groups), `gitops_host` for a self-managed instance (empty means gitlab.com), and
+  `gitlab_token_secret_name` (default `gitlab-forge-token`). Leave `github_repo` and
+  `enable_github_minter` unset: a GitLab install has no token minter. Terraform names the token
+  Secret and does not create it. Create it in the agent's namespace after the apply, as
+  [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) shows, so that the token
+  never enters `terraform.tfvars` or the Terraform state.
 
 - **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
 
@@ -862,6 +941,15 @@ kubectl rollout status deployment -n kubeagents-system
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
+A GitOps repository on GitLab needs no minter: skip `make deploy-github`. Put the GitLab access
+token in a Secret in `kubeagents-system` under the key `token`, and declare the forge in the
+PlatformAgent CR in Step 6: one `spec.integration.forges` entry with `provider: gitlab`, `host` for a
+self-managed instance, and `credentialsRef` naming that Secret, plus the project in
+`spec.integration.repositories` with `role: gitops`. The
+[PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
+describes the fields, and [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
+describes the token.
+
 `make deploy-github` renders the minter's Kubernetes half and imports nothing, so on this path the GitHub App and the Cloud KMS asymmetric signing key — the latter already holding the imported private key — must exist beforehand (see the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Token minter guide](docs/site/src/content/docs/deploy/token-minter.md)). `install.sh --github-pem-path` performs that import for you; this path has no equivalent.
 
 `GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the installer's preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
@@ -1009,8 +1097,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
   env HERMES_HOME=/opt/data/profiles/platform hermes cron list
 ```
 
-Each audit's report is a ledger issue in the GitOps repository, so the audits need the GitHub
-integration: with no GitOps repository configured, every run fails before it audits anything. A
+Each audit's report is a ledger issue in the GitOps repository, so the audits need a GitOps
+repository, on GitHub or on GitLab: with none configured, every run fails before it audits
+anything. A
 run that changed something since the last one also posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
