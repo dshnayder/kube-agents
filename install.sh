@@ -437,8 +437,9 @@ PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
-# the ConfigMap it goes into, which install.env records. The file's path is
-# never recorded.
+# the Secret it goes into, which install.env records. The file's path is
+# never recorded. GITOPS_CA_FILE in the environment counts as an interview
+# answer, not as the flag (see PARAM_GITOPS_CA_FILE_FROM_FLAG).
 PARAM_GITOPS_CA_FILE="${GITOPS_CA_FILE:-}"
 PARAM_GITOPS_CA_SECRET="${GITOPS_CA_SECRET:-}"
 # Whether the CA file came from --gitops-ca-file rather than the interview: a

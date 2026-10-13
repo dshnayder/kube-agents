@@ -253,7 +253,8 @@ Rules for the agent:
   self-managed `--gitops-host`. It is a regular PEM file with the root CA, and also the
   intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
   substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the
-  credential broker trusts the CA, and only for that host. Use a release whose `install.sh --help` lists `--gitops-ca-file`.
+  credential broker trusts the CA, and only for that host. Use a release whose
+  `install.sh --help` lists `--gitops-ca-file`.
 - `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
   the token. They check the content of a regular CA file. `--generate-only` never creates the
   Secrets. On a first install it writes the GitLab keys into `install.env`. Over an existing

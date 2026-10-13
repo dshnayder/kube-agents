@@ -72,6 +72,8 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 Run these checks on a machine that has a route to the GitLab host. It does not have to be the
 installer host. Each command sends the token in a header from a pipe, so the token is not in a
 process's arguments.
+For an instance behind a private CA, run them on a machine that holds the CA file, and add
+`--cacert "$HOME/secure/internal-ca.pem"` to each `curl` command.
 
 The token's user, scopes and expiry date:
 
@@ -85,9 +87,6 @@ and group access tokens (tested on GitLab 19.4). For the user name, use
 `https://gitlab.example.com/api/v4/user` with the same pipe.
 
 The token's access to the project. The path is URL-encoded:
-
-For an instance behind a private CA, add `--cacert "$HOME/secure/internal-ca.pem"` to each
-`curl` command in this section. Run them on a machine that holds the CA file.
 
 ```bash
 pass show gitlab/agent-token | head -n1 | sed 's/^/PRIVATE-TOKEN: /' |
@@ -132,7 +131,7 @@ For an instance behind a private CA, send the CA file to the Pod and give it to 
 same namespace as above:
 
 ```bash
-kubectl --context <install-context> -n default run gitlab-reach --rm -i --restart=Never \
+kubectl --context <install-context> -n <namespace> run gitlab-reach --rm -i --restart=Never \
   --image=curlimages/curl --command -- \
   sh -c 'cat > /tmp/ca.pem && curl -sS --cacert /tmp/ca.pem https://gitlab.example.com/api/v4/version' \
   < "$HOME/secure/internal-ca.pem"
@@ -332,6 +331,15 @@ For a file with more than one certificate:
 openssl crl2pkcs7 -nocrl -certfile "$HOME/secure/internal-ca.pem" |
   openssl pkcs7 -print_certs -noout
 ```
+
+Then check that the CA verifies the server's chain, from a machine with a route to the host:
+
+```bash
+openssl s_client -connect gitlab.example.com:443 -servername gitlab.example.com \
+  -CAfile "$HOME/secure/internal-ca.pem" -verify_return_error </dev/null
+```
+
+The output has the line `Verify return code: 0 (ok)` when the chain is correct.
 
 Then add this flag to the command in [Run the installer](#run-the-installer):
 

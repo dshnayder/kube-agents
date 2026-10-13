@@ -1050,10 +1050,6 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn("!var.enable_github_minter", self.main)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GitLabSecretOrderTest(unittest.TestCase):
     """An empty token source stops the run with exit 1 after the apply. The CA
     Secret must exist by then, so it is created first."""
@@ -1067,3 +1063,7 @@ class GitLabSecretOrderTest(unittest.TestCase):
             block.index('create_gitlab_ca_secret "$namespace"'),
             block.index('create_gitlab_token_secret "$namespace"'),
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
