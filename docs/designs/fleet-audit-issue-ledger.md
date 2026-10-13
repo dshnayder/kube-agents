@@ -1016,8 +1016,11 @@ coverage, and nothing else:
   the run speak again, unless a finding id that the stored run listed is not in this run's published
   set (its findings, the postures it withheld, and the held ids). A gap holds `resolved` at 0, so
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
-  those ids under `unreported_under_gap`. A run after a stored run that held the ledger open is
-  the exception: that stored run already said it found none of the ids the body carries. `finish`
+  those ids under `unreported_under_gap`. Each id is reported once: the stored record keeps, under
+  `reported_under_gap`, the ids that a run already reported and that are still not published, and
+  the next run does not report them again. A record without that key subtracts nothing, so a run
+  that held the ledger open without reporting an id (an unreadable conversation, an unaccounted
+  finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. `finish`
   cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
   of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
   channel, and the next scheduled run with the same gaps does not report it.

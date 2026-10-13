@@ -15618,12 +15618,62 @@ class TestStandingCoverageGap(HarnessTestCase):
             make_doc(findings=[finding], skipped=self.PARTIAL), generated_at=NOW
         )
         gaps = audit_report.coverage_gaps(make_doc(findings=[], skipped=self.PARTIAL))
-        self.seed_report(previous, coverage_gaps=gaps, status="CLEAN", ledger_held_open=True)
+        self.seed_report(
+            previous,
+            coverage_gaps=gaps,
+            status="CLEAN",
+            ledger_held_open=True,
+            reported_under_gap=audit_report.parse_delta_block(previous),
+        )
         self.harness.replies = {"issue-list": self.issue_list()}
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
         out = self.stdout_json()
         self.assertTrue(out["silent_ok"])
         self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
+
+    def test_a_held_open_run_that_reported_no_id_does_not_hide_one(self):
+        # A run whose comments could not be read holds the ledger open and
+        # reports no id. The gap run after it must still report the finding,
+        # once: the run after that, with the same gap, is silent.
+        previous = published_body(
+            make_doc(findings=[make_finding(fid="a", severity="major")]), generated_at=NOW
+        )
+        self.seed_report(previous, coverage_gaps=[], status="UPDATED")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view comments": 1}
+        complete = make_doc(findings=[])
+        complete["resolved_because"] = resolved_for(previous)
+        self.run_finish(complete)
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertTrue(stored["ledger_held_open"])
+        self.assertNotIn(audit_report.REPORTED_UNDER_GAP_KEY, stored)
+
+        self.harness.failures = {}
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        first = self.stdout_json()
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(
+            first[audit_report.UNREPORTED_UNDER_GAP_KEY], audit_report.parse_delta_block(previous)
+        )
+
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        second = self.stdout_json()
+        self.assertTrue(second["silent_ok"])
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, second)
+
+    def test_a_scheme_bump_over_a_standing_gap_lists_nothing(self):
+        # The ids on the two sides are spelled differently, as for `resolved`.
+        finding = make_finding(fid="a", severity="major")
+        previous = published_body(
+            make_doc(findings=[finding], skipped=self.PARTIAL), generated_at=NOW
+        ).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        self.seed(None, self.PARTIAL, status="UPDATED", findings_body=previous)
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, self.stdout_json())
 
     def test_a_shield_close_under_an_unchanged_gap_posts_the_partial_all_clear(self):
         # The comment lists the pull request the shield closed, so it is news.
@@ -15646,7 +15696,13 @@ class TestStandingCoverageGap(HarnessTestCase):
             make_doc(findings=[old], skipped=self.PARTIAL), generated_at=NOW
         )
         gaps = audit_report.coverage_gaps(make_doc(findings=[], skipped=self.PARTIAL))
-        self.seed_report(previous, coverage_gaps=gaps, status="CLEAN", ledger_held_open=True)
+        self.seed_report(
+            previous,
+            coverage_gaps=gaps,
+            status="CLEAN",
+            ledger_held_open=True,
+            reported_under_gap=audit_report.parse_delta_block(previous),
+        )
         self.harness.replies = {"issue-list": self.issue_list()}
         self.run_finish(make_doc(findings=[new], skipped=self.PARTIAL))
         self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, self.stdout_json())

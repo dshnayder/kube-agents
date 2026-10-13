@@ -1278,7 +1278,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
-  coverage gap stays, with the issue URL. Do not call them resolved.
+  coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
+  run with the same gap does not list it again.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same

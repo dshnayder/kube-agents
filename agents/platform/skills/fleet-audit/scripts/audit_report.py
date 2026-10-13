@@ -1170,6 +1170,10 @@ UNACCOUNTED_KEY = "unaccounted"
 # key a finding could leave the ledger and nothing would say so. On the JSON
 # line only when it is not empty.
 UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
+# On the stored envelope only: the ids that some run already reported under
+# `unreported_under_gap` and that are still not published. The next run does
+# not report them again. A record without the key subtracts nothing.
+REPORTED_UNDER_GAP_KEY = "reported_under_gap"
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -2682,6 +2686,7 @@ def report_envelope(
     ledger_document: dict | None = None,
     ledger_held_open: bool = False,
     delta_known: bool = True,
+    reported_under_gap: list[str] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -2747,6 +2752,13 @@ def report_envelope(
         **(
             {"ledger_document": _redact_document(ledger_document)}
             if ledger_document is not None
+            else {}
+        ),
+        # Only when not empty, so a run that reported nothing under a gap
+        # writes the envelope it wrote before.
+        **(
+            {REPORTED_UNDER_GAP_KEY: sorted(set(reported_under_gap))}
+            if reported_under_gap
             else {}
         ),
     }
@@ -16312,16 +16324,24 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
-    # this run's findings, the postures it withheld, and the held ids. A run
-    # after a stored run that was held open is the exception: the stored run
-    # already reported that it found none of the ids the body carries, so a
-    # second report of the same ids would repeat it.
-    stored_ledger_ids = set(previous_ids)
-    if (memory or {}).get("ledger_held_open"):
-        stored_ledger_ids = set()
+    # this run's findings, the postures it withheld, and the held ids. An id
+    # that an earlier run already reported this way, and that is still not
+    # published, is not reported again (`REPORTED_UNDER_GAP_KEY` on the stored
+    # record). The exception keys on what a run reported, not on the ledger
+    # being held open: a run can hold the ledger open and report no id.
+    # Withheld over a scheme bump, as `resolved` is: the ids on the two sides
+    # are spelled differently, so every stored id would look missing.
+    published_ids = held_exclude | held_ids
+    already_reported = {
+        str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
+    } - published_ids
     unreported_under_gap = (
-        sorted(stored_ledger_ids - held_exclude - held_ids) if gaps else []
+        sorted(set(previous_ids) - published_ids - already_reported)
+        if gaps and not stale_scheme
+        else []
     )
+    # What the stored record says this run and earlier runs reported.
+    reported_under_gap = sorted(already_reported | set(unreported_under_gap))
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -16888,6 +16908,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 ledger_document=ledger_document,
                 ledger_held_open=body_untouched,
                 delta_known=delta_known,
+                reported_under_gap=reported_under_gap,
             ),
             now,
             ledger_unchanged=body_untouched,
@@ -17352,6 +17373,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # is the one the next run's memory parses out of `ledger_body`.
             rendered_ids=parse_delta_block(ledger_body),
             delta_known=delta_known,
+            reported_under_gap=reported_under_gap,
         ),
         now,
     )
