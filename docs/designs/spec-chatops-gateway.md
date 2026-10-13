@@ -376,11 +376,14 @@ the turn, each stored hashed the same way and capped at eight - past the cap the
 refuses rather than silently drop an author; and against every hashed author whose text has
 reached the session's current incarnation, requesters and steerers of every turn alike, capped at
 sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or overflowed set refuses
-rather than admits. That third check is inert today: each turn gets a fresh one-task incarnation,
-so no turn yet sees an earlier turn's author in it; it becomes load-bearing once #2370's cross-turn
-memory lets a pod carry what an earlier turn in the same conversation said, at which point the
-bound it should hold is the whole conversation, not one incarnation - #2370 is where that question
-is decided. One live child per conversation, a detached-but-still-running one counting as live:
+rather than admits. That third check is load-bearing: each turn gets a fresh one-task
+incarnation, but the incarnation reads the transcript primer (below, "Rehydrate"), which carries
+every earlier turn the stream still holds. So when the pod is started, the requesters and steer
+authors of every turn the primer replays join the set. A turn whose requester is no longer on
+record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
+reads text whose authors the check can't count. The bound is the conversation as the primer
+carries it, not one incarnation. What else a session carries across incarnations is
+#2370. One live child per conversation, a detached-but-still-running one counting as live:
 the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
 gateway while that child still runs is refused with a notice naming the running task
 (`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
@@ -438,9 +441,11 @@ says so instead) or if another task already holds the conversation (waking would
 task's own pod); otherwise the wake is an ordinary session spawn and counts against
 `A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
 already relayed, and the room gets the standard cap notice rather than a second one. The wake
-inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod starts
-with no memory of the turn that delegated, so its text opens with what the human asked: the label
-`You were asked:` and the human's message that started the chain, fenced. It is the root turn's
+inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod is a fresh
+incarnation that reads the transcript primer like any other, and its text also opens with what the
+human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
+mixed rollout, still has the request and the result. The cost is reading them twice. It opens
+with the label `You were asked:` and the human's message that started the chain, fenced. It is the root turn's
 message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
 `You delegated to platform (task …), which completed.` (or failed, or was rejected), then the
 result, capped at `lib.DelegateTextCap` and fenced under the label
@@ -507,7 +512,8 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there, and
-the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
@@ -638,7 +644,17 @@ a new delegation in its conversation (above) until its own terminal, or a heal, 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
 task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
-the new pod as its first input. If the harness's own session file
+the new pod as its first input. The primer carries both sides of each earlier turn: what
+the user asked (the copy session-state keeps until `AskTTL`) and each result, labelled by
+who answered, and how a turn that didn't finish ended (failed, stopped or rejected, with the
+executor's reason), each fenced so a user's text can't pass for an earlier answer. A turn past
+`A2A_ASK_TTL` is left out. It keeps the
+newest turns that fit 8 KiB and says when earlier ones were dropped. The pod gets it as a
+downward-API file from its own annotation, and the worker puts it ahead of the new message,
+framed as history rather than instructions. The annotation is readable by anyone who can get
+pods in the install namespace, and the copy of the user's text on it isn't cleared at
+`A2A_ASK_TTL` the way session-state's is; it goes when the pod is reaped. Earlier results were
+already on the same annotation. Moving the primer to a per-pod Secret is tracked separately. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a
@@ -1452,13 +1468,35 @@ frozen gateway goes quiet instead, because it reaches Chat only through the brok
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
 
-**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
-threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
-channel mention binds the session to the mention message's own ts as thread root, with
-no thread-creation failure mode to handle. Session semantics are unchanged: the whole
-DM is one conversation, a channel is not a session, a thread in it is.
+**Conversation keys.** `slack:{channel}/{thread_ts}` for a channel thread and
+`slack:dm/{channel}/{thread_ts}` for a DM thread. Slack threads are implicit - replying
+with a `thread_ts` creates one - so a channel mention binds the session to the mention
+message's own ts as thread root, with no thread-creation failure mode to handle. A DM is
+keyed the same way, to match the Hermes Slack platform on `today` (2026-10-08): a
+top-level DM is a new conversation rooted on its own ts, and its placeholder, status
+edits and answer post in that thread; a DM typed inside a thread is that thread's
+conversation, so it steers the running task or follows up in the same context, as a
+channel thread reply does. Two top-level questions are two conversations. On Slack a
+thread is the session in a DM as in a channel. So `stop`, a status question and
+`/session` act on the thread they are typed in. A `stop` or a status question typed at
+the top of the DM is a conversation with nothing running in it, so it starts no task
+and its reply says to send it in the question's thread instead; the adapter marks such
+a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
+gateway keys the reply on that mark, not on the conversation's task history, so a
+`stop` in a thread with nothing running (a question refused at the session cap, say)
+gets the plain "nothing is running". A top-level status question matches the exact
+status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
+A bare `/session` asks for the next message in its thread.
 
-**Which messages become turns.** DMs carry every message. A channel message must
+The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
+is keyed that way. It is the form a DM record from before DMs threaded carries, so such
+a record relays its task's terminal into the DM where the ask was, and a message sent
+since starts its own thread rather than steering or stopping that task. It is also what
+`openDirect` returns, which makes a post the user did not ask for a new top-level
+message; a reply under it roots its own conversation.
+
+**Which messages become turns.** DMs carry every message, in a thread or not; a DM
+thread needs no task started in it to carry a reply. A channel message must
 mention the bot, and the ask's own ts is the thread the session will live in. A thread
 reply is a turn when it mentions the bot or the thread is a session thread - one the
 gateway has started a task in. That is what lets a session thread carry every message

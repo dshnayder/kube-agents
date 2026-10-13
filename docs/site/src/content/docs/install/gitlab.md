@@ -203,9 +203,10 @@ for the whole run, and the installer reads it after the apply. `pass` runs when 
 Unlock `gpg-agent` first, for example with `pass show gitlab/agent-token >/dev/null`. If `pass`
 cannot decrypt the entry, the source is empty. The installer then stops after the apply with
 "The GitLab token source … is empty; nothing was stored." and exit code 1, and creates no token
-Secret. For a private CA, the installer creates the CA Secret before it reads the token, so that
-Secret exists. Create the token Secret yourself, as [Rotating the token](#rotating-the-token)
-shows.
+Secret. Then create the missing Secrets yourself. Create the token Secret, as
+[Rotating the token](#rotating-the-token) shows. For a private CA, check with
+`kubectl get secret gitlab-forge-ca -n kubeagents-system` whether the CA Secret exists. If it
+does not, create it, as [Replacing the CA](#replacing-the-ca) shows.
 `/dev/stdin` works only with `./install.sh` from an unpacked release: under `curl … | bash`,
 standard input is the script itself.
 
