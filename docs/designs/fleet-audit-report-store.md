@@ -55,8 +55,8 @@ and `document`, this run's validated findings document, whole rather than clippe
 budget. The body's redaction backstop is applied to every string on the way in, so the envelope
 never holds a credential shape the public issue blanked — except a finding's `id`, which the hidden
 block publishes raw, and which a long object name can make look like a token. `current_ids` is
-exactly what the body's hidden block lists: the findings the body rendered plus the collector-held
-ids.
+exactly what the body's hidden block lists: the findings the body rendered, the collector-held ids,
+and the ids under _Not re-checked this run_ ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind

@@ -1017,8 +1017,8 @@ check that applies there did not run; when no entry names it and its project tar
 `scope.skipped`; or when the run listed no target of its kind. The candidates are the ids in the
 previous marker and the findings of the stored document that the previous body renders, which adds
 the findings the body budget cut. The place of each finding comes from its row on the previous
-body, or from the stored documents. An id from the marker with no known place is kept by id alone,
-with a reason that names no target, because the gap may be a waiver or a declared-intent search. The
+body, or from that stored document. An id with no known place is not kept, because a row held by id
+alone would never get a place back and would stay for as long as any gap stands. The
 rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how many it did not show.
 On a clean run over the same gap, a `/remediate` on one of these ids is deferred, not answered as
 "no longer reproduces". The id stays in the marker, so the next complete run

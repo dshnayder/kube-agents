@@ -14102,6 +14102,35 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
             self.assertNotIn("no longer reproduces", body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
 
+    def test_a_remediate_on_a_held_row_is_deferred_on_the_findings_branch(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {self.stage_id()}")]}
+        )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "UPDATED")
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        self.assertIn("did not read or did not check its target", deferred[0])
+        for body in posted:
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+
+    def test_an_id_the_collector_flags_gets_the_collector_reason_first(self):
+        request = {
+            "id": "c1",
+            "body": "/remediate both-id",
+            "author": {"login": "operator"},
+            "authorAssociation": "OWNER",
+        }
+        requests = audit_report.parse_remediate_commands(
+            [request], [], collector_flagged={"both-id"}, unread_held={"both-id"}
+        )
+        [reason] = requests.refusals[0]["reasons"]
+        self.assertEqual(reason, audit_report.collector_candidate_reason("both-id"))
+
     def test_a_remediate_on_a_held_row_is_deferred_not_refused(self):
         requests = audit_report.parse_remediate_commands(
             [
@@ -14154,17 +14183,22 @@ class TestUnreadTargetReason(unittest.TestCase):
         data = self.doc(AUDIT, [{"name": "prod-us-east", "checks_run": []}])
         self.assertIsNone(audit_report.unread_target_reason(data, "netpol-missing", "deleted"))
 
-    def test_an_id_with_no_known_place_is_held_by_id(self):
+    def test_an_id_with_no_known_place_is_not_kept(self):
+        """A row held by id alone never gets a place back, so it would stay for good."""
         body = audit_report.delta_block(["netpol-missing.x.y.z"])
         data = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
-        entries = audit_report.unread_held_entries(body, None, data, exclude=set())
-        self.assertEqual([e["id"] for e in entries], ["netpol-missing.x.y.z"])
-        self.assertTrue(entries[0]["location_unrecorded"])
-        # The gap may be a waiver or a declared-intent search, so the reason
-        # names no target.
-        self.assertEqual(
-            entries[0][audit_report.UNREAD_REASON_KEY], audit_report.UNREAD_PLACE_UNKNOWN_REASON
-        )
+        self.assertEqual(audit_report.unread_held_entries(body, None, data, exclude=set()), [])
+
+    def test_the_candidates_and_places_come_from_the_document_the_body_renders(self):
+        body = audit_report.delta_block(["netpol-missing.y.y.y"])
+        finding = {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/cut"}
+        memory = {
+            "ledger_document": {"findings": [{**finding, "id": "rendered", "cluster": "stage-eu", "title": "Shown"}]},
+            "document": {"findings": [{**finding, "id": "own", "cluster": "stage-eu", "title": "Not shown"}]},
+        }
+        data = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
+        entries = audit_report.unread_held_entries(body, memory, data, exclude=set())
+        self.assertEqual([(e["id"], e["title"]) for e in entries], [("rendered", "Shown")])
 
     def truncated_previous(self):
         """A previous body the budget truncated: prod findings rendered, stage-eu's minor cut."""
@@ -20262,6 +20296,44 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("only the shield's closes are made", self.err)
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+
+    def test_a_partial_run_keeps_a_shielded_pull_request_open_for_a_not_re_checked_finding(self):
+        # #6 covers api (declared, so shielded) and a finding on dr-west, which
+        # this run did not read. The dr-west finding is kept as not re-checked,
+        # so it counts as current for the shield's close, and #6 stays open:
+        # only #9, whose findings are all under the shield, is closed.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[api, worker, far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        previous_body = published_body(previous_doc, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id])),
+            pr(6, "platform-agent/fix-default-sa-far", body=audit_report.delta_block([api_id, far_id])),
+        ])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[worker], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(far_id, audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[-1]))
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
 
     def test_a_clean_run_still_closes_the_shielded_pull_request(self):
         # The clean call site: the document reports nothing, the collector

@@ -875,10 +875,6 @@ SHORTENED_ID_SUFFIX = re.compile(r"-[0-9a-f]{%d}$" % ID_DIGEST_CHARS)
 DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
-# The reason an unread held row shows when the run cannot place its finding.
-UNREAD_PLACE_UNKNOWN_REASON = (
-    "its target is unknown to this run, and the run has a coverage gap"
-)
 # Which identity scheme minted the ids in the block above it. Bump this
 # whenever `derive_finding_id` would spell an existing finding differently.
 #
@@ -7591,22 +7587,21 @@ def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
       check is in neither `checks_run` nor `checks_not_applicable`. This is
       also the case of a check in the collector's `checks_unevaluated`, which
       `cross_check_manifest` keeps out of both lists.
+    - The target is in `scope.clusters`, the check is a derived one (the
+      stream's `derived` slugs, read from roster checks), and a roster check
+      that applies there is in neither list.
     - No entry names the target, and its first segment names a project
       target in `scope.skipped`. A project that the run did not read lists
       none of its subnets or qualified clusters.
     - No entry names the target, and the run enumerated no target of its
       kind (`_stranded_kinds`).
 
-    - The target is in `scope.clusters`, the check is a derived one (the
-      stream's `derived` slugs, read from roster checks), and a roster check
-      that applies there is in neither list.
-
     In all other cases the run checked the target, or the target is not in
     the fleet now. A check declared not applicable is a check the run looked
     at, and a check that is neither on the target's roster nor derived is
-    not one this stream checks there. A target that has `limitations` and that ran
-    the check counts as checked: the text does not say which findings it
-    could not see. That target is still a coverage gap, so `resolved` stays
+    not one this stream checks there. A target that has `limitations` and
+    that ran the check counts as checked: the text does not say which
+    findings it could not see. That target is still a coverage gap, so `resolved` stays
     at zero.
     """
     name = str(cluster or "").strip()
@@ -7659,31 +7654,34 @@ def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
 
 
 def _stored_finding_places(memory: dict | None) -> dict[str, dict[str, str]]:
-    """{finding id: title, check, cluster, namespace, object} from the stored documents.
+    """{finding id: title, check, cluster, namespace, object} from the stored document the body renders.
 
-    The stored documents also name the findings that the body budget cut, so
-    they give a place for an id that has no row in the previous body.
-    `report_finding_titles` and `report_finding_places` read the same
-    documents, but they keep no object, and a held row needs one for its
-    `Where:` line.
+    `ledger_document` when the store has one, else `document`, which is how
+    `report_finding_titles` reads them. It also names the findings that the
+    body budget cut, so it gives the candidates and the places that have no
+    row in the previous body. `report_finding_titles` and
+    `report_finding_places` keep no object, and a held row needs one for its
+    `Where:` line, so they are not used here.
     """
+    envelope = memory or {}
+    document = envelope.get("ledger_document")
+    if not isinstance(document, dict):
+        document = envelope.get("document")
+    findings = document.get("findings") if isinstance(document, dict) else None
     places: dict[str, dict[str, str]] = {}
-    for key in ("ledger_document", "document"):
-        document = (memory or {}).get(key)
-        findings = document.get("findings") if isinstance(document, dict) else None
-        for finding in findings if isinstance(findings, list) else []:
-            if not isinstance(finding, dict) or not finding.get("id"):
-                continue
-            places.setdefault(
-                str(finding["id"]),
-                {
-                    "title": str(finding.get("title") or "").strip(),
-                    "check": str(finding.get("check") or "").strip(),
-                    "cluster": str(finding.get("cluster") or "").strip(),
-                    "namespace": str(finding.get("namespace") or "").strip(),
-                    "object": str(finding.get("object") or "").strip(),
-                },
-            )
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict) or not finding.get("id"):
+            continue
+        places.setdefault(
+            str(finding["id"]),
+            {
+                "title": str(finding.get("title") or "").strip(),
+                "check": str(finding.get("check") or "").strip(),
+                "cluster": str(finding.get("cluster") or "").strip(),
+                "namespace": str(finding.get("namespace") or "").strip(),
+                "object": str(finding.get("object") or "").strip(),
+            },
+        )
     return places
 
 
@@ -7711,12 +7709,12 @@ def unread_held_entries(
     `report_finding_titles` reads them). Less `exclude` (the document's ids,
     the withheld postures, the declared entries and the collector-held ids).
     The place of each comes from its row on the previous body, or else from
-    the stored documents. An id from the hidden block with no known place is
-    held by id alone: the caller calls this only over a coverage gap, and
-    nothing shows that the id is outside it. The `audit-findings-all` block
-    of a truncated body is not read: it gives ids with no place, and a cut
-    id was never in the hidden block, so holding it by id alone would hold
-    findings on targets that the run did check. Under
+    that same stored document. An id with no known place is not kept: a row
+    held by id alone never gets a place back, so it would stay for as long
+    as any gap stands, and a collector-held id-only row that the collector
+    stopped flagging would come back as not re-checked. The
+    `audit-findings-all` block of a truncated body is not read, because it
+    gives ids with no place. Under
     another identity scheme the rows are spelled again (`_respelled_rows`)
     and an id without a row is lost, as for every hold over a scheme change.
 
@@ -7726,21 +7724,11 @@ def unread_held_entries(
     previous_ids = parse_delta_block(previous_body)
     if not previous_ids:
         return []
-    envelope = memory or {}
-    rendered_document = envelope.get("ledger_document")
-    if not isinstance(rendered_document, dict):
-        rendered_document = envelope.get("document")
-    stored = (rendered_document or {}).get("findings") if isinstance(rendered_document, dict) else None
-    cut = [
-        str(finding["id"])
-        for finding in (stored if isinstance(stored, list) else [])
-        if isinstance(finding, dict) and finding.get("id")
-    ]
+    places = _stored_finding_places(memory)
     in_block = set(previous_ids)
-    previous_ids = previous_ids + [fid for fid in dict.fromkeys(cut) if fid not in in_block]
+    previous_ids = previous_ids + [fid for fid in places if fid not in in_block]
     stale = parse_id_scheme(previous_body) != ID_SCHEME
     respelled = _respelled_rows(previous_body) if stale else {}
-    places = _stored_finding_places(memory)
     for raw, where in parse_finding_locations(previous_body).items():
         places[raw] = {**where, "check": raw.split(".", 1)[0]}
     entries: dict[str, dict] = {}
@@ -7752,7 +7740,6 @@ def unread_held_entries(
             continue
         place = places.get(raw)
         if place is None:
-            entries[fid] = {**held_row_from_id(fid), UNREAD_REASON_KEY: UNREAD_PLACE_UNKNOWN_REASON}
             continue
         check = place.get("check") or raw.split(".", 1)[0]
         reason = unread_target_reason(data, check, place.get("cluster", ""))
@@ -8298,8 +8285,10 @@ def parse_remediate_commands(
     # an owner's standing choice rather than a gap the next run fills.
     covered = declared_by_id(declared)
     held_ids = set(collector_held or ())
-    unread_ids = set(unread_held or ()) - held_ids
-    flagged_ids = set(collector_flagged or ()) - held_ids - unread_ids
+    flagged_ids = set(collector_flagged or ()) - held_ids
+    # The collector's word first, as on the clean branch: an id the
+    # collector still flags gets the collector's reason.
+    unread_ids = set(unread_held or ()) - held_ids - flagged_ids
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -17186,10 +17175,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Less the withheld postures: those are the document's, held back by the
     # harness for want of a search, and already kept out of `resolved` by the
     # gap they file — naming them here would blame the collector for it.
-    # A finding held because this run did not check its target is not
-    # resolved either. Only a run with a gap holds one, and a gap already
-    # holds `resolved` at zero; this keeps the list true for its readers.
-    resolved_ids = [fid for fid in resolved_ids if fid not in unread_ids]
+    # No filter is needed for the findings held because this run did not
+    # check their target: only a run with a gap holds one, and every reader
+    # of `resolved_ids` below (the delta comment, the count, the store) reads
+    # it as empty over a gap.
     contradicted = [fid for fid in resolved_ids if fid in still_flagged - held_exclude]
     if contradicted:
         resolved_ids = [fid for fid in resolved_ids if fid not in still_flagged]
