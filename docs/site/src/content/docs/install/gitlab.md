@@ -18,8 +18,8 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- --help | grep -- --gitops-forge`,
   or `./install.sh --help | grep -- --gitops-forge` in an unpacked release.
 - **The GitLab version.** GitLab 16.11 or later. Tested with 16.11 and 19.4. On GitLab 16.x,
-  the diff of a merge request fails until
-  [#2801](https://github.com/gke-labs/kube-agents/pull/2801) merges.
+  use a release that includes [#2801](https://github.com/gke-labs/kube-agents/pull/2801). An
+  older release cannot show the diff of a merge request on GitLab 16.x.
 - **The project.** Create the GitOps project first. The installer does not create it. Note its
   full path with its nested groups, for example `platform/infra/gitops`. The project needs a
   default branch with at least one commit: the agent opens its merge requests against it.
