@@ -215,8 +215,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gitops-forge=gitlab \
   --gitops-host="gitlab.example.com" \
   --gitops-repo="platform/infra/gitops" \
-  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1) \
-  --gitops-ca-file="$HOME/secure/internal-ca.pem"
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
 ```
 
 Rules for the agent:
@@ -247,8 +246,9 @@ Rules for the agent:
     too. The source must hold only the token. A `pass` entry with more lines needs `| head -n1`.
     The operator unlocks `gpg-agent` before the run. `/dev/stdin` works only with `./install.sh`
     from an unpacked release: under `curl … | bash`, standard input is the script itself.
-- Give `--gitops-ca-file` only when a private CA signed the instance's certificate. Do not give it
-  for gitlab.com or for a certificate from a public CA. The installer refuses it without a
+- Only when a private CA signed the instance's certificate, add
+  `--gitops-ca-file="$HOME/secure/internal-ca.pem"` to the command above. Do not give it for
+  gitlab.com or for a certificate from a public CA. The installer refuses it without a
   self-managed `--gitops-host`. It is a regular PEM file with the root CA, and also the
   intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
   substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the

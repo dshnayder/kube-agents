@@ -244,7 +244,7 @@ first install it writes the GitLab keys into `install.env`. Over an existing `in
 not change them: have the operator set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
 `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` there before
 `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After
-`lifecycle.sh apply`, the operator creates the Secret, as
+`lifecycle.sh apply`, the operator creates the Secrets, as
 [Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
 shows.
 
@@ -441,7 +441,8 @@ Rules for the agent:
     lines, use `<(pass show gitlab/agent-token | head -n1)`. The operator unlocks `gpg-agent`
     before the run. Do not use `/dev/stdin` under `curl … | bash`, because standard input is the
     script there.
-- Add `--gitops-ca-file` only when a private CA signed the instance's certificate. Ask the operator
+- Only when a private CA signed the instance's certificate, add `--gitops-ca-file` to the dry run
+  and to the stage 3 run. Do not give it for gitlab.com or for a public CA. Ask the operator
   for the CA certificates (public; never a private key) as a regular PEM file: the root CA, and the
   intermediate CAs if the server does not send them. Do not use `/dev/stdin` or a process
   substitution for the CA. The installer refuses the flag without a self-managed `--gitops-host`.
@@ -464,11 +465,8 @@ The command below is a stage 2 dry run. Apply through stage 3 once the operator 
   --gitops-forge=gitlab \
   --gitops-host="gitlab.example.com" \
   --gitops-repo="platform/infra/gitops" \
-  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1) \
-  --gitops-ca-file="$HOME/secure/internal-ca.pem"
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
 ```
-
-Do not give `--gitops-ca-file` for gitlab.com or for a certificate from a public CA.
 
 Pass the same `--gitlab-token-file` source to the stage 3 run. The dry run only checks that it is
 readable.

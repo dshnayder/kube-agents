@@ -147,11 +147,11 @@ password manager. No flag or variable takes the token itself:
   --gitops-forge=gitlab \
   --gitops-host=gitlab.example.com \
   --gitops-repo=platform/infra/gitops \
-  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1) \
-  --gitops-ca-file="$HOME/secure/internal-ca.pem"
-````
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
+```
 
-Give `--gitops-ca-file` only for an instance behind a private CA.
+For an instance behind a private CA, add `--gitops-ca-file`, as
+[A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca) shows.
 
 | Flag                    | `install.env` key                      | Meaning                                                                                                                                                                               |
 | ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -172,8 +172,10 @@ user name, a URL) needs its first line only, as in the example above.
 for the whole run, and the installer reads it after the apply. `pass` runs when the run starts.
 Unlock `gpg-agent` first, for example with `pass show gitlab/agent-token >/dev/null`. If `pass`
 cannot decrypt the entry, the source is empty. The installer then stops after the apply with
-"The GitLab token source … is empty; nothing was stored." and exit code 1, and creates no
-Secret. Create the Secret yourself, as [Rotating the token](#rotating-the-token) shows.
+"The GitLab token source … is empty; nothing was stored." and exit code 1, and creates no token
+Secret. For a private CA, the installer creates the CA Secret before it reads the token, so that
+Secret exists. Create the token Secret yourself, as [Rotating the token](#rotating-the-token)
+shows.
 `/dev/stdin` works only with `./install.sh` from an unpacked release: under `curl … | bash`,
 standard input is the script itself.
 
@@ -280,7 +282,8 @@ project or Secret name. Then `upgrade.sh` and the Day-2 menu render what was app
 that you decline, or that ends with `--generate-only`, does not change these keys in an
 existing file. A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`. A
 switch back to GitHub drops the GitLab keys. Once `install.env` exists, the installer ignores a
-`GITOPS_FORGE`, `GITOPS_HOST` or `GITLAB_TOKEN_SECRET` exported in your shell. Use the flags.
+`GITOPS_FORGE`, `GITOPS_HOST`, `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in your
+shell. Use the flags.
 
 A re-run of `install.sh` keeps an existing Secret, unless you give it a new token file or
 choose to replace the Secret at the prompt. The installer refuses an empty token (whitespace
@@ -306,15 +309,23 @@ installer can check those sources only after the apply. If the content is bad
 then, the install completes with no CA Secret, and every GitLab call answers
 `FORGE_TLS_UNTRUSTED` until you create the Secret.
 
-Give the installer the CA file:
+Before the install, check the file on your machine. For one certificate:
 
 ```bash
-./install.sh -y \
-  --gitops-forge=gitlab \
-  --gitops-host=gitlab.internal.example \
-  --gitops-repo=platform/infra/gitops \
-  --gitlab-token-file="$HOME/secure/gitlab-token" \
-  --gitops-ca-file="$HOME/secure/internal-ca.pem"
+openssl x509 -in "$HOME/secure/internal-ca.pem" -noout -subject -enddate
+```
+
+For a file with more than one certificate:
+
+```bash
+openssl crl2pkcs7 -nocrl -certfile "$HOME/secure/internal-ca.pem" |
+  openssl pkcs7 -print_certs -noout
+```
+
+Then add this flag to the command in [Run the installer](#run-the-installer):
+
+```bash
+--gitops-ca-file="$HOME/secure/internal-ca.pem"
 ```
 
 The installer then does these steps:
@@ -362,6 +373,9 @@ To move the instance to a new root CA, do these steps:
    and update the Secret. The broker trusts every certificate in the file.
 2. Change the server's certificate to one that the new root signs.
 3. Remove the old root from the file, and update the Secret again.
+
+A new intermediate CA needs no change to the file when the server sends the intermediate in its
+chain. Put an intermediate in the file only when the server does not send it.
 
 Notes:
 
