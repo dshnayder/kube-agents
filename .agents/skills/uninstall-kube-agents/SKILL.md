@@ -29,10 +29,17 @@ that the Secret stays. Read its name and the namespace from the install's `insta
 the command:
 
 ```bash
-eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' /path/to/install.env)"
-kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
-  -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+ENV_FILE=/path/to/install.env   # the install's install.env
+(
+  unset NAMESPACE GITLAB_TOKEN_SECRET
+  eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$ENV_FILE")"
+  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
+    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+)
 ```
+
+The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
+in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).
 
 Also tell the operator to revoke the token in GitLab.
 

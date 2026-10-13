@@ -231,9 +231,10 @@ Rules for the agent:
   Developer role. On a GitLab tier without group or project access tokens, it is a personal access
   token of a dedicated account that is a Developer member of the project. It is never a person's
   own token.
-- The credential broker uses the token only for the declared repositories, inside their groups
-  and subgroups. Another project in the group gets no token. For `platform/infra/gitops`, the
-  group is `platform/infra`. The token limits what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
+- The broker uses the token only for the declared repositories. Another project in the
+  same group gets no token; `inspect-repository` reads it without one, so only a public project
+  is readable. A project outside those groups is refused. For `platform/infra/gitops`, the group
+  is `platform/infra`. The token limits what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
   is a project access token on the GitOps project, or a group access token on `platform/infra`,
   not on `platform`.
 - Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or

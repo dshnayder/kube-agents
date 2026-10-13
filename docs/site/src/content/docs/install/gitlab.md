@@ -17,8 +17,11 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   release, run
   `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- --help | grep -- --gitops-forge`,
   or `./install.sh --help | grep -- --gitops-forge` in an unpacked release.
+- **The GitLab version.** Tested with GitLab 19.4, and with GitLab 16.11 except for the diff
+  of a merge request.
 - **The project.** Create the GitOps project first. The installer does not create it. Note its
-  full path with its nested groups, for example `platform/infra/gitops`.
+  full path with its nested groups, for example `platform/infra/gitops`. The project needs a
+  default branch with at least one commit: the agent opens its merge requests against it.
 - **The host.** gitlab.com needs no host. For a self-managed instance, the host is a lowercase
   DNS name with at least two labels, such as `gitlab.example.com` or `gitlab.corp.internal`.
   It has no scheme, port or path. The broker connects to it with HTTPS on port 443. The
@@ -26,13 +29,13 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 - **The token.** Use a group or project access token with the `api` and `write_repository`
   scopes and the Developer role. On a GitLab tier without group or project access tokens, use
   a personal access token of a dedicated account that is a Developer member of the project.
-  Do not use a person's own token. Two limits apply:
-  - The credential broker uses the token only for the repositories that the install
-    declares. The API calls, commits and pushes all require a declared repository, inside
-    the groups of the declared repositories and their subgroups (for
-    `platform/infra/gitops`, the group `platform/infra`). Another project in that group gets
-    no token: `inspect-repository` reads it without a credential, so only a public project is
-    readable.
+  Do not use a person's own token. The Developer role is enough: the agent pushes its own
+  branches and opens merge requests, and it never merges or pushes to a protected branch. Two
+  limits apply:
+  - The broker uses the token only for the declared repositories. Another project in the
+    same group gets no token; `inspect-repository` reads it without one, so only a public
+    project is readable. A project outside those groups is refused. For
+    `platform/infra/gitops`, the group is `platform/infra`.
   - The token limits what GitLab lets the broker do. Give it the smallest reach: a project
     access token on the GitOps project, or a group access token on the project's own group
     (`platform/infra`, not `platform`).
@@ -45,10 +48,14 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   never connects to GitLab. If you add a policy that limits egress in the agent's namespace,
   let the broker pod reach the GitLab host on 443. The broker resolves the hostname through the
   cluster DNS. For a private hostname on GKE, a Cloud DNS private zone that is attached to the
-  cluster's VPC works. The VPC firewall must let the cluster's node and Pod ranges reach the
+  cluster's VPC works. A name in an on-premises DNS needs a Cloud DNS
+  [forwarding zone or peering](https://cloud.google.com/dns/docs/zones/zones-overview) to that
+  DNS. The VPC firewall must let the cluster's node and Pod ranges reach the
   host on 443. For a public instance, the cluster also needs Cloud NAT or public IP addresses.
   A route to a private network outside the VPC (Cloud VPN or Cloud Interconnect) must carry the
-  Pod range: advertise that range, or masquerade it with
+  Pod range: advertise that range with
+  [Cloud Router custom advertisements](https://cloud.google.com/network-connectivity/docs/router/how-to/advertising-overview),
+  or masquerade it with
   [the IP masquerade agent](https://cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it needs
   no route to the GitLab host and no trust for its certificate.
@@ -81,7 +88,7 @@ The token's access to the project. The path is URL-encoded:
 ```bash
 pass show gitlab/agent-token | head -n1 | sed 's/^/PRIVATE-TOKEN: /' |
   curl -sS -H @- https://gitlab.example.com/api/v4/projects/platform%2Finfra%2Fgitops |
-  jq '[.permissions.project_access.access_level, .permissions.group_access.access_level] | map(. // 0) | max'
+  jq 'if has("permissions") then ([.permissions.project_access.access_level, .permissions.group_access.access_level] | map(. // 0) | max) else . end'
 ```
 
 - `30` or more: the token can write (Developer or higher).
@@ -95,23 +102,27 @@ pass show gitlab/agent-token | head -n1 | sed 's/^/PRIVATE-TOKEN: /' |
 
 The test runs a short-lived Pod with `curl` in the cluster. `<install-context>` is the kubectl
 context that `gcloud container clusters get-credentials` writes for the cluster:
-`gke_<project>_<location>_<cluster>`.
+`gke_<project>_<location>_<cluster>`. `<namespace>` is one of these:
 
-- On a cluster that already exists, run it before the install, in the `default` namespace.
-  The `kubeagents-system` namespace does not exist yet. The policies of `default` can differ
-  from those of `kubeagents-system`.
-- On a new cluster, run it after the install, in `kubeagents-system`, together with
+- `default`: on a cluster that already exists, before the install. `kubeagents-system` does
+  not exist yet, and the policies of `default` can differ from those of `kubeagents-system`.
+- `kubeagents-system`: on a new cluster, after the install, together with
   [Check the connection](#check-the-connection).
 
 ```bash
-kubectl --context <install-context> -n default run gitlab-reach --rm -i --restart=Never \
+kubectl --context <install-context> -n <namespace> run gitlab-reach --rm -i --restart=Never \
   --image=curlimages/curl -- curl -sS https://gitlab.example.com/api/v4/version
 ```
 
 An answer of `401 Unauthorized` or a version object shows that DNS, the route and TLS work. A
-DNS, timeout or certificate error shows which part does not. A cluster that pulls only from an
-approved registry, or a private cluster without Cloud NAT, cannot pull `curlimages/curl`. Use
-an image with `curl` that the cluster can pull, for example from the install's registry prefix.
+DNS, timeout or certificate error shows which part does not.
+
+A cluster that pulls only from an approved registry, or a private cluster without Cloud NAT,
+cannot pull `curlimages/curl`. Use any image with `curl` from a registry that the cluster can
+pull from. The install's own shell sandbox image has `curl`:
+`<registry-prefix>/agent-sandbox:<RELEASE_VERSION>` (the default prefix is
+`ghcr.io/gke-labs/kube-agents`). Give `--command` before `curl`, so that the image's entrypoint
+does not run.
 
 ## Run the installer
 
@@ -275,10 +286,14 @@ only), and stores nothing.
   `install.env`:
 
   ```bash
-  # The install's install.env; see "The install.env keys" for where it is.
-  eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$HOME/kube-agents/install.env")"
-  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
-    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+  # The install's install.env. See "The install.env keys" for where it is.
+  ENV_FILE="$HOME/kube-agents/install.env"
+  (
+    unset NAMESPACE GITLAB_TOKEN_SECRET
+    eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$ENV_FILE")"
+    kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
+      -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+  )
   ```
 
 - After an uninstall, revoke the token in GitLab.
