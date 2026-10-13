@@ -14080,6 +14080,28 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
         self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
         self.assertIn("Stage namespace has no NetworkPolicy", body)
 
+    def test_a_remediate_on_a_held_row_is_deferred_on_a_clean_run_over_the_same_gap(self):
+        """The row says "not re-checked", so the answer must not say "no longer reproduces"."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        del self.harness.replies["issue-view !comments"]
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {self.stage_id()}")]}
+        )
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        self.assertIn("did not read or did not check its target", deferred[0])
+        for body in posted:
+            self.assertNotIn("no longer reproduces", body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+
     def test_a_remediate_on_a_held_row_is_deferred_not_refused(self):
         requests = audit_report.parse_remediate_commands(
             [
@@ -14138,29 +14160,67 @@ class TestUnreadTargetReason(unittest.TestCase):
         entries = audit_report.unread_held_entries(body, None, data, exclude=set())
         self.assertEqual([e["id"] for e in entries], ["netpol-missing.x.y.z"])
         self.assertTrue(entries[0]["location_unrecorded"])
+        # The gap may be a waiver or a declared-intent search, so the reason
+        # names no target.
+        self.assertEqual(
+            entries[0][audit_report.UNREAD_REASON_KEY], audit_report.UNREAD_PLACE_UNKNOWN_REASON
+        )
 
-    def test_the_stored_document_places_an_id_the_body_did_not_render(self):
-        body = audit_report.delta_block(["netpol-missing.stage-eu.payments.cut"])
-        memory = {
-            "document": {
-                "findings": [
-                    {
-                        "id": "netpol-missing.stage-eu.payments.cut",
-                        "check": "netpol-missing",
-                        "title": "Cut for room",
-                        "cluster": "stage-eu",
-                        "namespace": "payments",
-                        "object": "Namespace/cut",
-                    }
-                ]
-            }
-        }
-        read = self.doc(AUDIT, [{"name": "stage-eu", "checks_run": [{"check": "netpol-missing", "command": "k"}]}], [{"cluster": "dr", "reason": "x"}])
-        self.assertEqual(audit_report.unread_held_entries(body, memory, read, exclude=set()), [])
-        unread = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
-        [entry] = audit_report.unread_held_entries(body, memory, unread, exclude=set())
+    def truncated_previous(self):
+        """A previous body the budget truncated: prod findings rendered, stage-eu's minor cut."""
+        # Long excerpts truncate the body with few enough ids that the
+        # complete list stays under ALL_FINDINGS_BLOCK_CAP.
+        prod = [
+            make_finding(
+                fid=f"p-{n:04d}", severity="critical", cluster="prod-us-east", excerpt="x" * 3000
+            )
+            for n in range(60)
+        ]
+        cut = make_finding(fid="cut", severity="minor", cluster="stage-eu", title="Cut for room")
+        doc = make_doc(findings=prod + [cut])
+        audit_report.validate_findings(doc, AUDIT)
+        rendered = audit_report.render_issue_body(doc, generated_at=NOW)
+        cut_id = derived_id(cluster="stage-eu", fid="cut")
+        return rendered, doc, cut_id
+
+    def test_an_id_the_body_budget_cut_is_a_candidate(self):
+        rendered, doc, cut_id = self.truncated_previous()
+        # A real truncated body: the budget cut the stage-eu finding, so it
+        # is not in the delta block.
+        self.assertIn(cut_id, [f["id"] for f in rendered.omitted])
+        self.assertNotIn(cut_id, audit_report.parse_delta_block(rendered.body))
+        unread = make_doc(findings=[], clusters=[{"name": "prod-us-east"}], skipped=[{"cluster": "stage-eu", "reason": "x"}])
+        # With the stored document, the cut finding keeps its title and place.
+        [entry] = audit_report.unread_held_entries(
+            rendered.body, {"document": doc}, unread, exclude=set()
+        )
+        self.assertEqual(entry["id"], cut_id)
         self.assertEqual(entry["title"], "Cut for room")
         self.assertEqual(entry["cluster"], "stage-eu")
+        # Without it nothing places the cut id, and it was never in the hidden
+        # block, so it is not held by id alone.
+        self.assertEqual(audit_report.unread_held_entries(rendered.body, None, unread, exclude=set()), [])
+
+    def test_a_cut_id_on_a_target_that_was_checked_is_not_kept(self):
+        rendered, doc, cut_id = self.truncated_previous()
+        read = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "x"}])
+        ids = [e["id"] for e in audit_report.unread_held_entries(rendered.body, {"document": doc}, read, exclude=set())]
+        self.assertNotIn(cut_id, ids)
+
+    def test_a_derived_check_is_kept_where_a_roster_check_did_not_run(self):
+        audit = "fleet-consistency-drift"
+        command = {"command": "gcloud container clusters list --format=json"}
+        partly = self.doc(audit, [{"name": "a/b/host", "checks_run": [{"check": "no-environment-label", **command}]}])
+        reason = audit_report.unread_target_reason(partly, "uncohorted", "a/b/host")
+        self.assertIsNotNone(reason)
+        self.assertIn("`uncohorted` is read from checks that did not all run", reason)
+        whole = self.doc(
+            audit,
+            [{"name": "a/b/host", "checks_run": [{"check": c, **command} for c in audit_report.audit_checks(audit)]}],
+        )
+        self.assertIsNone(audit_report.unread_target_reason(whole, "uncohorted", "a/b/host"))
+        # A slug that is neither on the roster nor derived is not this stream's.
+        self.assertIsNone(audit_report.unread_target_reason(partly, "not-a-check", "a/b/host"))
 
 
 class TestUnreadHeldRendering(unittest.TestCase):
@@ -14210,6 +14270,19 @@ class TestUnreadHeldRendering(unittest.TestCase):
         note = "\n".join(audit_report._render_held_note([flagged, unread]))
         self.assertIn("1 previous finding(s) this run's document did not carry", note)
         self.assertIn(audit_report.UNREAD_HELD_SUBHEADING, note)
+
+    def test_an_overflow_past_the_cap_is_stated_on_every_tier_that_has_text(self):
+        unread, flagged = self.entries()
+        for lines in (
+            audit_report._render_collector_held([unread], unread_overflow=3),
+            audit_report._render_collector_held([flagged, unread], detail=False, unread_overflow=3),
+            audit_report._render_held_note([unread], unread_overflow=3),
+            audit_report._render_held_note([flagged, unread], unread_overflow=3),
+        ):
+            self.assertIn("_3 more previous finding(s) are on a target", "\n".join(lines))
+        self.assertNotIn("more previous finding(s)", "\n".join(audit_report._render_collector_held([unread])))
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread], unread_overflow=3).body
+        self.assertIn("_3 more previous finding(s) are on a target", body)
 
     def test_the_body_keeps_its_id_in_the_hidden_block(self):
         unread, _ = self.entries()
