@@ -131,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave, or the `PLATFORM_AGENT_MODE` a `--mode` gave, that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
-   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
+   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).
    - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
      ```bash
      cd terraform/examples/full-install
@@ -163,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
-When enabling GitOps pull-request automation, also provide the GitOps repository and GitHub App parameters:
+When enabling GitOps pull-request automation with a repository on GitHub, also provide the GitOps repository and GitHub App parameters. For a repository on GitLab, see [GitOps Repository on GitLab](#gitops-repository-on-gitlab):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -222,8 +222,9 @@ Rules for the agent:
 
 - Ask the operator for the GitLab host and the project's full path. The operator creates the project
   before the install. The installer does not create it.
-- `--gitops-host` is a bare hostname, with no scheme, port or path. Leave it out for gitlab.com. The
-  installer refuses a GitHub hostname.
+- `--gitops-host` is a lowercase DNS name with at least two labels, such as `gitlab.corp.internal`.
+  It has no scheme, port or path. Do not give it for gitlab.com. The installer refuses a GitHub
+  hostname. The broker connects to the host with HTTPS on port 443.
 - `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
   its `https://` URL on that host. Do not put the host in the path. `--gitops-org` is not used.
 - The token is a group or project access token with the `api` and `write_repository` scopes and the
@@ -231,29 +232,32 @@ Rules for the agent:
   token of a dedicated account that is a Developer member of the project. It is never a person's
   own token.
 - The credential broker acts only on the groups of the declared repositories, and on their
-  subgroups. For `platform/infra/gitops`, that is the group `platform/infra`. The token limits what
-  GitLab lets the broker do. Recommend the smallest reach: a project access token on the GitOps
-  project, or a group access token on `platform/infra`, not on `platform`.
+  subgroups. For `platform/infra/gitops`, that is the group `platform/infra`. The token limits
+  what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
+  is a project access token on the GitOps project, or a group access token on `platform/infra`,
+  not on `platform`.
 - Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or
   the transcript. Use one of these:
-  - Leave out `--gitlab-token-file`. The install completes and prints the command that creates the
-    Secret, and the operator runs it. Until then, every GitLab call answers
+  - Do not give `--gitlab-token-file`. The install completes and prints the command that creates
+    the Secret, and the operator runs it. Until then, every GitLab call answers
     `FORGE_CREDENTIAL_UNAVAILABLE`. No restart is necessary after the operator creates it.
   - Give `--gitlab-token-file` a file, or a process substitution such as the `pass` example above.
     The installer reads the whole source and removes all whitespace from it, newlines inside it
-    too. Thus the source must hold only the token, and a `pass` entry with more lines needs
-    `| head -n1`. The file descriptor of a process substitution stays open for the whole run, and
-    the installer reads it after the apply. `/dev/stdin` works only with `./install.sh` from an
-    unpacked release: under `curl … | bash`, standard input is the script itself.
+    too. The source must hold only the token. A `pass` entry with more lines needs `| head -n1`.
+    The operator unlocks `gpg-agent` before the run. `/dev/stdin` works only with `./install.sh`
+    from an unpacked release: under `curl … | bash`, standard input is the script itself.
 - `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
   the token. `--generate-only` never creates the token Secret. On a first install it writes the
-  GitLab keys into `install.env`, and over an existing `install.env` it does not change them. After
-  `lifecycle.sh apply`, the operator creates the Secret, as
-  [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only) shows.
-- Before the install, test that the cluster can reach the instance. After the install, check the
-  connection. [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) gives both
-  commands. It also has the network, DNS, certificate, token expiry and rotation rules, the
-  `install.env` keys, and what the install declares.
+  GitLab keys into `install.env`. Over an existing `install.env`, it does not change them, so set
+  `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO` and `GITLAB_TOKEN_SECRET` in that file before
+  `lifecycle.sh apply`. Otherwise the next `upgrade.sh` removes the GitLab forge. After the apply,
+  the operator creates the Secret, as
+  [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
+  shows.
+- Before the install, check the token and, on a cluster that already exists, the network path. After
+  the install, check the connection. [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
+  gives the commands. It also has the network, DNS, certificate, token expiry and rotation rules,
+  the `install.env` keys, and what the install declares.
 
 #### AI-Assisted Installation
 
@@ -308,10 +312,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    no key, and `gemini` can instead read one from the Secret Manager secret
    `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
    installer only warns, and the agent it installs cannot call a model. For a GitOps repository on
-   GitLab, do not ask the operator to paste the GitLab token. Either leave out `--gitlab-token-file`
-   and, after the install, have the operator run the Secret command that the installer prints, or
-   have the operator give a file path or a password-manager command for `--gitlab-token-file`. The
-   flags are in [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode).
+   GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
+   [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
 
    ```bash
    curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
@@ -944,7 +946,7 @@ To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
 A GitOps repository on GitLab needs no minter: skip `make deploy-github`. Put the GitLab access
 token in a Secret in `kubeagents-system` under the key `token`. Then declare the forge in the
-PlatformAgent CR in Step 6:
+PlatformAgent CR in Step 6. Add these fields to the sample's `spec.integration` before you apply it:
 
 ```yaml
 spec:
@@ -952,7 +954,7 @@ spec:
     forges:
       - name: gitlab # required; repositories refer to the forge by this name
         provider: gitlab
-        host: gitlab.example.com # leave out for gitlab.com
+        host: gitlab.example.com # omit for gitlab.com
         credentialsRef:
           name: gitlab-forge-token # the Secret with the key `token`
     repositories:

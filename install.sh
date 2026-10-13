@@ -655,9 +655,10 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org for GitOps repo
-  --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
-                                currently gke-fleet-iac)
+  --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
+  --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
+                                DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
+                                project's full path (required, no default)
   --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
                                 For gitlab, --gitops-repo is the project's full path
                                 (group/subgroup/project) and --gitops-org is not used

@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 On a GitLab install, the installer creates the token Secret (`gitlab-forge-token`) outside the
 Helm release. A teardown that deletes the cluster deletes it too. On a cluster that the teardown
 keeps, tell the operator that the Secret stays, and give the command:
-`kubectl delete secret gitlab-forge-token -n kubeagents-system --ignore-not-found=true`.
+`kubectl delete secret gitlab-forge-token -n kubeagents-system --ignore-not-found=true`. Also tell the operator to revoke the token in GitLab.
 
 The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run against the
 install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix

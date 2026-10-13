@@ -205,6 +205,8 @@ Or route one of these keys through a self-hosted LiteLLM gateway — see [`examp
 
 ## GitOps repo & GitHub token minter (for `submit-suggestion`)
 
+This section is for a GitOps repository on GitHub only. For GitLab, see [GitOps repo on GitLab](#gitops-repo-on-gitlab).
+
 The declarative workflow routes infrastructure mutations through pull requests via the GitHub token minter (Minty). When GitOps is enabled, prepare:
 
 - **GitHub Organization:** A GitHub repo **owned by an organization**. Minty queries `/orgs/{org}/installation`, so personal accounts fail token minting with HTTP 404 — see [Token minter](/kube-agents/deploy/token-minter/). A free organization is sufficient.
