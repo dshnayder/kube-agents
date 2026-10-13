@@ -241,7 +241,7 @@ states the trade in full.
 
 `litellm.redaction.enabled=true` makes the gateway redact every request body
 before it reaches the provider: the ConfigMap gains the shared redactor module,
-a LiteLLM pre-call hook and a `redaction.yaml` rule file, all mounted beside
+the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
 pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
@@ -406,8 +406,8 @@ terminal and Google Chat pull counters from its metrics-only port 9096 (elsewher
 that one selects no pod). The operator's policies on all three pods admit the
 collector's namespace, `gke-gmp-system`, on those ports either way, and on the
 first two they admit the operator's own pods as well; the value only decides
-whether a scrape is configured, and the operator's own read of the two counters
-into `status.usage` does not depend on it.
+whether a scrape is configured, and the operator's own read of the counters and
+cluster gauges into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -532,6 +532,19 @@ registration & Teams App manifest) —
 [INSTALL.md § Enable Chat Integrations](../../INSTALL.md) and
 [Microsoft Teams ChatOps Guide](../../docs/chatops/microsoft-teams.md) are the
 canonical walkthroughs.
+
+### Component stack (`platformAgent.mode`)
+
+`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
+renders the NATS bus and the A2A gateway, a development stack
+([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
+It defaults to `null`, which renders no field, and the operator reads an absent
+mode as `today`. Because Helm patches the CR from the difference between its
+renders, a mode set on the CR by hand stays while the value is `null`, and a
+value set and later cleared removes the field again. Changing it on a running
+release is a mode switch rather than a setting: the operator rolls the agent
+and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
+caps the A2A session pods a `next` install runs at once and renders only when set.
 
 ### Agent runtime knobs
 

@@ -50,7 +50,7 @@ Several exits (the service-account ownership check, input validation, a missing 
 `--dry-run`, the GitHub App PEM import) write no report and leave an earlier run's in place.
 
 Resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)
-(e.g. `0.4.0`) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
+(e.g. `0.4.0`; a GitLab install needs `0.9.0` or later) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
 over; never leave the placeholder unrendered.
 
 ### Stage 1: Detect and interview
@@ -97,9 +97,14 @@ in, where the operator sets it.
    `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
    gVisor; the
    [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
-   gives its access path. GitOps pull requests add `--gitops-org`, `--gitops-repo` and
-   `--github-app-id`; see
+   gives its access path.
+5. **Where the GitOps repository lives**, only if the operator wants GitOps pull requests. Ask
+   which forge holds it. On GitHub, pass `--gitops-org`, `--gitops-repo` and `--github-app-id`; see
    [GitOps Repository & GitHub Token Minter Configuration](#gitops-repository--github-token-minter-configuration).
+   On GitLab (gitlab.com or a self-managed instance), pass `--gitops-forge=gitlab`, `--gitops-repo`
+   and, for a self-managed instance, `--gitops-host`; see
+   [GitOps Repository on GitLab](#gitops-repository-on-gitlab). Never combine the GitHub App flags
+   with `--gitops-forge=gitlab`: the installer refuses them.
 
 Leave `--permission-set` at `read-only` unless the operator asks for `custom`. The flags in
 [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns) are
@@ -232,6 +237,13 @@ In `--generate-only` mode, the installer:
 2. Runs the same pre-apply validation checks a real run does: the GitOps organization check, the service-account ownership check, the scope container preflight when a folder or organisation is declared, which on this route, and on the interactive `g` answer, only warns (the apply it hands off may run as another identity; a run that applies, `-y` or the interactive `Y`, refuses, exit 1 with no report status like the ownership check, when the credentials Terraform applies with cannot set IAM policy on a container or an enforced organisation policy forbids the Cloud Asset API), and the existing-cluster node-pool and NetworkPolicy consent gates, but not the live-scope check, which needs the install's kubeconfig context and runs only on a run that will apply; the handoff says so. The interactive `g` answer is given after the pre-flight summary, by which point that check has run too, so the two routes differ in that one check. A cluster needing `--migrate-node-pools`, or one enforcing no NetworkPolicy that was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused (`REFUSED_MISSING_NODE_POOL_MIGRATION`, `REFUSED_MISSING_NETWORK_POLICY`), as is one that cannot be described (`FAILED_PREFLIGHT_CLUSTER_UNREADABLE`). A `REFUSED_*` status is a question for the operator, not a flag to add: see [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns). Step 1 has already written both files by then, so a refusal exits 1 leaving `install.env` and `terraform.tfvars` on disk — unvalidated, and with no handoff printed. Do not read the presence of `terraform.tfvars` as success; read the report status.
 3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
+
+On a GitLab install, step 2 skips the GitOps organization check: there is no GitHub organization.
+Generate-only never creates the GitLab token Secret. On a first install it writes the GitLab keys
+into `install.env`, and over an existing `install.env` it does not change them. After
+`lifecycle.sh apply`, the operator creates the Secret, as
+[Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
+shows.
 
 The interactive wizard also offers the same choice by answering `g` at the final confirmation step.
 
@@ -394,6 +406,53 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
   --github-app-id="YOUR_GITHUB_APP_ID"
 ```
 
+## GitOps Repository on GitLab
+
+A GitLab install has no GitHub App and no token minter. The credential broker holds a GitLab access
+token in a Kubernetes Secret, and the agent and its shell sandbox never get it.
+[GitLab as the GitOps forge](https://gke-labs.github.io/kube-agents/install/gitlab/) has the
+procedure, the network, DNS and certificate rules, a reachability test, the connection check,
+token expiry and rotation, and the `install.env` keys. Read it before the dry run.
+
+Rules for the agent:
+
+- Use release 0.9.0 or later. An earlier release has no `--gitops-forge` flag.
+- The operator creates the GitOps project first. The installer does not create it.
+- `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
+  its `https://` URL on that host. Put the host in `--gitops-host`, not in the path. Leave
+  `--gitops-host` out for gitlab.com.
+- The credential broker acts only on the groups of the declared repositories, and on their
+  subgroups. Recommend the token with the smallest reach: a project access token on the GitOps
+  project, or a group access token on the project's own group (for `platform/infra/gitops`, the
+  group `platform/infra`, not `platform`). Tell the operator to record the token's expiry date.
+- Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or
+  the transcript. Use one of these:
+  - Leave out `--gitlab-token-file`. The install completes and prints the command that creates the
+    Secret, and the operator runs it. Until then, GitLab calls answer
+    `FORGE_CREDENTIAL_UNAVAILABLE`. No restart is necessary afterwards.
+  - The operator gives a file path or a password-manager command, which you pass as
+    `--gitlab-token-file=<(…)`. The installer reads the whole source and removes all whitespace,
+    newlines inside it too. Thus the source must hold only the token: for a `pass` entry with more
+    lines, use `<(pass show gitlab/agent-token | head -n1)`. Do not use `/dev/stdin` under
+    `curl … | bash`, because standard input is the script there.
+- The dry run checks only that the token source is readable. It does not read the token, and
+  `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
+- Before stage 3, have the operator run the reachability test from the GitLab page. After stage 3,
+  run the connection check from the same page.
+
+The command below is a stage 2 dry run. Apply through stage 3 once the operator confirms:
+
+```bash
+./install.sh --dry-run --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --gitops-forge=gitlab \
+  --gitops-host="gitlab.example.com" \
+  --gitops-repo="platform/infra/gitops"
+```
+
 ## Supported Command-Line Flags
 
 Defaults marked "`installer_common.sh`" reach the installer through
@@ -413,6 +472,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gke-cluster-name=NAME`               | GKE Cluster Name                                                                                                                                                                                                                                                                                                                    | `installer_common.sh` `DEFAULT_CLUSTER_NAME`                                                                                                       |
 | `--gke-cluster-mode=MODE`               | Shape of a cluster this run creates: `autopilot` \| `standard`. Autopilot is regional: unset at a zonal `--gcp-region` builds `standard`, explicit `autopilot` there is an error. No bearing on an existing cluster, whose live shape the generator probes                                                                          | `autopilot`                                                                                                                                        |
 | `--agent-namespace=NAME`                | Kubernetes namespace the agent and operator are installed into                                                                                                                                                                                                                                                                      | `installer_common.sh` `DEFAULT_NAMESPACE`                                                                                                          |
+| `--mode=MODE`                           | The `PlatformAgent`'s `spec.mode`: `today` \| `next` (unsupported dev stack). Recorded as `PLATFORM_AGENT_MODE` when `install.env` sets none; later, switch by editing that key, since a disagreeing `--mode` is refused                                                                                                            | `installer_common.sh` `DEFAULT_PLATFORM_AGENT_MODE`                                                                                                |
 | `--image-tag=TAG`                       | Validated immutable release tag or full commit SHA (developer/CI only)                                                                                                                                                                                                                                                              | Developer and CI/CD testing only; end users must use official release installations. Default: inferred from baked release, bundle, or local `HEAD` |
 | `--registry-prefix=PATH`                | Registry path (no URL scheme) for the first-party images this project builds                                                                                                                                                                                                                                                        | `installer_common.sh` `DEFAULT_REGISTRY_PREFIX`                                                                                                    |
 | `--third-party-registry-prefix=PATH`    | Registry path holding the mirrored third-party images (cert-manager, LiteLLM, fluent-bit, token minter, Hindsight). Not implied by `--registry-prefix`                                                                                                                                                                              | _unset_ — upstream registries                                                                                                                      |
@@ -434,8 +494,12 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--scope-exclude-clusters=TRIPLES`      | Clusters to leave unmanaged, each as `project/location/cluster`                                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--scoped-sa-pool-enabled[=BOOL]`       | Arm the scoped service account pool: one reader service account per project the plan lists in scope, created in the install's project; the credential broker selects from them and refuses a cluster in a project with none. Members hold no IAM grant yet, so leave it off. Recorded as `SCOPED_SA_POOL_ENABLED`                   | `false`                                                                                                                                            |
 | `--scoped-sa-pool-max-accounts=N`       | The most pool accounts the plan may create in the install's project, set from its free service-account quota (a whole number of at least 1); a pool past it is refused at plan. Recorded as `SCOPED_SA_POOL_MAX_ACCOUNTS`                                                                                                           | _unset_ (the module's 100)                                                                                                                         |
-| `--gitops-org=ORG`                      | GitHub organization for the GitOps IaC repository                                                                                                                                                                                                                                                                                   | _unset_                                                                                                                                            |
-| `--gitops-repo=REPO`                    | GitOps IaC repository name                                                                                                                                                                                                                                                                                                          | `gke-fleet-iac`                                                                                                                                    |
+| `--gitops-org=ORG`                      | GitHub organization for the GitOps IaC repository. Not used with `--gitops-forge=gitlab`                                                                                                                                                                                                                                            | _unset_                                                                                                                                            |
+| `--gitops-repo=REPO`                    | GitOps IaC repository name. With `--gitops-forge=gitlab`, the project's full path (`group/subgroup/project`) or its `https://` URL on the GitLab host                                                                                                                                                                               | `gke-fleet-iac`                                                                                                                                    |
+| `--gitops-forge=FORGE`                  | Forge that holds the GitOps repository: `github` or `gitlab` (gitlab.com or a self-managed instance). A GitLab install has no GitHub App and no token minter                                                                                                                                                                        | `github`                                                                                                                                           |
+| `--gitops-host=HOST`                    | Self-managed GitLab hostname, with no scheme, port or path. A GitHub hostname is refused. Only with `--gitops-forge=gitlab`                                                                                                                                                                                                         | gitlab.com                                                                                                                                         |
+| `--gitlab-token-file=PATH`              | File, `/dev/stdin` or `<(command)` that holds the GitLab access token (scopes `api` and `write_repository`). Read into the Secret after the apply and never recorded. Without it, a non-interactive run prints the command that creates the Secret                                                                                  | _unset_                                                                                                                                            |
+| `--gitlab-token-secret=NAME`            | Kubernetes Secret that holds the GitLab token                                                                                                                                                                                                                                                                                       | `gitlab-forge-token`                                                                                                                               |
 | `--github-app-id=ID`                    | Numeric GitHub App ID for the token minter                                                                                                                                                                                                                                                                                          | _unset_                                                                                                                                            |
 | `--github-pem-path=PATH`                | Path to downloaded GitHub App private key (`.pem`) for initial Cloud KMS import                                                                                                                                                                                                                                                     | _unset_                                                                                                                                            |
 | `--kms-keyring=NAME`                    | Cloud KMS Key Ring name for the token minter key                                                                                                                                                                                                                                                                                    | `installer_common.sh` `DEFAULT_KMS_KEYRING`                                                                                                        |

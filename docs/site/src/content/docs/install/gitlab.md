@@ -11,15 +11,53 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 
 ## Before you start
 
+- **The release.** GitLab support starts in release 0.9.0. An earlier release has no
+  `--gitops-forge` flag. The latest release is on
+  [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest). To check a
+  release, run
+  `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- --help | grep -- --gitops-forge`,
+  or `./install.sh --help | grep -- --gitops-forge` in an unpacked release.
 - **The project.** Create the GitOps project first; the installer does not create it. Note
   its full path, nested groups included: `platform/infra/gitops`.
 - **The token.** A group or project access token with the `api` and `write_repository`
   scopes and the Developer role. On a GitLab tier without group or project access tokens,
   use a personal access token of a dedicated account that is a Developer member of the
-  project, never a person's own. The agent can reach every project in the GitOps project's
-  group that the token can reach, so a group token's group is the boundary you are setting.
-- **Egress.** The cluster must reach the GitLab host over HTTPS. A self-managed instance on
-  a private network needs a route from the cluster.
+  project, never a person's own. Two limits apply:
+  - The credential broker acts only on the groups of the repositories that the install
+    declares, and on their subgroups. For `platform/infra/gitops`, that is the group
+    `platform/infra`.
+  - The token limits what GitLab lets the broker do. Give it the smallest reach: a project
+    access token on the GitOps project, or a group access token on the project's own group
+    (`platform/infra`, not `platform`).
+- **Token expiry.** GitLab access tokens expire, by default after at most one year. An
+  administrator of a self-managed instance can change that limit. Record the expiry date, and replace the token
+  before it expires (see [Rotating the token](#rotating-the-token)).
+- **Network.** Only the credential broker pod (`<agent>-credential-proxy`) connects to
+  GitLab, over HTTPS on port 443. The NetworkPolicy that kube-agents ships for that pod limits
+  ingress only, so its egress is open, to private ranges too. The agent pod's egress policy
+  excludes private ranges, but the agent never connects to GitLab. If you add a policy that
+  limits egress in the agent's namespace, let the broker pod reach the GitLab host on 443.
+  The broker resolves the hostname through the cluster DNS. For a private hostname on GKE, a
+  Cloud DNS private zone attached to the cluster's VPC works. Your VPC firewall, and Cloud NAT
+  for a public instance, must let the cluster's node and Pod ranges reach the host on 443.
+  To test the path before the install, run a short-lived Pod in the cluster:
+
+  ```bash
+  kubectl run gitlab-reach --rm -i --restart=Never --image=curlimages/curl -- \
+    curl -sS https://gitlab.example.com/api/v4/version
+  ```
+
+  An answer of `401 Unauthorized` or a version object shows that DNS, the route and TLS work.
+  A DNS, timeout or certificate error shows which part does not.
+
+- **The installer host.** `install.sh` never connects to GitLab. The machine that runs it
+  needs no route to the GitLab host and no trust for its certificate.
+- **The certificate.** On a self-managed instance, the certificate must chain to a CA that
+  the broker image trusts: a public CA, or a proxy that terminates TLS with such a
+  certificate. No release has a setting for a private CA yet. To check a release, run its
+  `--help` (as in the release item above) and look for `--gitops-ca-file`.
+- **`gh`.** The installer checks for the GitHub CLI on every install, and installs it when it
+  is missing (a dry run stops instead). A GitLab install does not use it to reach GitLab.
 
 ## Run the installer
 
@@ -52,10 +90,59 @@ takes the token's value:
 
 `--github-app-id` and `--github-pem-path` are refused with `--gitops-forge=gitlab`.
 
+**The token source.** The installer reads the whole source and removes all whitespace from it,
+newlines inside it too. So the source must hold only the token. A `pass` entry with more lines
+(a user name, a URL) needs its first line only: `--gitlab-token-file=<(pass show gitlab/agent-token | head -n1)`.
+
+The file descriptor of a process substitution stays open for the whole run, and the installer
+reads it after the apply. `/dev/stdin` works only with `./install.sh` from an unpacked release:
+under `curl … | bash`, standard input is the script itself.
+
+### Dry run and generate-only
+
+`--dry-run` and `--generate-only` check only that the token source is readable. They do not
+read the token. A real run reads it once, after the apply.
+
+`--generate-only` writes `terraform.tfvars`, and it never creates the token Secret:
+
+- On a first install, it writes `install.env` with the GitLab keys (`GITOPS_FORGE`,
+  `GITOPS_HOST`, `GITOPS_REPO` and `GITLAB_TOKEN_SECRET`).
+- Over an existing `install.env`, it does not change the GitLab keys.
+
+After `lifecycle.sh apply`, create the Secret in the agent's namespace, as
+[Rotating the token](#rotating-the-token) shows.
+
 Without a token file in a non-interactive run, the install completes and prints the
 command that creates the Secret. Until it exists the agent answers every GitLab call with
 `FORGE_CREDENTIAL_UNAVAILABLE`; it reads the Secret on each call, so creating it later needs
 no restart.
+
+## Check the connection
+
+After the install, ask the broker who the token is, from the shell sandbox:
+
+```bash
+kubectl exec -n kubeagents-system -c shell platform-agent-shell-0 -- \
+  python3 /opt/data/skills/version-control/scripts/vcs.py identity \
+  --repo https://gitlab.example.com/platform/infra/gitops
+```
+
+It prints one JSON object with the token's user name. Other answers:
+
+- `FORGE_CREDENTIAL_UNAVAILABLE`: the Secret does not exist, or has no `token` key.
+- `FORGE_UNAUTHENTICATED`: GitLab refused the token. It expired, or someone revoked it.
+- A message that the forge's TLS certificate failed verification: the broker does not trust
+  the instance's certificate (see [Before you start](#before-you-start)).
+
+The PlatformAgent status does not report these, so this check is the way to see them. The
+broker also logs `version control enabled … forges=github,gitlab` when it starts.
+
+To see the forge that the install declared:
+
+```bash
+kubectl get platformagent platform-agent -n kubeagents-system \
+  -o jsonpath='{.spec.integration.forges}{"\n"}{.spec.integration.repositories}{"\n"}'
+```
 
 ## Where the token goes
 
@@ -67,7 +154,10 @@ key into the credential broker's pod only; the agent and its shell sandbox never
 
 ## Rotating the token
 
-Replace the Secret's value; the broker picks the new token up on its next call:
+Replace the token before it expires: an expired token gives `FORGE_UNAUTHENTICATED` on every
+GitLab call, and nothing else reports it. Create the new token in GitLab, put it in the
+Secret, then revoke the old token. Replace the Secret's value; the broker picks the new token
+up on its next call:
 
 ```bash
 kubectl create secret generic gitlab-forge-token -n <namespace> \
@@ -77,7 +167,8 @@ kubectl create secret generic gitlab-forge-token -n <namespace> \
 
 Use `--server-side`. A plain `kubectl apply` stores the whole object, token
 included, in the Secret's `kubectl.kubernetes.io/last-applied-configuration`
-annotation.
+annotation. The broker removes whitespace around the token when it reads the Secret, so a
+trailing newline in the file does no harm.
 
 `install.sh` records the forge, host, project and Secret name in `install.env`: on a
 first install, and on any later run that goes on to apply with a forge, host, project or
@@ -178,6 +269,20 @@ Notes:
 - **Terraform and Helm.** Terraform takes `gitlab_ca_secret_name`. The chart
   takes `platformAgent.integration.forges[].caBundleRef.name` (and an optional
   `key`). Both only name the Secret. You create it.
+
+## Upgrade and uninstall
+
+- `upgrade.sh` reads the forge, host, project and Secret name from `install.env`. It needs no
+  token, and it keeps the token Secret.
+- The token Secret is not part of the Helm release. Deleting the PlatformAgent or uninstalling
+  the release leaves it. A full teardown that deletes the cluster deletes it too. On a cluster
+  that the teardown keeps, delete it yourself:
+  `kubectl delete secret gitlab-forge-token -n kubeagents-system --ignore-not-found=true`.
+
+## Limits
+
+- The skills read GitLab entries in `managed_repos`, but only GitHub entries in `context_repos`.
+  A GitLab repository that you add as a context repository is skipped with a warning.
 
 ## What the install declares
 
