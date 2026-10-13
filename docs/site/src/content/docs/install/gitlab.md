@@ -27,9 +27,12 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   scopes and the Developer role. On a GitLab tier without group or project access tokens, use
   a personal access token of a dedicated account that is a Developer member of the project.
   Do not use a person's own token. Two limits apply:
-  - The credential broker acts only on the groups of the repositories that the install
-    declares, and on their subgroups. For `platform/infra/gitops`, that is the group
-    `platform/infra`.
+  - The credential broker uses the token only for the repositories that the install
+    declares. The API calls, commits and pushes all require a declared repository, inside
+    the groups of the declared repositories and their subgroups (for
+    `platform/infra/gitops`, the group `platform/infra`). Another project in that group gets
+    no token: `inspect-repository` reads it without a credential, so only a public project is
+    readable.
   - The token limits what GitLab lets the broker do. Give it the smallest reach: a project
     access token on the GitOps project, or a group access token on the project's own group
     (`platform/infra`, not `platform`).
@@ -44,6 +47,9 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   cluster DNS. For a private hostname on GKE, a Cloud DNS private zone that is attached to the
   cluster's VPC works. The VPC firewall must let the cluster's node and Pod ranges reach the
   host on 443. For a public instance, the cluster also needs Cloud NAT or public IP addresses.
+  A route to a private network outside the VPC (Cloud VPN or Cloud Interconnect) must carry the
+  Pod range: advertise that range, or masquerade it with
+  [the IP masquerade agent](https://cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it needs
   no route to the GitLab host and no trust for its certificate.
 - **The certificate.** On a self-managed instance, the broker must trust the certificate. A
@@ -55,45 +61,57 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 
 ### Check the token
 
-Before the install, read the token's user, scopes and expiry date with the GitLab API. The
-command sends the token in a header from a pipe, so the token is not in a process's arguments:
+Run these checks on a machine that has a route to the GitLab host. It does not have to be the
+installer host. Each command sends the token in a header from a pipe, so the token is not in a
+process's arguments.
+
+The token's user, scopes and expiry date:
 
 ```bash
 pass show gitlab/agent-token | head -n1 | sed 's/^/PRIVATE-TOKEN: /' |
   curl -sS -H @- https://gitlab.example.com/api/v4/personal_access_tokens/self
 ```
 
-The answer has `scopes`, `user_id`, `active` and `expires_at`. This works for a personal
-access token and for a project access token (tested on GitLab 19.4). Then check that the token
-can read the project. The path is URL-encoded:
+The answer has `scopes`, `user_id`, `active` and `expires_at`. This works for personal, project
+and group access tokens (tested on GitLab 19.4). For the user name, use
+`https://gitlab.example.com/api/v4/user` with the same pipe.
+
+The token's access to the project. The path is URL-encoded:
 
 ```bash
 pass show gitlab/agent-token | head -n1 | sed 's/^/PRIVATE-TOKEN: /' |
-  curl -sS -o /dev/null -w '%{http_code}\n' -H @- \
-  https://gitlab.example.com/api/v4/projects/platform%2Finfra%2Fgitops
+  curl -sS -H @- https://gitlab.example.com/api/v4/projects/platform%2Finfra%2Fgitops |
+  jq '[.permissions.project_access.access_level, .permissions.group_access.access_level] | map(. // 0) | max'
 ```
 
-`200` means that the token can read the project. `404` means that it cannot, or that the
-path is wrong.
+- `30` or more: the token can write (Developer or higher).
+- A lower number, or `0`: the token can only read, or has no membership. On a public project,
+  GitLab answers the read with no membership, so a successful read alone proves nothing.
+- `{"message":"404 Project Not Found"}`: the token cannot see the project, or the path is
+  wrong.
+- `{"message":"401 Unauthorized"}`: the token is not valid, has expired, or is revoked.
 
 ### Check the network path
 
-The test runs a short-lived Pod with `curl` in the cluster. On a cluster that already exists,
-run it before the install. On a new cluster, run it after the install, with
-[Check the connection](#check-the-connection). Use the install's kubectl context:
+The test runs a short-lived Pod with `curl` in the cluster. `<install-context>` is the kubectl
+context that `gcloud container clusters get-credentials` writes for the cluster:
+`gke_<project>_<location>_<cluster>`.
+
+- On a cluster that already exists, run it before the install, in the `default` namespace.
+  The `kubeagents-system` namespace does not exist yet. The policies of `default` can differ
+  from those of `kubeagents-system`.
+- On a new cluster, run it after the install, in `kubeagents-system`, together with
+  [Check the connection](#check-the-connection).
 
 ```bash
-kubectl --context <install-context> -n kubeagents-system run gitlab-reach --rm -i \
-  --restart=Never --image=curlimages/curl -- \
-  curl -sS https://gitlab.example.com/api/v4/version
+kubectl --context <install-context> -n default run gitlab-reach --rm -i --restart=Never \
+  --image=curlimages/curl -- curl -sS https://gitlab.example.com/api/v4/version
 ```
 
 An answer of `401 Unauthorized` or a version object shows that DNS, the route and TLS work. A
-DNS, timeout or certificate error shows which part does not. The Pod runs in
-`kubeagents-system`, so the policies of that namespace apply to it. A cluster that pulls only
-from an approved registry, or a private cluster without Cloud NAT, cannot pull
-`curlimages/curl`. Use an image with `curl` that the cluster can pull, for example from the
-install's registry prefix.
+DNS, timeout or certificate error shows which part does not. A cluster that pulls only from an
+approved registry, or a private cluster without Cloud NAT, cannot pull `curlimages/curl`. Use
+an image with `curl` that the cluster can pull, for example from the install's registry prefix.
 
 ## Run the installer
 
@@ -225,9 +243,15 @@ whitespace around the token when it reads it, so a trailing newline does no harm
 
 ## The `install.env` keys
 
-A first install writes `install.env` in the source directory that it uses: the unpacked
-release or checkout that it runs from, or `$HOME/kube-agents` under `curl … | bash`.
-`KUBE_AGENTS_INSTALL_ENV` names another path.
+The installer reads `install.env` from the first of these places:
+
+1. the path in `KUBE_AGENTS_INSTALL_ENV`;
+2. an `install.env` beside `install.sh`;
+3. an `install.env` in the current directory;
+4. the source directory that the install uses: the unpacked release or checkout that it runs
+   from, or `$HOME/kube-agents` under `curl … | bash`.
+
+A first install writes the file in that same place.
 
 `install.sh` records the forge, host, project and Secret name in `install.env`. It does this
 on a first install, and on a later run that goes on to the apply with a different forge, host,
@@ -247,8 +271,16 @@ only), and stores nothing.
   token, and it keeps the token Secret.
 - The token Secret is not part of the Helm release. Deleting the PlatformAgent or uninstalling
   the release leaves it. A full teardown that deletes the cluster deletes it too. On a cluster
-  that the teardown keeps, delete it yourself:
-  `kubectl delete secret gitlab-forge-token -n kubeagents-system --ignore-not-found=true`.
+  that the teardown keeps, delete it yourself. Take its name and the namespace from
+  `install.env`:
+
+  ```bash
+  # The install's install.env; see "The install.env keys" for where it is.
+  eval "$(grep -E '^(NAMESPACE|GITLAB_TOKEN_SECRET)=' "$HOME/kube-agents/install.env")"
+  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" \
+    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+  ```
+
 - After an uninstall, revoke the token in GitLab.
 
 ## Limits
