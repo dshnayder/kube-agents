@@ -113,7 +113,10 @@ title's count, a title whose count disagrees with the finding total the relayed
 line states, and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
-title, or over a refreshed coverage title when a gap opened the ledger). A report whose last line is only the link and with no line carrying a
+title, or over a refreshed coverage title when a gap opened the ledger). A run that speaks only
+because findings are no longer reported under a standing gap (`unreported_under_gap`) gets the
+card only when its line's finding total matches the title's count, or the line states a non-zero
+new, resolved or severity count; otherwise it gets the bold line. A report whose last line is only the link and with no line carrying a
 count has no headline and goes out unchanged. A truncation notice leads the leg's
 message but is never read as the relayed line. Nothing is posted into the headline's
 thread, but the incident row stores the full report, so a reply in the thread is

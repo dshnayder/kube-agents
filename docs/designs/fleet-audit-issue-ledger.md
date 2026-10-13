@@ -1086,21 +1086,20 @@ fielded the request. That run takes the same execute → save → deliver → ma
 one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
 the session that triggered it says only that the job is queued and leaves the report to the run.
 
-On a scheduled run there is no channel on the other side of that verdict today, and the mechanism
-says so: a scheduled audit is a cron run on the Platform Agent's own roster
+On a scheduled run the Platform Agent has no channel of its own: a scheduled audit is a cron run on the Platform Agent's own roster
 (`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
 with no kanban card behind it and so no completion for a chat subscription to follow. The Platform
 Agent profile holds no chat destination either — it ships no `platforms:` section, and a privileged
 fleet-management profile should not acquire one — so the Platform Agent's own delivery leg has no
-destination, and the Tier 1 ledger is where a scheduled run's report is read. `silent_ok` still earns
-its keep on the dispatched path, where a person is demonstrably waiting. The scheduled chat ping
-lives on the Chat Agent, which owns ingress: the cron report relay
+destination. The channel is the Chat Agent's, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
 ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
 a headline carrying the count of the most severe findings present, up to ten critical findings or
 the top two of a lower severity when there are none (tagged new where the body marks it so), a
 count of the rest, any clusters the run did not scan, and a link to the issue; the
-issue stays the report, and the card only summarises what it already says.
+issue stays the report, and the card only summarises what it already says. `silent_ok` decides
+whether the relay posts anything for a scheduled run: a `[SILENT]` answer skips delivery, so nothing
+reaches the channel. The ledger stays the record in both cases.
 
 ## 8. Labels
 
