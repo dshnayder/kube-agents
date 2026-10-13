@@ -186,6 +186,17 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-project-id="my-gcp-project"
 ```
 
+**Self-managed GitLab behind a private CA.** When a private CA signs the GitLab instance's
+certificate, add `--gitops-ca-file` with the CA certificate in PEM (a file, `/dev/stdin` or a
+process substitution) to a GitLab install that names its host with `--gitops-host`. The installer
+stores the certificate in the Secret `gitlab-forge-ca` and records only the Secret's name in
+`install.env` (`GITOPS_CA_SECRET`). Only the credential broker trusts that CA, and only for that
+host. gitlab.com and GitHub keep the public CAs, so the installer refuses `--gitops-ca-file`
+without a self-managed `--gitops-host`. A CA without the Key Usage extension works. A certificate
+failure answers `FORGE_TLS_UNTRUSTED` with its cause.
+[A self-managed GitLab with a private CA](docs/site/src/content/docs/install/gitlab.md#a-self-managed-gitlab-with-a-private-ca)
+has the details.
+
 _Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
 
 #### AI-Assisted Installation
