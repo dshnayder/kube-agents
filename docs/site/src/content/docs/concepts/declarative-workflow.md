@@ -73,6 +73,16 @@ A run that finds nothing **closes the issue as completed**, and closes any remed
 
 Unless the run could not see the whole fleet. A cluster that was skipped, or one that was read but where some checks could not run, makes the run **partial** — and a finding's absence from a cluster nobody looked at is not evidence it was fixed. Over a partial run the ledger stays open with a comment naming the gaps, nothing is announced as resolved, and no remediation PR is retired, except one whose fix a repository declaration forbids, which is closed on the declaration alone.
 
+#### Where a manual fix belongs
+
+A `manual` finding from the obtainability, compliance and AI security audits and the fleet-wide cost analysis gets a note that says where to make the fix. The note comes from the audit's collector. You configure nothing beyond the GitOps repository. The note names the first of these that the collector finds: the YAML file in the GitOps repository that declares the object; the Argo CD `Application` or Flux `HelmRelease` file in the repository that installs the chart or overlay that renders the object; or the directory in the repository where a new object for that namespace belongs. A second note names what reasserts the object's spec, read off the object: the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations give "the Helm release `<name>` in <namespace>" (Flux's Helm controller writes them too), the `argocd.argoproj.io/tracking-id` annotation gives "the Argo CD Application `<name>`", and an `app.kubernetes.io/managed-by` label with a value other than `Helm` gives that value. A release with no file in the repository gets only this second note. The notes do not change the finding's own text. For example:
+
+```text
+- **Remediation (manual):** Pin the image by digest after a Pod runs.
+
+_(Reconciled by the Helm release `vllm` in serving. A change made by hand to the live object is reverted; make the change where that reconciler gets its configuration.)_
+```
+
 ### Tier 2 — remediation pull requests
 
 A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<slug>-<digest>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`, and it takes them again on every run that finds it still open — so a `severity:` that escalates between runs is reflected rather than frozen at whatever the PR opened with, and labels stripped during triage come back rather than leaving a PR the audit still owns invisible to `agent:audit`. Only the labels are re-applied: a run never force-pushes or rewrites a pull request it has decided to leave alone. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
