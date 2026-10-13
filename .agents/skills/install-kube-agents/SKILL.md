@@ -50,7 +50,7 @@ Several exits (the service-account ownership check, input validation, a missing 
 `--dry-run`, the GitHub App PEM import) write no report and leave an earlier run's in place.
 
 Resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)
-(e.g. `0.4.0`) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
+(e.g. `0.4.0`; a GitLab install needs `0.9.0` or later) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
 over; never leave the placeholder unrendered.
 
 ### Stage 1: Detect and interview
@@ -238,6 +238,13 @@ In `--generate-only` mode, the installer:
 3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
+On a GitLab install, step 2 skips the GitOps organization check: there is no GitHub organization.
+Generate-only never creates the GitLab token Secret. On a first install it writes the GitLab keys
+into `install.env`, and over an existing `install.env` it does not change them. After
+`lifecycle.sh apply`, the operator creates the Secret, as
+[Dry run and generate-only](https://gke-labs.github.io/kube-agents/install/gitlab/#dry-run-and-generate-only)
+shows.
+
 The interactive wizard also offers the same choice by answering `g` at the final confirmation step.
 
 ## Adopting a cluster the operator already owns
@@ -402,40 +409,36 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
 ## GitOps Repository on GitLab
 
 A GitLab install has no GitHub App and no token minter. The credential broker holds a GitLab access
-token in a Kubernetes Secret, and the agent and its shell sandbox never get it. The procedure, the
-token's scopes and role, rotation, and the `install.env` keys are in
-[GitLab as the GitOps forge](https://gke-labs.github.io/kube-agents/install/gitlab/). Read it before
-the dry run.
+token in a Kubernetes Secret, and the agent and its shell sandbox never get it.
+[GitLab as the GitOps forge](https://gke-labs.github.io/kube-agents/install/gitlab/) has the
+procedure, the network, DNS and certificate rules, a reachability test, the connection check,
+token expiry and rotation, and the `install.env` keys. Read it before the dry run.
 
 Rules for the agent:
 
 - Use release 0.9.0 or later. An earlier release has no `--gitops-forge` flag.
 - The operator creates the GitOps project first. The installer does not create it.
-- Recommend the token with the smallest reach: a project access token on the GitOps project, or a
-  group access token on the project's own group (for `platform/infra/gitops`, the group
-  `platform/infra`, not `platform`). Tell the operator to record the token's expiry date.
 - `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
   its `https://` URL on that host. Put the host in `--gitops-host`, not in the path. Leave
   `--gitops-host` out for gitlab.com.
-- Do not ask the operator to paste the token, and do not put it in a flag, a variable or the
-  transcript. Use one of these:
+- The credential broker acts only on the groups of the declared repositories, and on their
+  subgroups. Recommend the token with the smallest reach: a project access token on the GitOps
+  project, or a group access token on the project's own group (for `platform/infra/gitops`, the
+  group `platform/infra`, not `platform`). Tell the operator to record the token's expiry date.
+- Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or
+  the transcript. Use one of these:
   - Leave out `--gitlab-token-file`. The install completes and prints the command that creates the
-    Secret. The operator runs that command. Until then, GitLab calls answer
-    `FORGE_CREDENTIAL_UNAVAILABLE`, and no restart is necessary afterwards.
+    Secret, and the operator runs it. Until then, GitLab calls answer
+    `FORGE_CREDENTIAL_UNAVAILABLE`. No restart is necessary afterwards.
   - The operator gives a file path or a password-manager command, which you pass as
     `--gitlab-token-file=<(…)`. The installer reads the whole source and removes all whitespace,
-    newlines inside it too, so the source must hold only the token. For a `pass` entry with more
-    lines, use `<(pass show gitlab/agent-token | head -n1)`.
-- The dry run checks only that the token source is readable; it does not read the token. Only the
-  stage 3 run reads it, after the apply. `install.sh` never connects to GitLab.
-- A self-managed instance must present a certificate that the broker image trusts (a public CA, or
-  a proxy that terminates TLS with such a certificate), unless the release has `--gitops-ca-file`
-  (releases up to and including 0.9.0 do not; check with `./install.sh --help`). Only the
-  credential broker pod connects to GitLab, and its egress is open. The GitLab hostname must
-  resolve through the cluster DNS.
-- After stage 3, check the connection: run `vcs.py identity` in the shell sandbox, as the GitLab page
-  shows. `FORGE_CREDENTIAL_UNAVAILABLE` means no Secret; `FORGE_UNAUTHENTICATED` means GitLab
-  refused the token.
+    newlines inside it too. Thus the source must hold only the token: for a `pass` entry with more
+    lines, use `<(pass show gitlab/agent-token | head -n1)`. Do not use `/dev/stdin` under
+    `curl … | bash`, because standard input is the script there.
+- The dry run checks only that the token source is readable. It does not read the token, and
+  `install.sh` never connects to GitLab. Only the stage 3 run reads the token, after the apply.
+- Before stage 3, have the operator run the reachability test from the GitLab page. After stage 3,
+  run the connection check from the same page.
 
 The command below is a stage 2 dry run. Apply through stage 3 once the operator confirms:
 

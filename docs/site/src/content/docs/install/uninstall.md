@@ -40,11 +40,11 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
 2. **Delete unmanaged or integration secrets (optional).**
 
    ```bash
-   kubectl delete secret github-app-credentials a2a-slack-principal-map \
+   kubectl delete secret github-app-credentials a2a-slack-principal-map gitlab-forge-token \
      -n kubeagents-system --ignore-not-found=true
    ```
 
-   `github-app-credentials` only exists if you configured the GitHub integration. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
+   `github-app-credentials` only exists if you configured the GitHub integration. `gitlab-forge-token` is the GitLab access token of a GitLab install. The installer creates it outside the Helm release, so no uninstall step deletes it. `a2a-slack-principal-map` is the optional user-created Slack identity mapping under `spec.mode: next`.
 
    **Note on `platform-agent-secrets`:** If installed via Terraform or with Helm's `platformAgent.credentials.create=true`, the core `platform-agent-secrets` Secret is managed by the Helm release rather than owned by the CR. Deleting only the CR leaves it in place for re-installations, and Helm will recreate it on the next upgrade. If `platformAgent.credentials.create=false` (the Helm default), the Secret is externally managed and will not be recreated by Helm. To purge credentials without a full teardown, delete it explicitly:
 

@@ -47,7 +47,7 @@ Run the interactive one-liner installer directly in **Google Cloud Shell** or an
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-_Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+_Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later)._
 
 When running the official release installer (`<RELEASE_VERSION>/install.sh`) or executing inside an official release checkout or unpacked release archive, the release version is baked in and used automatically without prompting. A checkout of a release line (`release/<X.Y>`) that has moved past its latest release still carries that release's baked version but is not that release: run from that checkout, with the release's tag and full history fetched, `install.sh` defaults to the checkout's own commit, as a `main` checkout does, and says so; a clone that lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch to run.
 
@@ -140,6 +140,13 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
    - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
+On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
+creates the GitLab token Secret. On a first install it writes the GitLab keys into `install.env`,
+and over an existing `install.env` it does not change them. After `lifecycle.sh apply`, create the
+Secret, as
+[Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
+shows.
+
 ### Non-Interactive & AI Agent Execution Mode
 
 For human operators, running the official release installer interactively (Method 0 above, or `./install.sh` inside an official release checkout or bundle) is strongly recommended on initial setup: it detects sensible defaults from your active `gcloud` session, prompts for mandatory cloud project and LLM provider credentials, and records configuration to `install.env`.
@@ -174,74 +181,6 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 _(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
 
-When the GitOps repository is on GitLab (gitlab.com or a self-managed instance), give the GitLab
-flags in place of the GitHub App flags. GitLab support starts in release 0.9.0: use 0.9.0 or a
-later release as `<RELEASE_VERSION>`. A GitLab install has no GitHub App and no token minter. The
-installer refuses `--github-app-id` and `--github-pem-path` with `--gitops-forge=gitlab`, and the Go
-and Cloud KMS prerequisites for the PEM import do not apply.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
-  --non-interactive \
-  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
-  --gke-cluster-name="platform-agent-host" \
-  --gcp-region="us-central1" \
-  --model-provider="gemini" \
-  --permission-set="read-only" \
-  --gitops-forge=gitlab \
-  --gitops-host="gitlab.example.com" \
-  --gitops-repo="platform/infra/gitops" \
-  --gitlab-token-file=<(pass show gitlab/agent-token)
-```
-
-- `--gitops-host`: leave it out for gitlab.com. For a self-managed instance, give the bare hostname,
-  with no scheme, port or path. A GitHub hostname is refused.
-- `--gitops-repo`: the project's full path, with its nested groups (`group/subgroup/project`), or the
-  project's `https://` URL on that host. Do not put the host in the path. `--gitops-org` is not used.
-- The project: create it before the install. The installer does not create it.
-- The token: a group or project access token with the `api` and `write_repository` scopes and the
-  Developer role. On a GitLab tier without group or project access tokens, use a personal access
-  token of a dedicated account that is a Developer member of the project, never a person's own
-  token. The agent can reach every project that the token can reach.
-- `--gitlab-token-file` reads the token from a file, `/dev/stdin`, or a process substitution such as
-  `<(pass show …)`. No flag or variable takes the token itself. The installer reads the whole
-  source and removes all whitespace from it, newlines inside it too, so the source must hold
-  only the token. For a `pass` entry with more lines, use
-  `--gitlab-token-file=<(pass show gitlab/agent-token | head -n1)`. The installer stores the token in
-  the Kubernetes Secret `gitlab-forge-token` (`--gitlab-token-secret` changes the name). Only the
-  credential broker reads it; the agent and its shell sandbox never get it.
-- Without `--gitlab-token-file`, a non-interactive install completes and prints the command that
-  creates the Secret. Until the Secret exists, every GitLab call answers
-  `FORGE_CREDENTIAL_UNAVAILABLE`. The broker reads the Secret on each call, so no restart is
-  necessary after you create it.
-- `--dry-run` and `--generate-only` check only that the token source is readable; they do not
-  read the token. A real run reads it once, after the apply. `--generate-only` never creates the
-  Secret: create it after `lifecycle.sh apply`.
-- `install.sh` never connects to GitLab, so the installer host needs no route to it. Only the
-  credential broker pod (`platform-agent-credential-proxy`) connects to GitLab, on port 443. Its
-  shipped NetworkPolicy limits ingress only, so its egress is open, to private ranges too. A
-  private hostname must resolve through the cluster DNS; on GKE, a Cloud DNS private zone
-  attached to the cluster's VPC works.
-- A self-managed instance must present a certificate that the broker image trusts: one from a
-  public CA, or from a proxy that terminates TLS with such a certificate. Releases up to and
-  including 0.9.0 have no setting for a private CA. A later release adds `--gitops-ca-file`;
-  check with `./install.sh --help | grep -- --gitops-ca-file`.
-- GitLab access tokens expire. Replace the token before it expires; an expired token gives
-  `FORGE_UNAUTHENTICATED` on every GitLab call.
-- After the install, check the connection from the shell sandbox:
-
-  ```bash
-  kubectl exec -n kubeagents-system -c shell platform-agent-shell-0 -- \
-    python3 /opt/data/skills/version-control/scripts/vcs.py identity \
-    --repo https://gitlab.example.com/platform/infra/gitops
-  ```
-
-  It prints the token's user name, or `FORGE_CREDENTIAL_UNAVAILABLE` (no Secret) or
-  `FORGE_UNAUTHENTICATED` (the token expired or was revoked).
-
-[GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) has the full procedure:
-the interview, token rotation, the `install.env` keys, and what the install declares.
-
 To run pre-flight checks and output configuration state (`terraform.tfvars` and
 `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
 validates the Terraform configuration, and previews the full resource plan when Application
@@ -254,7 +193,67 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-project-id="my-gcp-project"
 ```
 
-_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
+_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`; a GitLab install needs `0.9.0` or later), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
+
+#### GitOps Repository on GitLab
+
+When the GitOps repository is on GitLab (gitlab.com or a self-managed instance), use the GitLab
+flags in place of the GitHub App flags. GitLab support starts in release 0.9.0. Use 0.9.0 or a later
+release as `<RELEASE_VERSION>`. The latest release is on
+[GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest). A GitLab install has no
+GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path`
+with `--gitops-forge=gitlab`. The Go and Cloud KMS prerequisites of the PEM import do not apply.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only" \
+  --gitops-forge=gitlab \
+  --gitops-host="gitlab.example.com" \
+  --gitops-repo="platform/infra/gitops" \
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
+```
+
+Rules for the agent:
+
+- Ask the operator for the GitLab host and the project's full path. The operator creates the project
+  before the install. The installer does not create it.
+- `--gitops-host` is a bare hostname, with no scheme, port or path. Leave it out for gitlab.com. The
+  installer refuses a GitHub hostname.
+- `--gitops-repo` is the project's full path with its nested groups (`group/subgroup/project`), or
+  its `https://` URL on that host. Do not put the host in the path. `--gitops-org` is not used.
+- The token is a group or project access token with the `api` and `write_repository` scopes and the
+  Developer role. On a GitLab tier without group or project access tokens, it is a personal access
+  token of a dedicated account that is a Developer member of the project. It is never a person's
+  own token.
+- The credential broker acts only on the groups of the declared repositories, and on their
+  subgroups. For `platform/infra/gitops`, that is the group `platform/infra`. The token limits what
+  GitLab lets the broker do. Recommend the smallest reach: a project access token on the GitOps
+  project, or a group access token on `platform/infra`, not on `platform`.
+- Do not ask the operator to paste the token. Do not put the token in a flag value, a variable or
+  the transcript. Use one of these:
+  - Leave out `--gitlab-token-file`. The install completes and prints the command that creates the
+    Secret, and the operator runs it. Until then, every GitLab call answers
+    `FORGE_CREDENTIAL_UNAVAILABLE`. No restart is necessary after the operator creates it.
+  - Give `--gitlab-token-file` a file, or a process substitution such as the `pass` example above.
+    The installer reads the whole source and removes all whitespace from it, newlines inside it
+    too. Thus the source must hold only the token, and a `pass` entry with more lines needs
+    `| head -n1`. The file descriptor of a process substitution stays open for the whole run, and
+    the installer reads it after the apply. `/dev/stdin` works only with `./install.sh` from an
+    unpacked release: under `curl … | bash`, standard input is the script itself.
+- `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
+  the token. `--generate-only` never creates the token Secret. On a first install it writes the
+  GitLab keys into `install.env`, and over an existing `install.env` it does not change them. After
+  `lifecycle.sh apply`, the operator creates the Secret, as
+  [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only) shows.
+- Before the install, test that the cluster can reach the instance. After the install, check the
+  connection. [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) gives both
+  commands. It also has the network, DNS, certificate, token expiry and rotation rules, the
+  `install.env` keys, and what the install declares.
 
 #### AI-Assisted Installation
 
@@ -429,7 +428,7 @@ curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VE
 cd kube-agents-<RELEASE_VERSION>
 ```
 
-Alternatively, if you require a Git repository checkout, clone pinned to an official release tag (for example, `0.4.0`):
+Alternatively, if you require a Git repository checkout, clone pinned to an official release tag (for example, `0.4.0`; a GitLab install needs `0.9.0` or later):
 
 ```bash
 git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
@@ -944,10 +943,25 @@ kubectl rollout status deployment -n kubeagents-system
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
 A GitOps repository on GitLab needs no minter: skip `make deploy-github`. Put the GitLab access
-token in a Secret in `kubeagents-system` under the key `token`, and declare the forge in the
-PlatformAgent CR in Step 6: one `spec.integration.forges` entry with `provider: gitlab`, `host` for a
-self-managed instance, and `credentialsRef` naming that Secret, plus the project in
-`spec.integration.repositories` with `role: gitops`. The
+token in a Secret in `kubeagents-system` under the key `token`. Then declare the forge in the
+PlatformAgent CR in Step 6:
+
+```yaml
+spec:
+  integration:
+    forges:
+      - name: gitlab # required; repositories refer to the forge by this name
+        provider: gitlab
+        host: gitlab.example.com # leave out for gitlab.com
+        credentialsRef:
+          name: gitlab-forge-token # the Secret with the key `token`
+    repositories:
+      - forge: gitlab # required: the forge's name
+        repository: platform/infra/gitops # required: the project's full path
+        role: gitops
+```
+
+The
 [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
 describes the fields, and [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
 describes the token.

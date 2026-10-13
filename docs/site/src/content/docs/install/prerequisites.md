@@ -222,7 +222,8 @@ When the GitOps repository is on GitLab (gitlab.com or a self-managed instance),
 
 - **GitLab project:** the GitOps project, created before the install. Note its full path, with its nested groups (`group/subgroup/project`).
 - **Access token:** a group or project access token with the `api` and `write_repository` scopes and the Developer role. On a GitLab tier without group or project access tokens, use a personal access token of a dedicated account that is a Developer member of the project.
-- **Network access:** the cluster must reach the GitLab host over HTTPS. A self-managed instance on a private network needs a route from the cluster.
+- **Network access:** the credential broker pod must reach the GitLab host over HTTPS. A self-managed instance on a private network needs a route from the cluster.
+- **Certificate:** a self-managed instance must present a certificate that the broker trusts. See [Before you start](/kube-agents/install/gitlab/#before-you-start).
 
 See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) for the installer flags and where the token goes.
 

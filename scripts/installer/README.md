@@ -310,6 +310,28 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
+### The GitOps forge
+
+`GITOPS_FORGE` is `github` (the default) or `gitlab`. A GitLab install records these keys:
+
+| Key                   | Value                                                                      |
+| --------------------- | -------------------------------------------------------------------------- |
+| `GITOPS_FORGE`        | `gitlab`                                                                   |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                 |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                         |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`) |
+
+The token, and the path of the file it came from, are never recorded.
+
+- `install.sh` records these keys on a first install, and on a later run that goes on to the apply
+  with a different forge, host, project or Secret name.
+- A run that you decline, or that ends with `--generate-only`, does not change them in an existing
+  file.
+- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`. A switch back to
+  GitHub drops the GitLab keys.
+- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST` or
+  `GITLAB_TOKEN_SECRET` exported in the shell. Use the flags.
+
 ### Projects, folders, organisations and selectors in scope
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
