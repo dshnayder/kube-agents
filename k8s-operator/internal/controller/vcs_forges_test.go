@@ -315,9 +315,12 @@ func TestAGitHubEnterpriseServerForgeReachesTheBroker(t *testing.T) {
 			t.Errorf("the gateway pod mounts the GitHub Enterprise Server CA as %q", volume.Name)
 		}
 	}
-	state := buildGitopsStateConfigMap(agent).Data[gitopsStateManagedReposKey]
-	if want := `[{"type":"github","url":"https://ghe.example.com/acme/infra"}]`; state != want {
-		t.Errorf("managed_repos = %s, expected %s", state, want)
+	stateData := buildGitopsStateConfigMap(agent).Data
+	if want := `[{"type":"github","url":"https://ghe.example.com/acme/infra"}]`; stateData[gitopsStateManagedReposKey] != want {
+		t.Errorf("managed_repos = %s, expected %s", stateData[gitopsStateManagedReposKey], want)
+	}
+	if got := stateData[gitopsStateGitHubHostKey]; got != "ghe.example.com" {
+		t.Errorf("github_host = %q, expected ghe.example.com", got)
 	}
 }
 
@@ -343,6 +346,9 @@ func TestAGitHubDotComInstallRendersTheSameWhateverItsSpelling(t *testing.T) {
 	base := render("")
 	if _, found := base[0].(*corev1.ConfigMap).Data[vcsForgesKey]; found {
 		t.Fatal("a github.com install carries a forge configuration")
+	}
+	if _, found := base[3].(*corev1.ConfigMap).Data[gitopsStateGitHubHostKey]; found {
+		t.Fatal("a github.com install carries a github_host key")
 	}
 	for _, host := range []string{"github.com", "WWW.GitHub.com", "ssh.github.com"} {
 		if got := render(host); !reflect.DeepEqual(got, base) {

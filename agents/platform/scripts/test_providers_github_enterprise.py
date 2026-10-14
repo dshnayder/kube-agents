@@ -32,6 +32,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -342,7 +343,20 @@ class WriteCredentialTest(unittest.TestCase):
 
 
 class ManagedKeysTest(unittest.TestCase):
+    def state(self, github_host: str | None) -> None:
+        """A mounted gitops-state directory, with the operator's `github_host` key or without it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "managed_repos").write_text("[]")
+        if github_host is not None:
+            (root / gitops_workspace.GITHUB_HOST_KEY).write_text(github_host + "\n")
+        patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(root / "managed_repos")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_an_enterprise_entry_is_keyed_and_named_with_its_host(self):
+        self.state(HOST)
         entries = [
             {"type": "github", "url": f"https://{HOST}/acme/infra"},
             {"type": "github", "url": "https://github.com/acme/web"},
@@ -354,9 +368,27 @@ class ManagedKeysTest(unittest.TestCase):
         )
         self.assertEqual(["acme/web", "acme/bare", f"{HOST}/acme/infra"],
                          gitops_workspace._forge_repo_names(entries, gitops_workspace.MANAGED_REPOS_KEY))
-        self.assertEqual(HOST, gitops_workspace.github_host(entries))
-        self.assertEqual("github.com", gitops_workspace.github_host(entries[1:]))
+        self.assertEqual(HOST, gitops_workspace.github_host())
         self.assertTrue(gitops_workspace.is_valid_repo_slug(f"{HOST}/acme/infra"))
+
+    def test_the_host_comes_from_the_operators_key_and_never_from_an_entry(self):
+        # A hand-added GitHub entry on another host must not move the host of
+        # a github.com install: it is skipped with the warning it had before.
+        self.state(None)
+        entries = [{"type": "github", "url": "https://gitlab.acme.example/acme/infra"}]
+        self.assertEqual("github.com", gitops_workspace.github_host())
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            self.assertEqual([], gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY))
+        self.assertIn("typed github but is not a github.com owner/name repository", "\n".join(logs.output))
+        # On a GitHub Enterprise Server install, an entry on a third host is skipped too.
+        self.state(HOST)
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            self.assertEqual([], gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY))
+        # A key that is not a hostname, or names github.com, reads as github.com.
+        for value in ("not a host", "github.com", "WWW.GitHub.com", ""):
+            with self.subTest(value=value):
+                self.state(value)
+                self.assertEqual("github.com", gitops_workspace.github_host())
 
     def test_the_broker_admits_an_enterprise_repository_by_its_host_key(self):
         forge = providers.Registry({"forges": [{"provider": "github", "host": HOST}]}).forges[0]
@@ -516,14 +548,222 @@ class ContentWorkspaceTest(unittest.TestCase):
             self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"),
                              credential_proxy._workspace_locate(f"{HOST}/acme/infra"))
             self.assertEqual(HOST, credential_proxy._workspace_github_host())
-            self.assertIs(registry.forges[0], credential_proxy._provider_forge("github", HOST))
-            with self.assertRaises(PermissionError):
-                credential_proxy._provider_forge("github", "github.com")
+            self.assertIs(registry.forges[0], credential_proxy._provider_forge("github"))
         dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]})
         with mock.patch.object(credential_proxy, "forge_registry", return_value=dotcom):
             self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"),
                              credential_proxy._workspace_locate("github.com/acme/infra"))
             self.assertEqual("github.com", credential_proxy._workspace_github_host())
+
+
+WRITE_TOKEN = "ghs_mockwritetoken0002"
+READ_TOKEN = "ghs_mockreadtoken0003"
+EXTRAHEADER = f"http.https://{HOST}/.extraheader"
+
+
+def _basic(token: str) -> str:
+    return "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True,
+                          env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+                               "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                               "GIT_COMMITTER_EMAIL": "t@example.com"})
+
+
+class _EnterpriseGitCase(unittest.TestCase):
+    """A GitHub Enterprise Server install whose repositories are local bare repositories.
+
+    Every git the broker runs is recorded with the configuration its
+    credential asked for, then run for real with the instance's clone URL
+    pointed at a local bare repository. So the assertion is on what git was
+    actually handed, on the invocations that reach the remote.
+    """
+
+    REMOTE_SUBCOMMANDS = ("clone", "fetch", "push", "ls-remote")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.origins = {}
+        for repo in ("acme/infra", "acme/docs"):
+            origin = self.dir / "origins" / repo
+            origin.mkdir(parents=True)
+            _git(origin, "init", "--quiet", "--bare", "--initial-branch=main")
+            seed = self.dir / "seed" / repo
+            seed.mkdir(parents=True)
+            _git(seed, "init", "--quiet", "--initial-branch=main")
+            (seed / "README.md").write_text("origin\n")
+            _git(seed, "add", "-A")
+            _git(seed, "commit", "--quiet", "-m", "first")
+            _git(seed, "push", "--quiet", str(origin), "main")
+            self.origins[f"https://{HOST}/{repo}.git"] = str(origin)
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [{"provider": "github", "host": HOST}]}))
+        env = mock.patch.dict(os.environ, {FORGES_CONFIG_ENV: str(config)})
+        env.start()
+        self.addCleanup(env.stop)
+        # The module-level registry the routes share is built from the same file.
+        previous = credential_proxy._forge_registry
+        credential_proxy._forge_registry = None
+        self.addCleanup(setattr, credential_proxy, "_forge_registry", previous)
+        self.calls: list[tuple[str, dict]] = []
+
+    def run_git(self, argv, cwd, config=()):
+        """Record the call, then run it with the instance's URLs on local paths."""
+        subcommand = next((a for a in argv[1:] if not a.startswith("-")), "")
+        self.calls.append((subcommand, dict(config)))
+        argv = [self.origins.get(a, a) for a in argv]
+        flags = [f for key, value in config for f in ("-c", f"{key}={value}")]
+        return subprocess.run([argv[0], *flags, *argv[1:]], cwd=str(cwd), capture_output=True, text=True,
+                              env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+                                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                                   "GIT_COMMITTER_EMAIL": "t@example.com"})
+
+    def remote_calls(self) -> list[tuple[str, dict]]:
+        return [(sub, config) for sub, config in self.calls if sub in self.REMOTE_SUBCOMMANDS]
+
+
+class VcsBrokerGitTest(_EnterpriseGitCase):
+    """`clone` and `publish` through the broker hand git the minted token on the host."""
+
+    def broker(self):
+        minted = []
+
+        def mint_write(provider, repo):
+            minted.append(repo)
+            return WRITE_TOKEN
+
+        def git_runner(argv, cwd, check=True, config=()):
+            done = self.run_git(argv, cwd, config)
+            if check and done.returncode != 0:
+                raise subprocess.CalledProcessError(done.returncode, argv, done.stdout, done.stderr)
+            return done
+
+        broker = vcs_broker.VcsBroker(self.dir / "scratch", git_runner=git_runner, mint_write=mint_write)
+        forge = broker.registry.forges[0]
+        # The forge composes the instance's URL; the runner maps it to a local repository.
+        self.assertEqual(f"https://{HOST}/acme/infra.git", forge.clone_url("acme/infra"))
+        return broker, minted
+
+    def test_clone_and_publish_present_the_write_token_to_git_on_the_host(self):
+        broker, minted = self.broker()
+        answer = broker.clone({"repository": f"https://{HOST}/acme/infra"})
+        work = self.dir / "work"
+        bundle = self.dir / "in.bundle"
+        bundle.write_bytes(base64.b64decode(answer["bundleBase64"]))
+        _git(self.dir, "clone", "--quiet", "--branch", answer["branch"], str(bundle), str(work))
+        _git(work, "checkout", "--quiet", "-b", "fix/replicas")
+        (work / "README.md").write_text("changed\n")
+        _git(work, "commit", "--quiet", "-am", "change it")
+        out = self.dir / "out.bundle"
+        _git(work, "bundle", "create", str(out), "fix/replicas", f"^{answer['revision']}")
+        broker.publish({
+            "repository": f"https://{HOST}/acme/infra",
+            "branch": "fix/replicas",
+            "target": "main",
+            "baseRevision": answer["revision"],
+            "bundleBase64": base64.b64encode(out.read_bytes()).decode(),
+        })
+        remote = self.remote_calls()
+        self.assertIn("clone", [sub for sub, _ in remote])
+        self.assertIn("push", [sub for sub, _ in remote])
+        for sub, config in remote:
+            with self.subTest(subcommand=sub):
+                self.assertEqual(_basic(WRITE_TOKEN), config.get(EXTRAHEADER))
+                self.assertEqual("", config.get("credential.helper"))
+                self.assertEqual({EXTRAHEADER, "credential.helper"}, set(config))
+        self.assertEqual({"acme/infra"}, set(minted))
+        tip = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", "refs/heads/fix/replicas").stdout
+        self.assertTrue(tip.strip())
+
+
+class ContentWorkspaceGitTest(_EnterpriseGitCase):
+    """`build_workspace_store` opens a managed and a context repository with the right token."""
+
+    def setUp(self):
+        super().setUp()
+        executor = credential_proxy.CommandExecutor(
+            timeout_seconds=5, max_output_bytes=1 << 16, state_dir=str(self.dir / "state"), scoped_pool=None
+        )
+        self.helper_runs: list[list[str]] = []
+
+        def run_helper(provider, helper, arguments, action, log_success=False):
+            self.helper_runs.append(arguments)
+            if arguments[0] == credential_proxy.FORGE_READ_ONLY_FLAG:
+                stdout = READ_TOKEN
+            else:
+                stdout = json.dumps({"token": WRITE_TOKEN, "repositories": ["acme/infra"]})
+            return credential_proxy.ExecutionResult(exit_code=0, stdout=stdout, stderr="", duration_ms=1,
+                                                    truncated=False, timed_out=False)
+
+        def workspace_git(argv, cwd, config=()):
+            done = self.run_git(argv, cwd, config)
+            return credential_proxy.ExecutionResult(exit_code=done.returncode, stdout=done.stdout,
+                                                    stderr=done.stderr, duration_ms=1, truncated=False,
+                                                    timed_out=False)
+
+        helper = self.dir / "github_token_refresh.py"
+        helper.write_text("")
+        for patcher in (
+            mock.patch.object(credential_proxy, "managed_repositories",
+                              return_value=frozenset({f"github:{HOST}/acme/infra"})),
+            mock.patch.object(credential_proxy, "context_repositories",
+                              return_value=frozenset({f"github:{HOST}/acme/docs"})),
+            mock.patch.object(credential_proxy.CommandExecutor, "_forge_helper", return_value=helper),
+            mock.patch.object(credential_proxy.CommandExecutor, "_run_forge_helper", side_effect=run_helper),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.store = credential_proxy.build_workspace_store(types.SimpleNamespace(
+            content_workspace_root=self.dir / "trees",
+            workspace_dir=self.dir / "agent",
+            execute_workspace_git=workspace_git,
+            mint_read_credential=executor.mint_read_credential,
+            mint_write_credential=executor.mint_write_credential,
+            tls_refusal=executor.tls_refusal,
+        ))
+        (self.dir / "agent").mkdir()
+
+    def test_a_managed_repository_opens_and_pushes_on_the_write_token(self):
+        from content_workspace import Change, repo_relative
+
+        workspace = self.store.open("acme/infra")
+        self.assertEqual(f"{HOST}/acme/infra", workspace.repo)
+        self.store.commit(workspace.handle, "platform-agent/change", "feat: a change",
+                          [Change(repo_relative("notes.md"), b"hello\n")])
+        credential_proxy.require_managed_workspace(self.store, workspace.handle)
+        self.store.push(workspace.handle, "platform-agent/change")
+        remote = self.remote_calls()
+        self.assertIn("clone", [sub for sub, _ in remote])
+        self.assertIn("push", [sub for sub, _ in remote])
+        for sub, config in remote:
+            with self.subTest(subcommand=sub):
+                self.assertEqual(_basic(WRITE_TOKEN), config.get(EXTRAHEADER))
+        # The mint was asked about the forge's path, never the store's host-qualified name.
+        self.assertTrue(self.helper_runs)
+        for arguments in self.helper_runs:
+            self.assertEqual("acme/infra", arguments[-1])
+
+    def test_a_context_repository_opens_on_a_read_token_and_never_the_write_one(self):
+        workspace = self.store.open(f"{HOST}/acme/docs")
+        self.assertEqual(f"{HOST}/acme/docs", workspace.repo)
+        [(sub, config)] = [c for c in self.remote_calls() if c[0] == "clone"]
+        self.assertEqual(_basic(READ_TOKEN), config.get(EXTRAHEADER))
+        self.assertEqual([[credential_proxy.FORGE_READ_ONLY_FLAG, "acme/docs"]], self.helper_runs)
+
+
+class BrokerHostCheckTest(unittest.TestCase):
+    def test_github_owned_hosts_never_build_an_enterprise_forge(self):
+        for host in ("api.github.com", "gist.github.com", "raw.githubusercontent.com", "acme.ghe.com",
+                     "acme.github.io", "githubassets.com"):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                providers.Registry({"forges": [{"provider": "github", "host": host}]})
+        # Every spelling of github.com is the github.com forge, ssh.github.com included.
+        [forge] = providers.Registry({"forges": [{"provider": "github", "host": "ssh.github.com"}]}).forges
+        self.assertEqual(("cli", ("github.com", "www.github.com")), (forge.transport, forge.hosts))
 
 
 class GitHubDotComUnaffectedTest(unittest.TestCase):
@@ -536,7 +776,8 @@ class GitHubDotComUnaffectedTest(unittest.TestCase):
         self.assertIsInstance(forge.credential, providers.BrokeredCredential)
         self.assertEqual(("gh",), registry.executables)
         self.assertEqual("https://github.com/acme/infra.git", forge.clone_url("acme/infra"))
-        self.assertEqual("github.com", gitops_workspace.github_host([{"type": "github", "url": "acme/infra"}]))
+        with mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": "/nonexistent/managed_repos"}):
+            self.assertEqual("github.com", gitops_workspace.github_host())
 
 
 if __name__ == "__main__":

@@ -1160,24 +1160,20 @@ def repository_role(repository: str, forge: providers.Forge | None = None) -> st
     return ROLE_UNREGISTERED
 
 
-def _provider_forge(provider: str, host: str = "") -> providers.Forge:
-    """The configured forge called ``provider``, at ``host`` when one is named, or a refusal.
+def _provider_forge(provider: str) -> providers.Forge:
+    """The configured forge called ``provider``, or a refusal.
 
     For the privileged operations, which are handed a provider name and a path
     by a caller that has already resolved them. A provider this install did not
     build is refused rather than read as the install's one forge: answering for
     it from another forge's list is how a registration on one forge would
-    admit a name on another. With ``host`` the forge must serve it; without
-    one, the first forge of the provider answers. GitHub has one forge per
-    install, at github.com or at one GitHub Enterprise Server host, so for
-    GitHub that forge is the answer either way.
+    admit a name on another. GitHub has one forge per install, at github.com
+    or at one GitHub Enterprise Server host, so for GitHub that forge is the
+    answer.
     """
-    wanted = host.strip().lower()
     for forge in forge_registry().forges:
-        if forge.name == provider and (not wanted or wanted in forge.hosts):
+        if forge.name == provider:
             return forge
-    if wanted:
-        raise PermissionError(f"{provider} at {wanted} is not a forge this install serves")
     raise PermissionError(f"{provider} is not a forge this install serves")
 
 
@@ -1304,18 +1300,50 @@ def _workspace_credential(registry: providers.Registry, repository: str) -> prov
     clone proceeds without one, as an unregistered repository's does, and the
     log says why.
     """
-    if not _is_bare_name(repository):
-        return read_credential_for(registry, repository)
+    if _is_bare_name(repository):
+        try:
+            _provider_forge(CONTENT_WORKSPACE_PROVIDER)
+        except PermissionError:
+            LOGGER.warning(
+                "content workspace open repo=%s: this install serves no %s forge and the "
+                "content workspace clones %s repositories only; cloning without a credential",
+                repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
+            )
+            return providers.NoCredential()
+        repository = _hosted(repository, CONTENT_WORKSPACE_PROVIDER)
+    credential = read_credential_for(registry, repository)
+    if isinstance(credential, providers.NoCredential):
+        return credential
     try:
-        _provider_forge(CONTENT_WORKSPACE_PROVIDER)
-    except PermissionError:
-        LOGGER.warning(
-            "content workspace open repo=%s: this install serves no %s forge and the "
-            "content workspace clones %s repositories only; cloning without a credential",
-            repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
-        )
-        return providers.NoCredential()
-    return read_credential_for(registry, _hosted(repository, CONTENT_WORKSPACE_PROVIDER))
+        _forge, path = registry.resolve(repository)
+    except providers.WorkspaceError:
+        return credential
+    return _ForgePathCredential(credential, path)
+
+
+class _ForgePathCredential:
+    """A credential that the store asks about by its own name, bound to the forge's path.
+
+    The store names a repository on another host `<host>/<path>`, and a
+    credential is asked about the forge's reading of it, `<path>`: a minted
+    credential's managed and context checks key on the forge and the path,
+    and a host left in the path would match no registration. So every call
+    the store makes with its name is answered for the path.
+    """
+
+    def __init__(self, credential: providers.Credential, path: str) -> None:
+        self._credential = credential
+        self._path = path
+        self.stored_token = bool(getattr(credential, "stored_token", False))
+
+    def ensure(self, repo: str) -> None:
+        self._credential.ensure(self._path)
+
+    def headers(self, repo: str) -> dict[str, str]:
+        return self._credential.headers(self._path)
+
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        return self._credential.git_config(self._path)
 
 
 def _workspace_github_host() -> str:
@@ -5079,8 +5107,11 @@ class CommandExecutor:
         # vcs verbs waiting for that lock, guarded by `_slot_condition`: a route
         # refresher waiting for the budget under the lock yields it to them.
         self._covered_refresh_waiter_count = 0
-        self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
-        self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
+        # Keyed by (provider, host) and by (provider, host, org): the token
+        # slot is a forge host's, so a refresh on one host coalesces nothing
+        # on another.
+        self._last_forge_refresh: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
+        self._last_forge_refresh_failure: dict[tuple[str, str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)

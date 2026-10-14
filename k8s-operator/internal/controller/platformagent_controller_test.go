@@ -3665,6 +3665,78 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 }
 
+// The operator owns the gitops-state ConfigMap's github_host key: it is
+// written for a GitHub Enterprise Server host, absent for github.com, and a
+// declaration that moves the host updates it and writes a Warning Event.
+func TestReconcileGitopsStateGitHubHost(t *testing.T) {
+	scheme := setupScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: fakeClient, Scheme: scheme, Recorder: recorder}
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	declare := func(host string) {
+		agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: host, Namespace: "acme"}},
+		}}
+	}
+	cmKey := client.ObjectKey{Name: "test-agent-gitops-state", Namespace: "test-ns"}
+	read := func() (string, bool) {
+		var cm corev1.ConfigMap
+		if err := fakeClient.Get(ctx, cmKey, &cm); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		host, ok := cm.Data[gitopsStateGitHubHostKey]
+		return host, ok
+	}
+	events := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-recorder.Events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
+
+	declare("")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, ok := read(); ok {
+		t.Errorf("a github.com install carries github_host = %q", host)
+	}
+	declare("GHE.example.com")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q, expected ghe.example.com", host)
+	}
+	if got := events(); len(got) != 1 || !strings.Contains(got[0], "GitHubHostChanged") ||
+		!strings.Contains(got[0], "from github.com to ghe.example.com") {
+		t.Errorf("events = %v, expected one GitHubHostChanged warning", got)
+	}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("an unchanged host wrote events: %v", got)
+	}
+	declare("")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, ok := read(); ok {
+		t.Errorf("github_host = %q stayed after the declaration moved back to github.com", host)
+	}
+	if got := events(); len(got) != 1 || !strings.Contains(got[0], "from ghe.example.com to github.com") {
+		t.Errorf("events = %v, expected one GitHubHostChanged warning", got)
+	}
+}
+
 func TestReconcileGitopsStateConfigMap(t *testing.T) {
 	scheme := setupScheme()
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()

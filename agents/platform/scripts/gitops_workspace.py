@@ -950,64 +950,54 @@ def extract_github_slug(entry: str) -> str | None:
     )
 
 
-#: Domains under which GitHub runs its own services, and GitLab's: a host at or
-#: under one is never a GitHub Enterprise Server instance. The operator's
-#: github provider refuses the same (`ReservedDomains` in gitprovider.go).
-NOT_ENTERPRISE_DOMAINS = (
-    "github.com", "githubusercontent.com", "githubassets.com", "githubapp.com",
-    "github.io", "github.dev", "ghe.com", "gitlab.com",
-)
+#: The gitops-state ConfigMap key that names the install's GitHub host. The
+#: operator writes it only for a GitHub Enterprise Server host, so a github.com
+#: install has no such key and reads as github.com.
+GITHUB_HOST_KEY = "github_host"
 
 
-def github_enterprise_ref(entry: str) -> tuple[str, str] | None:
-    """`(host, owner/name)` for a GitHub entry URL on a GitHub Enterprise Server host, else None.
+def github_host() -> str:
+    """The install's one GitHub host: github.com, or its GitHub Enterprise Server host.
 
-    The operator seeds a repository on a GitHub forge at a GitHub Enterprise
-    Server host as its full URL, `https://<host>/owner/name`. A github.com
-    URL, a bare name, a host that is not a fully qualified name, and a path
-    that is not `owner/name` answer None: `extract_github_slug` reads the
-    github.com ones.
+    Read from the operator's `github_host` key in the mounted gitops-state
+    ConfigMap, and never inferred from a repository entry: an entry is
+    administrator-writable, and one hand-added URL must not move the host
+    every refresh and publish goes to. github.com when the key is absent,
+    unreadable, or not a fully qualified hostname. No kubectl fallback, so a
+    hot path such as a chat message parser can ask.
     """
-    if _names_a_port(entry):
-        return None
-    ref = repo_ref.try_parse(str(entry or ""))
-    if ref is None or not ref.host:
-        return None
-    host = ref.host.lower()
-    if not HOSTNAME_RE.fullmatch(host) or any(
-        host == domain or host.endswith("." + domain) for domain in NOT_ENTERPRISE_DOMAINS
-    ):
-        return None
-    if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH or not repo_ref.is_github_slug(ref.path):
-        return None
-    return host, ref.path
-
-
-def github_host(entries: list[dict[str, str]] | None = None) -> str:
-    """The install's one GitHub host: github.com, or the GitHub Enterprise Server host.
-
-    Read from the GitHub entries of the repository lists: the host of the
-    first one on a GitHub Enterprise Server host, which the operator seeds by
-    its full URL. github.com when there is none. An install serves one GitHub
-    host, so the first answers for all of them. Without `entries`, the mounted
-    managed and context lists are read, with no kubectl fallback, so a hot
-    path such as a chat message parser can ask.
-    """
-    if entries is None:
-        entries = mounted_repo_entries(MANAGED_REPOS_KEY) + mounted_repo_entries(CONTEXT_REPOS_KEY)
-    for entry in entries:
-        if str(entry.get("type") or "") != GITHUB_REPO_TYPE:
-            continue
-        found = github_enterprise_ref(str(entry.get("url") or ""))
-        if found is not None:
-            return found[0]
-    return repo_ref.GITHUB_CANONICAL_HOST
+    try:
+        value = _state_key_path(GITHUB_HOST_KEY).read_text(encoding="utf-8").strip().lower()
+    except (OSError, UnicodeDecodeError):
+        return repo_ref.GITHUB_CANONICAL_HOST
+    if not HOSTNAME_RE.fullmatch(value) or value in repo_ref.GITHUB_HOSTS:
+        return repo_ref.GITHUB_CANONICAL_HOST
+    return value
 
 
 def is_github_host(host: str) -> bool:
     """Whether `host` is github.com in a spelling, or the install's GitHub Enterprise Server host."""
     folded = str(host or "").strip().lower()
     return folded in repo_ref.GITHUB_HOSTS or (bool(folded) and folded == github_host())
+
+
+def github_enterprise_ref(entry: str, host: str | None = None) -> tuple[str, str] | None:
+    """`(host, owner/name)` for a GitHub entry URL on the install's GitHub Enterprise Server host.
+
+    None for any other URL: a github.com one (`extract_github_slug` reads
+    those), a bare name, a URL on another host, a port, or a path that is not
+    `owner/name`. `host` is the install's GitHub host, read with
+    `github_host` when not given; on a github.com install nothing matches.
+    """
+    host = (github_host() if host is None else host).lower()
+    if host == repo_ref.GITHUB_CANONICAL_HOST or _names_a_port(entry):
+        return None
+    ref = repo_ref.try_parse(str(entry or ""))
+    if ref is None or not ref.host or ref.host.lower() != host:
+        return None
+    if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH or not repo_ref.is_github_slug(ref.path):
+        return None
+    return host, ref.path
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
@@ -1240,6 +1230,7 @@ def _github_entries(
     """
     res: list[dict] = []
     seen: set[str] = set()
+    install_host = github_host()
     for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
@@ -1251,7 +1242,7 @@ def _github_entries(
             )
             continue
         slug = extract_github_slug(url)
-        if not slug and github_enterprise_ref(url) is not None:
+        if not slug and github_enterprise_ref(url, install_host) is not None:
             # A GitHub Enterprise Server repository: named with its host by
             # `get_managed_repos`, never as a bare slug, which reads as
             # github.com everywhere a link or a CLI call is built from it.
@@ -1291,12 +1282,14 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
     lowercased, since both forges this is written for compare names that way.
 
     A GitHub entry may be written as a bare `owner/name`, as it always could,
-    and is keyed under its canonical host. A GitHub entry on a GitHub
-    Enterprise Server host is keyed under that host. Any other forge's entry must name
+    and is keyed under its canonical host. A GitHub entry on the install's
+    GitHub Enterprise Server host (`github_host`) is keyed under that host;
+    one on any other host is skipped. Any other forge's entry must name
     its host -- a self-managed instance has no canonical one -- and one that
     does not is skipped with a warning, as an unreadable GitHub URL is.
     """
     keys: list[str] = []
+    install_host = github_host()
     for entry in entries:
         url = entry.get("url", "")
         kind = str(entry.get("type") or "")
@@ -1306,7 +1299,7 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
         if kind == GITHUB_REPO_TYPE:
             slug = extract_github_slug(url)
             item = f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" if slug else None
-            enterprise = None if slug else github_enterprise_ref(url)
+            enterprise = None if slug else github_enterprise_ref(url, install_host)
             if enterprise is not None:
                 # Keyed under its own host: the broker's GitHub forge at that
                 # host asks `github:<host>/owner/name`, and a github.com forge
@@ -1332,8 +1325,7 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
             # forge's URL typed `github` from habit.
             LOGGER.warning(
                 "Skipping %s repository %r: it is typed github but is not a "
-                "github.com owner/name repository, nor one on a GitHub Enterprise "
-                "Server host; correct its type or its URL.",
+                "github.com owner/name repository; correct its type or its URL.",
                 key, url,
             )
             continue
@@ -1444,13 +1436,14 @@ def _forge_repo_names(
         [e for e in entries if e.get("type") == GITHUB_REPO_TYPE], key, fold_case=False
     )]
     others: list[str] = []
+    install_host = github_host()
     for entry in entries:
         kind, url = entry.get("type"), entry.get("url", "")
         if kind == GITHUB_REPO_TYPE:
             # A GitHub Enterprise Server repository is named with its host, as
             # another forge's is: the links and the broker read the host from
             # the name.
-            enterprise = None if extract_github_slug(url) else github_enterprise_ref(url)
+            enterprise = None if extract_github_slug(url) else github_enterprise_ref(url, install_host)
             if enterprise is not None:
                 name = "/".join(enterprise)
                 if name not in others:

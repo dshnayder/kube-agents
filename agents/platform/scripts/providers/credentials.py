@@ -217,8 +217,10 @@ class MintedWriteCredential:
     installs anything. `ensure` asks the executor for a token, which keeps it
     in memory and nowhere else, and this object hands it to the two places
     that spend it: the API transport as an `Authorization` header, and the one
-    git invocation about to run as an `extraheader` on this forge's host. It
-    never reaches argv, the environment, a file, or a CLI's store.
+    git invocation about to run as an `extraheader` on this forge's host. It is
+    in the environment of the one git process that spends it
+    (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's store or the
+    sandbox.
 
     `stored_token` is set for the content workspace's reason: no ambient
     helper stands behind this token, so a managed clone presents it on its own

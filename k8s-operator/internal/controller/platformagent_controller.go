@@ -84,6 +84,10 @@ const (
 	// ones. gitops_workspace.py names the same two keys on the agent side.
 	gitopsStateManagedReposKey = "managed_repos"
 	gitopsStateContextReposKey = "context_repos"
+	// gitopsStateGitHubHostKey is the install's GitHub host, written only when
+	// it is a GitHub Enterprise Server host. The agent reads it, with
+	// github.com as the default, so a github.com install carries no key.
+	gitopsStateGitHubHostKey = "github_host"
 	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
 	// template render; minterBaseTemplateKey is the policy every rendered key is
 	// derived from.
@@ -1385,6 +1389,34 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			updated = true
 		}
 	}
+	// The GitHub host key is the operator's alone: written from the
+	// declaration, and removed when the declaration names github.com. A
+	// declaration that does not resolve leaves it as it is, as it leaves the
+	// lists.
+	if wantHost, resolved := declaredGitHubHost(agent); resolved {
+		haveHost, present := found.Data[gitopsStateGitHubHostKey]
+		if (haveHost != wantHost && wantHost != "") || (wantHost == "" && present) {
+			previous, next := haveHost, wantHost
+			if previous == "" {
+				previous = agentv1alpha1.DefaultGitHubHost
+			}
+			if next == "" {
+				next = agentv1alpha1.DefaultGitHubHost
+			}
+			r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonGitHubHostChanged, fmt.Sprintf(
+				"the install's GitHub host changed from %s to %s; the first GitHub forge declared that can be served decides it, and repositories registered on %s are no longer served",
+				previous, next, previous))
+			if found.Data == nil {
+				found.Data = map[string]string{}
+			}
+			if wantHost == "" {
+				delete(found.Data, gitopsStateGitHubHostKey)
+			} else {
+				found.Data[gitopsStateGitHubHostKey] = wantHost
+			}
+			updated = true
+		}
+	}
 	if updated {
 		if err := r.Update(ctx, found); err != nil {
 			return err
@@ -1392,6 +1424,28 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+}
+
+// conditionReasonGitHubHostChanged is the Event reason for a reconcile that
+// moves the install's GitHub host.
+const conditionReasonGitHubHostChanged = "GitHubHostChanged"
+
+// declaredGitHubHost is the GitHub host the gitops-state ConfigMap carries:
+// "" for github.com, so a github.com install carries no key, and the GitHub
+// Enterprise Server host otherwise. resolved is false when the declaration
+// does not resolve, and the key is then left as it is.
+func declaredGitHubHost(agent *agentv1alpha1.PlatformAgent) (host string, resolved bool) {
+	if agent.Spec.Integration == nil {
+		return "", true
+	}
+	ri, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return "", false
+	}
+	if h := ri.GitHubHost(); h != agentv1alpha1.DefaultGitHubHost {
+		return h, true
+	}
+	return "", true
 }
 
 // mergeRepoEntries puts front before a repository list's JSON and back after

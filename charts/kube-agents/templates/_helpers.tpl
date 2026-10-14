@@ -666,6 +666,7 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $gitlabHosts := dict -}}
 {{- $hostProviders := dict -}}
 {{- $ghHost := "" -}}
+{{- $ghCA := "" -}}
 {{- /* Mirrors the github provider's ReservedDomains. */ -}}
 {{- $githubReserved := "(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com)$" -}}
 {{- range $i, $f := $forges -}}
@@ -721,6 +722,14 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
 {{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
+{{- end -}}
+{{- /* One CA bundle for the one GitHub host, as the operator's hostConflicts: the broker trusts one bundle per host. */ -}}
+{{- if eq $provider "github" -}}
+{{- $thisCA := printf "%s/%s" $caMap ($caKey | default "ca.crt") -}}
+{{- if and $ghCA (ne $ghCA $thisCA) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s already has a CA bundle, %s; the broker trusts one CA bundle per host, so name the same Secret key on both forges or on one" $i $ghHost $ghCA) -}}
+{{- end -}}
+{{- $ghCA = $thisCA -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $provider "gitlab" -}}

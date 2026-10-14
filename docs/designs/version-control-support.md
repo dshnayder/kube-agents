@@ -1534,7 +1534,10 @@ minter, and the minter mints for one GitHub host. So an install serves
 github.com or one GitHub Enterprise Server, never both. The operator refuses a
 second GitHub forge at another host, and it refuses one host that two providers
 claim. Two GitHub forges at one host are still allowed: they name two
-organisations, as they always could.
+organisations, as they always could. The first GitHub forge declared that can
+be served decides the host. A change of the declaration that moves the host
+writes a `GitHubHostChanged` Warning Event on the PlatformAgent, because the
+repositories registered on the old host are then no longer served.
 
 **The host.** A GitHub forge's `host` may be a GitHub Enterprise Server
 hostname. A spelling of github.com folds to github.com. A host at or under a
@@ -1559,8 +1562,9 @@ minter as on github.com. What changes is where the broker keeps it:
   (`MintedWriteCredential`). The API client sends it as an `Authorization`
   header. git gets it as `http.https://<host>/.extraheader` on that host only,
   in the configuration of the one git invocation that spends it, with
-  `credential.helper` cleared. The token never goes into argv, the environment,
-  a file or a CLI's store. The broker uses one token again for 30 minutes for
+  `credential.helper` cleared. The token is in the environment of the one git
+  process that spends it (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's
+  store or the sandbox, as the read token is. The broker uses one token again for 30 minutes for
   each repository it covers, and it checks the managed list on every request.
 - A context repository gets a read-only token for each clone, as on github.com.
 
@@ -1582,7 +1586,12 @@ repository `<host>/owner/name`, as it names another forge's repository. A bare
 so a name with its host is what keeps the links right. The links that the
 scripts build from a repository use the host in the name: the fleet-audit
 ledger, the audit headline and the opened-pull-request message. The install's
-GitHub host is read from the GitHub entries of the repository lists.
+GitHub host is the `github_host` key of the gitops-state ConfigMap. The
+operator writes the key only for a GitHub Enterprise Server host, so a
+github.com install has no key and reads as github.com. The host is never read
+from a repository entry: the lists are administrator-writable, and one entry
+added by hand must not move the host that every refresh and publish goes to. A
+GitHub entry on any other host is skipped with a warning.
 
 **What it does not include.**
 
@@ -1593,6 +1602,11 @@ GitHub host is read from the GitHub entries of the repository lists.
   as a host; it has its own API host and needs a check of its own.
 - **A port.** The broker reads a forge on the standard HTTPS port only, as for
   GitLab.
+- **A renamed repository.** GitHub answers a renamed repository with a
+  redirect to its new name. The API client refuses every redirect, and git on
+  a host with a CA bundle follows none, so an API call on the old name fails
+  with `FORGE_REDIRECTED` and a clone on it fails. Declare the repository by
+  its new name.
 
 ### Where the error contract splits
 
@@ -2563,7 +2577,10 @@ other host:
 - git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
   file across a redirect, so a redirect would carry the CA to another host.
   GitLab answers a moved project in the git protocol itself, and its clone URLs
-  end in `.git`, so its git traffic needs no redirect.
+  end in `.git`, so its git traffic needs no redirect. GitHub Enterprise Server
+  redirects a renamed repository to its new name. That redirect is refused too,
+  so a renamed repository is declared by its new name; the CA and the token
+  never follow a redirect to another host.
 
 Python 3.13 turns on strict X.509 checks in its default context. These checks
 refuse a CA certificate with no Key Usage extension, and a server certificate

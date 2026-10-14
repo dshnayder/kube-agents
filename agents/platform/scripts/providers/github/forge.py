@@ -64,9 +64,23 @@ MAX_ISSUE_PAGES = 10
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
 
 
-#: github.com and the spelling of it a registered URL may carry. Every other
-#: host a GitHub forge is configured at is a GitHub Enterprise Server instance.
+#: The hosts the github.com forge resolves: github.com and the spelling of it a
+#: registered URL may carry.
 DOTCOM_HOSTS = ("github.com", "www.github.com")
+
+#: Domains under which GitHub runs its own services. A host at or under one is
+#: never a GitHub Enterprise Server instance, so no forge is built there with
+#: a minted token and a private CA. The operator refuses the same domains
+#: (`ReservedDomains` in gitprovider.go); this is the broker's own check for a
+#: configuration written another way.
+GITHUB_OWNED_DOMAINS = (
+    "github.com", "githubusercontent.com", "githubassets.com", "githubapp.com",
+    "github.io", "github.dev", "ghe.com",
+)
+
+
+def _github_owned(host: str) -> bool:
+    return any(host == domain or host.endswith("." + domain) for domain in GITHUB_OWNED_DOMAINS)
 
 #: The REST API's prefix on a GitHub Enterprise Server instance.
 ENTERPRISE_API_PREFIX = "/api/v3"
@@ -93,8 +107,9 @@ class GitHubForge(Forge):
     ) -> None:
         super().__init__()
         self._mint = mint
-        if host in DOTCOM_HOSTS:
-            # github.com presents a certificate the public CAs sign, and a
+        if host in repo_ref.GITHUB_HOSTS:
+            # Every spelling of github.com, ssh.github.com included, is the
+            # github.com forge. github.com presents a certificate the public CAs sign, and a
             # private CA must never vouch for it: the operator refuses
             # caBundleRef there, and a configuration written another way is
             # refused here too.
@@ -102,6 +117,8 @@ class GitHubForge(Forge):
                 raise ValueError(f"the {self.name} forge at {host} names a caFile; only a GitHub Enterprise Server host may")
             self.credential = BrokeredCredential(self.name, refresh)
             return
+        if _github_owned(host):
+            raise ValueError(f"{host} is a service GitHub operates, not a GitHub Enterprise Server host")
         # A GitHub Enterprise Server instance: one host, the in-process
         # transport, and a write token in memory. No CLI: gh is never logged
         # in to the instance, so its store and its git helper never hold a
@@ -136,7 +153,7 @@ class GitHubForge(Forge):
             if not mine:
                 return ()
             hosts = {str(entry.get("host") or "") for entry in mine}
-            folded = {"github.com" if h in DOTCOM_HOSTS else h for h in hosts}
+            folded = {"github.com" if h in repo_ref.GITHUB_HOSTS else h for h in hosts}
             if len(folded) > 1:
                 raise ValueError(
                     f"the {cls.name} forge is configured at {', '.join(sorted(folded))}; "

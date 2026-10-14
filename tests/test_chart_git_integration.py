@@ -689,6 +689,11 @@ class ChartGitIntegrationTest(unittest.TestCase):
                                          *_forge(1, name="gl", provider="gitlab", host="GIT.example.com", namespace="acme"),
                                          secret),
              "forges[1].host: git.example.com is already the host of a github forge"),
+            ("two CA bundles", (*_forge(0, name="a", host="ghe.example.com", namespace="acme"),
+                                f"{_P}forges[0].caBundleRef.name=ca-one",
+                                *_forge(1, name="b", host="ghe.example.com", namespace="beta"),
+                                f"{_P}forges[1].caBundleRef.name=ca-two"),
+             "forges[1].host: ghe.example.com already has a CA bundle"),
         ):
             with self.subTest(case=label):
                 result = _render(_CR_TEMPLATE, *sets)
