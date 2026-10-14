@@ -4552,9 +4552,9 @@ validate_gitops_forge_flags() {
     fi
     # A regular file can be read now and again after the apply, so an empty
     # one stops the run here, before anything is built. A one-shot source
-    # (/dev/stdin, a process substitution) is not read here: reading it would
-    # use it up, so create_gitlab_token_secret still checks it after the apply.
-    if [ -f "$PARAM_GITLAB_TOKEN_FILE" ]; then
+    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
+    # can use it up, so create_gitlab_token_secret checks it after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
       local early_token=""
       IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
       early_token="$(gitlab_token_strip "$early_token")"
@@ -4595,11 +4595,11 @@ validate_gitops_forge_flags() {
       [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
       return 1
     fi
-    # A regular file is checked now, before the apply records the ConfigMap's
-    # name in install.env, the tfvars and the CR. /dev/stdin and a process
-    # substitution can be read only once, so they are checked when they are
-    # read, after the apply.
-    if [ -f "$PARAM_GITOPS_CA_FILE" ]; then
+    # A regular file is checked now, before the apply records the Secret's
+    # name in install.env, the tfvars and the CR. /dev/stdin, /dev/fd/N and a
+    # process substitution can be read only once, so they are checked when
+    # they are read, after the apply.
+    if gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
       local pem_problem
       pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
       if [ -n "$pem_problem" ]; then
@@ -4660,6 +4660,32 @@ apply_gitlab_token_secret() {
     print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
+}
+
+# True when PATH is a file the installer can read now and again later: a
+# regular file outside /dev and /proc, also after symlinks are resolved.
+# /dev/stdin, /dev/fd/N and a process substitution can be a redirected regular
+# file, and `[ -f ]` is then true. On macOS, opening /dev/fd/N shares the
+# descriptor's offset, so an early read moves it to the end and the read after
+# the apply finds nothing. Such a source is read only after the apply.
+gitops_source_is_rereadable() {
+  local path="$1" target="" hops=0
+  [ -f "$path" ] || return 1
+  # Every hop of a symlink chain is checked, not only its end: on Linux,
+  # /dev/stdin resolves through /proc/self/fd/0 to the redirected file itself.
+  while :; do
+    case "$path" in
+      /dev/* | /proc/*) return 1 ;;
+    esac
+    [ -L "$path" ] || return 0
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    target="$(readlink -- "$path" 2>/dev/null)" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="$(dirname -- "$path")/$target" ;;
+    esac
+  done
 }
 
 # A token as GitLab issues it is one line; a file or a paste often carries a
@@ -5567,8 +5593,9 @@ main() {
   fi
 
   # The GitOps forge's inputs need nothing but themselves, so they are judged
-  # before any work: a GitLab install handed a GitHub App, a bad host or an
-  # unreadable token source stops here, not after the cluster is built.
+  # before any work: a GitLab install handed a GitHub App, a bad host, an
+  # unreadable token source or an empty token file stops here, not after the
+  # cluster is built.
   validate_gitops_forge_flags || exit 1
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation

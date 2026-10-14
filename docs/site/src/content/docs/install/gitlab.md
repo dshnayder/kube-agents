@@ -41,14 +41,14 @@ takes the token's value:
   --gitlab-token-file="$HOME/secure/gitlab-token"
 ```
 
-| Flag                    | `install.env` key                      | Meaning                                                                                                                                                         |
-| ----------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                 |
-| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit for gitlab.com. A GitHub host is refused.                                                               |
-| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                           |
-| `--gitlab-token-file`   | _never recorded_                       | A file (or `/dev/stdin`, or `<(command)`) holding the token. Read once, piped into the Secret, and neither its path nor its contents is written anywhere else.  |
-| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                |
-| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A PEM file with the private CA that signed a self-managed instance's certificate. Read once into Secret `gitlab-forge-ca`. Its path is not recorded. See below. |
+| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                                                                                                  |
+| ----------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                                                                                                                                          |
+| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit for gitlab.com. A GitHub host is refused.                                                                                                                                                                                        |
+| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                                                                                                                                                    |
+| `--gitlab-token-file`   | _never recorded_                       | A file (or `/dev/stdin`, or `<(command)`) holding the token. A regular file is checked before the apply and read after it. `/dev/stdin` and `<(command)` are read once, after the apply. The token goes into the Secret, and neither its path nor its contents is written anywhere else. |
+| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                                                                                                                                         |
+| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A PEM file with the private CA that signed a self-managed instance's certificate. Read once into Secret `gitlab-forge-ca`. Its path is not recorded. See below.                                                                                                                          |
 
 `--github-app-id` and `--github-pem-path` are refused with `--gitops-forge=gitlab`.
 
@@ -91,10 +91,10 @@ your shell is ignored; use the flags.
 
 A re-run of `install.sh` keeps an existing Secret unless you give it a new token file, or
 choose to replace it at the prompt. An empty token (whitespace only) is refused, and
-nothing is stored. A token file that is a regular file is read before the apply, also in a
-dry run, so an empty file stops the run before anything is built. A one-shot source, such as
-`/dev/stdin` or a process substitution, is read only after the apply, because a read uses
-it up.
+nothing is stored. A token file that is a regular file is checked before the apply, also in
+a `--dry-run` or a `--generate-only` run, so an empty file stops the run before anything is
+built. `/dev/stdin`, `/dev/fd/N` and a process substitution are read only after the apply, on
+every platform, because a read can use them up.
 
 ## A self-managed GitLab with a private CA
 

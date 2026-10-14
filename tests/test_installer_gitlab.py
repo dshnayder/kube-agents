@@ -1108,6 +1108,68 @@ class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
         self.assertIn("v=0 left=tok-from-pipe", proc.stdout, proc.stderr)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
 
+    def test_a_redirected_file_on_dev_fd_survives_repeated_validation(self):
+        # Review: on macOS, /dev/fd/N on a redirected regular file shares the
+        # offset, and `[ -f ]` is true, so an early read moved it to the end.
+        # The validator runs up to three times in one install; the token must
+        # still reach the read after the apply.
+        tok = self._tmp / "token-file"
+        tok.write_text(_SENTINEL + "\n")
+        proc = self._validate_with(
+            f"exec 9< {shlex.quote(str(tok))}\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/9\n"
+            "validate_gitops_forge_flags && a=0 || a=$?\n"
+            "validate_gitops_forge_flags && b=0 || b=$?\n"
+            'IFS= read -r -d "" got </dev/fd/9 || true\n'
+            'got="$(gitlab_token_strip "$got")"\n'
+            '[ "$got" = ' + shlex.quote(_SENTINEL) + ' ] && ok=yes || ok=no\n'
+            'echo "a=$a b=$b token-kept=$ok"'
+        )
+        self.assertIn("a=0 b=0 token-kept=yes", proc.stdout, proc.stderr)
+        self.assertNotIn(_SENTINEL, proc.stdout + proc.stderr)
+
+
+class GitOpsSourceIsRereadableTest(unittest.TestCase):
+    """The guard both pre-apply checks use: only a regular file outside /dev
+    and /proc, also after symlinks, is read before the apply."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _check(self, preamble, path):
+        setup = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"{preamble}\n"
+            f'gitops_source_is_rereadable {shlex.quote(path)} && echo "yes" || echo "no"\n'
+        )
+        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        return _run_installer_bash(setup, env).stdout.strip().splitlines()[-1]
+
+    def test_a_regular_file_is_rereadable(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        self.assertEqual("yes", self._check("", str(f)))
+
+    def test_dev_fd_on_a_redirected_regular_file_is_not(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        self.assertEqual("no", self._check(f"exec 9< {shlex.quote(str(f))}", "/dev/fd/9"))
+        self.assertEqual("no", self._check(f"exec 0< {shlex.quote(str(f))}", "/dev/stdin"))
+
+    def test_a_symlink_to_dev_stdin_is_not(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        link = self._tmp / "link"
+        link.symlink_to("/dev/stdin")
+        self.assertEqual("no", self._check(f"exec 0< {shlex.quote(str(f))}", str(link)))
+
+    def test_a_directory_or_a_missing_path_is_not(self):
+        self.assertEqual("no", self._check("", str(self._tmp)))
+        self.assertEqual("no", self._check("", str(self._tmp / "missing")))
+
 
 if __name__ == "__main__":
     unittest.main()
