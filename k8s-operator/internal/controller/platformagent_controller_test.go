@@ -6259,8 +6259,10 @@ func TestMinterGitHubHost(t *testing.T) {
 	if got := minterGitHubHost(agent); got != agentv1alpha1.DefaultGitHubHost {
 		t.Errorf("minterGitHubHost(no integration) = %q", got)
 	}
-	agent.Spec.Integration = &agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{
-		{Name: "ghe", Provider: "github", Host: "GHE.example.com", Namespace: "test-org"},
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+		Forges: []agentv1alpha1.ForgeSpec{
+			{Name: "ghe", Provider: "github", Host: "GHE.example.com", Namespace: "test-org"},
+		},
 	}}
 	if got := minterGitHubHost(agent); got != "ghe.example.com" {
 		t.Errorf("minterGitHubHost(GHES forge) = %q, expected ghe.example.com", got)
