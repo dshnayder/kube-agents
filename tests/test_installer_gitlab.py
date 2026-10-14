@@ -709,6 +709,25 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
                 self.assertRegex(proc.stdout, r"rc=[1-9] cm=\s*$", proc.stderr + proc.stdout)
                 self.assertIn(message, proc.stdout + proc.stderr)
 
+    def test_a_ca_on_a_descriptor_is_not_read_before_the_apply(self):
+        # Review: the CA pre-check uses gitops_source_is_rereadable. A CA on
+        # /dev/fd/N is read only after the apply, so a bad PEM there is not
+        # refused here, and the descriptor still holds its content. With
+        # `[ -f ]` (the old check) Linux reads /dev/fd/9 and refuses it here.
+        bad = self._tmp / "not-pem-on-fd.pem"
+        bad.write_text("hello\n")
+        body = (
+            f"exec 9< {shlex.quote(str(bad))}\n"
+            "PARAM_GITOPS_FORGE=gitlab PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token "
+            "PARAM_GITOPS_HOST=gitlab.internal PARAM_GITOPS_REPO=group/project "
+            "PARAM_GITOPS_CA_FILE=/dev/fd/9 PARAM_GITOPS_CA_FILE_FROM_FLAG=true\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?\n'
+            'IFS= read -r line <&9 || true\n'
+            'echo "rc=$rc left=[$line]"'
+        )
+        proc = self._run_install_func(body)
+        self.assertIn("rc=0 left=[hello]", proc.stdout, proc.stderr + proc.stdout)
+
     def test_an_interview_on_an_unreadable_ca_path_can_answer_none_next(self):
         # The prompt offers no default, and a refused interview answer is
         # cleared, so the next pass can leave the CA empty.
