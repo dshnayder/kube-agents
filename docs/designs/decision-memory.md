@@ -50,6 +50,7 @@ From these pain points, enterprise adopters defined six expectations for long-te
 | Adopter expectation | Operational requirement |
 | --- | --- |
 | **Explain past rationale** | Answer *"Why is X configured this way?"* with the exact decision ID, the pull request URL, and the approver. |
+| **Day-one "first two hours" bootstrap** | Scan the past 2 years of repository pull requests within 2 hours of onboarding and produce a baseline "state of being" for the environment. |
 | **Triage history at scale** | Scan years of past pull requests, `/docs` folders, and external wikis incrementally. Separate active rules from superseded, rejected, or anachronistic changes. |
 | **Resolve contradictory PRs** | When one pull request accepted a change and another rejected or reversed it, apply deterministic precedence rules instead of similarity ranking. |
 | **Learn from agent actions** | Capture lessons automatically when an agent fix pull request merges and resolves the issue, or when a fix fails or is rejected. |
@@ -245,6 +246,23 @@ To solve the cold-start problem on existing repositories, an incremental harvest
 | `noise` | Formatting edits, version bumps, or commits with no stated rationale. | Ignore. |
 
 4. **Priority ordering.** Each curation PR orders drafts by impact: paths with incident findings first, repeatedly edited guarded fields second, and newest merges third.
+
+##### The "first two hours" bootstrap
+
+When an organization installs `kube-agents`, the agent starts with zero institutional context—like a new junior engineer on day one.
+Adopters expect the system to scan 2 years of pull requests within 2 hours and produce a baseline "state of being".
+
+Scanning 2 years of pull requests sequentially with an LLM would exceed the 2-hour window.
+The bootstrap mode (`decision_memory.py bootstrap --since 2y --budget-minutes 120`) meets the 2-hour target through four deterministic stages before calling the model:
+
+| Stage | Time budget | Operation | Output |
+| --- | --- | --- | --- |
+| **1. Fast git & metadata scan** | $0\text{–}15\text{ min}$ | Scan 2 years of `git log` and forge PR metadata (`gh pr list --state all`) without LLM calls. Identify governed files, revert commits, high-churn resource fields (`memory`, `cpu`, `limits`, `replicas`, `maxSurge`, `PodDisruptionBudget`, `ResourceQuota`), and PRs linked to incidents. | Ranked candidate list of $50\text{–}150$ high-signal PRs out of thousands. |
+| **2. Five-way deterministic triage** | $15\text{–}30\text{ min}$ | Compare each candidate's diff against the current `HEAD` tree. Classify candidates into `current`, `superseded`, `rejected`, `anachronistic`, or `noise`. | Filtered set of `current` and `rejected` candidates that still govern `HEAD`. |
+| **3. Parallel draft generation** | $30\text{–}90\text{ min}$ | Synthesize `DEC-YYYY-NNN.md` and negative `LES-YYYY-NNN.md` drafts (`status: proposed`) for the top-ranked candidates per area (namespace, cluster family, or build pipeline). | Scoped record drafts with `guard` blocks and PR evidence links. |
+| **4. Baseline "state of being" PR** | $90\text{–}120\text{ min}$ | Open a bootstrap pull request containing `knowledge/STATE_OF_BEING.md` (architecture summary, hot spots, active constraints, and uncovered areas) plus the initial batch of proposed records. | Reviewable day-one baseline ready for the platform team within 2 hours. |
+
+Once the initial bootstrap completes, the harvester switches to incremental watermark mode and backfills any remaining lower-priority history in bounded weekly slices.
 
 #### Path W3 — Populate from explicit chat statements
 
