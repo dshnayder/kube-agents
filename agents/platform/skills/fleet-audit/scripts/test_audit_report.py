@@ -15028,6 +15028,17 @@ class TestRemediateRefusesWhereNoProposalCanLand(unittest.TestCase):
         self.assertIn("directory mode", str(caught.exception))
 
 
+class TestRefreshCredentialsOnAnotherHost(unittest.TestCase):
+    def test_the_log_does_not_call_a_minted_token_stored(self):
+        # A GitHub Enterprise Server repository's token is minted by the broker.
+        logged = []
+        with patch.object(audit_report, "log", side_effect=logged.append), \
+                patch("github_token_refresh.refresh_git_credentials") as refresh:
+            audit_report.refresh_credentials("ghe.example.com/acme/infra")
+        refresh.assert_not_called()
+        self.assertEqual(["No credential refresh for ghe.example.com/acme/infra: the broker presents its forge's token itself."], logged)
+
+
 class TestLedgerStoreForNestedPaths(unittest.TestCase):
     def setUp(self):
         # Only the path is computed; nothing is created under it.

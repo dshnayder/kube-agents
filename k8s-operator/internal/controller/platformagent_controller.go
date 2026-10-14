@@ -1442,6 +1442,12 @@ func declaredGitHubHost(agent *agentv1alpha1.PlatformAgent) (host string, resolv
 	if err != nil {
 		return "", false
 	}
+	// A declared GitHub forge that validation refuses holds the key as it
+	// is, as a refusal holds the minter's organisation and the egress: a typo
+	// in the instance's forge must not move the install back to github.com.
+	if ri.GitHubForgeRefused() {
+		return "", false
+	}
 	if h := ri.GitHubHost(); h != agentv1alpha1.DefaultGitHubHost {
 		return h, true
 	}
@@ -1692,6 +1698,13 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, githubHost, listN
 		// too: a write policy for a repository the agent never serves would
 		// widen the token for nothing.
 		if githubHost != agentv1alpha1.DefaultGitHubHost {
+			// A port is skipped too: the agent reads a GitHub Enterprise
+			// Server entry only without one (gitops_workspace._names_a_port).
+			if agentEntryNamesAPort(fullRepo) {
+				logger.Info("skipping a GitHub repository entry with a port in minter policy sync; the agent does not serve it",
+					"list", listName, "index", positions[i], "githubHost", githubHost)
+				continue
+			}
 			if ref, perr := agentv1alpha1.ParseRepoRef(fullRepo); perr == nil && ref.Host == "" {
 				logger.Info("skipping a GitHub repository entry with no host in minter policy sync; on a GitHub Enterprise Server install an entry names its host",
 					"list", listName, "index", positions[i], "githubHost", githubHost)
@@ -1741,6 +1754,16 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, githubHost, listN
 	}
 	sort.Strings(bare)
 	return bare, unreadable, nil
+}
+
+// agentPortRegex is gitops_workspace._PORT_RE: a URL, or a bare host:port/path,
+// that names a port.
+var agentPortRegex = regexp.MustCompile(`(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)`)
+
+// agentEntryNamesAPort reports whether a registered URL names a port, as the
+// agent reads it.
+func agentEntryNamesAPort(value string) bool {
+	return agentPortRegex.MatchString(strings.TrimSpace(value))
 }
 
 // onGitHubDotCom reports whether a GitHub entry that the install's GitHub

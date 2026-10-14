@@ -296,8 +296,26 @@ class RefusedTokenTest(MockGitHubEnterpriseCase):
             binding.api("GET", "repos/acme/infra/labels")
         self.assertEqual(401, caught.exception.status)
         self.assertEqual(["github"], dropped)
+
+    def test_a_401_in_one_request_leaves_a_concurrent_requests_token(self):
+        # Two requests on one repository: B meets a 401, A is past its
+        # `ensure` and still presents its token. Only the minter's cache is
+        # dropped, so A's next call carries its token rather than none.
+        dropped = []
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [{"provider": "github", "host": HOST, "caFile": str(self.ca)}]}))
+        os.environ[FORGES_CONFIG_ENV] = str(config)
+        broker = vcs_broker.VcsBroker(self.dir / "scratch", git_runner=lambda *a, **k: None,
+                                      mint_write=self.mint_write, drop_write=dropped.append, http_timeout=10.0)
+        a = broker._bind({"repository": REPO_URL})
+        b = broker._bind({"repository": REPO_URL})
+        a.ensure()
+        self.mock.answers = [{"__status__": 401, "__detail__": "Bad credentials"}]
         with self.assertRaises(WorkspaceError):
-            binding.forge.credential.headers("acme/infra")
+            b.api("GET", "repos/acme/infra/labels")
+        self.assertEqual(["github"], dropped)
+        self.assertEqual({"Authorization": f"Bearer {TOKEN}"}, a.forge.credential.headers("acme/infra"))
+        self.assertIn(EXTRAHEADER, dict(a.forge.credential.git_config("acme/infra")))
 
     def test_a_401_on_the_identity_query_drops_the_token(self):
         dropped = []
@@ -475,7 +493,7 @@ class WriteMintTest(unittest.TestCase):
         self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/web"))
         self.assertEqual([[credential_proxy.FORGE_WRITE_MINT_FLAG, credential_proxy.FORGE_HOST_FLAG, HOST, "acme/infra"]],
                          self.runs)
-        self.assertEqual({("github", HOST)}, set(self.executor._write_tokens))
+        self.assertEqual({("github", HOST, "acme")}, set(self.executor._write_tokens))
 
     def test_an_unmanaged_repository_is_refused_before_anything_runs(self):
         with self.assertRaises(PermissionError):
@@ -493,15 +511,27 @@ class WriteMintTest(unittest.TestCase):
         config = ((f"http.https://{HOST}/.extraheader", "AUTHORIZATION: basic x"), ("credential.helper", ""))
         # A failure that is not a refused credential keeps the token.
         self.executor._drop_write_tokens_refused_by(128, "fatal: repository not found", config)
-        self.assertIn(("github", HOST), self.executor._write_tokens)
+        self.assertIn(("github", HOST, "acme"), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
             128, "fatal: could not read Username for 'https://ghe.other.example': terminal prompts disabled", config)
-        self.assertIn(("github", HOST), self.executor._write_tokens)
+        self.assertIn(("github", HOST, "acme"), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
             128, f"fatal: could not read Username for 'https://{HOST}': terminal prompts disabled", config)
-        self.assertNotIn(("github", HOST), self.executor._write_tokens)
+        self.assertNotIn(("github", HOST, "acme"), self.executor._write_tokens)
         self.executor.mint_write_credential("github", "acme/infra")
         self.assertEqual(2, len(self.runs))
+
+    def test_two_organisations_each_keep_their_token(self):
+        # A mint covers one organisation, so each keeps its own slot and
+        # alternate requests do not mint again.
+        with mock.patch.object(credential_proxy, "managed_repositories",
+                               return_value=frozenset({f"github:{HOST}/acme/infra", f"github:{HOST}/other/x"})):
+            for repo in ("acme/infra", "other/x", "acme/infra", "other/x"):
+                self.executor.mint_write_credential("github", repo)
+        self.assertEqual([["acme/infra"], ["other/x"]], [run[-1:] for run in self.runs])
+        self.assertEqual({("github", HOST, "acme"), ("github", HOST, "other")}, set(self.executor._write_tokens))
+        self.executor.drop_write_credential("github")
+        self.assertEqual({}, self.executor._write_tokens)
 
     def test_drop_write_credential_forgets_the_forges_token(self):
         self.executor.mint_write_credential("github", "acme/infra")
@@ -558,8 +588,8 @@ class RefusedGitCallTest(unittest.TestCase):
 
     def test_a_401_from_git_drops_the_refusing_hosts_token_only(self):
         now = time.monotonic()
-        self.executor._write_tokens[("github", self.host)] = (now, frozenset({"acme/infra"}), TOKEN)
-        self.executor._write_tokens[("github", "ghe.other.example")] = (now, frozenset({"acme/infra"}), TOKEN)
+        self.executor._write_tokens[("github", self.host, "acme")] = (now, frozenset({"acme/infra"}), TOKEN)
+        self.executor._write_tokens[("github", "ghe.other.example", "acme")] = (now, frozenset({"acme/infra"}), TOKEN)
         header = "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
         config = (
             (f"http.https://{self.host}/.extraheader", header),
@@ -576,8 +606,8 @@ class RefusedGitCallTest(unittest.TestCase):
         self.assertIn("terminal prompts disabled", result.stderr)
         # The token was presented, and the server refused it.
         self.assertIn(header.split(": ", 1)[1].replace("basic", "Basic").lower(), [h.lower() for h in self.seen if h])
-        self.assertNotIn(("github", self.host), self.executor._write_tokens)
-        self.assertIn(("github", "ghe.other.example"), self.executor._write_tokens)
+        self.assertNotIn(("github", self.host, "acme"), self.executor._write_tokens)
+        self.assertIn(("github", "ghe.other.example", "acme"), self.executor._write_tokens)
 
 
 class HelperPrintModeTest(unittest.TestCase):
@@ -1075,6 +1105,38 @@ class HostNormalisationTest(unittest.TestCase):
                 self.assertEqual("cli", forge.transport)
         with self.assertRaises(ValueError):
             next(c for c in providers.AVAILABLE if c.name == "github")(host=" API.GitHub.com ")
+
+
+class EnterpriseRepositoryReadersTest(unittest.TestCase):
+    """The readers that pick repositories to act on name the instance's repositories."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "managed_repos").write_text(json.dumps([{"type": "github", "url": f"https://{HOST}/acme/infra"}]))
+        (root / "context_repos").write_text(json.dumps([
+            {"type": "github", "url": f"https://{HOST}/acme/docs", "ref": "release"},
+        ]))
+        (root / gitops_workspace.GITHUB_HOST_KEY).write_text(HOST)
+        patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(root / "managed_repos")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_context_entries_carry_the_instances_repository_and_its_ref(self):
+        entries = gitops_workspace.get_context_github_repo_entries()
+        self.assertEqual([(f"{HOST}/acme/docs", "release")], [(e["repo"], e["ref"]) for e in entries])
+
+    def test_the_picker_names_the_instances_repository_and_the_bare_reader_stays_empty(self):
+        self.assertEqual([f"{HOST}/acme/infra"], gitops_workspace.get_managed_github_repo_names())
+        self.assertEqual([], gitops_workspace.get_managed_github_repos())
+
+    def test_the_delivery_ledger_is_the_instances_repository(self):
+        import chat_delivery_watch
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop(chat_delivery_watch.LEDGER_REPO_ENV, None)
+            self.assertEqual(f"{HOST}/acme/infra", chat_delivery_watch.ledger_repo())
 
 
 class GitHubDotComEntriesOnAnEnterpriseInstallTest(unittest.TestCase):

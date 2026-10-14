@@ -298,8 +298,13 @@ class MintedWriteCredential:
         self._tokens[repo] = token
 
     def invalidate(self, repo: str) -> None:
-        """Forget the token: the forge refused it (401). The next `ensure` mints anew."""
-        self._tokens.pop(repo, None)
+        """The forge refused the token (401): the next `ensure` mints anew.
+
+        Only the minter's cached token is dropped. The token a concurrent
+        request on the same repository is still presenting stays where it is:
+        taking it away would fail that request for a reason it cannot see,
+        and the next `ensure` replaces it with a fresh one.
+        """
         if self._drop is not None:
             self._drop(self.provider)
 

@@ -1220,7 +1220,7 @@ def get_context_repo_entries() -> list[dict[str, str]]:
 
 
 def _github_entries(
-    entries: list[dict[str, str]], key: str, *, fold_case: bool
+    entries: list[dict[str, str]], key: str, *, fold_case: bool, enterprise: bool = False
 ) -> list[dict]:
     """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
 
@@ -1257,12 +1257,18 @@ def _github_entries(
             )
             continue
         slug = extract_github_slug(url)
-        if not slug and github_enterprise_ref(url, install_host) is not None:
-            # A GitHub Enterprise Server repository: named with its host by
-            # `get_managed_repos`, never as a bare slug, which reads as
-            # github.com everywhere a link or a CLI call is built from it.
-            continue
-        if slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+        found = None if slug else github_enterprise_ref(url, install_host)
+        if found is not None:
+            # A GitHub Enterprise Server repository: never a bare slug, which
+            # reads as github.com everywhere a link or a CLI call is built
+            # from it. A reader that asks for `enterprise` gets it named with
+            # its host, `<host>/owner/name`, as the verbs take it; the
+            # bare-slug readers (the `--repo` allowlists, the token scope)
+            # leave it to `get_managed_repos`.
+            if not enterprise:
+                continue
+            slug = "/".join(found)
+        elif slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
             _warn_not_on_install_host(key, url, install_host)
             continue
         if not slug:
@@ -1281,10 +1287,16 @@ def _github_entries(
 
 
 def _github_slugs(
-    entries: list[dict[str, str]], key: str, *, fold_case: bool
+    entries: list[dict[str, str]], key: str, *, fold_case: bool, enterprise: bool = False
 ) -> list[str]:
-    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
-    return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates.
+
+    With `enterprise`, a repository on the install's GitHub Enterprise Server
+    host is included as `<host>/owner/name`."""
+    return [
+        entry["repo"]
+        for entry in _github_entries(entries, key, fold_case=fold_case, enterprise=enterprise)
+    ]
 
 
 def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
@@ -1563,6 +1575,18 @@ def get_managed_github_repos() -> list[str]:
     return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
 
 
+def get_managed_github_repo_names() -> list[str]:
+    """The managed GitHub repositories, named as the verbs take them.
+
+    `owner/name` on github.com, and `<host>/owner/name` on the install's
+    GitHub Enterprise Server host. For a reader that picks a repository to act
+    on (the first-run audits, the delivery ledger), not for a reader that
+    compares a bare slug: `get_managed_github_repos` stays bare, and on a GitHub
+    Enterprise Server install it is empty.
+    """
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False, enterprise=True)
+
+
 def get_context_github_repos() -> list[str]:
     """The GitHub `owner/name` slugs under `context_repos`, in ConfigMap order.
 
@@ -1583,7 +1607,7 @@ def get_context_github_repo_entries() -> list[dict]:
     `refused_ref` instead, and that caller skips the repository. Same skip
     rule, same warning, same one-way relationship to the managed list.
     """
-    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True, enterprise=True)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:

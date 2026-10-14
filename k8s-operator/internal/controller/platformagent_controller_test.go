@@ -3725,6 +3725,19 @@ func TestReconcileGitopsStateGitHubHost(t *testing.T) {
 	if got := events(); len(got) != 0 {
 		t.Errorf("an unchanged host wrote events: %v", got)
 	}
+	// A typo that validation refuses holds the key: the install does not move
+	// back to github.com.
+	agent.Spec.Integration.Forges[0].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "GHE_CA"}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q after a refused declaration, expected it held at ghe.example.com", host)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("a refused declaration wrote events: %v", got)
+	}
+	agent.Spec.Integration.Forges[0].CABundleRef = nil
 	declare("")
 	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
 		t.Fatal(err)
@@ -6311,6 +6324,7 @@ func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
 		`{"type":"github","url":"test-org/repo-2"},` +
 		`{"type":"github","url":"https://GHE.example.com/test-org/repo-3.git"},` +
 		`{"type":"github","url":"https://github.com/test-org/dotcom"},` +
+		`{"type":"github","url":"https://ghe.example.com:8443/test-org/with-port"},` +
 		`{"type":"github","url":"https://ghe.other.example/test-org/elsewhere"}]`
 	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", "ghe.example.com", gitopsStateManagedReposKey)
 	if err != nil {
@@ -6319,7 +6333,7 @@ func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
 	if want := []string{"repo-1", "repo-3"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
-	if want := []string{"managed_repos[4]"}; !slices.Equal(unreadable, want) {
+	if want := []string{"managed_repos[5]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
 	}
 }

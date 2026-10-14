@@ -6007,8 +6007,12 @@ class CommandExecutor:
         return self._forge_write_mint_lock
 
     @property
-    def _write_tokens(self) -> dict[tuple[str, str], tuple[float, frozenset[str], str]]:
-        """(provider, host) -> (minted at, repositories covered, token): in memory only."""
+    def _write_tokens(self) -> dict[tuple[str, str, str], tuple[float, frozenset[str], str]]:
+        """(provider, host, owner) -> (minted at, repositories covered, token): in memory only.
+
+        One slot per owner, because a mint covers one organisation's
+        repositories: two organisations on one host would otherwise evict
+        each other's token on every alternate request."""
         if getattr(self, "_forge_write_tokens", None) is None:
             self._forge_write_tokens = {}
         return self._forge_write_tokens
@@ -6496,8 +6500,8 @@ class CommandExecutor:
         if not repository_is_managed(repository, forge):
             raise PermissionError(f"{repository} is not a repository this install manages")
         host = forge.hosts[0] if forge.hosts else ""
-        key = (provider, host)
         clean_repo = repository.strip().lower()
+        key = (provider, host, clean_repo.split("/", 1)[0])
 
         def cached() -> str | None:
             entry = self._write_tokens.get(key)
@@ -6553,8 +6557,9 @@ class CommandExecutor:
         except PermissionError:
             return
         host = forge.hosts[0] if forge.hosts else ""
-        if self._write_tokens.pop((provider, host), None) is not None:
-            LOGGER.info("%s write token for %s dropped after the forge refused it", provider, host)
+        for key in list(self._write_tokens):
+            if key[:2] == (provider, host) and self._write_tokens.pop(key, None) is not None:
+                LOGGER.info("%s write token for %s dropped after the forge refused it", provider, host)
 
     def _drop_write_tokens_refused_by(
         self, exit_code: int, stderr: str, config: tuple[tuple[str, str], ...]
@@ -6582,9 +6587,10 @@ class CommandExecutor:
         refused = set(GIT_USERNAME_REFUSAL_RE.findall(text)) & hosts
         if not refused and len(hosts) == 1 and any(marker in text for marker in GIT_REFUSED_CREDENTIAL_MARKERS):
             refused = hosts
-        for provider, host in list(self._write_tokens):
+        for key in list(self._write_tokens):
+            provider, host = key[0], key[1]
             if host in refused:
-                self._write_tokens.pop((provider, host), None)
+                self._write_tokens.pop(key, None)
                 LOGGER.info("%s write token for %s dropped after git was refused", provider, host)
 
     def _within_workspace(self, candidate: Path) -> bool:

@@ -142,6 +142,10 @@ func TestAnInstallServesOneGitHubHost(t *testing.T) {
 		if got := resolved.Accepted(RepositoryRoleManaged); len(got) != 0 {
 			t.Errorf("%s: a repository on the refused forge was accepted", name)
 		}
+		// The status counts it as withheld on a refused forge.
+		if withheld := resolved.OnRefusedForge(); len(withheld) != 1 || withheld[0].ForgeName != "ghe" {
+			t.Errorf("%s: OnRefusedForge() = %v, expected the repository on the refused forge", name, withheld)
+		}
 		if got, want := resolved.GitHubHost(), resolved.Forges[0].Host; got != want && !(want == "" && got == "github.com") {
 			t.Errorf("%s: GitHubHost() = %q, expected the first forge's", name, got)
 		}

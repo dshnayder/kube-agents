@@ -326,6 +326,23 @@ func (ri *ResolvedIntegration) GitHubHost() string {
 	return gitProviders[GitProviderGitHub].DefaultHost
 }
 
+// GitHubForgeRefused reports that the declaration names a GitHub forge and
+// validation refuses every one of them, so the install's GitHub host cannot
+// be read from it. A caller that holds state derived from the host (the
+// gitops-state key) leaves it as it is while this holds.
+func (ri *ResolvedIntegration) GitHubForgeRefused() bool {
+	if ri == nil {
+		return false
+	}
+	declared := false
+	for _, f := range ri.Forges {
+		if f.Provider == GitProviderGitHub {
+			declared = true
+		}
+	}
+	return declared && ri.gitHubForge() == nil
+}
+
 // gitHubForge is the first GitHub forge that can be served, or nil.
 func (ri *ResolvedIntegration) gitHubForge() *ResolvedForge {
 	if ri == nil {
@@ -632,7 +649,7 @@ func (ri *ResolvedIntegration) OnRefusedForge() []*ResolvedRepository {
 		if r.Forge == nil {
 			continue
 		}
-		if _, isShadowed := shadowed[r.Forge]; !r.Forge.valid() || isShadowed {
+		if _, isShadowed := shadowed[r.Forge]; !ri.usable(r.Forge) || isShadowed {
 			withheld = append(withheld, r)
 		}
 	}
