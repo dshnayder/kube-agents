@@ -4550,6 +4550,20 @@ validate_gitops_forge_flags() {
       print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
       return 1
     fi
+    # A regular file can be read now and again after the apply, so an empty
+    # one stops the run here, before anything is built. A one-shot source
+    # (/dev/stdin, a process substitution) is not read here: reading it would
+    # use it up, so create_gitlab_token_secret still checks it after the apply.
+    if [ -f "$PARAM_GITLAB_TOKEN_FILE" ]; then
+      local early_token=""
+      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
+      early_token="$(gitlab_token_strip "$early_token")"
+      if [ -z "$early_token" ]; then
+        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
+        return 1
+      fi
+      early_token=""
+    fi
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
   # certificate the public CAs sign, and a private CA must never vouch for it.

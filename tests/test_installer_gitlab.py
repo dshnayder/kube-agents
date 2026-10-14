@@ -1050,5 +1050,64 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn("!var.enable_github_minter", self.main)
 
 
+class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
+    """An empty regular token file stops the run before the apply.
+
+    Before, the validator checked only that the file was readable, and the
+    empty content was found after a full Terraform and Helm apply. A one-shot
+    source is still read only after the apply: reading it early uses it up.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _validate_with(self, preamble):
+        setup = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "PARAM_GITOPS_FORGE=gitlab PARAM_GITOPS_REPO=group/sub/project "
+            "PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token PARAM_GITHUB_APP_ID= PARAM_GITHUB_PEM_PATH=\n"
+            f"{preamble}\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"\n'
+        )
+        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        return _run_installer_bash(setup, env)
+
+    def _file(self, content):
+        tok = self._tmp / "token-file"
+        tok.write_text(content)
+        return f"PARAM_GITLAB_TOKEN_FILE={shlex.quote(str(tok))}"
+
+    def test_an_empty_regular_file_is_refused(self):
+        proc = self._validate_with(self._file(""))
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("is empty", proc.stdout + proc.stderr)
+
+    def test_a_whitespace_only_regular_file_is_refused(self):
+        proc = self._validate_with(self._file(" \n\t\r\n"))
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("is empty", proc.stdout + proc.stderr)
+
+    def test_a_file_with_a_token_passes_and_its_content_is_not_shown(self):
+        proc = self._validate_with(self._file(_SENTINEL + "\n"))
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn(_SENTINEL, proc.stdout + proc.stderr)
+
+    def test_a_one_shot_source_is_not_read_early(self):
+        # The validator must leave a pipe unread: the post-apply read still
+        # needs the token. An empty pipe is not refused here either.
+        proc = self._validate_with(
+            "exec 9< <(printf %s 'tok-from-pipe')\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/9\n"
+            'validate_gitops_forge_flags && v=0 || v=$?\n'
+            'IFS= read -r -d "" left <&9 || true; echo "v=$v left=$left"\n'
+            "exec 8< <(printf '')\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/8"
+        )
+        self.assertIn("v=0 left=tok-from-pipe", proc.stdout, proc.stderr)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -91,7 +91,10 @@ your shell is ignored; use the flags.
 
 A re-run of `install.sh` keeps an existing Secret unless you give it a new token file, or
 choose to replace it at the prompt. An empty token (whitespace only) is refused, and
-nothing is stored.
+nothing is stored. A token file that is a regular file is read before the apply, also in a
+dry run, so an empty file stops the run before anything is built. A one-shot source, such as
+`/dev/stdin` or a process substitution, is read only after the apply, because a read uses
+it up.
 
 ## A self-managed GitLab with a private CA
 
