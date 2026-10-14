@@ -71,10 +71,20 @@ EXTRAHEADER_USERNAME = "x-access-token"
 # So a MintedReadCredential presents it whether or not a token was minted.
 CREDENTIAL_HELPER_KEY = "credential.helper"
 # `http.<url>.followRedirects` set to false for the forge's host, on every git
-# invocation a minted token rides. A redirect is an answer, not a hop: the
-# token is presented on the host it was minted for, and on no host a redirect
-# names. The API client refuses redirects for the same reason.
+# invocation a minted token rides on a host other than github.com (a GitHub
+# Enterprise Server). A redirect is an answer, not a hop: the token is
+# presented on the host it was minted for, and on no host a redirect names.
+# The API client refuses redirects for the same reason. github.com keeps
+# git's own redirect handling, so a repository renamed there still clones.
 FOLLOW_REDIRECTS_KEY = "http.https://{host}/.followRedirects"
+REDIRECTS_KEPT_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+
+
+def _redirect_pin(host: str) -> tuple[tuple[str, str], ...]:
+    """The followRedirects pin for `host`, or none on github.com."""
+    if host in REDIRECTS_KEPT_HOSTS:
+        return ()
+    return ((FOLLOW_REDIRECTS_KEY.format(host=host), "false"),)
 
 
 class Credential(Protocol):
@@ -208,7 +218,7 @@ class MintedReadCredential:
         ).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
-            (FOLLOW_REDIRECTS_KEY.format(host=self._host), "false"),
+            *_redirect_pin(self._host),
             helper_cleared,
         )
 
@@ -300,7 +310,7 @@ class MintedWriteCredential:
         basic = base64.b64encode(f"{EXTRAHEADER_USERNAME}:{token}".encode("utf-8")).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
-            (FOLLOW_REDIRECTS_KEY.format(host=self._host), "false"),
+            *_redirect_pin(self._host),
             helper_cleared,
         )
 

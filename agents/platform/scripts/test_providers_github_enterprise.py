@@ -914,6 +914,16 @@ class RedirectPinTest(unittest.TestCase):
                 self.assertEqual("false", config[f"http.https://{HOST}/.followRedirects"])
                 self.assertIn(EXTRAHEADER, config)
 
+    def test_github_com_keeps_its_redirect_behaviour(self):
+        # A repository renamed on github.com still clones on the read token.
+        credential = providers.MintedReadCredential("github", lambda provider, repo: TOKEN, "github.com")
+        credential.ensure("acme/infra")
+        config = credential.git_config("acme/infra")
+        self.assertEqual(
+            ("http.https://github.com/.extraheader", "credential.helper"),
+            tuple(key for key, _ in config),
+        )
+
 
 class HostNormalisationTest(unittest.TestCase):
     def test_a_host_is_lowered_and_stripped_before_it_is_judged(self):

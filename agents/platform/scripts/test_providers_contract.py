@@ -698,7 +698,7 @@ class ReadCredentialTest(unittest.TestCase):
              "credential.helper"),
             tuple(key for key, _ in config),
         )
-        # A redirect is refused on the host the token rides, so it never
+        # A redirect is refused on a host other than github.com, so it never
         # carries the header to a host the redirect names.
         self.assertEqual("false", dict(config)["http.https://acme.example/.followRedirects"])
         header = dict(config)["http.https://acme.example/.extraheader"]

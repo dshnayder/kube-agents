@@ -1581,9 +1581,10 @@ answers an installation with its App's bot login. That is the query `gh auth
 status` makes on github.com. A login that does not come back is a refusal, not
 an empty answer: an empty login would drop the ownership checks.
 
-**Redirects.** Every git invocation a minted token rides sets
+**Redirects.** Every git invocation a minted token rides on the instance sets
 `http.https://<host>/.followRedirects=false`, with or without a CA bundle, so a
-redirect never carries the token to another host.
+redirect never carries the token to another host. github.com keeps git's own
+redirect handling, so a repository renamed there still clones.
 
 **A private CA.** A GitHub Enterprise Server behind a private CA names it in
 `caBundleRef`, as a self-managed GitLab does
