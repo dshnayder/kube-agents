@@ -142,5 +142,37 @@ class MinterOnGitHubEnterpriseServerTest(unittest.TestCase):
         self.assertTrue(any(peer.get("ipBlock") == {"cidr": "0.0.0.0/0"} for r in https for peer in r["to"]))
 
 
+class GitHubEnterpriseCrdGuardTest(unittest.TestCase):
+    """A CRD from before GitHub Enterprise Server refuses caBundleRef on a github
+    forge with a CEL rule, so `helm upgrade` without `crds/` would fail after the
+    release has started. The chart refuses first when the installed CRD lacks the
+    rule that a forge at another host names its provider. `lookup` is empty under
+    `helm template`, so the guard is pinned as text, and its sentinel is checked
+    against the CRD this chart ships: present there, absent from the old rule."""
+
+    _SENTINEL = "names its provider"
+
+    def setUp(self):
+        self.template = (_CHART / "templates" / "platform-agent-cr.yaml").read_text()
+        self.crd = (_CHART / "crds" / "kubeagents.x-k8s.io_platformagents.yaml").read_text()
+
+    def test_the_guard_reads_the_installed_forge_rules_and_names_the_remedy(self):
+        block = self.template[self.template.index("{{- $crd := lookup"):]
+        self.assertIn('dig "forges" "items" "x-kubernetes-validations" (list) $props', block)
+        self.assertIn(f'regexMatch "{self._SENTINEL}"', block)
+        self.assertIn("declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD predates it", block)
+        self.assertIn("apply charts/kube-agents/crds/ first", block)
+
+    def test_the_sentinel_is_in_the_shipped_crd_and_not_in_the_old_rule(self):
+        crd = yaml.safe_load(self.crd)
+        [version] = [v for v in crd["spec"]["versions"] if v["name"] == "v1alpha1"]
+        forges = version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["integration"]["properties"]["forges"]
+        messages = [rule["message"] for rule in forges["items"]["x-kubernetes-validations"]]
+        self.assertTrue(any(self._SENTINEL in m for m in messages), messages)
+        old = "caBundleRef is for a gitlab forge: the github provider does not read it yet"
+        self.assertFalse(any(old in m for m in messages))
+        self.assertNotIn(self._SENTINEL, old)
+
+
 if __name__ == "__main__":
     unittest.main()

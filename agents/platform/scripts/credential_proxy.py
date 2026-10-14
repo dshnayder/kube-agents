@@ -3424,6 +3424,13 @@ FORGE_READ_ONLY_FLAG = "--read-only"
 FORGE_WRITE_MINT_FLAG = "--print-write-token"
 FORGE_HOST_FLAG = "--host"
 
+# What git prints when the server refused the credential it presented.
+GIT_REFUSED_CREDENTIAL_MARKERS = (
+    "could not read Username for '",
+    "returned error: 401",
+    "Authentication failed",
+)
+
 # How long a minted write token is handed out again, for any repository the
 # mint reported it covers. An installation token lives an hour; reusing it for
 # half of that keeps a verb from minting once per call and leaves the other
@@ -6552,13 +6559,15 @@ class CommandExecutor:
     ) -> None:
         """Drop each cached write token a failed git call presented and the forge refused.
 
-        git says `The requested URL returned error: 401` (or `Authentication
-        failed`) when the server refused the credential. Only the hosts whose
+        With an extraheader and the credential helper cleared, git answers a
+        401 by asking for a username, and with prompts off (`_execute` sets
+        GIT_TERMINAL_PROMPT=0 on these calls) it says `could not read Username
+        for '<url>'`. Older and other paths say `The requested URL returned
+        error: 401` or `Authentication failed`. Only the hosts whose
         extraheader the call carried are dropped.
         """
-        if exit_code == 0 or not (
-            "returned error: 401" in (stderr or "") or "Authentication failed" in (stderr or "")
-        ):
+        text = stderr or ""
+        if exit_code == 0 or not any(marker in text for marker in GIT_REFUSED_CREDENTIAL_MARKERS):
             return
         hosts = {
             key[len("http.https://"):-len("/.extraheader")]
@@ -7056,6 +7065,13 @@ class CommandExecutor:
         elif argv and Path(argv[0]).name == "kubectl":
             command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
+            # A git call that carries a forge credential never prompts: there
+            # is no terminal, and with the helper cleared a refused token
+            # would otherwise end in a prompt that cannot be answered. With
+            # prompts off, git's refusal reads the same every time ("could not
+            # read Username for '<url>': terminal prompts disabled"), which is
+            # what a refused write token is recognised by.
+            command_environment["GIT_TERMINAL_PROMPT"] = "0"
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
             # set still wins on a key both name -- git takes the last value in

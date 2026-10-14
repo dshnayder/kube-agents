@@ -309,11 +309,18 @@ class Binding:
 
     def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
+        return self.refused_drops(lambda: self.transport().api(method, path, **kwargs))
+
+    def whoami(self) -> str:
+        """The transport's login, on the credential made current first."""
+        self.ensure()
+        return self.refused_drops(lambda: self.transport().whoami())
+
+    def refused_drops(self, call: Callable[[], Any]) -> Any:
+        """Run `call`; on a 401, the credential drops a token it cached, so the next call mints anew."""
         try:
-            return self.transport().api(method, path, **kwargs)
+            return call()
         except WorkspaceError as refused:
-            # A credential the forge refused is not presented again: one that
-            # caches a minted token drops it, so the next call mints anew.
             if refused.status == 401:
                 invalidate = getattr(self.forge.credential, "invalidate", None)
                 if invalidate is not None:
@@ -1472,7 +1479,7 @@ class VcsBroker:
         it is left to the caller to refuse.
         """
         try:
-            return bound.transport().whoami()
+            return bound.whoami()
         except ForgeUnsupported:
             return ""
 
@@ -1673,9 +1680,7 @@ class VcsBroker:
         caller hands the fact back rather than a spelling it does not know.
         """
         bound = self._bind(payload)
-        bound.ensure()
-        transport = bound.transport()
-        viewer = transport.whoami()
+        viewer = bound.whoami()
         login = payload.get("login")
         if login is not None and not isinstance(login, str):
             raise WorkspaceError("login must be a string")

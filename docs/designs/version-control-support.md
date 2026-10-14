@@ -1554,7 +1554,8 @@ reverse. On such an install, the agent and the minter's policy sync both skip a
 GitHub entry that names github.com or no host.
 
 **The provider is named.** A forge at a host other than github.com must name
-its `provider`; the field has no default. A forge written for a GitLab instance
+its `provider`. The CRD stores no default; an omitted provider reads as github,
+and only at github.com. A forge written for a GitLab instance
 without a provider would otherwise be read as a GitHub Enterprise Server and be
 handed a GitHub token.
 
@@ -1636,7 +1637,7 @@ GitHub entry on any other host is skipped with a warning.
   GitLab.
 - **A renamed repository.** GitHub answers a renamed repository with a
   redirect to its new name. The API client refuses every redirect, and git on
-  a host with a CA bundle follows none, so an API call on the old name fails
+  a GitHub Enterprise Server host follows none, so an API call on the old name fails
   with `FORGE_REDIRECTED` and a clone on it fails. Declare the repository by
   its new name.
 

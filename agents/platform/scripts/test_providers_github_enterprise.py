@@ -32,6 +32,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -298,6 +299,24 @@ class RefusedTokenTest(MockGitHubEnterpriseCase):
         with self.assertRaises(WorkspaceError):
             binding.forge.credential.headers("acme/infra")
 
+    def test_a_401_on_the_identity_query_drops_the_token(self):
+        dropped = []
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [{"provider": "github", "host": HOST, "caFile": str(self.ca)}]}))
+        os.environ[FORGES_CONFIG_ENV] = str(config)
+        broker = vcs_broker.VcsBroker(self.dir / "scratch", git_runner=lambda *a, **k: None,
+                                      mint_write=self.mint_write, drop_write=dropped.append, http_timeout=10.0)
+        handler_class = self.mock.server.RequestHandlerClass
+
+        def refuse(handler):
+            handler._json(401, {"message": "Bad credentials"})
+
+        handler_class.do_POST = refuse
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.identity({"repository": REPO_URL})
+        self.assertEqual(401, caught.exception.status)
+        self.assertEqual(["github"], dropped)
+
 
 class TrustTest(MockGitHubEnterpriseCase):
     def call(self, broker) -> object:
@@ -476,7 +495,7 @@ class WriteMintTest(unittest.TestCase):
         self.executor._drop_write_tokens_refused_by(128, "fatal: repository not found", config)
         self.assertIn(("github", HOST), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
-            128, f"fatal: unable to access 'https://{HOST}/acme/infra.git/': The requested URL returned error: 401", config)
+            128, f"fatal: could not read Username for 'https://{HOST}': terminal prompts disabled", config)
         self.assertNotIn(("github", HOST), self.executor._write_tokens)
         self.executor.mint_write_credential("github", "acme/infra")
         self.assertEqual(2, len(self.runs))
@@ -489,6 +508,61 @@ class WriteMintTest(unittest.TestCase):
     def test_the_flags_match_the_helpers(self):
         self.assertEqual(github_token_refresh.PRINT_WRITE_FLAG, credential_proxy.FORGE_WRITE_MINT_FLAG)
         self.assertEqual(github_token_refresh.HOST_FLAG, credential_proxy.FORGE_HOST_FLAG)
+
+
+@unittest.skipUnless(OPENSSL and shutil.which("git"), "openssl and git are needed")
+class RefusedGitCallTest(unittest.TestCase):
+    """Real git, through the executor, against a local HTTPS server that answers 401.
+
+    With the extraheader and the helper cleared, git answers a 401 by asking
+    for a username. The executor turns prompts off on these calls, so git's
+    refusal is stable, and the cached write token for the host is dropped.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        ca, cert, key = make_pki(self.dir / "pki", ("localhost",))
+        self.ca = ca
+
+        class Refuse(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - the stdlib's name
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="mock"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Refuse)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"https://localhost:{server.server_address[1]}/acme/infra.git"
+        self.executor = credential_proxy.CommandExecutor(
+            timeout_seconds=20, max_output_bytes=1 << 16, state_dir=str(self.dir / "state"), scoped_pool=None
+        )
+
+    def test_a_401_from_git_drops_the_hosts_write_token(self):
+        self.executor._write_tokens[("github", HOST)] = (time.monotonic(), frozenset({"acme/infra"}), TOKEN)
+        config = (
+            (f"http.https://{HOST}/.extraheader", "AUTHORIZATION: basic eDp5"),
+            ("credential.helper", ""),
+            ("http.sslCAInfo", str(self.ca)),
+        )
+        self.executor.vcs_root.mkdir(parents=True, exist_ok=True)
+        result = self.executor.execute_vcs_git(
+            ["git", "ls-remote", self.url], self.executor.vcs_root, check=False, config=config
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("could not read Username for", result.stderr)
+        self.assertIn("terminal prompts disabled", result.stderr)
+        self.assertNotIn(("github", HOST), self.executor._write_tokens)
 
 
 class HelperPrintModeTest(unittest.TestCase):

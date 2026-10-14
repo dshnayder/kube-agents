@@ -492,7 +492,7 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  read-only reference). `provider` is `github` or `gitlab`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
   ignored for `github` and required for `gitlab`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,

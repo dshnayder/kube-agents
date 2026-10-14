@@ -313,6 +313,8 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. | **Methods 2 & 3, or Method 0/1 with PEM import** |
 | **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                     | **Methods 2 & 3 only**                           |
 
+The GitHub CLI is not needed on the [GitHub Enterprise Server](#github-enterprise-server) path.
+
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
 [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
@@ -596,7 +598,10 @@ The agent can use a GitOps repository on a GitHub Enterprise Server instance: a 
 #### Before you start
 
 - **The cluster's network.** The cluster's pods (the credential broker and the token minter) must reach the instance on TCP port 443 and resolve its hostname. A port other than 443 is not supported. An instance on a private network needs a route from the cluster's VPC, such as [Cloud VPN](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview) or [Cloud Interconnect](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview), [firewall rules](https://cloud.google.com/firewall/docs/firewalls) that allow it, and, for a hostname in a private DNS zone, a [Cloud DNS forwarding zone](https://cloud.google.com/dns/docs/zones/forwarding-zones) in the cluster's VPC.
-  - **A new cluster** (`create_cluster = true`, the default) is created in the project's `default` VPC network: the composition has no network or subnetwork variable. If the instance is reachable only from another VPC (the one your VPN or Interconnect attaches to, or a Shared VPC), create the cluster yourself in that VPC, for example with `gcloud container clusters create-auto CLUSTER --region=REGION --network=NETWORK --subnetwork=SUBNETWORK --project=PROJECT_ID` (for a Shared VPC, name the host project's network and subnetwork by their full paths), and install onto it with `create_cluster = false`, as the [composition README](terraform/examples/full-install/README.md#prerequisites) describes.
+  - **A new cluster** (`create_cluster = true`, the default) is created in the project's `default` VPC network: the composition has no network or subnetwork variable. If the instance is reachable only from another VPC (the one your VPN or Interconnect attaches to, or a Shared VPC), create the cluster yourself in that VPC, for example with `gcloud container clusters create-auto CLUSTER --region=REGION --network=NETWORK --subnetwork=SUBNETWORK --project=PROJECT_ID`, and install onto it with `create_cluster = false`, as the [composition README](terraform/examples/full-install/README.md#prerequisites) describes.
+    - **Shared VPC:** name the host project's network and subnetwork by their full paths, and set up the host-project IAM and the subnet's secondary ranges for Pods and Services as [GKE with Shared VPC](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc) describes.
+    - **The return route:** traffic from the Pods to the instance leaves with the Pod addresses, so the network on the instance's side must route the cluster's Pod range (and node range) back over the VPN or Interconnect.
+    - **Database encryption (CMEK):** the composition sets it only on a cluster it creates. On a cluster that you create, it is your choice: add `--database-encryption-key=projects/PROJECT_ID/locations/REGION/keyRings/RING/cryptoKeys/KEY` to the create command (see [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements)).
   - **The check.** On an existing cluster, run it before you install. On a new cluster, run it right after the apply in step 5, before you create the CA Secret. It needs a cluster, and it reads the CA file from your machine:
 
     ```bash
@@ -610,7 +615,9 @@ The agent can use a GitOps repository on a GitHub Enterprise Server instance: a 
     The first command prints the instance's address. The second prints `200`, or `401` on an instance in private mode, which asks for a credential even here; both mean that the cluster reaches the instance and trusts its certificate. A curl error (no route, a DNS failure, or a certificate error) means that the path is not ready: fix the route, the firewall rule or the DNS zone, and run the check again. Until it passes, the agent's calls to the instance fail. For an instance whose certificate a public CA signed, drop `--cacert /tmp/ca.crt` and the `< /path/to/ca.pem`.
 
 - **The GitHub App, on the instance.** An App belongs to one GitHub host, so create it on the GitHub Enterprise Server, not on github.com. Give it the repository permissions `Contents: Read & write`, `Pull requests: Read & write` and `Issues: Read & write`. It needs no webhook: clear "Active" under Webhook. Install it on the organization that owns the GitOps repository, on the GitOps repository, and on each repository that the agent reads as context. The repository must be owned by an organization. Record the App ID, and download the App's private key (a `.pem` file).
-- **The tools.** `gcloud`, `kubectl`, Terraform, Helm, and `go` 1.21 or later for the key import, as for Method 1.
+- **The tools.** `gcloud`, `kubectl`, Terraform, Helm, and `go` 1.21 or later for the key import, as for Method 1. The GitHub CLI (`gh`) is not needed.
+- **The release.** Use a release whose CRD serves GitHub Enterprise Server: it carries the rule that a forge at a host other than github.com names its provider. In the release sources, `grep -c 'has(self.provider) || !has(self.host)' charts/kube-agents/crds/kubeagents.x-k8s.io_platformagents.yaml` prints `1`. On an existing install, `kubectl get crd platformagents.kubeagents.x-k8s.io -o yaml | grep -c 'has(self.provider) || !has(self.host)'` prints `0` until you apply the new `crds/`, and the chart refuses the forge until then.
+- **The agent sandbox.** For the gVisor sandbox, set `agent_runtime_class = "gvisor"` in `terraform.tfvars`, and the shell sandbox's `runtimeClassName` in `ghes.auto.tfvars`, as [The Shell Sandbox](#the-shell-sandbox) describes. The chart README explains why the composition renders the agent's runtime class from that variable.
 
 #### Install, in this order
 
@@ -1153,7 +1160,8 @@ issue and the pull requests.
 ## Upgrading
 
 To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
-for that release. It carries its own version, so the run names no image tag, and it reuses the
+for that release. An install whose GitHub forge is a GitHub Enterprise Server does not use
+`upgrade.sh`: see [Upgrade, switch and teardown](#upgrade-switch-and-teardown). It carries its own version, so the run names no image tag, and it reuses the
 install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
 
 ```bash

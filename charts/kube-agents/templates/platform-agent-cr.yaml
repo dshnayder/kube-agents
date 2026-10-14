@@ -624,6 +624,18 @@ spec:
   {{- if and $caBundled (not (hasKey (dig "forges" "items" "properties" (dict) $props) "caBundleRef")) }}
   {{- fail "platformAgent.integration.forges[].caBundleRef needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- /* The same for a GitHub Enterprise Server forge: a CRD from before it refuses caBundleRef on a github forge with a CEL rule, after helm has started. The CRD that serves it carries the rule that a forge at another host names its provider. */}}
+  {{- $ghes := false }}
+  {{- range $forges }}
+  {{- if and (eq (.provider | default "github") "github") .host (not (has (lower .host) (list "github.com" "www.github.com" "ssh.github.com"))) }}{{ $ghes = true }}{{ end }}
+  {{- end }}
+  {{- $rules := list }}
+  {{- range (dig "forges" "items" "x-kubernetes-validations" (list) $props) }}
+  {{- $rules = append $rules (.message | default "") }}
+  {{- end }}
+  {{- if and $ghes (not (regexMatch "names its provider" (join "\n" $rules))) }}
+  {{- fail "platformAgent.integration.forges declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD predates it (it refuses caBundleRef on a github forge), and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
