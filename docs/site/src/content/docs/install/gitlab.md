@@ -449,8 +449,9 @@ Notes:
   token and no CA file, and it keeps both Secrets.
 - The token Secret, and the CA Secret if there is one, are not part of the Helm release.
   Deleting the PlatformAgent or uninstalling the release leaves them. A full teardown that
-  deletes the cluster deletes them too. On a cluster that the teardown keeps, delete them with
-  the command in step 2 of [Uninstall](/kube-agents/install/uninstall/). That command reads the
+  deletes the cluster deletes them too. On a cluster that the teardown keeps, delete the
+  namespace, or only these Secrets with the command in
+  [What a teardown leaves](/kube-agents/install/uninstall/#what-a-teardown-leaves). That command reads the
   Secret names and the namespace from `install.env`.
 - After an uninstall, revoke the token in GitLab.
 

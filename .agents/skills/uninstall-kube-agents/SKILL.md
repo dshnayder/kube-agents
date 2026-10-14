@@ -25,8 +25,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 On a GitLab install, the installer creates the token Secret, and the CA Secret for a private CA,
 outside the Helm release. A teardown that deletes the cluster deletes them too. On a cluster that
-the teardown keeps, tell the operator that the Secrets stay, and give the command in step 2 of the
-site's uninstall page (`docs/site/src/content/docs/install/uninstall.md`). That command sources
+the teardown keeps, tell the operator that the Secrets stay, and give the command in "What a teardown
+leaves" on the site's uninstall page (`docs/site/src/content/docs/install/uninstall.md`), or tell
+the operator to delete the namespace. That command sources
 the install's `install.env` in a subshell, the same way the installer reads it, so renamed Secrets
 or a non-default namespace are found. Then tell the operator to revoke the token in GitLab.
 
