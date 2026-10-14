@@ -59,6 +59,9 @@ type ResolvedForge struct {
 	// Provider is the provider name as declared, lowercased, never empty. It
 	// may be unregistered; Problems reports that.
 	Provider string
+	// ProviderDeclared records that the declaration named the provider, rather
+	// than leaving it to the default.
+	ProviderDeclared bool
 	// Host is the declared host, empty for the provider's default.
 	Host string
 	// Namespace is the declared organisation, user, or group path.
@@ -153,9 +156,10 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			provider = DefaultGitProvider
 		}
 		forge := &ResolvedForge{
-			Index:     i,
-			Name:      strings.TrimSpace(f.Name),
-			Provider:  provider,
+			Index:            i,
+			ProviderDeclared: strings.TrimSpace(f.Provider) != "",
+			Name:             strings.TrimSpace(f.Name),
+			Provider:         provider,
 			Host:      strings.TrimSpace(f.Host),
 			Namespace: strings.TrimSpace(f.Namespace),
 		}
@@ -206,12 +210,34 @@ func (f *ResolvedForge) valid() bool {
 	if err != nil {
 		return false
 	}
-	return validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) == nil &&
+	return f.providerProblem() == nil &&
+		validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) == nil &&
 		provider.ValidateHost(f.Host) == nil &&
 		validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength) == nil &&
 		provider.ValidateNamespaceOn(f.Host, f.Namespace) == nil &&
 		f.credentialsProblem(provider) == nil &&
 		f.caBundleProblem(provider) == nil
+}
+
+// providerProblem is why a forge must name its provider, or nil. A forge at
+// a host other than a spelling of github.com names it: left to the default,
+// a forge declared for a GitLab instance before the provider field existed
+// would be read as a GitHub Enterprise Server and handed a GitHub token. The
+// deprecated alias names no host, so it never needs one.
+func (f *ResolvedForge) providerProblem() error {
+	if f.ProviderDeclared {
+		return nil
+	}
+	host := lowerASCII(strings.TrimSpace(f.Host))
+	if host == "" || githubHosts[host] {
+		return nil
+	}
+	// A host the github provider refuses anyway (gitlab.com, a GitHub service
+	// domain) is reported at the host, once: the forge is refused either way.
+	if gitProviders[GitProviderGitHub].ValidateHost(host) != nil {
+		return nil
+	}
+	return fmt.Errorf("the forge at host %q names no provider; name it: github for a GitHub Enterprise Server, gitlab for a GitLab instance", f.Host)
 }
 
 // usable reports whether a forge can be served: its own fields are valid, and
@@ -735,6 +761,9 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		if err != nil {
 			add(ri.forgePath(f, gitProviderField), f.Provider, err)
 			continue
+		}
+		if err := f.providerProblem(); err != nil {
+			add(ri.forgePath(f, gitProviderField), f.Provider, err)
 		}
 		if why, conflicted := conflicts[f]; conflicted {
 			add(ri.forgePath(f, gitHostField), f.Host, errors.New(why))

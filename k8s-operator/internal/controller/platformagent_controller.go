@@ -1687,6 +1687,17 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, githubHost, listN
 			continue
 		}
 		fullRepo := entry.URL
+		// On a GitHub Enterprise Server install a bare owner/name names no
+		// host, and the agent skips it (gitops_workspace), so the minter does
+		// too: a write policy for a repository the agent never serves would
+		// widen the token for nothing.
+		if githubHost != agentv1alpha1.DefaultGitHubHost {
+			if ref, perr := agentv1alpha1.ParseRepoRef(fullRepo); perr == nil && ref.Host == "" {
+				logger.Info("skipping a GitHub repository entry with no host in minter policy sync; on a GitHub Enterprise Server install an entry names its host",
+					"list", listName, "index", positions[i], "githubHost", githubHost)
+				continue
+			}
+		}
 		slug, err := agentv1alpha1.GitHubRepoSlugOnHost(fullRepo, primaryOrg, githubHost)
 		agentSpelling, spelled := agentURLSpelling(fullRepo)
 		if err != nil && spelled {

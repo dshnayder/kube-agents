@@ -1502,6 +1502,7 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 //
 // A gitlab forge's credentialsRef is required by the API server too, so it
 // holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 // +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
 type ForgeSpec struct {
@@ -1518,9 +1519,12 @@ type ForgeSpec struct {
 	// URL's text.
 	//
 	// "github" and "gitlab" are registered; the enum grows with each
-	// agent-side provider. Defaults to "github".
+	// agent-side provider. Omitted, it is "github".
+	//
+	// A forge at a host other than a spelling of github.com must name it, so
+	// a forge written for another instance is never read as a GitHub
+	// Enterprise Server by default.
 	// +kubebuilder:validation:Enum=github;gitlab
-	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
 

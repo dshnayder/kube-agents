@@ -5868,12 +5868,14 @@ class CommandExecutor:
                 "issues on its own behalf"
             )
         with self._outside_budget():
-            return self._execute(
+            result = self._execute(
                 [executable_path, *argv[1:]],
                 cwd=str(cwd),
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
             )
+        self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
+        return result
 
     def tls_refusal(self, output: str):
         """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
@@ -5932,6 +5934,7 @@ class CommandExecutor:
             containment_root=self.vcs_root,
             extra_config=tuple(config),
         )
+        self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         if check and result.exit_code != 0:
             raise subprocess.CalledProcessError(
                 result.exit_code, argv, result.stdout, result.stderr
@@ -6528,6 +6531,44 @@ class CommandExecutor:
                 raise RuntimeError("write credential mint returned no token")
             self._write_tokens[key] = (time.monotonic(), covered | {clean_repo}, token)
         return token
+
+    def drop_write_credential(self, provider: str) -> None:
+        """Forget the write token cached for ``provider``'s forge, so the next use mints anew.
+
+        Called when the forge refuses the token (401): a reinstalled App or a
+        revoked token then recovers on the next call, not when the reuse
+        window ends.
+        """
+        try:
+            forge = _provider_forge(provider)
+        except PermissionError:
+            return
+        host = forge.hosts[0] if forge.hosts else ""
+        if self._write_tokens.pop((provider, host), None) is not None:
+            LOGGER.info("%s write token for %s dropped after the forge refused it", provider, host)
+
+    def _drop_write_tokens_refused_by(
+        self, exit_code: int, stderr: str, config: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Drop each cached write token a failed git call presented and the forge refused.
+
+        git says `The requested URL returned error: 401` (or `Authentication
+        failed`) when the server refused the credential. Only the hosts whose
+        extraheader the call carried are dropped.
+        """
+        if exit_code == 0 or not (
+            "returned error: 401" in (stderr or "") or "Authentication failed" in (stderr or "")
+        ):
+            return
+        hosts = {
+            key[len("http.https://"):-len("/.extraheader")]
+            for key, _ in config
+            if key.startswith("http.https://") and key.endswith("/.extraheader")
+        }
+        for provider, host in list(self._write_tokens):
+            if host in hosts:
+                self._write_tokens.pop((provider, host), None)
+                LOGGER.info("%s write token for %s dropped after git was refused", provider, host)
 
     def _within_workspace(self, candidate: Path) -> bool:
         return _within(self.workspace_dir, candidate)
@@ -7139,7 +7180,11 @@ def build_workspace_store(
     # there never asks for the write mint, and the content workspace never
     # hands its write credential out.
     registry = providers.Registry(
-        {"mint": executor.mint_read_credential, "mint_write": executor.mint_write_credential}
+        {
+            "mint": executor.mint_read_credential,
+            "mint_write": executor.mint_write_credential,
+            "drop_write": executor.drop_write_credential,
+        }
     )
     store = ContentWorkspaceStore(
         executor.content_workspace_root,
@@ -7189,6 +7234,7 @@ def build_vcs_broker(
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
         mint_write=executor.mint_write_credential,
+        drop_write=executor.drop_write_credential,
         base_branch=base_branch,
         http_timeout=executor.timeout_seconds,
         http_max_bytes=executor.max_output_bytes,

@@ -290,3 +290,36 @@ func TestACABundleRefOnAGitHubForge(t *testing.T) {
 		t.Errorf("Problems() = %v, expected only the second CA bundle refused", paths)
 	}
 }
+
+// A forge at a host other than github.com names its provider. Left to the
+// default, a forge written for a GitLab instance would be read as a GitHub
+// Enterprise Server and handed a GitHub token. A host the github provider
+// refuses anyway is reported at the host alone.
+func TestAForgeAtAnotherHostNamesItsProvider(t *testing.T) {
+	unnamed := ForgeSpec{Name: "f", Host: "git.example.com", Namespace: "acme"}
+	resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{unnamed}}).ResolveGit()
+	paths := problemPaths(resolved)
+	if why, ok := paths["forges[0].provider"]; !ok || !strings.Contains(why, "names no provider") {
+		t.Errorf("Problems() = %v, expected forges[0].provider refused", paths)
+	}
+	if got := resolved.BrokerForges("/creds", "/ca"); got != nil {
+		t.Errorf("an unnamed forge reached the broker: %+v", got)
+	}
+	if resolved.GitHubHost() != "github.com" {
+		t.Errorf("GitHubHost() = %q, expected github.com while the forge is refused", resolved.GitHubHost())
+	}
+	for name, f := range map[string]ForgeSpec{
+		"named github":       gheForge("f", "git.example.com", "acme"),
+		"github.com, unnamed": {Name: "f", Host: "WWW.GitHub.com", Namespace: "acme"},
+		"no host, unnamed":    {Name: "f", Namespace: "acme"},
+	} {
+		resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{f}}).ResolveGit()
+		if paths := problemPaths(resolved); len(paths) != 0 {
+			t.Errorf("%s: Problems() = %v, expected none", name, paths)
+		}
+	}
+	resolved, _ = (&IntegrationSpec{Forges: []ForgeSpec{{Name: "f", Host: "gitlab.com"}}}).ResolveGit()
+	if paths := problemPaths(resolved); len(paths) != 1 || paths["forges[0].host"] == "" {
+		t.Errorf("Problems() = %v, expected only forges[0].host", paths)
+	}
+}

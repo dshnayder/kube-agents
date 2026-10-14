@@ -686,6 +686,10 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
 {{- end -}}
+{{- /* A forge at a host other than github.com names its provider, as the CRD's rule: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
+{{- if and (not $f.provider) $host (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- end -}}
 {{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
 {{- $canon := lower ($host | default "") -}}
 {{- if eq $provider "github" -}}

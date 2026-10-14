@@ -309,7 +309,16 @@ class Binding:
 
     def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self.transport().api(method, path, **kwargs)
+        try:
+            return self.transport().api(method, path, **kwargs)
+        except WorkspaceError as refused:
+            # A credential the forge refused is not presented again: one that
+            # caches a minted token drops it, so the next call mints anew.
+            if refused.status == 401:
+                invalidate = getattr(self.forge.credential, "invalidate", None)
+                if invalidate is not None:
+                    invalidate(self.repo)
+            raise
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -343,6 +352,7 @@ class VcsBroker:
         merge_observer: Callable[[int], None] | None = None,
         started_at: float | None = None,
         mint_write: Callable[[str, str], str] | None = None,
+        drop_write: Callable[[str], None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
@@ -397,7 +407,7 @@ class VcsBroker:
         # whether its credential strategy has any use for one.
         # `mint_write` is the second: the in-memory write token a forge with no
         # CLI behind it presents itself.
-        self.registry = Registry({"refresh": refresh, "mint_write": mint_write})
+        self.registry = Registry({"refresh": refresh, "mint_write": mint_write, "drop_write": drop_write})
         # Only the counter. Two requests share nothing else -- each gets its own
         # scratch directory and deletes it -- so serialising whole requests
         # would make a clone of one repository wait on a publish of another for

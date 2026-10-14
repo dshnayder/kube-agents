@@ -913,7 +913,13 @@ def validate_repo_org(repo: str) -> str:
     applies to GitHub repositories only.
     """
     host, path = split_host(repo) if repo else ("", "")
-    github = not host or host == repo_ref.GITHUB_CANONICAL_HOST or is_github_host(host)
+    # github.com, as before, or the install's GitHub Enterprise Server host;
+    # the other spellings of github.com keep the answer they had.
+    github = (
+        not host
+        or host == repo_ref.GITHUB_CANONICAL_HOST
+        or (host not in repo_ref.GITHUB_HOSTS and host == github_host())
+    )
     primary_org = os.environ.get("GITOPS_ORG") or (
         os.environ.get("GITHUB_ORG") if github else None
     )

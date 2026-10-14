@@ -104,6 +104,7 @@ class GitHubForge(Forge):
         mint_write: Callable[[str, str], str] | None = None,
         ca_file: str = "",
         ca_source: str = "",
+        drop_write: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self._mint = mint
@@ -135,7 +136,7 @@ class GitHubForge(Forge):
         # with its bot login: the same query `gh auth status` makes on
         # github.com. On a GitHub Enterprise Server, GraphQL is at /api/graphql.
         self.whoami_graphql = f"https://{host}/api/graphql"
-        self.credential = MintedWriteCredential(self.name, mint_write, host)
+        self.credential = MintedWriteCredential(self.name, mint_write, host, drop_write)
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -192,6 +193,7 @@ class GitHubForge(Forge):
                 mint_write=config.get("mint_write"),
                 ca_file=ca_file,
                 ca_source=ca_source,
+                drop_write=config.get("drop_write"),
             ),
         )
 
@@ -206,7 +208,12 @@ class GitHubForge(Forge):
         """
         if self._mint is None:
             return NoCredential()
-        return MintedReadCredential(self.name, self._mint, self.hosts[0])
+        # github.com keeps git's own redirect handling, so a repository
+        # renamed there still clones; on a GitHub Enterprise Server a redirect
+        # is refused, so the token never follows one to another host.
+        return MintedReadCredential(
+            self.name, self._mint, self.hosts[0], pin_redirects=self.hosts[0] not in DOTCOM_HOSTS
+        )
 
     # -- identity -----------------------------------------------------------
 

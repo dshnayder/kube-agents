@@ -51,7 +51,10 @@ When the install's GitHub forge is at a GitHub Enterprise Server host, Minty min
     -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
   ```
 
-  The key ring and the import-only key must exist first; the `gcloud kms` commands that create them are in INSTALL.md. The import makes key version `1`, the version the chart uses (`githubMinter.kms.keyVersion`, default `"1"`).
+  The key ring and the import-only key must exist first; the `gcloud kms` commands that create them are in INSTALL.md. On a new key, the import makes key version `1`, the version the chart uses (`githubMinter.kms.keyVersion`, default `"1"`). When the key already exists (a switch from github.com, or a reinstall in the same project), skip the create commands, read the new version with `gcloud kms keys versions list --key=github-token-minter-key --keyring=github-token-minter-keyring --location=REGION --project=PROJECT_ID --filter=state=ENABLED`, and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values`.
+
+- **Readiness.** Minty's readiness probe asks its own `/version` route, and minty `v2.7.1` calls the instance only when it mints. So the pod becomes Ready without the CA Secret or a route to the instance; a mint then fails until both are in place.
+- **Extra repositories.** Register another repository on the instance by its full URL, `https://<host>/owner/name`, with `"type": "github"`. A bare `owner/name` or a github.com URL is skipped on a GitHub Enterprise Server install, by the operator's policy sync and by the agent, so it gets no policy.
 
 - **Install.** `install.sh` and `upgrade.sh` cannot write a GitHub Enterprise Server forge yet. Use the Terraform + Helm method, with the forge in `ghes.auto.tfvars`: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 

@@ -240,8 +240,8 @@ reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
 pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
-each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
-the list names, so a repository's name does not change when a second forge is added and the names
+each entry the way the verbs take it. A github.com entry is its bare `owner/name` however many forges
+the list names (an entry on a GitHub Enterprise Server is `<host>/owner/name`, as another forge's is), so a repository's name does not change when a second forge is added and the names
 already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
 canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
@@ -1550,7 +1550,13 @@ GitLab refuses the same domains. A repository on the forge names the declared
 host or no host. The operator seeds it into the state ConfigMap by its full URL,
 `https://<host>/owner/name`, and the broker keys it `github:<host>/owner/name`,
 so an entry for github.com never admits a repository on the instance, and the
-reverse.
+reverse. On such an install, the agent and the minter's policy sync both skip a
+GitHub entry that names github.com or no host.
+
+**The provider is named.** A forge at a host other than github.com must name
+its `provider`; the field has no default. A forge written for a GitLab instance
+without a provider would otherwise be read as a GitHub Enterprise Server and be
+handed a GitHub token.
 
 **The credential.** The token is a GitHub App installation token, minted by the
 minter as on github.com. What changes is where the broker keeps it:
@@ -1563,7 +1569,9 @@ minter as on github.com. What changes is where the broker keeps it:
   (`MintedWriteCredential`). The API client sends it as an `Authorization`
   header. git gets it as `http.https://<host>/.extraheader` on that host only,
   in the configuration of the one git invocation that spends it, with
-  `credential.helper` cleared. The token is in the environment of the one git
+  `credential.helper` cleared. A 401 from the instance, on an API call or a
+  git push, drops the cached token, so a reinstalled App or a revoked token is
+  replaced on the next call. The token is in the environment of the one git
   process that spends it (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's
   store or the sandbox, as the read token is. The broker uses one token again for 30 minutes for
   each repository it covers, and it checks the managed list on every request.

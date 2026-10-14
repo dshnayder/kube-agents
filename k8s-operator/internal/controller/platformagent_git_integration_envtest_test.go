@@ -97,6 +97,11 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs",
 				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},
 		}, "caBundleRef is for a self-managed host"},
+		// A forge at another host names its provider, so a forge written for
+		// a GitLab instance is never read as a GitHub Enterprise Server.
+		"unnamed-provider-at-a-host": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "f", Host: "git.example.com", Namespace: "acme"}},
+		}, "names its provider"},
 		"github-com-named-ca": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Host: "SSH.GitHub.com", Namespace: "gke-labs",
 				CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "gh-ca"}}},

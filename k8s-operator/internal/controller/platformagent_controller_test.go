@@ -6303,9 +6303,9 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 }
 
 // On a GitHub Enterprise Server install the minter mints for the declared
-// host: its entries and bare names resolve there, a github.com entry is
-// another host's and is skipped without holding pruning, and an entry on a
-// third host is still unreadable.
+// host: its entries resolve there; a bare name, which the agent skips, and a
+// github.com entry, which is another host's, are skipped without holding
+// pruning; and an entry on a third host is still unreadable.
 func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
 	repos := `[{"type":"github","url":"https://ghe.example.com/test-org/repo-1"},` +
 		`{"type":"github","url":"test-org/repo-2"},` +
@@ -6316,7 +6316,7 @@ func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
-	if want := []string{"repo-1", "repo-2", "repo-3"}; !slices.Equal(bare, want) {
+	if want := []string{"repo-1", "repo-3"}; !slices.Equal(bare, want) {
 		t.Errorf("bare = %v, expected %v", bare, want)
 	}
 	if want := []string{"managed_repos[4]"}; !slices.Equal(unreadable, want) {

@@ -70,21 +70,17 @@ EXTRAHEADER_USERNAME = "x-access-token"
 # write credential, the fallback this credential exists to make impossible.
 # So a MintedReadCredential presents it whether or not a token was minted.
 CREDENTIAL_HELPER_KEY = "credential.helper"
-# `http.<url>.followRedirects` set to false for the forge's host, on every git
-# invocation a minted token rides on a host other than github.com (a GitHub
-# Enterprise Server). A redirect is an answer, not a hop: the token is
-# presented on the host it was minted for, and on no host a redirect names.
-# The API client refuses redirects for the same reason. github.com keeps
-# git's own redirect handling, so a repository renamed there still clones.
+# `http.<url>.followRedirects` set to false for the forge's host, on the git
+# invocations a minted token rides, unless the forge keeps git's own redirect
+# handling for its host (`pin_redirects=False`). A redirect is an answer, not
+# a hop: the token is presented on the host it was minted for, and on no host
+# a redirect names. The API client refuses redirects for the same reason.
 FOLLOW_REDIRECTS_KEY = "http.https://{host}/.followRedirects"
-REDIRECTS_KEPT_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 
 
-def _redirect_pin(host: str) -> tuple[tuple[str, str], ...]:
-    """The followRedirects pin for `host`, or none on github.com."""
-    if host in REDIRECTS_KEPT_HOSTS:
-        return ()
-    return ((FOLLOW_REDIRECTS_KEY.format(host=host), "false"),)
+def _redirect_pin(host: str, pin: bool) -> tuple[tuple[str, str], ...]:
+    """The followRedirects pin for `host`, or none when the forge keeps redirects."""
+    return ((FOLLOW_REDIRECTS_KEY.format(host=host), "false"),) if pin else ()
 
 
 class Credential(Protocol):
@@ -184,10 +180,13 @@ class MintedReadCredential:
       write gate's business.
     """
 
-    def __init__(self, provider: str, mint: MintOperation | None, host: str) -> None:
+    def __init__(
+        self, provider: str, mint: MintOperation | None, host: str, pin_redirects: bool = True
+    ) -> None:
         self.provider = provider
         self._mint = mint
         self._host = host
+        self._pin_redirects = pin_redirects
         self._token: str | None = None
 
     def ensure(self, repo: str) -> None:
@@ -218,7 +217,7 @@ class MintedReadCredential:
         ).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
-            *_redirect_pin(self._host),
+            *_redirect_pin(self._host, self._pin_redirects),
             helper_cleared,
         )
 
@@ -252,11 +251,19 @@ class MintedWriteCredential:
 
     stored_token = True
 
-    def __init__(self, provider: str, mint: WriteMintOperation | None, host: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        mint: WriteMintOperation | None,
+        host: str,
+        drop: Callable[[str], None] | None = None,
+    ) -> None:
         if not _HOST_RE.fullmatch(host or ""):
             raise ValueError(f"the host {host!r} is not a hostname")
         self.provider = provider
         self._mint = mint
+        self._drop = drop
+        self._pin_redirects = True
         self._host = host
         # repository -> the token its last `ensure` was answered with. Bounded
         # by the managed list, since the executor mints for nothing else.
@@ -290,6 +297,12 @@ class MintedWriteCredential:
             )
         self._tokens[repo] = token
 
+    def invalidate(self, repo: str) -> None:
+        """Forget the token: the forge refused it (401). The next `ensure` mints anew."""
+        self._tokens.pop(repo, None)
+        if self._drop is not None:
+            self._drop(self.provider)
+
     def headers(self, repo: str) -> dict[str, str]:
         token = self._tokens.get(repo)
         if not token:
@@ -310,7 +323,7 @@ class MintedWriteCredential:
         basic = base64.b64encode(f"{EXTRAHEADER_USERNAME}:{token}".encode("utf-8")).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
-            *_redirect_pin(self._host),
+            *_redirect_pin(self._host, self._pin_redirects),
             helper_cleared,
         )
 

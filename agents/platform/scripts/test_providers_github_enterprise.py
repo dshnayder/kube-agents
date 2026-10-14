@@ -279,6 +279,26 @@ class VerbsAgainstTheMockTest(MockGitHubEnterpriseCase):
         self.assertEqual(f"https://{HOST}/acme/infra/blob/{{ref}}/{{path}}", forge.file_url("acme/infra"))
 
 
+class RefusedTokenTest(MockGitHubEnterpriseCase):
+    """A 401 from the instance drops the cached write token, so the next call mints anew."""
+
+    def test_an_api_401_drops_the_token(self):
+        dropped = []
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [{"provider": "github", "host": HOST, "caFile": str(self.ca)}]}))
+        os.environ[FORGES_CONFIG_ENV] = str(config)
+        broker = vcs_broker.VcsBroker(self.dir / "scratch", git_runner=lambda *a, **k: None,
+                                      mint_write=self.mint_write, drop_write=dropped.append, http_timeout=10.0)
+        self.mock.answers = [{"__status__": 401, "__detail__": "Bad credentials"}]
+        binding = broker._bind({"repository": REPO_URL})
+        with self.assertRaises(WorkspaceError) as caught:
+            binding.api("GET", "repos/acme/infra/labels")
+        self.assertEqual(401, caught.exception.status)
+        self.assertEqual(["github"], dropped)
+        with self.assertRaises(WorkspaceError):
+            binding.forge.credential.headers("acme/infra")
+
+
 class TrustTest(MockGitHubEnterpriseCase):
     def call(self, broker) -> object:
         self.mock.answers = [[]]
@@ -449,6 +469,23 @@ class WriteMintTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 self.executor.mint_write_credential("github", "acme/infra")
 
+    def test_a_refused_git_call_drops_the_token_and_the_next_use_mints_anew(self):
+        self.executor.mint_write_credential("github", "acme/infra")
+        config = ((f"http.https://{HOST}/.extraheader", "AUTHORIZATION: basic x"), ("credential.helper", ""))
+        # A failure that is not a refused credential keeps the token.
+        self.executor._drop_write_tokens_refused_by(128, "fatal: repository not found", config)
+        self.assertIn(("github", HOST), self.executor._write_tokens)
+        self.executor._drop_write_tokens_refused_by(
+            128, f"fatal: unable to access 'https://{HOST}/acme/infra.git/': The requested URL returned error: 401", config)
+        self.assertNotIn(("github", HOST), self.executor._write_tokens)
+        self.executor.mint_write_credential("github", "acme/infra")
+        self.assertEqual(2, len(self.runs))
+
+    def test_drop_write_credential_forgets_the_forges_token(self):
+        self.executor.mint_write_credential("github", "acme/infra")
+        self.executor.drop_write_credential("github")
+        self.assertEqual({}, self.executor._write_tokens)
+
     def test_the_flags_match_the_helpers(self):
         self.assertEqual(github_token_refresh.PRINT_WRITE_FLAG, credential_proxy.FORGE_WRITE_MINT_FLAG)
         self.assertEqual(github_token_refresh.HOST_FLAG, credential_proxy.FORGE_HOST_FLAG)
@@ -508,6 +545,16 @@ class ConsumerLinksTest(unittest.TestCase):
             self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.validate_repo_org(f"{HOST}/acme/infra"))
             with self.assertRaises(ValueError):
                 gitops_workspace.validate_repo_org(f"{HOST}/other/infra")
+
+    def test_other_github_com_spellings_keep_mains_org_answer(self):
+        # On main, `www.github.com/...` and `ssh.github.com/...` are not held
+        # to GITHUB_ORG; this change applies the org only to the instance.
+        for host in (HOST, "github.com"):
+            with self.subTest(install_host=host), mock.patch.dict(os.environ, {"GITHUB_ORG": "acme"}), \
+                    mock.patch.object(gitops_workspace, "github_host", return_value=host):
+                os.environ.pop("GITOPS_ORG", None)
+                for name in ("www.github.com/other/x", "ssh.github.com/other/x"):
+                    self.assertEqual(name, gitops_workspace.validate_repo_org(name))
 
     def test_the_sandbox_refresh_names_the_repository_on_the_install_host(self):
         seen = []
@@ -727,6 +774,7 @@ class ContentWorkspaceGitTest(_EnterpriseGitCase):
             execute_workspace_git=workspace_git,
             mint_read_credential=executor.mint_read_credential,
             mint_write_credential=executor.mint_write_credential,
+            drop_write_credential=executor.drop_write_credential,
             tls_refusal=executor.tls_refusal,
         ))
         (self.dir / "agent").mkdir()
@@ -906,7 +954,8 @@ class RedirectPinTest(unittest.TestCase):
     def test_the_write_and_read_credentials_pin_follow_redirects_off(self):
         for credential in (
             MintedWriteCredential("github", lambda provider, repo: TOKEN, HOST),
-            providers.MintedReadCredential("github", lambda provider, repo: TOKEN, HOST),
+            providers.Registry({"forges": [{"provider": "github", "host": HOST}],
+                                "mint": lambda provider, repo: TOKEN}).forges[0].read_credential("acme/infra"),
         ):
             with self.subTest(credential=type(credential).__name__):
                 credential.ensure("acme/infra")
@@ -916,7 +965,8 @@ class RedirectPinTest(unittest.TestCase):
 
     def test_github_com_keeps_its_redirect_behaviour(self):
         # A repository renamed on github.com still clones on the read token.
-        credential = providers.MintedReadCredential("github", lambda provider, repo: TOKEN, "github.com")
+        credential = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}],
+                                         "mint": lambda provider, repo: TOKEN}).forges[0].read_credential("acme/infra")
         credential.ensure("acme/infra")
         config = credential.git_config("acme/infra")
         self.assertEqual(
