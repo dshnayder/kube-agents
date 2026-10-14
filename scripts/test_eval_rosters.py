@@ -170,6 +170,7 @@ ADDED_AFTER_THE_MOVE = [
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
     "fleet-audit-clean-close-reads-clean",  # the clean close's banner, with close_ledger_reads_clean
+    "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
 ]
 # Taken back out of the nightly file after registering there, each with a
