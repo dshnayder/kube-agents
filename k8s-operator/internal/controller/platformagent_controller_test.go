@@ -6159,7 +6159,7 @@ func TestMinterBareReposLogsNoEntryValue(t *testing.T) {
 		`{"type":"github","url":"https://x:` + secret + `@github.com/other-org/app"},` +
 		`{"type":"gitlab","url":"https://x:` + secret + `@gitlab.com/g/p"},` +
 		`{"type":"github","url":"https://github.com/test-org/repo-1"}]`
-	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", gitopsStateManagedReposKey)
+	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", agentv1alpha1.DefaultGitHubHost, gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
@@ -6218,7 +6218,7 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 		`{"type":"github","url":"https://[x@github.com/test-org/open"},` +
 		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"},` +
 		`{"type":"github","url":"https://[TOKEN]@github.com/test-org/paired"}]`
-	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", agentv1alpha1.DefaultGitHubHost, gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
@@ -6227,6 +6227,43 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	}
 	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]", "managed_repos[17]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// On a GitHub Enterprise Server install the minter mints for the declared
+// host: its entries and bare names resolve there, a github.com entry is
+// another host's and is skipped without holding pruning, and an entry on a
+// third host is still unreadable.
+func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
+	repos := `[{"type":"github","url":"https://ghe.example.com/test-org/repo-1"},` +
+		`{"type":"github","url":"test-org/repo-2"},` +
+		`{"type":"github","url":"https://GHE.example.com/test-org/repo-3.git"},` +
+		`{"type":"github","url":"https://github.com/test-org/dotcom"},` +
+		`{"type":"github","url":"https://ghe.other.example/test-org/elsewhere"}]`
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", "ghe.example.com", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if want := []string{"repo-1", "repo-2", "repo-3"}; !slices.Equal(bare, want) {
+		t.Errorf("bare = %v, expected %v", bare, want)
+	}
+	if want := []string{"managed_repos[4]"}; !slices.Equal(unreadable, want) {
+		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// The minter's host comes from the declaration: github.com with none, the
+// GitHub Enterprise Server host when a GitHub forge declares one.
+func TestMinterGitHubHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{}
+	if got := minterGitHubHost(agent); got != agentv1alpha1.DefaultGitHubHost {
+		t.Errorf("minterGitHubHost(no integration) = %q", got)
+	}
+	agent.Spec.Integration = &agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{
+		{Name: "ghe", Provider: "github", Host: "GHE.example.com", Namespace: "test-org"},
+	}}
+	if got := minterGitHubHost(agent); got != "ghe.example.com" {
+		t.Errorf("minterGitHubHost(GHES forge) = %q, expected ghe.example.com", got)
 	}
 }
 

@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""A GitHub forge at a GitHub Enterprise Server host, tested against a mock instance (#2752).
+
+    python3 -m pytest -q agents/platform/scripts/test_providers_github_enterprise.py
+
+The mock is a local HTTPS server. Its CA, key and certificate are made with
+the `openssl` binary at test time, so no key is kept in the repository. It
+answers at the `/api/v3` prefix a GitHub Enterprise Server instance serves the
+REST API under, and it replays the github.com recordings in
+`testdata/providers/github/`: the instance serves the same API, so the forge
+must make the same calls and give the same answers as on github.com. The
+broker reaches it at its own hostname, `ghe.mock.test`; the test sends that
+name's connections to the loopback port the mock listens on, so TLS checks
+the certificate against the real hostname.
+
+What is pinned, beside the verbs: the write token reaches the mock as an
+`Authorization` header and nowhere else; the CA trust is the forge's own, so a
+wrong or missing CA is FORGE_TLS_UNTRUSTED; a redirect is refused and the
+credential is not sent on; the managed-repository keys are
+`github:<host>/owner/name`; and a github.com install is what it was.
+"""
+
+from __future__ import annotations
+
+import base64
+import http.server
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import credential_proxy
+import github_token_refresh
+import gitops_workspace
+import providers
+import vcs_broker
+from providers import transport as transport_module
+from providers.credentials import MintedWriteCredential
+from providers.registry import FORGES_CONFIG_ENV
+from workspace_paths import WorkspaceError
+
+OPENSSL = shutil.which("openssl")
+HOST = "ghe.mock.test"
+OTHER_HOST = "elsewhere.mock.test"
+REPO_URL = f"https://{HOST}/acme/infra"
+TOKEN = "ghs_mockinstallationtoken0001"
+FIXTURES = Path(__file__).resolve().parent / "testdata" / "providers" / "github"
+DIFF = "diff --git a/x b/x\n"
+
+
+def _openssl(*args: str, cwd: Path) -> None:
+    subprocess.run([OPENSSL, *args], cwd=cwd, check=True, capture_output=True)
+
+
+def make_pki(root: Path, hosts: tuple[str, ...]) -> tuple[Path, Path, Path]:
+    """A private CA, and a server certificate for `hosts` it signed."""
+    root.mkdir(parents=True, exist_ok=True)
+    _openssl(
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+        "-keyout", "ca.key", "-out", "ca.crt", "-subj", "/CN=mock GitHub Enterprise Server CA",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash",
+        cwd=root,
+    )
+    (root / "leaf.ext").write_text(
+        "subjectAltName=" + ",".join(f"DNS:{h}" for h in hosts) + "\n"
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        "authorityKeyIdentifier=keyid\n"
+        "subjectKeyIdentifier=hash\n"
+    )
+    _openssl(
+        "req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key",
+        "-out", "leaf.csr", "-subj", f"/CN={hosts[0]}", cwd=root,
+    )
+    _openssl(
+        "x509", "-req", "-in", "leaf.csr", "-CA", "ca.crt", "-CAkey", "ca.key",
+        "-CAcreateserial", "-days", "2", "-out", "leaf.crt", "-extfile", "leaf.ext",
+        cwd=root,
+    )
+    return root / "ca.crt", root / "leaf.crt", root / "leaf.key"
+
+
+class MockGitHubEnterprise:
+    """A mock GitHub Enterprise Server: the REST API at /api/v3, answered from a queue.
+
+    Each request takes the next queued answer: a JSON value, a recorded
+    refusal (`{"__status__": 404, "__detail__": ...}`), or, for a request that
+    asks for the diff media type, the diff. A path outside /api/v3 is a 404
+    the test fails on. `redirect_to` makes every request answer 302 to that
+    URL instead.
+    """
+
+    def __init__(self, cert: Path, key: Path) -> None:
+        self.answers: list = []
+        self.requests: list[dict] = []
+        self.redirect_to = ""
+        mock_server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                mock_server.requests.append({
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "accept": self.headers.get("Accept"),
+                    "host": self.headers.get("Host"),
+                    "body": json.loads(body) if body else None,
+                })
+                if mock_server.redirect_to:
+                    self.send_response(302)
+                    self.send_header("Location", mock_server.redirect_to)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if not self.path.startswith("/api/v3/"):
+                    return self._json(404, {"message": "Not Found"})
+                if (self.headers.get("Accept") or "").endswith(".diff"):
+                    data = DIFF.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if not mock_server.answers:
+                    return self._json(500, {"message": f"the mock has no answer for {self.command} {self.path}"})
+                answer = mock_server.answers.pop(0)
+                if isinstance(answer, dict) and "__status__" in answer:
+                    return self._json(int(answer["__status__"]), {"message": answer.get("__detail__") or ""})
+                self._json(200, answer)
+
+            def _json(self, status: int, value) -> None:
+                data = json.dumps(value).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = _answer
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class Recorded:
+    """The transport's `api` answering from a fixture: how the forge behaves on github.com."""
+
+    def __init__(self, responses: list) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple] = []
+
+    def __call__(self, method, path, *, params=None, body=None, raw=None):
+        self.calls.append((method, path, params, body, raw))
+        if raw:
+            return DIFF
+        answer = self.responses.pop(0)
+        if isinstance(answer, dict) and "__status__" in answer:
+            raise WorkspaceError(answer.get("__detail__") or "recorded refusal",
+                                 status=int(answer["__status__"]), code="FORGE_CALL_FAILED")
+        return answer
+
+
+@unittest.skipUnless(OPENSSL, "openssl is needed to make the mock's private CA")
+class MockGitHubEnterpriseCase(unittest.TestCase):
+    """A broker configured with one GitHub forge at the mock's host."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        transport_module._CA_CONTEXTS.clear()
+        self.ca, cert, key = make_pki(self.dir / "pki", (HOST, OTHER_HOST))
+        self.other_ca, _, _ = make_pki(self.dir / "other-pki", (HOST,))
+        self.mock = MockGitHubEnterprise(cert, key)
+        self.addCleanup(self.mock.close)
+        # The mock's hostname, and the second one a redirect names, reach
+        # the mock's loopback port; nothing else is touched.
+        real = socket.create_connection
+        port = self.mock.port
+
+        def connect(address, *args, **kwargs):
+            if address[0] in (HOST, OTHER_HOST) and address[1] == 443:
+                address = ("127.0.0.1", port)
+            return real(address, *args, **kwargs)
+
+        patcher = mock.patch("socket.create_connection", side_effect=connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        self.minted: list[tuple[str, str]] = []
+
+    def mint_write(self, provider: str, repo: str) -> str:
+        self.minted.append((provider, repo))
+        return TOKEN
+
+    def broker(self, ca_file: str | None = None, *, ca_source: str = "") -> vcs_broker.VcsBroker:
+        entry = {"provider": "github", "host": HOST}
+        if ca_file is None:
+            ca_file = str(self.ca)
+        if ca_file:
+            entry["caFile"] = ca_file
+        if ca_source:
+            entry["caSecret"] = ca_source
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [entry]}))
+        os.environ[FORGES_CONFIG_ENV] = str(config)
+        return vcs_broker.VcsBroker(
+            self.dir / "scratch",
+            git_runner=lambda *a, **k: None,
+            mint_write=self.mint_write,
+            http_timeout=10.0,
+        )
+
+
+class VerbsAgainstTheMockTest(MockGitHubEnterpriseCase):
+    def test_every_verb_makes_github_coms_calls_at_the_api_v3_prefix_with_the_minted_token(self):
+        dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]}).forges[0]
+        broker = self.broker()
+        forge = broker.registry.forges[0]
+        for fixture_file in sorted(FIXTURES.glob("*.json")):
+            verb = fixture_file.stem
+            fixture = json.loads(fixture_file.read_text())
+            with self.subTest(verb=verb):
+                recorded = Recorded(fixture["responses"])
+                expected = getattr(dotcom, verb.replace("-", "_"))(recorded, "acme/infra", dict(fixture["payload"]))
+                self.mock.requests.clear()
+                self.mock.answers = [r for r in fixture["responses"]]
+                binding = broker._bind({"repository": REPO_URL})
+                self.assertIs(forge, binding.forge)
+                answer = getattr(forge, verb.replace("-", "_"))(binding.api, binding.repo, dict(fixture["payload"]))
+                self.assertEqual(expected, answer)
+                self.assertEqual(len(recorded.calls), len(self.mock.requests))
+                for (method, path, params, body, raw), seen in zip(recorded.calls, self.mock.requests):
+                    self.assertEqual(method, seen["method"])
+                    self.assertTrue(seen["path"].startswith(f"/api/v3/{path.lstrip('/')}"), seen["path"])
+                    self.assertEqual(f"Bearer {TOKEN}", seen["authorization"])
+                    self.assertEqual(HOST, seen["host"])
+                    self.assertEqual(body, seen["body"])
+                    if raw:
+                        self.assertEqual(raw, seen["accept"])
+                self.assertEqual([], self.mock.answers, "the mock holds answers the forge never asked for")
+        self.assertTrue(self.minted)
+        self.assertEqual({("github", "acme/infra")}, set(self.minted))
+
+    def test_the_forge_is_the_http_transport_with_no_cli(self):
+        broker = self.broker()
+        forge = broker.registry.forges[0]
+        self.assertEqual(("http", f"https://{HOST}/api/v3", (HOST,)), (forge.transport, forge.api_url, forge.hosts))
+        self.assertEqual((), broker.registry.executables)
+        self.assertIsInstance(forge.credential, MintedWriteCredential)
+        self.assertEqual(f"https://{HOST}/acme/infra.git", forge.clone_url("acme/infra"))
+        self.assertEqual(f"https://{HOST}/acme/infra/blob/{{ref}}/{{path}}", forge.file_url("acme/infra"))
+
+
+class TrustTest(MockGitHubEnterpriseCase):
+    def call(self, broker) -> object:
+        self.mock.answers = [[]]
+        binding = broker._bind({"repository": REPO_URL})
+        return binding.api("GET", "repos/acme/infra/labels")
+
+    def test_the_forges_own_ca_is_trusted(self):
+        self.assertEqual([], self.call(self.broker()))
+
+    def test_a_wrong_ca_is_untrusted_and_sends_nothing(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            self.call(self.broker(str(self.other_ca)))
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        self.assertIn(HOST, caught.exception.fields["detail"])
+        self.assertEqual([], self.mock.requests)
+
+    def test_no_ca_is_untrusted(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            self.call(self.broker(""))
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+
+    def test_a_ca_file_that_is_not_mounted_names_its_secret(self):
+        with self.assertRaises(WorkspaceError) as caught:
+            self.call(self.broker(str(self.dir / "absent.crt"), ca_source="ghe-ca"))
+        self.assertEqual("FORGE_TLS_UNTRUSTED", caught.exception.fields["code"])
+        self.assertIn("ghe-ca", caught.exception.fields["detail"])
+
+    def test_a_redirect_is_refused_and_the_token_is_not_sent_on(self):
+        broker = self.broker()
+        self.mock.redirect_to = f"https://{OTHER_HOST}/api/v3/repos/acme/infra/labels"
+        with self.assertRaises(WorkspaceError) as caught:
+            self.call(broker)
+        self.assertEqual("FORGE_REDIRECTED", caught.exception.fields["code"])
+        self.assertEqual([HOST], [r["host"] for r in self.mock.requests])
+
+
+class WriteCredentialTest(unittest.TestCase):
+    def test_git_gets_the_token_as_an_extraheader_on_the_host_only(self):
+        credential = MintedWriteCredential("github", lambda provider, repo: TOKEN, HOST)
+        self.assertEqual((("credential.helper", ""),), credential.git_config("acme/infra"))
+        credential.ensure("acme/infra")
+        basic = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+        self.assertEqual(
+            ((f"http.https://{HOST}/.extraheader", f"AUTHORIZATION: basic {basic}"), ("credential.helper", "")),
+            credential.git_config("acme/infra"),
+        )
+        self.assertEqual({"Authorization": f"Bearer {TOKEN}"}, credential.headers("acme/infra"))
+        # Another repository has no token until its own mint.
+        with self.assertRaises(WorkspaceError):
+            credential.headers("acme/other")
+
+    def test_a_refused_mint_propagates_and_a_failed_one_is_named(self):
+        def refuse(provider, repo):
+            raise PermissionError("not managed")
+
+        with self.assertRaises(PermissionError):
+            MintedWriteCredential("github", refuse, HOST).ensure("acme/infra")
+        for mint in (lambda p, r: (_ for _ in ()).throw(RuntimeError("minter down")), lambda p, r: "", None):
+            with self.subTest(mint=mint), self.assertRaises(WorkspaceError) as caught:
+                MintedWriteCredential("github", mint, HOST).ensure("acme/infra")
+            self.assertEqual("FORGE_CREDENTIAL_UNAVAILABLE", caught.exception.fields["code"])
+
+
+class ManagedKeysTest(unittest.TestCase):
+    def test_an_enterprise_entry_is_keyed_and_named_with_its_host(self):
+        entries = [
+            {"type": "github", "url": f"https://{HOST}/acme/infra"},
+            {"type": "github", "url": "https://github.com/acme/web"},
+            {"type": "github", "url": "acme/bare"},
+        ]
+        self.assertEqual(
+            [f"github:{HOST}/acme/infra", "github:github.com/acme/web", "github:github.com/acme/bare"],
+            gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY),
+        )
+        self.assertEqual(["acme/web", "acme/bare", f"{HOST}/acme/infra"],
+                         gitops_workspace._forge_repo_names(entries, gitops_workspace.MANAGED_REPOS_KEY))
+        self.assertEqual(HOST, gitops_workspace.github_host(entries))
+        self.assertEqual("github.com", gitops_workspace.github_host(entries[1:]))
+        self.assertTrue(gitops_workspace.is_valid_repo_slug(f"{HOST}/acme/infra"))
+
+    def test_the_broker_admits_an_enterprise_repository_by_its_host_key(self):
+        forge = providers.Registry({"forges": [{"provider": "github", "host": HOST}]}).forges[0]
+        dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]}).forges[0]
+        keys = frozenset({f"github:{HOST}/acme/infra"})
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=keys):
+            self.assertTrue(credential_proxy.repository_is_managed("acme/infra", forge))
+            self.assertFalse(credential_proxy.repository_is_managed("acme/infra", dotcom))
+
+
+class WriteMintTest(unittest.TestCase):
+    """The executor's in-memory write mint: managed only, cached per host."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.executor = credential_proxy.CommandExecutor(
+            timeout_seconds=5, max_output_bytes=1 << 16, state_dir=tmp.name, scoped_pool=None
+        )
+        self.forge = providers.Registry({"forges": [{"provider": "github", "host": HOST}]}).forges[0]
+        self.runs: list[list[str]] = []
+        helper = Path(tmp.name) / "github_token_refresh.py"
+        helper.write_text("")
+        patches = [
+            mock.patch.object(credential_proxy, "_provider_forge", return_value=self.forge),
+            mock.patch.object(credential_proxy, "managed_repositories",
+                              return_value=frozenset({f"github:{HOST}/acme/infra", f"github:{HOST}/acme/web"})),
+            mock.patch.object(credential_proxy.CommandExecutor, "_forge_helper", return_value=helper),
+            mock.patch.object(credential_proxy.CommandExecutor, "_run_forge_helper", side_effect=self.run_helper),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_helper(self, provider, helper, arguments, action, log_success=False):
+        self.runs.append(arguments)
+        stdout = json.dumps({"token": TOKEN, "repositories": ["acme/infra", "acme/web"]})
+        return credential_proxy.ExecutionResult(exit_code=0, stdout=stdout, stderr="", duration_ms=1, truncated=False, timed_out=False)
+
+    def test_a_managed_repository_is_minted_once_for_the_repositories_the_token_covers(self):
+        self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/infra"))
+        self.assertEqual(TOKEN, self.executor.mint_write_credential("github", "acme/web"))
+        self.assertEqual([[credential_proxy.FORGE_WRITE_MINT_FLAG, credential_proxy.FORGE_HOST_FLAG, HOST, "acme/infra"]],
+                         self.runs)
+        self.assertEqual({("github", HOST)}, set(self.executor._write_tokens))
+
+    def test_an_unmanaged_repository_is_refused_before_anything_runs(self):
+        with self.assertRaises(PermissionError):
+            self.executor.mint_write_credential("github", "acme/elsewhere")
+        self.assertEqual([], self.runs)
+
+    def test_a_repository_unregistered_since_the_mint_is_refused_from_the_cache(self):
+        self.executor.mint_write_credential("github", "acme/infra")
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            with self.assertRaises(PermissionError):
+                self.executor.mint_write_credential("github", "acme/infra")
+
+    def test_the_flags_match_the_helpers(self):
+        self.assertEqual(github_token_refresh.PRINT_WRITE_FLAG, credential_proxy.FORGE_WRITE_MINT_FLAG)
+        self.assertEqual(github_token_refresh.HOST_FLAG, credential_proxy.FORGE_HOST_FLAG)
+
+
+class HelperPrintModeTest(unittest.TestCase):
+    def test_it_mints_for_the_host_and_installs_nothing(self):
+        keys = [f"github:{HOST}/acme/infra", f"github:{HOST}/acme/web", f"github:{HOST}/other/x",
+                "github:github.com/acme/dotcom"]
+        with mock.patch.object(github_token_refresh, "broker_oidc_token", return_value="oidc"), \
+                mock.patch.object(github_token_refresh, "request_minty_token", return_value=TOKEN) as minty, \
+                mock.patch.object(gitops_workspace, "get_managed_repo_keys", return_value=keys), \
+                mock.patch.object(github_token_refresh.subprocess, "run") as run:
+            answer = github_token_refresh.mint_write_token("acme/infra", HOST)
+        self.assertEqual({"token": TOKEN, "repositories": ["acme/infra", "acme/web"]}, answer)
+        minty.assert_called_once_with("oidc", "acme", ["infra", "web"], github_token_refresh.MINTY_WRITE_SCOPE)
+        run.assert_not_called()
+
+    def test_it_refuses_github_com_and_a_bad_repository(self):
+        for repo, host in (("acme/infra", "github.com"), ("acme/infra", ""), ("not-a-slug", HOST)):
+            with self.subTest(repo=repo, host=host), self.assertRaises(RuntimeError):
+                github_token_refresh.mint_write_token(repo, host)
+
+
+class ConsumerLinksTest(unittest.TestCase):
+    """The links and names built from a repository follow the install's GitHub host."""
+
+    def test_a_ledger_on_the_enterprise_host_is_found_and_named_with_it(self):
+        import slack_audit_report
+
+        report = f"Fleet audit: 2 new findings — https://{HOST}/acme/infra/issues/12"
+        with mock.patch.object(slack_audit_report, "_github_host", return_value=HOST):
+            ref = slack_audit_report.ledger_ref(report)
+            dotcom = slack_audit_report.ledger_ref("Fleet audit: 2 new — https://github.com/acme/infra/issues/7")
+            other = slack_audit_report.ledger_ref("Fleet audit: 2 new — https://ghe.other.example/acme/infra/issues/7")
+        self.assertEqual((f"https://{HOST}/acme/infra/issues/12", f"{HOST}/acme/infra", 12), tuple(ref))
+        self.assertEqual(("https://github.com/acme/infra/issues/7", "acme/infra", 7), tuple(dotcom))
+        self.assertIsNone(other)
+        # A github.com install does not read another host's issue as its ledger.
+        with mock.patch.object(slack_audit_report, "_github_host", return_value="github.com"):
+            self.assertIsNone(slack_audit_report.ledger_ref(report))
+
+    def test_an_opened_pull_request_on_the_enterprise_host_is_a_moment(self):
+        import slack_moments
+
+        text = f"Opened PR https://{HOST}/acme/infra/pull/41"
+        self.assertEqual(f"https://{HOST}/acme/infra/pull/41", slack_moments.opened_pr(text, HOST)[0])
+        self.assertIsNone(slack_moments.opened_pr(text, "github.com"))
+        self.assertIsNone(slack_moments.opened_pr("Opened PR https://ghe.other.example/a/b/pull/1", HOST))
+        self.assertEqual("https://github.com/acme/infra/pull/9",
+                         slack_moments.opened_pr("Opened PR https://github.com/acme/infra/pull/9", HOST)[0])
+
+    def test_github_org_binds_an_enterprise_repository(self):
+        with mock.patch.dict(os.environ, {"GITHUB_ORG": "acme"}), \
+                mock.patch.object(gitops_workspace, "github_host", return_value=HOST):
+            os.environ.pop("GITOPS_ORG", None)
+            self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.validate_repo_org(f"{HOST}/acme/infra"))
+            with self.assertRaises(ValueError):
+                gitops_workspace.validate_repo_org(f"{HOST}/other/infra")
+
+    def test_the_sandbox_refresh_names_the_repository_on_the_install_host(self):
+        seen = []
+
+        class Answer:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def urlopen(request, timeout=None):
+            seen.append(json.loads(request.data))
+            return Answer()
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}), \
+                mock.patch.object(gitops_workspace, "github_host", return_value=HOST), \
+                mock.patch.object(github_token_refresh.urllib.request, "urlopen", side_effect=urlopen):
+            github_token_refresh.refresh_git_credentials("acme/infra")
+        self.assertEqual([{"provider": "github", "repository": f"https://{HOST}/acme/infra"}], seen)
+
+
+class ContentWorkspaceTest(unittest.TestCase):
+    def test_a_bare_name_is_placed_on_the_install_github_host(self):
+        from content_workspace import ContentWorkspaceStore
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "agent").mkdir()
+        store = ContentWorkspaceStore(root / "trees", root / "agent", lambda *a, **k: None, github_host=lambda: HOST)
+        self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"), store._where("acme/infra"))
+        dotcom = ContentWorkspaceStore(root / "trees2", root / "agent", lambda *a, **k: None)
+        self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"), dotcom._where("acme/infra"))
+
+    def test_the_broker_locates_an_enterprise_repository_with_its_host(self):
+        registry = providers.Registry({"forges": [{"provider": "github", "host": HOST}]})
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=registry):
+            self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"),
+                             credential_proxy._workspace_locate(f"{HOST}/acme/infra"))
+            self.assertEqual(HOST, credential_proxy._workspace_github_host())
+            self.assertIs(registry.forges[0], credential_proxy._provider_forge("github", HOST))
+            with self.assertRaises(PermissionError):
+                credential_proxy._provider_forge("github", "github.com")
+        dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]})
+        with mock.patch.object(credential_proxy, "forge_registry", return_value=dotcom):
+            self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"),
+                             credential_proxy._workspace_locate("github.com/acme/infra"))
+            self.assertEqual("github.com", credential_proxy._workspace_github_host())
+
+
+class GitHubDotComUnaffectedTest(unittest.TestCase):
+    def test_a_github_com_install_builds_the_cli_forge_as_before(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop(FORGES_CONFIG_ENV, None)
+            registry = providers.Registry({"refresh": lambda p, r: None, "mint_write": lambda p, r: TOKEN})
+        [forge] = registry.forges
+        self.assertEqual(("cli", "gh", ("github.com", "www.github.com")), (forge.transport, forge.cli, forge.hosts))
+        self.assertIsInstance(forge.credential, providers.BrokeredCredential)
+        self.assertEqual(("gh",), registry.executables)
+        self.assertEqual("https://github.com/acme/infra.git", forge.clone_url("acme/infra"))
+        self.assertEqual("github.com", gitops_workspace.github_host([{"type": "github", "url": "acme/infra"}]))
+
+
+if __name__ == "__main__":
+    unittest.main()

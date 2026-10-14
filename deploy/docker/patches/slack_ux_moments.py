@@ -225,10 +225,25 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
         return ""
 
 
+def _github_host() -> str:
+    """The install's GitHub host, github.com or its GitHub Enterprise Server host.
+
+    Read from the mounted repository lists by ``gitops_workspace``, which sits
+    beside ``slack_moments`` in the scripts directory. github.com when it
+    cannot be imported or read.
+    """
+    try:
+        import gitops_workspace
+
+        return gitops_workspace.github_host()
+    except Exception:  # noqa: BLE001 — github.com, as before
+        return "github.com"
+
+
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
     """Post each PR ``text`` says was opened, once per thread; True when any posted."""
     posted = False
-    for url, repo, number, line in _moments.opened_prs(text):
+    for url, repo, number, line in _moments.opened_prs(text, _github_host()):
         key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
         if key in _announced:
             continue

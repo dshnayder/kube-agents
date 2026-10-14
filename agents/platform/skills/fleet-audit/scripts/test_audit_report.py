@@ -15048,6 +15048,15 @@ class TestLedgerStoreForNestedPaths(unittest.TestCase):
             audit_report.reports_dir_for("compliance-audit", "github.com/Acme/fleet"),
         )
 
+    def test_a_github_enterprise_server_repository_keeps_its_hosts_ledger(self):
+        # Named `<host>/owner/name` by the managed list, its ledger sits below
+        # its host and is never the github.com repository of the same name.
+        ghes = audit_report.reports_dir_for("compliance-audit", "GHE.example.com/Acme/fleet")
+        self.assertEqual(Path(self.root, "compliance-audit", "ghe.example.com", "acme%2Ffleet"), ghes)
+        self.assertNotEqual(audit_report.reports_dir_for("compliance-audit", "acme/fleet"), ghes)
+        self.assertEqual("ghe.example.com/acme/fleet", audit_report._ledger_key("GHE.example.com/Acme/fleet"))
+        self.assertNotEqual(audit_report._ledger_key("acme/fleet"), audit_report._ledger_key("ghe.example.com/acme/fleet"))
+
     def test_a_deep_path_without_a_host_or_with_a_climb_is_refused(self):
         for repo in ("acme/platform/infra", "gitlab.com/acme/../infra", "gitlab.com/acme"):
             with self.subTest(repo=repo):

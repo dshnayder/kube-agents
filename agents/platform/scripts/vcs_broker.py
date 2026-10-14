@@ -342,6 +342,7 @@ class VcsBroker:
         tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
         merge_observer: Callable[[int], None] | None = None,
         started_at: float | None = None,
+        mint_write: Callable[[str, str], str] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
@@ -394,7 +395,9 @@ class VcsBroker:
         # The refresh operation is configuration in the sense that matters: it
         # is how this install performs a privileged act, and a forge decides
         # whether its credential strategy has any use for one.
-        self.registry = Registry({"refresh": refresh})
+        # `mint_write` is the second: the in-memory write token a forge with no
+        # CLI behind it presents itself.
+        self.registry = Registry({"refresh": refresh, "mint_write": mint_write})
         # Only the counter. Two requests share nothing else -- each gets its own
         # scratch directory and deletes it -- so serialising whole requests
         # would make a clone of one repository wait on a publish of another for
@@ -457,9 +460,11 @@ class VcsBroker:
         invocations, so a credential belonging to one forge is not installed on
         every git in the process.
         """
-        config = tuple(forge.credential.git_config(repo))
-
+        # Read per invocation, not at bind time: a minted credential holds no
+        # token until the verb's `ensure` has run, and a token minted later
+        # than the bind is the one git must present.
         def run(cwd: Path, *args: str, check: bool = True):
+            config = tuple(forge.credential.git_config(repo))
             return self._git_runner(["git", *args], cwd, check, config)
 
         return run

@@ -39,9 +39,23 @@ import slack_presenter as _presenter
 #: trailing path (``/files``, ``#discussion``) left out of the match. Any other
 #: host is left to the ordinary line: the headline vouches for the url in the
 #: bot's voice and the evidence line hides its host, so a note echoing someone
-#: else's link must not become a button. GitHub alone, as in
-#: ``repo_ref.GITHUB_HOSTS``, which names no enterprise host.
-PR_URL = re.compile(r"https://github\.com/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)")
+#: else's link must not become a button. github.com, and the install's GitHub
+#: Enterprise Server host when it has one (``_pr_url``), and no other host.
+PR_URL_TEMPLATE = r"https://(?:{hosts})/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)"
+PR_URL = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com"))
+
+
+_PR_URLS: dict[str, re.Pattern] = {}
+
+
+def _pr_url(github_host: str) -> re.Pattern:
+    """:data:`PR_URL` for an install whose GitHub host is ``github_host``."""
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return PR_URL
+    if host not in _PR_URLS:
+        _PR_URLS[host] = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com|" + re.escape(host)))
+    return _PR_URLS[host]
 #: What must sit right before the url for a line to announce the PR as ours:
 #: the verb, then optionally "a"/"the", "new", "PR"/"pull request" with its
 #: number, a colon, dash or "(", and the opening of a ``[label](`` or ``<`` link.
@@ -184,15 +198,19 @@ WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
 
-def opened_pr(text: str) -> tuple[str, str, str, str] | None:
+def opened_pr(text: str, github_host: str | None = None) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
-    return next(opened_prs(text), None)
+    return next(opened_prs(text, github_host), None)
 
 
-def opened_prs(text: str) -> Iterator[tuple[str, str, str, str]]:
-    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order."""
+def opened_prs(text: str, github_host: str | None = None) -> Iterator[tuple[str, str, str, str]]:
+    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order.
+
+    ``github_host`` is the install's GitHub host, which the caller reads; None
+    is github.com. This module reads nothing but its arguments."""
+    pattern = _pr_url(github_host or "github.com")
     for line in str(text or "").splitlines():
-        for match in PR_URL.finditer(line):
+        for match in pattern.finditer(line):
             verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
                 line[: match.start()], match.group(3)
             )

@@ -12,6 +12,12 @@ and the transport the broker built for it does the calling.
 was already there for the App installation flow, so borrowing it costs nothing.
 That is a fact about this install's history rather than about GitHub, which is
 why it is one word here and not a shape the interface has to have.
+
+A GitHub Enterprise Server instance is the same class at the host the install
+declares, with the in-process HTTP transport at `https://<host>/api/v3` and a
+write token minted into memory rather than into the CLI's store. The calls are
+the same calls: the instance serves the REST API github.com serves, under that
+prefix.
 """
 
 from __future__ import annotations
@@ -22,7 +28,13 @@ from urllib.parse import quote
 import repo_ref
 
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
-from ..credentials import BrokeredCredential, Credential, MintedReadCredential, NoCredential
+from ..credentials import (
+    BrokeredCredential,
+    Credential,
+    MintedReadCredential,
+    MintedWriteCredential,
+    NoCredential,
+)
 from ..validate import (
     MAX_PAGE_SIZE,
     repo_segments,
@@ -52,9 +64,17 @@ MAX_ISSUE_PAGES = 10
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
 
 
+#: github.com and the spelling of it a registered URL may carry. Every other
+#: host a GitHub forge is configured at is a GitHub Enterprise Server instance.
+DOTCOM_HOSTS = ("github.com", "www.github.com")
+
+#: The REST API's prefix on a GitHub Enterprise Server instance.
+ENTERPRISE_API_PREFIX = "/api/v3"
+
+
 class GitHubForge(Forge):
     name = "github"
-    hosts = ("github.com", "www.github.com")
+    hosts = DOTCOM_HOSTS
     proposal_noun = "pull request"
     verbs = COLLABORATION_VERBS
     transport = "cli"
@@ -66,10 +86,33 @@ class GitHubForge(Forge):
         self,
         refresh: Callable[[str, str], None] | None = None,
         mint: Callable[[str, str], str] | None = None,
+        host: str = "github.com",
+        mint_write: Callable[[str, str], str] | None = None,
+        ca_file: str = "",
+        ca_source: str = "",
     ) -> None:
         super().__init__()
-        self.credential = BrokeredCredential(self.name, refresh)
         self._mint = mint
+        if host in DOTCOM_HOSTS:
+            # github.com presents a certificate the public CAs sign, and a
+            # private CA must never vouch for it: the operator refuses
+            # caBundleRef there, and a configuration written another way is
+            # refused here too.
+            if ca_file:
+                raise ValueError(f"the {self.name} forge at {host} names a caFile; only a GitHub Enterprise Server host may")
+            self.credential = BrokeredCredential(self.name, refresh)
+            return
+        # A GitHub Enterprise Server instance: one host, the in-process
+        # transport, and a write token in memory. No CLI: gh is never logged
+        # in to the instance, so its store and its git helper never hold a
+        # token for it.
+        self.hosts = (host,)
+        self.transport = "http"
+        self.cli = ""
+        self.api_url = f"https://{host}{ENTERPRISE_API_PREFIX}"
+        self.ca_file = ca_file
+        self.ca_source = ca_source
+        self.credential = MintedWriteCredential(self.name, mint_write, host)
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
@@ -78,22 +121,31 @@ class GitHubForge(Forge):
         With no forge configuration at all (`forges` absent or None) the
         install predates it and is GitHub, as every install has been. With one,
         GitHub is built only if an entry names it -- a GitLab-only install has
-        no GitHub to resolve a bare name to. The only host served is
-        github.com: an enterprise host is a declared host this forge does not
-        mint for yet, and is refused rather than quietly treated as
-        github.com. `refresh` and `mint` are the two privileged operations the
-        credentials are handed.
+        no GitHub to resolve a bare name to. The entry's host is github.com,
+        or a GitHub Enterprise Server host. An install serves one GitHub host,
+        so entries naming two hosts are refused rather than built side by side.
+        `refresh`, `mint` and `mint_write` are the privileged operations the
+        credentials are handed: the CLI refresh is github.com's, the write mint
+        a GitHub Enterprise Server instance's, and the read mint both.
         """
         entries = config.get("forges")
+        host = "github.com"
+        ca_file = ca_source = ""
         if entries is not None:
             mine = [entry for entry in entries if entry.get("provider") == cls.name]
             if not mine:
                 return ()
+            hosts = {str(entry.get("host") or "") for entry in mine}
+            folded = {"github.com" if h in DOTCOM_HOSTS else h for h in hosts}
+            if len(folded) > 1:
+                raise ValueError(
+                    f"the {cls.name} forge is configured at {', '.join(sorted(folded))}; "
+                    "an install serves one GitHub host"
+                )
+            host = folded.pop()
+            if not host:
+                raise ValueError(f"a {cls.name} forge entry names no host")
             for entry in mine:
-                if entry.get("host") not in cls.hosts:
-                    raise ValueError(
-                        f"{entry.get('host')} is not a {cls.name} host this broker serves"
-                    )
                 # Refused rather than ignored: the same key narrows a forge
                 # whose credential reaches a whole host, and accepted here it
                 # would read as narrowing this one. The App installation's
@@ -103,12 +155,22 @@ class GitHubForge(Forge):
                         f"allowedPaths is not supported for {cls.name}: scope the "
                         "App installation's repositories instead"
                     )
-                # Refused for the same reason: this forge reads no CA bundle,
-                # and git alone trusting one for github.com would leave the two
-                # clients disagreeing about the host's certificate.
+                # One CA bundle per host, as the operator renders it.
                 if entry.get("ca_file"):
-                    raise ValueError(f"caFile is not supported for {cls.name}: it reads no CA bundle")
-        return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
+                    if ca_file and entry["ca_file"] != ca_file:
+                        raise ValueError(f"the {cls.name} forge at {host} names two caFiles")
+                    ca_file = str(entry["ca_file"])
+                    ca_source = str(entry.get("ca_source") or "")
+        return (
+            cls(
+                refresh=config.get("refresh"),
+                mint=config.get("mint"),
+                host=host,
+                mint_write=config.get("mint_write"),
+                ca_file=ca_file,
+                ca_source=ca_source,
+            ),
+        )
 
     def read_credential(self, repo: str) -> Credential:
         """A `contents: read` App installation token for `repo`, per clone.
@@ -130,7 +192,7 @@ class GitHubForge(Forge):
             parts = repo_segments(url, self.hosts)
         except repo_ref.RepoRefError as error:
             raise WorkspaceError(
-                f"{url!r} is not a GitHub repository; expected owner/name"
+                f"{url!r} is not a GitHub repository on {self.hosts[0]}; expected owner/name"
             ) from error
         if len(parts) != 2:
             raise WorkspaceError(
@@ -139,10 +201,10 @@ class GitHubForge(Forge):
         return "/".join(parts)
 
     def clone_url(self, repo: str) -> str:
-        return f"https://github.com/{repo}.git"
+        return f"https://{self.hosts[0]}/{repo}.git"
 
     def file_url(self, repo: str) -> str:
-        return f"https://github.com/{repo}/blob/{{ref}}/{{path}}"
+        return f"https://{self.hosts[0]}/{repo}/blob/{{ref}}/{{path}}"
 
     # -- shared by two verbs ------------------------------------------------
 
