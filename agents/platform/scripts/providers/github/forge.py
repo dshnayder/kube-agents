@@ -107,6 +107,7 @@ class GitHubForge(Forge):
     ) -> None:
         super().__init__()
         self._mint = mint
+        host = (host or "").strip().lower()
         if host in repo_ref.GITHUB_HOSTS:
             # Every spelling of github.com, ssh.github.com included, is the
             # github.com forge. github.com presents a certificate the public CAs sign, and a
@@ -129,6 +130,11 @@ class GitHubForge(Forge):
         self.api_url = f"https://{host}{ENTERPRISE_API_PREFIX}"
         self.ca_file = ca_file
         self.ca_source = ca_source
+        # An installation token cannot read `GET /user` (403), so the login
+        # comes from GraphQL `viewer`, which answers for an App installation
+        # with its bot login: the same query `gh auth status` makes on
+        # github.com. On a GitHub Enterprise Server, GraphQL is at /api/graphql.
+        self.whoami_graphql = f"https://{host}/api/graphql"
         self.credential = MintedWriteCredential(self.name, mint_write, host)
 
     @classmethod
@@ -152,7 +158,7 @@ class GitHubForge(Forge):
             mine = [entry for entry in entries if entry.get("provider") == cls.name]
             if not mine:
                 return ()
-            hosts = {str(entry.get("host") or "") for entry in mine}
+            hosts = {str(entry.get("host") or "").strip().lower() for entry in mine}
             folded = {"github.com" if h in repo_ref.GITHUB_HOSTS else h for h in hosts}
             if len(folded) > 1:
                 raise ValueError(

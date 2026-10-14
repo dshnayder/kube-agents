@@ -981,6 +981,15 @@ def is_github_host(host: str) -> bool:
     return folded in repo_ref.GITHUB_HOSTS or (bool(folded) and folded == github_host())
 
 
+def _warn_not_on_install_host(key: str, url: str, install_host: str) -> None:
+    """Say why a github.com or bare GitHub entry is skipped on a GitHub Enterprise Server install."""
+    LOGGER.warning(
+        "Skipping %s repository %r: it names github.com or no host, and this "
+        "install's GitHub host is %s; register the repository by its URL on %s.",
+        key, url, install_host, install_host,
+    )
+
+
 def github_enterprise_ref(entry: str, host: str | None = None) -> tuple[str, str] | None:
     """`(host, owner/name)` for a GitHub entry URL on the install's GitHub Enterprise Server host.
 
@@ -1247,6 +1256,9 @@ def _github_entries(
             # `get_managed_repos`, never as a bare slug, which reads as
             # github.com everywhere a link or a CLI call is built from it.
             continue
+        if slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+            _warn_not_on_install_host(key, url, install_host)
+            continue
         if not slug:
             LOGGER.warning(
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
@@ -1298,6 +1310,9 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
             continue
         if kind == GITHUB_REPO_TYPE:
             slug = extract_github_slug(url)
+            if slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+                _warn_not_on_install_host(key, url, install_host)
+                continue
             item = f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" if slug else None
             enterprise = None if slug else github_enterprise_ref(url, install_host)
             if enterprise is not None:

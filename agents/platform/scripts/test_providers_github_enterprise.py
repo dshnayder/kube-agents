@@ -322,7 +322,8 @@ class WriteCredentialTest(unittest.TestCase):
         credential.ensure("acme/infra")
         basic = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
         self.assertEqual(
-            ((f"http.https://{HOST}/.extraheader", f"AUTHORIZATION: basic {basic}"), ("credential.helper", "")),
+            ((f"http.https://{HOST}/.extraheader", f"AUTHORIZATION: basic {basic}"),
+             (f"http.https://{HOST}/.followRedirects", "false"), ("credential.helper", "")),
             credential.git_config("acme/infra"),
         )
         self.assertEqual({"Authorization": f"Bearer {TOKEN}"}, credential.headers("acme/infra"))
@@ -362,12 +363,14 @@ class ManagedKeysTest(unittest.TestCase):
             {"type": "github", "url": "https://github.com/acme/web"},
             {"type": "github", "url": "acme/bare"},
         ]
-        self.assertEqual(
-            [f"github:{HOST}/acme/infra", "github:github.com/acme/web", "github:github.com/acme/bare"],
-            gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY),
-        )
-        self.assertEqual(["acme/web", "acme/bare", f"{HOST}/acme/infra"],
-                         gitops_workspace._forge_repo_names(entries, gitops_workspace.MANAGED_REPOS_KEY))
+        # The github.com and bare entries are skipped on this install (see
+        # GitHubDotComEntriesOnAnEnterpriseInstallTest).
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            self.assertEqual([f"github:{HOST}/acme/infra"],
+                             gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY))
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            self.assertEqual([f"{HOST}/acme/infra"],
+                             gitops_workspace._forge_repo_names(entries, gitops_workspace.MANAGED_REPOS_KEY))
         self.assertEqual(HOST, gitops_workspace.github_host())
         self.assertTrue(gitops_workspace.is_valid_repo_slug(f"{HOST}/acme/infra"))
 
@@ -674,7 +677,8 @@ class VcsBrokerGitTest(_EnterpriseGitCase):
             with self.subTest(subcommand=sub):
                 self.assertEqual(_basic(WRITE_TOKEN), config.get(EXTRAHEADER))
                 self.assertEqual("", config.get("credential.helper"))
-                self.assertEqual({EXTRAHEADER, "credential.helper"}, set(config))
+                self.assertEqual({EXTRAHEADER, f"http.https://{HOST}/.followRedirects", "credential.helper"}, set(config))
+                self.assertEqual("false", config[f"http.https://{HOST}/.followRedirects"])
         self.assertEqual({"acme/infra"}, set(minted))
         tip = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", "refs/heads/fix/replicas").stdout
         self.assertTrue(tip.strip())
@@ -753,6 +757,200 @@ class ContentWorkspaceGitTest(_EnterpriseGitCase):
         [(sub, config)] = [c for c in self.remote_calls() if c[0] == "clone"]
         self.assertEqual(_basic(READ_TOKEN), config.get(EXTRAHEADER))
         self.assertEqual([[credential_proxy.FORGE_READ_ONLY_FLAG, "acme/docs"]], self.helper_runs)
+
+
+BOT = "kube-agents[bot]"
+
+
+def _pull(number: int, branch: str, author: str, state: str, sha: str) -> dict:
+    """A pull request as the instance answers it, trimmed to what the translation reads."""
+    return {
+        "number": number, "state": "closed" if state == "merged" else state, "title": "t",
+        "user": {"login": author, "type": "Bot" if author.endswith("[bot]") else "User"},
+        "body": "", "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z",
+        "closed_at": None if state == "open" else "2026-10-02T00:00:00Z",
+        "merged_at": "2026-10-02T00:00:00Z" if state == "merged" else None, "draft": False,
+        "html_url": f"https://{HOST}/acme/infra/pull/{number}",
+        "head": {"ref": branch, "sha": sha, "repo": {"full_name": "acme/infra"}},
+        "base": {"ref": "main", "sha": "0" * 40},
+    }
+
+
+class OwnershipAgainstTheMockTest(MockGitHubEnterpriseCase, _EnterpriseGitCase):
+    """The ownership checks hold on a GitHub Enterprise Server.
+
+    The mock answers GraphQL `viewer { login }` at /api/graphql with the App's
+    bot login, as GitHub answers it for an installation token, and the pull
+    requests by the query each call sends. git reaches a local bare repository.
+    """
+
+    def setUp(self):
+        MockGitHubEnterpriseCase.setUp(self)
+        _EnterpriseGitCase.setUp(self)
+        self.pulls_open: list[dict] = []
+        self.pulls_all: list[dict] = []
+        self.viewer: object = {"data": {"viewer": {"login": BOT}}}
+        mock_server = self.mock
+        test = self
+        original = mock_server.server.RequestHandlerClass._answer
+
+        def routed(handler):
+            if handler.path == "/api/graphql" and handler.command == "POST":
+                length = int(handler.headers.get("Content-Length") or 0)
+                body = json.loads(handler.rfile.read(length) or b"{}")
+                mock_server.requests.append({"method": "POST", "path": handler.path, "body": body,
+                                             "authorization": handler.headers.get("Authorization"),
+                                             "host": handler.headers.get("Host"), "accept": None})
+                return handler._json(200, test.viewer)
+            if handler.command == "GET" and handler.path.startswith("/api/v3/repos/acme/infra/pulls?"):
+                mock_server.requests.append({"method": "GET", "path": handler.path, "body": None,
+                                             "authorization": handler.headers.get("Authorization"),
+                                             "host": handler.headers.get("Host"), "accept": None})
+                query = handler.path.split("?", 1)[1]
+                if "base=" in query:
+                    return handler._json(200, [])
+                return handler._json(200, test.pulls_open if "state=open" in query else test.pulls_all)
+            return original(handler)
+
+        handler_class = mock_server.server.RequestHandlerClass
+        handler_class.do_GET = handler_class.do_POST = routed
+
+    def broker(self):
+        config = self.dir / "forges.json"
+        config.write_text(json.dumps({"forges": [{"provider": "github", "host": HOST, "caFile": str(self.ca)}]}))
+        os.environ[FORGES_CONFIG_ENV] = str(config)
+
+        def git_runner(argv, cwd, check=True, config=()):
+            done = self.run_git(argv, cwd, config)
+            if check and done.returncode != 0:
+                raise subprocess.CalledProcessError(done.returncode, argv, done.stdout, done.stderr)
+            return done
+
+        return vcs_broker.VcsBroker(self.dir / "scratch", git_runner=git_runner,
+                                    mint_write=lambda provider, repo: WRITE_TOKEN, http_timeout=10.0)
+
+    def push_branch(self, branch: str) -> str:
+        """Put `branch` on the instance's repository, as a person's push would."""
+        origin = self.origins[f"https://{HOST}/acme/infra.git"]
+        work = self.dir / "person"
+        if not work.exists():
+            _git(self.dir, "clone", "--quiet", origin, str(work))
+        _git(work, "checkout", "--quiet", "-B", branch, "origin/main")
+        (work / "theirs.txt").write_text(branch + "\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "--quiet", "-m", "theirs")
+        _git(work, "push", "--quiet", "--force", "origin", branch)
+        return _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    def test_identity_names_the_installation_login(self):
+        answer = self.broker().identity({"repository": REPO_URL})
+        self.assertEqual(BOT, answer["identity"]["login"])
+        [graphql] = [r for r in self.mock.requests if r["path"] == "/api/graphql"]
+        self.assertEqual(f"Bearer {WRITE_TOKEN}", graphql["authorization"])
+        self.assertIn("viewer", graphql["body"]["query"])
+
+    def test_a_missing_login_is_refused_not_read_as_no_login(self):
+        self.viewer = {"data": None, "errors": [{"message": "Resource not accessible by integration"}]}
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker().identity({"repository": REPO_URL})
+        self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields["code"])
+
+    def test_advance_onto_a_strangers_open_proposal_is_refused(self):
+        broker = self.broker()
+        branch = "release-1.2"
+        self.push_branch(branch)
+        answer = broker.clone({"repository": REPO_URL, "branch": branch})
+        work = self.dir / "agent-work"
+        bundle = self.dir / "agent.bundle"
+        bundle.write_bytes(base64.b64decode(answer["bundleBase64"]))
+        _git(self.dir, "clone", "--quiet", "--branch", branch, str(bundle), str(work))
+        (work / "mine.txt").write_text("mine\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "--quiet", "-m", "mine")
+        out = self.dir / "agent-out.bundle"
+        _git(work, "bundle", "create", str(out), branch, f"^{answer['revision']}")
+        self.pulls_open = [_pull(7, branch, "a-person", "open", answer["revision"])]
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.publish({
+                "repository": REPO_URL, "branch": branch, "target": "main", "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": base64.b64encode(out.read_bytes()).decode(),
+            })
+        self.assertEqual("CLONED_BRANCH", caught.exception.fields["code"])
+        self.assertIn("a-person", str(caught.exception))
+        tip = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        self.assertEqual(answer["revision"], tip)
+
+    def test_branch_delete_refuses_a_branch_a_stranger_proposed_from(self):
+        branch = "platform-agent/someone-elses"
+        tip = self.push_branch(branch)
+        self.pulls_all = [_pull(9, branch, "a-person", "merged", tip)]
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker().branch_delete({"repository": REPO_URL, "branch": branch, "revision": tip})
+        self.assertEqual("BRANCH_NOT_OURS", caught.exception.fields["code"])
+        self.assertIn("a-person", str(caught.exception))
+        still = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        self.assertEqual(tip, still)
+
+    def test_branch_delete_removes_a_spent_branch_the_installation_opened(self):
+        branch = "platform-agent/mine"
+        tip = self.push_branch(branch)
+        self.pulls_all = [_pull(10, branch, BOT, "merged", tip)]
+        answer = self.broker().branch_delete({"repository": REPO_URL, "branch": branch, "revision": tip})
+        self.assertTrue(answer["branch"]["deleted"])
+
+
+class RedirectPinTest(unittest.TestCase):
+    """Every git call a minted token rides follows no redirect from the forge's host."""
+
+    def test_the_write_and_read_credentials_pin_follow_redirects_off(self):
+        for credential in (
+            MintedWriteCredential("github", lambda provider, repo: TOKEN, HOST),
+            providers.MintedReadCredential("github", lambda provider, repo: TOKEN, HOST),
+        ):
+            with self.subTest(credential=type(credential).__name__):
+                credential.ensure("acme/infra")
+                config = dict(credential.git_config("acme/infra"))
+                self.assertEqual("false", config[f"http.https://{HOST}/.followRedirects"])
+                self.assertIn(EXTRAHEADER, config)
+
+
+class HostNormalisationTest(unittest.TestCase):
+    def test_a_host_is_lowered_and_stripped_before_it_is_judged(self):
+        [forge] = providers.Registry({"forges": [{"provider": "github", "host": " GHE.Example.COM "}]}).forges
+        self.assertEqual((HOST.replace("mock.test", "example.com"),), forge.hosts)
+        for host in (" GitHub.com ", "SSH.GITHUB.COM"):
+            with self.subTest(host=host):
+                forge = providers.GitHubForge(host=host) if hasattr(providers, "GitHubForge") else \
+                    next(c for c in providers.AVAILABLE if c.name == "github")(host=host)
+                self.assertEqual("cli", forge.transport)
+        with self.assertRaises(ValueError):
+            next(c for c in providers.AVAILABLE if c.name == "github")(host=" API.GitHub.com ")
+
+
+class GitHubDotComEntriesOnAnEnterpriseInstallTest(unittest.TestCase):
+    """On a GitHub Enterprise Server install, a github.com or bare GitHub entry is skipped."""
+
+    def test_they_are_neither_named_nor_keyed(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "managed_repos").write_text("[]")
+        (root / gitops_workspace.GITHUB_HOST_KEY).write_text(HOST)
+        entries = [
+            {"type": "github", "url": "https://github.com/other/repo"},
+            {"type": "github", "url": "acme/bare"},
+            {"type": "github", "url": f"https://{HOST}/acme/infra"},
+        ]
+        with mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(root / "managed_repos")}), \
+                self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
+            names = gitops_workspace._forge_repo_names(entries, gitops_workspace.MANAGED_REPOS_KEY)
+            keys = gitops_workspace._repository_keys(entries, gitops_workspace.MANAGED_REPOS_KEY)
+            slugs = gitops_workspace._github_slugs(entries, gitops_workspace.MANAGED_REPOS_KEY, fold_case=False)
+        self.assertEqual([f"{HOST}/acme/infra"], names)
+        self.assertEqual([f"github:{HOST}/acme/infra"], keys)
+        self.assertEqual([], slugs)
+        self.assertIn("this install's GitHub host is " + HOST, "\n".join(logs.output))
 
 
 class BrokerHostCheckTest(unittest.TestCase):

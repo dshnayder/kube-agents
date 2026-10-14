@@ -434,6 +434,7 @@ class VcsBroker:
                 timeout=self._http_timeout,
                 max_bytes=self._http_max_bytes,
                 whoami_route=forge.whoami_route,
+                whoami_graphql=getattr(forge, "whoami_graphql", ""),
                 opener=self._http_opener,
                 outer_deadline=self._request_deadline,
                 ca_file=forge.ca_file,

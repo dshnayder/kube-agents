@@ -70,6 +70,11 @@ EXTRAHEADER_USERNAME = "x-access-token"
 # write credential, the fallback this credential exists to make impossible.
 # So a MintedReadCredential presents it whether or not a token was minted.
 CREDENTIAL_HELPER_KEY = "credential.helper"
+# `http.<url>.followRedirects` set to false for the forge's host, on every git
+# invocation a minted token rides. A redirect is an answer, not a hop: the
+# token is presented on the host it was minted for, and on no host a redirect
+# names. The API client refuses redirects for the same reason.
+FOLLOW_REDIRECTS_KEY = "http.https://{host}/.followRedirects"
 
 
 class Credential(Protocol):
@@ -203,6 +208,7 @@ class MintedReadCredential:
         ).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
+            (FOLLOW_REDIRECTS_KEY.format(host=self._host), "false"),
             helper_cleared,
         )
 
@@ -294,6 +300,7 @@ class MintedWriteCredential:
         basic = base64.b64encode(f"{EXTRAHEADER_USERNAME}:{token}".encode("utf-8")).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
+            (FOLLOW_REDIRECTS_KEY.format(host=self._host), "false"),
             helper_cleared,
         )
 
