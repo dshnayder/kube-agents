@@ -1161,7 +1161,7 @@ issue and the pull requests.
 
 To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
 for that release. An install whose GitHub forge is a GitHub Enterprise Server does not use
-`upgrade.sh`: see [Upgrade, switch and teardown](#upgrade-switch-and-teardown). It carries its own version, so the run names no image tag, and it reuses the
+`upgrade.sh`: see [Upgrade, switch and teardown](#upgrade-switch-and-teardown). `upgrade.sh` carries its own version, so the run names no image tag, and it reuses the
 install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
 
 ```bash

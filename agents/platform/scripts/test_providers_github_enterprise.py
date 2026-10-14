@@ -495,6 +495,9 @@ class WriteMintTest(unittest.TestCase):
         self.executor._drop_write_tokens_refused_by(128, "fatal: repository not found", config)
         self.assertIn(("github", HOST), self.executor._write_tokens)
         self.executor._drop_write_tokens_refused_by(
+            128, "fatal: could not read Username for 'https://ghe.other.example': terminal prompts disabled", config)
+        self.assertIn(("github", HOST), self.executor._write_tokens)
+        self.executor._drop_write_tokens_refused_by(
             128, f"fatal: could not read Username for 'https://{HOST}': terminal prompts disabled", config)
         self.assertNotIn(("github", HOST), self.executor._write_tokens)
         self.executor.mint_write_credential("github", "acme/infra")
@@ -526,8 +529,12 @@ class RefusedGitCallTest(unittest.TestCase):
         ca, cert, key = make_pki(self.dir / "pki", ("localhost",))
         self.ca = ca
 
+        self.seen: list[str | None] = []
+        seen = self.seen
+
         class Refuse(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802 - the stdlib's name
+                seen.append(self.headers.get("Authorization"))
                 self.send_response(401)
                 self.send_header("WWW-Authenticate", 'Basic realm="mock"')
                 self.send_header("Content-Length", "0")
@@ -543,15 +550,20 @@ class RefusedGitCallTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        self.url = f"https://localhost:{server.server_address[1]}/acme/infra.git"
+        self.host = f"localhost:{server.server_address[1]}"
+        self.url = f"https://{self.host}/acme/infra.git"
         self.executor = credential_proxy.CommandExecutor(
             timeout_seconds=20, max_output_bytes=1 << 16, state_dir=str(self.dir / "state"), scoped_pool=None
         )
 
-    def test_a_401_from_git_drops_the_hosts_write_token(self):
-        self.executor._write_tokens[("github", HOST)] = (time.monotonic(), frozenset({"acme/infra"}), TOKEN)
+    def test_a_401_from_git_drops_the_refusing_hosts_token_only(self):
+        now = time.monotonic()
+        self.executor._write_tokens[("github", self.host)] = (now, frozenset({"acme/infra"}), TOKEN)
+        self.executor._write_tokens[("github", "ghe.other.example")] = (now, frozenset({"acme/infra"}), TOKEN)
+        header = "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
         config = (
-            (f"http.https://{HOST}/.extraheader", "AUTHORIZATION: basic eDp5"),
+            (f"http.https://{self.host}/.extraheader", header),
+            ("http.https://ghe.other.example/.extraheader", header),
             ("credential.helper", ""),
             ("http.sslCAInfo", str(self.ca)),
         )
@@ -560,9 +572,12 @@ class RefusedGitCallTest(unittest.TestCase):
             ["git", "ls-remote", self.url], self.executor.vcs_root, check=False, config=config
         )
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("could not read Username for", result.stderr)
+        self.assertIn(f"could not read Username for 'https://{self.host}'", result.stderr)
         self.assertIn("terminal prompts disabled", result.stderr)
-        self.assertNotIn(("github", HOST), self.executor._write_tokens)
+        # The token was presented, and the server refused it.
+        self.assertIn(header.split(": ", 1)[1].replace("basic", "Basic").lower(), [h.lower() for h in self.seen if h])
+        self.assertNotIn(("github", self.host), self.executor._write_tokens)
+        self.assertIn(("github", "ghe.other.example"), self.executor._write_tokens)
 
 
 class HelperPrintModeTest(unittest.TestCase):

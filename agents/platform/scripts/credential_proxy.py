@@ -3424,9 +3424,11 @@ FORGE_READ_ONLY_FLAG = "--read-only"
 FORGE_WRITE_MINT_FLAG = "--print-write-token"
 FORGE_HOST_FLAG = "--host"
 
-# What git prints when the server refused the credential it presented.
+# What git prints when the server refused the credential it presented. With
+# prompts off it asks for a username on the refusing URL, which names the
+# host (and port); the other two name none.
+GIT_USERNAME_REFUSAL_RE = re.compile(r"could not read Username for 'https://([^'/]+)['/]")
 GIT_REFUSED_CREDENTIAL_MARKERS = (
-    "could not read Username for '",
     "returned error: 401",
     "Authentication failed",
 )
@@ -6567,15 +6569,21 @@ class CommandExecutor:
         extraheader the call carried are dropped.
         """
         text = stderr or ""
-        if exit_code == 0 or not any(marker in text for marker in GIT_REFUSED_CREDENTIAL_MARKERS):
+        if exit_code == 0:
             return
         hosts = {
             key[len("http.https://"):-len("/.extraheader")]
             for key, _ in config
             if key.startswith("http.https://") and key.endswith("/.extraheader")
         }
+        # The host git asked a username for is the host that refused. The
+        # other markers name no host, so they count only when the call
+        # carried one host's token.
+        refused = set(GIT_USERNAME_REFUSAL_RE.findall(text)) & hosts
+        if not refused and len(hosts) == 1 and any(marker in text for marker in GIT_REFUSED_CREDENTIAL_MARKERS):
+            refused = hosts
         for provider, host in list(self._write_tokens):
-            if host in hosts:
+            if host in refused:
                 self._write_tokens.pop((provider, host), None)
                 LOGGER.info("%s write token for %s dropped after git was refused", provider, host)
 

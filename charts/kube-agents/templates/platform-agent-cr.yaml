@@ -631,10 +631,10 @@ spec:
   {{- end }}
   {{- $rules := list }}
   {{- range (dig "forges" "items" "x-kubernetes-validations" (list) $props) }}
-  {{- $rules = append $rules (.message | default "") }}
+  {{- $rules = append $rules (.rule | default "") }}
   {{- end }}
-  {{- if and $ghes (not (regexMatch "names its provider" (join "\n" $rules))) }}
-  {{- fail "platformAgent.integration.forges declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD predates it (it refuses caBundleRef on a github forge), and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- if and $ghes (not (contains "has(self.provider) || !has(self.host)" (join "\n" $rules))) }}
+  {{- fail "platformAgent.integration.forges declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD is older than this chart's GitHub Enterprise Server support, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
