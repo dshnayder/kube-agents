@@ -394,6 +394,20 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
   --github-app-id="YOUR_GITHUB_APP_ID"
 ```
 
+### GitHub Enterprise Server
+
+If the operator's GitOps repository is on a GitHub Enterprise Server (a GitHub instance at a host they run, not github.com), `install.sh` cannot install it yet: it writes only the github.com spelling, and its organization check asks github.com. Do not run `install.sh` for this install, and do not run it later on it. Tell the operator this, and follow [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server) with them: the Terraform + Helm method, with the forge in `extra_helm_values`. Its steps and their order:
+
+1. Create the GitHub App on the instance (not on github.com), with the same permissions, installed on the organization, the GitOps repository and each context repository.
+2. If a private CA signed the instance's certificate, create the namespace and the CA Secret before the apply.
+3. Set `enable_github_minter`, `github_repo` (owner and name on the instance) and `github_app_id` in `terraform.tfvars`.
+4. Declare the forge in `extra_helm_values`, with `github = null` to remove the github.com alias.
+5. `./lifecycle.sh apply`.
+6. Import the App's private key with `minty tools import-pk` (Path 2 above). The import calls only Cloud KMS.
+7. Check the minter's `SOURCE_SYSTEM_API_BASE_URL` and the gitops-state ConfigMap's `github_host`.
+
+Ask the operator for: the instance's hostname (no scheme, path or port; port 443 only), the organization and repository on it, the App ID, and the CA file if a private CA signed the certificate. An install serves one GitHub host, so this install has no github.com repositories.
+
 ## Supported Command-Line Flags
 
 Defaults marked "`installer_common.sh`" reach the installer through

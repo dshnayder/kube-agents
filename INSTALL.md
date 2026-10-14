@@ -23,6 +23,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
      - [AI-Assisted Installation](#ai-assisted-installation)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
+   - [GitHub Enterprise Server](#github-enterprise-server)
 5. [The Shell Sandbox](#the-shell-sandbox)
 6. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
@@ -48,6 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 _Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+
+`install.sh` cannot write a GitHub Enterprise Server forge yet. For a GitOps repository on a GitHub Enterprise Server, use Method 1: see [GitHub Enterprise Server](#github-enterprise-server).
 
 When running the official release installer (`<RELEASE_VERSION>/install.sh`) or executing inside an official release checkout or unpacked release archive, the release version is baked in and used automatically without prompting. A checkout of a release line (`release/<X.Y>`) that has moved past its latest release still carries that release's baked version but is not that release: run from that checkout, with the release's tag and full history fetched, `install.sh` defaults to the checkout's own commit, as a `main` checkout does, and says so; a clone that lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch to run.
 
@@ -585,6 +588,66 @@ empty, and an empty allowlist admits every user. `upgrade.sh` renders the allowl
 and `install.sh` does not change a key the file assigns, so set the allowlist in the file. It
 refuses `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
+
+### GitHub Enterprise Server
+
+The agent can use a GitOps repository on a GitHub Enterprise Server instance: a GitHub instance at a host that you run, behind a certificate that a public CA or your own private CA signed. An install serves one GitHub host: github.com, or one GitHub Enterprise Server. `install.sh` cannot write a GitHub Enterprise Server forge yet, so do not use it for this install, and do not run it later on the install: it writes the github.com spelling back. Use the Terraform + Helm method, in this order:
+
+1. **Create the GitHub App on the instance.** An App belongs to one GitHub host, so create it on the GitHub Enterprise Server, not on github.com. Give it the repository permissions `Contents: Read & write`, `Pull requests: Read & write` and `Issues: Read & write`. Install it on the organization that owns the GitOps repository, on the GitOps repository, and on each repository that the agent reads as context. The repository must be owned by an organization. Record the App ID, and download the App's private key.
+2. **Create the CA Secret, if a private CA signed the instance's certificate.** Create the namespace first, because Helm has not made it yet:
+
+   ```bash
+   kubectl create namespace kubeagents-system
+   kubectl create secret generic ghe-ca -n kubeagents-system --from-file=ca.crt=/path/to/ca.pem
+   ```
+
+   The credential broker and the token minter both read this Secret. They trust the CA beside the system CAs: the broker for the instance's host only, and the minter for all of its outbound calls. The CA is one that you trust and install.
+
+3. **Set the GitHub variables in `terraform.tfvars`** of the [`full-install`](terraform/examples/full-install/README.md) composition. `github_repo` is the owner and name on the instance; the composition reads it for the minter's organization and repository.
+
+   ```hcl
+   enable_github_minter = true
+   github_repo          = "acme/infra"
+   github_app_id        = "12"
+   ```
+
+4. **Declare the forge in `extra_helm_values`**, in the same file. The composition writes the deprecated `github` alias from `github_repo`, and the alias always means github.com. `github = null` removes it: Helm removes a key that a later values document sets to null. Then `forges` and `repositories` declare the GitHub forge at the instance's host. Omit `caBundleRef` when a public CA signed the instance's certificate.
+
+   ```hcl
+   extra_helm_values = {
+     platformAgent = {
+       integration = {
+         github = null
+         forges = [{
+           name        = "github"
+           provider    = "github"
+           host        = "ghe.example.com"
+           namespace   = "acme"
+           caBundleRef = { name = "ghe-ca" }
+         }]
+         repositories = [{ forge = "github", repository = "infra", role = "gitops" }]
+       }
+     }
+   }
+   ```
+
+5. **Apply** the composition with `./lifecycle.sh apply`.
+6. **Import the App's private key into Cloud KMS** with `minty tools import-pk`, as the [token minter guide](docs/site/src/content/docs/deploy/token-minter.md#path-2-ahead-of-time-aot-pre-provisioned-key-cicd--production) describes. The import calls only Cloud KMS, so it is the same for an App on a GitHub Enterprise Server. Until the key version is `ENABLED`, the minter pod is not Ready.
+7. **Check the install:**
+
+   ```bash
+   # The minter mints on the instance.
+   kubectl get deployment github-token-minter -n kubeagents-system \
+     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SOURCE_SYSTEM_API_BASE_URL")].value}'
+   # The agent reads the instance's host.
+   kubectl get configmap platform-agent-gitops-state -n kubeagents-system -o jsonpath='{.data.github_host}'
+   ```
+
+   The first command prints `https://ghe.example.com/api/v3`, and the second prints `ghe.example.com`.
+
+Keep the forge in `extra_helm_values`. Do not edit the PlatformAgent with `kubectl edit`: the chart owns it, and the next apply or `helm upgrade` writes the values back. With Helm alone (no Terraform), put the same `platformAgent.integration` keys in your values file, with `githubMinter.enabled`, `githubMinter.org`, `githubMinter.repo` and `githubMinter.appId`, and provision the minter's Google Cloud resources with the [`github-minter`](terraform/modules/github-minter) module. The manual kustomize path (`make deploy-github`, Method 2) does not set the minter's API URL or CA.
+
+How the broker and the minter use the instance, and what is not supported (a port other than 443, a renamed repository, github.com and an instance in one install): see the [token minter guide](docs/site/src/content/docs/deploy/token-minter.md#github-enterprise-server) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md).
 
 ---
 

@@ -1575,10 +1575,20 @@ Server gets no `gh` in the broker's executable allowlist.
 **A private CA.** A GitHub Enterprise Server behind a private CA names it in
 `caBundleRef`, as a self-managed GitLab does
 ([A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca)).
-The broker trusts the CA for that host only, in its API client and in git. The
-token minter reaches the instance to mint, so the minter also needs the CA. The
-minter's client trusts the configured CA for all of its outbound calls. The
-CA is one that the customer trusts and installs.
+The broker trusts the CA for that host only, in its API client and in git.
+
+**The minter.** The token minter mints on the instance: the chart reads the
+GitHub forge and sets the minter's `SOURCE_SYSTEM_API_BASE_URL` to
+`https://<host>/api/v3`, the root it composes its App routes under in place of
+`api.github.com`. The minter reaches the instance to mint, so it needs the CA
+too. It is a Go program on the default HTTP transport, which reads the system
+roots: the bundle in its image, and each certificate file in the directories
+`SSL_CERT_DIR` names. So the chart mounts the forge's `caBundleRef` key into
+the minter's pod and points `SSL_CERT_DIR` at it. The minter's client trusts
+the configured CA for all of its outbound calls, beside the image's bundle.
+The CA is one that the customer trusts and installs. No `githubMinter.*` value
+repeats the host or the CA: the forge declaration is the one place both are
+set.
 
 **The agent side.** The managed list names a GitHub Enterprise Server
 repository `<host>/owner/name`, as it names another forge's repository. A bare

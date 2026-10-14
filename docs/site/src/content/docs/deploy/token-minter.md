@@ -35,6 +35,17 @@ A repository registered under `context_repos` — a Terraform repository an audi
 
 The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
+## GitHub Enterprise Server
+
+When the install's GitHub forge is at a GitHub Enterprise Server host, Minty mints on that instance instead of on github.com. The chart does this from the forge declaration in `platformAgent.integration.forges`; there is no separate `githubMinter.*` value for it. An install serves one GitHub host, github.com or one GitHub Enterprise Server, so one Minty serves it.
+
+- **API URL.** The chart sets `SOURCE_SYSTEM_API_BASE_URL=https://<host>/api/v3` on the Minty container. Minty then calls the instance's REST API, where it calls `api.github.com` on github.com. A github.com install does not get the variable.
+- **Private CA.** When the GitHub forge names `caBundleRef`, the chart mounts that key of the Secret into the Minty pod at `/etc/kube-agents/minter-ca/ca.crt` and sets `SSL_CERT_DIR=/etc/kube-agents/minter-ca`. Minty is a Go program that uses the default HTTP transport, so it reads the system roots: the CA bundle in its image, and each certificate file in the directories that `SSL_CERT_DIR` names. Minty trusts the configured CA beside the image's bundle, for all of its outbound calls (the instance, and the Google APIs it calls). The CA is one that you trust and install. It is the same Secret that the credential broker reads, in the release namespace. The mount is optional: until the Secret exists, Minty starts, and its calls to the instance fail on TLS.
+- **Egress.** Minty's NetworkPolicy (`githubMinter.networkPolicy`, on by default) allows TCP port 443 to any address, private ranges included. So Minty reaches an instance on a private network on port 443, if the cluster's network can route to it. An instance on another port is not supported. A firewall or a VPC route outside the cluster is yours to open.
+- **GitHub App.** Create the App on the instance, not on github.com: an App and its installation belong to one GitHub host. Give it the same repository permissions as on github.com (`Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`), and install it on the organization, the GitOps repository and each context repository. The repository must be owned by an organization, for the reason above.
+- **Key import.** `minty tools import-pk` imports the App's private key into the Cloud KMS key, and it calls only Cloud KMS. So the import is the same for an App on a GitHub Enterprise Server; use [Path 2](#path-2-ahead-of-time-aot-pre-provisioned-key-cicd--production) below.
+- **Install.** `install.sh` cannot write a GitHub Enterprise Server forge yet. Use the Terraform + Helm method: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 ## Setup and Key Provisioning
 
 Minty requires a GitHub App private key imported into Google Cloud KMS as an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`). You can either let the `kube-agents` installer import the key automatically during initial setup, or pre-provision it Ahead-Of-Time (AOT).

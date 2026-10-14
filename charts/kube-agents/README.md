@@ -363,6 +363,17 @@ Deployment passes its readiness probe. The chart never imports it;
 `install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
+When the GitHub forge in `platformAgent.integration.forges` is at a GitHub
+Enterprise Server host, the minter mints there. The chart reads the forge, so
+no `githubMinter.*` value is needed for it: it sets
+`SOURCE_SYSTEM_API_BASE_URL=https://<host>/api/v3`, and when the forge names
+`caBundleRef` it mounts that Secret key into the minter and sets
+`SSL_CERT_DIR` to its directory, so minty trusts the CA beside its image's
+bundle for all of its outbound calls. The NetworkPolicy already allows port 443
+to any address. `org` and `repo` are the organization and repository on the
+instance, and the App is the one created on the instance. See
+[GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -505,13 +516,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   repository that the install registered by URL. Name a GitLab repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
-  `host` must be a GitHub spelling (`github.com`, `www.github.com`,
-  `ssh.github.com`), and a repository must name a declared forge.
+  `host` is a spelling of github.com (`github.com`, `www.github.com`,
+  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and a
+  repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. The alias is still what `install.sh` and the
   `full-install` Terraform composition write. One GitHub forge with no
-  `credentialsRef` and at most one repository, the gitops one, with no
+  `credentialsRef`, no `caBundleRef`, no host other than a spelling of
+  github.com, and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a
   namespace or the repository, and the repository is one the operator would

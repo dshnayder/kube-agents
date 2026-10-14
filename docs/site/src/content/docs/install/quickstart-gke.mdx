@@ -21,7 +21,10 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   `--github-pem-path` and it imports the key, or pre-provision it Ahead-Of-Time
   (AOT) — see
   [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
-  and [Token minter](/kube-agents/deploy/token-minter/).
+  and [Token minter](/kube-agents/deploy/token-minter/). The installer cannot
+  install a GitOps repository on a GitHub Enterprise Server yet; for one, use
+  the Terraform + Helm method in
+  [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 </Aside>
 
 ## Run the Zero-Friction One-Liner Installer
