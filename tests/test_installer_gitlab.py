@@ -1111,6 +1111,9 @@ class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
     def test_a_redirected_file_on_dev_fd_survives_repeated_validation(self):
         # Review: on macOS, /dev/fd/N on a redirected regular file shares the
         # offset, and `[ -f ]` is true, so an early read moved it to the end.
+        # Without the guard this test can fail only on macOS; Linux reopens
+        # /dev/fd/N through /proc. GitOpsSourceIsRereadableTest covers the
+        # guard on every platform.
         # The validator runs up to three times in one install; the token must
         # still reach the read after the apply.
         tok = self._tmp / "token-file"
@@ -1165,6 +1168,40 @@ class GitOpsSourceIsRereadableTest(unittest.TestCase):
         link = self._tmp / "link"
         link.symlink_to("/dev/stdin")
         self.assertEqual("no", self._check(f"exec 0< {shlex.quote(str(f))}", str(link)))
+
+    def test_a_symlink_to_a_regular_file_is_rereadable(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        link = self._tmp / "link-to-file"
+        link.symlink_to(f)
+        self.assertEqual("yes", self._check("", str(link)))
+
+    def test_other_spellings_of_a_descriptor_path_are_not(self):
+        # Review: the match ran on the path as written.
+        f = self._tmp / "f"
+        f.write_text("x")
+        redirect = f"exec 9< {shlex.quote(str(f))}\nexec 0< {shlex.quote(str(f))}"
+        for spelling in ("//dev/fd/9", "/./dev/fd/9", "/dev/../dev/stdin"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual("no", self._check(redirect, spelling))
+        rel = self._tmp / "rel-link"
+        rel.symlink_to(os.path.relpath("/dev/stdin", self._tmp))
+        self.assertEqual("no", self._check(redirect, str(rel)))
+        dirlink = self._tmp / "fd-dir"
+        dirlink.symlink_to("/dev/fd")
+        self.assertEqual("no", self._check(redirect, str(dirlink / "9")))
+        self.assertEqual("no", self._check(f"{redirect}\ncd /", "dev/stdin"))
+
+    def test_a_regular_file_elsewhere_under_dev_is_rereadable(self):
+        # Only descriptor paths are refused; /dev/shm keeps the early check.
+        shm = pathlib.Path("/dev/shm")
+        if not shm.is_dir() or not os.access(shm, os.W_OK):
+            self.skipTest("this platform has no writable /dev/shm")
+        fd, name = tempfile.mkstemp(dir=shm)
+        os.close(fd)
+        self.addCleanup(os.unlink, name)
+        pathlib.Path(name).write_text("x")
+        self.assertEqual("yes", self._check("", name))
 
     def test_a_directory_or_a_missing_path_is_not(self):
         self.assertEqual("no", self._check("", str(self._tmp)))

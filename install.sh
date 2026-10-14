@@ -4663,19 +4663,29 @@ apply_gitlab_token_secret() {
 }
 
 # True when PATH is a file the installer can read now and again later: a
-# regular file outside /dev and /proc, also after symlinks are resolved.
+# regular file that is not a descriptor path (/dev/fd/N, /dev/stdin,
+# /dev/stdout, /dev/stderr, /proc/...), also after symlinks are resolved.
 # /dev/stdin, /dev/fd/N and a process substitution can be a redirected regular
 # file, and `[ -f ]` is then true. On macOS, opening /dev/fd/N shares the
 # descriptor's offset, so an early read moves it to the end and the read after
 # the apply finds nothing. Such a source is read only after the apply.
 gitops_source_is_rereadable() {
-  local path="$1" target="" hops=0
+  local path="$1" target="" dir="" hops=0
   [ -f "$path" ] || return 1
   # Every hop of a symlink chain is checked, not only its end: on Linux,
   # /dev/stdin resolves through /proc/self/fd/0 to the redirected file itself.
+  # The directory part is made physical at each hop, so `//dev/fd/9`,
+  # `/./dev/fd/9`, a relative path and a symlinked directory are judged by
+  # where they lead. Only the paths that can share a descriptor's offset are
+  # refused; another file under /dev keeps the early check.
   while :; do
+    dir="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+    path="${dir%/}/$(basename -- "$path")"
     case "$path" in
-      /dev/* | /proc/*) return 1 ;;
+      /dev/fd/* | /dev/stdin | /dev/stdout | /dev/stderr | /proc/* | \
+        //dev/fd/* | //dev/stdin | //dev/stdout | //dev/stderr | //proc/*)
+        return 1
+        ;;
     esac
     [ -L "$path" ] || return 0
     hops=$((hops + 1))
@@ -4683,7 +4693,7 @@ gitops_source_is_rereadable() {
     target="$(readlink -- "$path" 2>/dev/null)" || return 1
     case "$target" in
       /*) path="$target" ;;
-      *) path="$(dirname -- "$path")/$target" ;;
+      *) path="${dir%/}/$target" ;;
     esac
   done
 }
