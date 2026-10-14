@@ -8,6 +8,12 @@ Terraform composition and the same Helm chart at a newer revision, re-rendering 
 the configuration it already has. A release copy of the script carries the version it upgrades to,
 so the ordinary upgrade names no version at all.
 
+An install whose GitHub forge is a GitHub Enterprise Server does not use `upgrade.sh`: it
+regenerates `terraform.tfvars` from `install.env`, which has no keys for the instance. Move the
+checkout to the new release, apply `charts/kube-agents/crds/`, and run the composition's
+`lifecycle.sh apply`, with the forge kept in `ghes.auto.tfvars`: see
+[GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-and-switch).
+
 ## Before you start
 
 Record what the install runs now, so you can tell afterwards what moved:

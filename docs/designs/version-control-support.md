@@ -408,7 +408,8 @@ sidecar validates across a trust boundary and must not pull in a module that she
 - `CleanRepoSlugWithOrg` in the operator was the Go one. It is now a deprecated wrapper over the
   GitHub provider's resolution: `repo_ref.go` parses the value with its host kept, and the
   provider refuses any host that is not one of its spellings — `github.com`, `www.github.com`,
-  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
+  `ssh.github.com` — or the forge's declared GitHub Enterprise Server host, before its
+  two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
   the admission path, goes through the same `Resolve`, so it and normalisation are still one
   rule, now a provider's.
 
@@ -1571,6 +1572,18 @@ minter as on github.com. What changes is where the broker keeps it:
 **The transport.** The forge uses `HttpTransport` at `https://<host>/api/v3`, so
 the broker runs no `gh` for it, and an install with only a GitHub Enterprise
 Server gets no `gh` in the broker's executable allowlist.
+
+**The broker's own login.** The ownership checks (an `advance` onto a branch, a
+`branch-delete`) compare a proposal's author with the credential's own login. An
+installation token cannot read `GET /user`, which answers it with 403, so the
+forge asks GraphQL `viewer { login }` at `https://<host>/api/graphql`, which
+answers an installation with its App's bot login. That is the query `gh auth
+status` makes on github.com. A login that does not come back is a refusal, not
+an empty answer: an empty login would drop the ownership checks.
+
+**Redirects.** Every git invocation a minted token rides sets
+`http.https://<host>/.followRedirects=false`, with or without a CA bundle, so a
+redirect never carries the token to another host.
 
 **A private CA.** A GitHub Enterprise Server behind a private CA names it in
 `caBundleRef`, as a self-managed GitLab does

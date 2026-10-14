@@ -364,15 +364,11 @@ Deployment passes its readiness probe. The chart never imports it;
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
 When the GitHub forge in `platformAgent.integration.forges` is at a GitHub
-Enterprise Server host, the minter mints there. The chart reads the forge, so
-no `githubMinter.*` value is needed for it: it sets
-`SOURCE_SYSTEM_API_BASE_URL=https://<host>/api/v3`, and when the forge names
-`caBundleRef` it mounts that Secret key into the minter and sets
-`SSL_CERT_DIR` to its directory, so minty trusts the CA beside its image's
-bundle for all of its outbound calls. The NetworkPolicy already allows port 443
-to any address. `org` and `repo` are the organization and repository on the
-instance, and the App is the one created on the instance. See
-[GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+Enterprise Server host, the minter mints there, from the forge declaration
+alone: no `githubMinter.*` value repeats the host or the CA. What the chart
+sets, and the restart a new or rotated CA Secret needs, are in
+[GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
+in the token minter guide.
 
 ### Telemetry
 
