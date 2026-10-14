@@ -160,8 +160,8 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			ProviderDeclared: strings.TrimSpace(f.Provider) != "",
 			Name:             strings.TrimSpace(f.Name),
 			Provider:         provider,
-			Host:      strings.TrimSpace(f.Host),
-			Namespace: strings.TrimSpace(f.Namespace),
+			Host:             strings.TrimSpace(f.Host),
+			Namespace:        strings.TrimSpace(f.Namespace),
 		}
 		if f.CredentialsRef != nil {
 			forge.CredentialsSecret = strings.TrimSpace(f.CredentialsRef.Name)

@@ -9922,7 +9922,6 @@ spec:
                             pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
                             type: string
                           provider:
-                            default: github
                             description: |-
                               Provider names the forge's kind. It is the discriminator the operator
                               writes into the gitops-state ConfigMap as each repository's `type`, so
@@ -9930,7 +9929,11 @@ spec:
                               URL's text.
 
                               "github" and "gitlab" are registered; the enum grows with each
-                              agent-side provider. Defaults to "github".
+                              agent-side provider. Omitted, it is "github".
+
+                              A forge at a host other than a spelling of github.com must name it, so
+                              a forge written for another instance is never read as a GitHub
+                              Enterprise Server by default.
                             enum:
                               - github
                               - gitlab
@@ -9939,6 +9942,14 @@ spec:
                           - name
                         type: object
                         x-kubernetes-validations:
+                          - message:
+                              "a forge at a host other than github.com names its
+                              provider: github for a GitHub Enterprise Server, gitlab
+                              for a GitLab instance"
+                            rule:
+                              has(self.provider) || !has(self.host) || size(self.host)
+                              == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com',
+                              'ssh.github.com']
                           - message:
                               "a gitlab forge needs credentialsRef.name: the Secret
                               holding its access token under the key token"

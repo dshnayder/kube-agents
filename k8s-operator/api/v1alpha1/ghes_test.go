@@ -309,7 +309,7 @@ func TestAForgeAtAnotherHostNamesItsProvider(t *testing.T) {
 		t.Errorf("GitHubHost() = %q, expected github.com while the forge is refused", resolved.GitHubHost())
 	}
 	for name, f := range map[string]ForgeSpec{
-		"named github":       gheForge("f", "git.example.com", "acme"),
+		"named github":        gheForge("f", "git.example.com", "acme"),
 		"github.com, unnamed": {Name: "f", Host: "WWW.GitHub.com", Namespace: "acme"},
 		"no host, unnamed":    {Name: "f", Namespace: "acme"},
 	} {
