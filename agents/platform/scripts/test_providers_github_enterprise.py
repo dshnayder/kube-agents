@@ -621,11 +621,11 @@ class ConsumerLinksTest(unittest.TestCase):
         import slack_moments
 
         text = f"Opened PR https://{HOST}/acme/infra/pull/41"
-        self.assertEqual(f"https://{HOST}/acme/infra/pull/41", slack_moments.opened_pr(text, HOST)[0])
-        self.assertIsNone(slack_moments.opened_pr(text, "github.com"))
-        self.assertIsNone(slack_moments.opened_pr("Opened PR https://ghe.other.example/a/b/pull/1", HOST))
+        self.assertEqual(f"https://{HOST}/acme/infra/pull/41", slack_moments.opened_pr(text, github_host=HOST)[0])
+        self.assertIsNone(slack_moments.opened_pr(text, github_host="github.com"))
+        self.assertIsNone(slack_moments.opened_pr("Opened PR https://ghe.other.example/a/b/pull/1", github_host=HOST))
         self.assertEqual("https://github.com/acme/infra/pull/9",
-                         slack_moments.opened_pr("Opened PR https://github.com/acme/infra/pull/9", HOST)[0])
+                         slack_moments.opened_pr("Opened PR https://github.com/acme/infra/pull/9", github_host=HOST)[0])
 
     def test_github_org_binds_an_enterprise_repository(self):
         with mock.patch.dict(os.environ, {"GITHUB_ORG": "acme"}), \
