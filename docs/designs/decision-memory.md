@@ -2,9 +2,9 @@
 
 ## Summary
 
-Enterprise platform teams operate large Kubernetes fleets over many years.
-When engineers or AI agents cannot find the rationale behind an infrastructure setting, they undo past fixes or repeat rejected changes.
-Previous outages and misconfigurations then return.
+A memory system is only valuable for the operational outcomes it enables that the agent could not achieve before.
+In long-lived Kubernetes fleets, engineers and AI agents lack the historical rationale behind infrastructure settings.
+Without that history, they undo protective fixes or repeat rejected changes, and previous outages return.
 
 [`memory.md`](memory.md) introduced retrieval-backed memory on Hindsight (`kube-agents-memory`).
 That design decoupled context window usage from corpus size ($4,264$ tokens vs $110,907$ tokens at $1,414$ records).
@@ -56,6 +56,19 @@ From these pain points, enterprise adopters defined six expectations for long-te
 | **Learn from agent actions** | Capture lessons automatically when an agent fix pull request merges and resolves the issue, or when a fix fails or is rejected. |
 | **Prioritize relevance over recall** | Surface records only when they apply to the target files or question. Avoid noisy recall that distracts the model. |
 | **Keep telemetry inside the boundary** | Keep all pull request outcomes, records, and metrics inside the local installation with zero automatic outbound telemetry. |
+
+### Operational impact: what the agent can do that it could not do before
+
+This design is driven by measurable operational outcomes rather than storage mechanics.
+Decision memory enables five capabilities that `kube-agents` cannot perform today:
+
+| Capability | Without decision memory (`memory.md` only) | With decision memory | Measurable eval / operational impact |
+| --- | --- | --- | --- |
+| **1. Learn from yesterday's trajectories** | Every run starts stateless. On task `b-0011`, the agent proposed the same invalid quota increase in 4 separate runs. | Verified outcomes (`resolved-merged`, `pr-merged-persists`, `refused`) produce scoped `LES` records with deterministic guards. | Two-trajectory eval: run 2 achieves $0$ repeat bad fixes after run 1's fix is refused or fails verification. |
+| **2. Block regressions on human and agent PRs** | Neither CI nor the agent checks diffs against past incident fixes. Engineers accidentally revert protective settings during cost tuning. | `decision_memory.py check` runs in the submission tool path and in pull request CI, blocking any change that violates an active guard. | $100\%$ of guarded regressions are intercepted before merge with the exact historical PR citation. |
+| **3. Onboard a 2-year repo in 2 hours** | A newly installed agent has zero historical context until humans manually state facts in chat. | `decision_memory.py bootstrap --since 2y` triages 2 years of PRs and docs in under 2 hours into a `STATE_OF_BEING.md` baseline and initial records. | Day-one agent answers rationale queries across 2 years of GCP and Kubernetes history immediately after onboarding. |
+| **4. Answer "why" with verifiable provenance** | Observation consolidation paraphrases text and drops record IDs in $11$ of $12$ recall misses (`id_stripped`). | Records live in git and index as verbatim chunks (`enable_observations: false`), preserving every ID, quantity, and PR URL. | $0$ `id_stripped` citation misses; every rationale answer links to the approving PR and commit. |
+| **5. Detect silent drift and graduate to policy** | Superseded rules stay in memory ($0.407$ contamination), and out-of-band edits silently break past decisions. | Nightly `dream` runs flag `at_risk` records the morning after a breaking change and propose `policy/` admission rules for recurring lessons. | $0.000$ superseded contamination on active recall; recurring failure classes graduate to API-server enforcement. |
 
 ### How this design addresses adopter needs
 
@@ -385,7 +398,7 @@ Enabling it by default requires passing an A/B evaluation (`with-decision-memory
 
 | Evaluation dimension | Method and acceptance bar |
 | --- | --- |
-| **1. Repeat-failure prevention (Pass rate)** | Replay the `b-0011` quota exhaustion task (`gitops-fix-cycle.md`) with `DEC-2026-001` (payments quota cap guard) and a negative lesson from a refused quota PR present in `knowledge/`. **Bar:** $0$ quota-increase pull requests across $3$ consecutive runs. |
+| **1. Cross-trajectory learning (`b-0011` repeat-failure prevention)** | Run a two-trajectory eval on `b-0011` (`gitops-fix-cycle.md`): trajectory 1 proposes the invalid quota raise and gets refused (or fails verification), producing a lesson; trajectory 2 runs against the resulting `knowledge/` record. **Bar:** $0$ quota-increase pull requests across $3$ consecutive runs. |
 | **2. Negative control (False-positive block rate)** | Run benign manifest changes in a governed namespace where all `guard.expect` assertions remain satisfied. **Bar:** $100\%$ pass rate and $0$ false-positive `block` verdicts. |
 | **3. Citation preservation (`id_stripped` rate)** | Run the 26 queries from `tests/memory-scale/queries.json` against `kube-agents-decisions` seeded one document per record in `chunks` mode. **Bar:** $0$ `id_stripped` misses on indexed records. |
 | **4. Stale recall contamination** | Query the 6 three-version contested policies from `tests/memory-scale/` with `status:active` tag filtering enabled. **Bar:** $0.000$ superseded contamination on active recall ($100\%$ current policy ranked first). |
