@@ -144,6 +144,11 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
+# The chart's GitHub token minter Deployment. install.sh restarts it after it
+# writes a GitHub Enterprise Server's CA Secret, because the minter reads its
+# CA when it starts.
+# shellcheck disable=SC2034  # read by install.sh
+readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
 # The design document a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
 # The Slack app setup page's allowlist section, which says how to find a
@@ -1281,23 +1286,34 @@ derive_chat_sub_name() {
 # Classifies a GitHub account name against the public API, echoing exactly one
 # of: organization | user | missing | unknown.
 #
+# With HOST, a GitHub Enterprise Server hostname, it asks that instance's REST
+# API (https://HOST/api/v3) and not api.github.com, and with CA_FILE it trusts
+# that PEM CA for the call. The request carries no credential, on either host,
+# and does not follow a redirect. An instance in private mode answers 401 to an
+# anonymous request, which reads as "unknown".
+#
 # "unknown" is the catch-all for every inconclusive answer — curl absent, the
 # network down, rate limiting, an unexpected payload — so a caller can tell
 # "GitHub says no" apart from "we could not ask". Never exits and never prints,
 # so it is safe to call from an interactive prompt loop; callers decide whether
 # an answer is fatal. install.sh uses it to validate before provisioning starts.
 github_account_type() {
-  local name="${1:-}"
+  local name="${1:-}" host="${2:-}" ca_file="${3:-}"
   if [ -z "$name" ] || ! command -v curl &>/dev/null; then
     echo "unknown"
     return 0
   fi
+  local api="https://api.github.com"
+  [ -n "$host" ] && api="https://${host}/api/v3"
+  local ca_args=()
+  [ -n "$host" ] && [ -n "$ca_file" ] && ca_args=(--cacert "$ca_file")
 
   # Status is appended on its own line so a transport failure (curl non-zero)
   # stays distinguishable from an HTTP error (curl zero, status in the body).
   local response status body
-  if ! response=$(trap - ERR; curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
-      -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
+  if ! response=$(trap - ERR; curl -sS --max-time 10 --proto '=https' ${ca_args[@]+"${ca_args[@]}"} \
+      -H "Accept: application/vnd.github+json" \
+      -w '\n%{http_code}' "${api}/users/${name}" 2>/dev/null); then
     echo "unknown"
     return 0
   fi
@@ -1333,8 +1349,13 @@ github_account_type() {
 # re-prompt: install.sh calls github_account_type directly and settles the value
 # before provisioning starts. An inconclusive lookup is never fatal — an
 # unreachable api.github.com must not block a provision that is otherwise fine.
+# HOST and CA_FILE are the GitHub Enterprise Server's, as for
+# github_account_type: the organization is looked up on the install's GitHub
+# host, never on github.com for an instance.
 check_github_org_is_organization() {
-  local org="${1:-}"
+  local org="${1:-}" host="${2:-}" ca_file="${3:-}"
+  local where="GitHub"
+  [ -n "$host" ] && where="$host"
   [ -z "$org" ] && return 0
   # A GitLab install has no token minter, so no GitHub account to check.
   [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
@@ -1344,10 +1365,10 @@ check_github_org_is_organization() {
     return 0
   fi
 
-  case "$(github_account_type "$org")" in
+  case "$(github_account_type "$org" "$host" "$ca_file")" in
     organization) return 0 ;;
     user)
-      print_error "GITOPS_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "GITOPS_ORG='${org}' is a user account on ${where}, not an organization."
       print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
       print_error "which does not exist for personal accounts, so every token request would"
       print_error "fail with a 404 after deployment."
@@ -1358,18 +1379,16 @@ check_github_org_is_organization() {
       exit 1
       ;;
     missing)
-      print_error "GITOPS_ORG='${org}' does not exist on GitHub."
+      print_error "GITOPS_ORG='${org}' does not exist on ${where}."
       print_error "Check the spelling. The Token Minter resolves installations at"
       print_error "/orgs/${org}/installation, so a name that does not exist fails every"
       print_error "token request after deployment."
       print_error "Edit GITOPS_ORG in install.env, or re-run with"
       print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
-      print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
-      print_error "both talk to api.github.com.)"
       exit 1
       ;;
     *)
-      print_warning "Could not determine whether '${org}' is an organization; continuing."
+      print_warning "Could not determine whether '${org}' is an organization on ${where}; continuing."
       return 0
       ;;
   esac
@@ -3724,6 +3743,15 @@ write_tfvars_from_state() {
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
+      # A GitHub Enterprise Server: the composition declares the github forge
+      # at this host, with the CA Secret, in place of the github.com alias.
+      # Only then, so a github.com install renders the lines it always has.
+      if [ -n "${GITOPS_HOST:-}" ]; then
+        echo "gitops_host = $(hcl_str "${GITOPS_HOST}")"
+        if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+          echo "github_ca_secret_name = $(hcl_str "${GITOPS_CA_SECRET}")"
+        fi
+      fi
     fi
     echo "enable_github_minter = ${enable_github_minter}"
     echo "github_app_id        = $(hcl_str "${GITHUB_APP_ID:-}")"
