@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -211,9 +212,9 @@ func TestBrokerForgesPutsGitHubAtTheEnterpriseHostWithItsCA(t *testing.T) {
 	if err != nil || entry.Type != GitProviderGitHub || entry.URL != "https://ghe.example.com/acme/infra" {
 		t.Errorf("ManagedRepoEntry() = (%+v, %v), expected the full GitHub Enterprise Server URL", entry, err)
 	}
-	egress := strings.Join(ForgeEgressPatterns(in), ",")
-	if !strings.HasSuffix(egress, ",ghe.example.com") {
-		t.Errorf("egress = %s, expected the GitHub Enterprise Server host as a literal", egress)
+	egress := ForgeEgressPatterns(in)
+	if !slices.Contains(egress, "ghe.example.com") {
+		t.Errorf("egress = %v, expected the GitHub Enterprise Server host as a literal", egress)
 	}
 }
 
