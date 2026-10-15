@@ -1593,7 +1593,9 @@ type ForgeSpec struct {
 	// the PEM CA certificates that signed this forge's TLS certificate:
 	// a self-managed instance behind a private CA. The broker trusts these
 	// certificates for this forge's host only, beside the system bundle, in
-	// its API client and in git, so they never vouch for another host. It is
+	// its API client and in git. On a GitHub Enterprise Server forge, the
+	// chart also gives them to the token minter, which trusts them for all of
+	// its outbound calls. It is
 	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
 	// is refused when host is empty, gitlab.com or github.com, whose
 	// certificates the public CAs sign.

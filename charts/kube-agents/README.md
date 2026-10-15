@@ -506,7 +506,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   fails the render. A self-managed
   instance whose certificate a private CA signed also sets `caBundleRef`
   (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
-  holds the CA, which the broker trusts for that host only. A Secret, so
+  holds the CA, which the broker trusts for that host only. On a GitHub
+  Enterprise Server forge, the token minter also gets the CA, and it trusts
+  the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
   forge at a self-managed host, GitLab or GitHub Enterprise Server, never
   gitlab.com or github.com. With a `gitlab` forge

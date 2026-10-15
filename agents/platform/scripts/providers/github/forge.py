@@ -79,7 +79,14 @@ GITHUB_OWNED_DOMAINS = (
 )
 
 
+def _bare_host(host: str) -> str:
+    """``host`` without a ``:<port>`` suffix, for the checks that judge the name only."""
+    name, sep, port = host.rpartition(":")
+    return name if sep and port.isdigit() else host
+
+
 def _github_owned(host: str) -> bool:
+    host = _bare_host(host)
     return any(host == domain or host.endswith("." + domain) for domain in GITHUB_OWNED_DOMAINS)
 
 #: The REST API's prefix on a GitHub Enterprise Server instance.
@@ -119,7 +126,10 @@ class GitHubForge(Forge):
                 raise ValueError(f"the {self.name} forge at {host} names a caFile; only a GitHub Enterprise Server host may")
             self.credential = BrokeredCredential(self.name, refresh)
             return
-        if _github_owned(host):
+        if _bare_host(host) in repo_ref.GITHUB_HOSTS or _github_owned(host):
+            # github.com with a port, or a host under a domain where GitHub runs its
+            # own services: never a GitHub Enterprise Server host, so never given a
+            # minted write token or a private CA.
             raise ValueError(f"{host} is a service GitHub operates, not a GitHub Enterprise Server host")
         # A GitHub Enterprise Server instance: one host, the in-process
         # transport, and a write token in memory. No CLI: gh is never logged
