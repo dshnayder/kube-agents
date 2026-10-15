@@ -328,7 +328,8 @@ the App on the instance:
 github forge at that host. After the apply, `install.sh` writes the CA file into the Secret and
 restarts the token minter, which reads the CA when it starts. `--gitops-host=github.com` switches the
 install back to github.com and drops the three keys. The App and its KMS key belong to one GitHub
-host: a switch between github.com and an instance needs the other host's App, as
+host: a switch between github.com and an instance needs the other host's App and a new KMS key
+(`install.sh` refuses a change of host that keeps the recorded `GITHUB_APP_ID` or key), as
 [Switch between github.com and a GitHub Enterprise Server](../../INSTALL.md#switch-between-githubcom-and-a-github-enterprise-server)
 describes.
 

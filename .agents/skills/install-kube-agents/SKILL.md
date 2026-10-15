@@ -428,7 +428,7 @@ Rules for the agent:
 - Do not give `--gitops-ca-file` when a public CA signed the certificate. Do not use `/dev/stdin` or a process substitution for it.
 - The organization check asks the instance with the CA and sends no credential. On an instance in private mode it warns that it cannot verify the organization and goes on.
 - To upgrade, run `upgrade.sh`. To remove, run `uninstall.sh`. Both read the forge from `install.env` (`GITOPS_FORGE=github`, `GITOPS_HOST`, `GITOPS_CA_SECRET`).
-- A switch between github.com and an instance needs the App on the new host and a new `--kms-key`, because `install.sh` imports a key only into a key with no `ENABLED` version. INSTALL.md, "Switch between github.com and a GitHub Enterprise Server", gives the command. `--gitops-host=github.com` switches back.
+- A switch between github.com and an instance needs the App on the new host and a new `--kms-key`, because `install.sh` imports a key only into a key with no `ENABLED` version. The installer refuses a change of host that keeps the recorded App or key. INSTALL.md, "Switch between github.com and a GitHub Enterprise Server", gives the command. `--gitops-host=github.com` switches back.
 - With `--generate-only`, the operator creates the CA Secret and restarts the minter after `lifecycle.sh apply`; INSTALL.md gives the commands. Over an existing `install.env`, generate-only does not record the forge keys: have the operator set `GITOPS_FORGE=github`, `GITOPS_HOST` and, for a private CA, `GITOPS_CA_SECRET` there before `lifecycle.sh apply`, or the next `upgrade.sh` renders github.com.
 - When `install.env` records `GITOPS_FORGE=gitlab`, also pass `--gitops-forge=github` to switch to an instance.
 
