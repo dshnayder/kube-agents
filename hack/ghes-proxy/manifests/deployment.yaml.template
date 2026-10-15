@@ -19,6 +19,8 @@ spec:
         app.kubernetes.io/name: ghes-proxy
     spec:
       automountServiceAccountToken: false
+      # Longer than the proxy's 25-second drain of the requests in flight.
+      terminationGracePeriodSeconds: 30
       enableServiceLinks: false
       securityContext:
         runAsNonRoot: true

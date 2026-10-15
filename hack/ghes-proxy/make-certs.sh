@@ -72,18 +72,28 @@ umask 077
 work=$(mktemp -d "$out/.make-certs.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-openssl req -x509 -new -nodes -sha256 -days "$days" \
+# openssl, with its output kept and shown only when it fails: a failed step
+# must say why, not exit silently.
+ossl() {
+  if ! openssl "$@" >"$work/openssl.log" 2>&1; then
+    echo "make-certs: 'openssl $1' failed:" >&2
+    cat "$work/openssl.log" >&2
+    exit 1
+  fi
+}
+
+ossl req -x509 -new -nodes -sha256 -days "$days" \
   -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout "$work/ca.key" -out "$work/ca.crt" \
   -subj "/CN=ghes-proxy eval CA for $host" \
   -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
   -addext "keyUsage=critical,keyCertSign,cRLSign" \
-  -addext "subjectKeyIdentifier=hash" 2>/dev/null
+  -addext "subjectKeyIdentifier=hash"
 
-openssl req -new -nodes -sha256 \
+ossl req -new -nodes -sha256 \
   -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout "$work/tls.key" -out "$work/tls.csr" \
-  -subj "/CN=$host" 2>/dev/null
+  -subj "/CN=$host"
 
 cat >"$work/ext.cnf" <<EOF
 basicConstraints=critical,CA:FALSE
@@ -94,11 +104,11 @@ subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid,issuer
 EOF
 
-openssl x509 -req -sha256 -days "$days" \
+ossl x509 -req -sha256 -days "$days" \
   -in "$work/tls.csr" -CA "$work/ca.crt" -CAkey "$work/ca.key" -set_serial "0x$(openssl rand -hex 16)" \
-  -extfile "$work/ext.cnf" -out "$work/tls.crt" 2>/dev/null
+  -extfile "$work/ext.cnf" -out "$work/tls.crt"
 
-openssl verify -CAfile "$work/ca.crt" "$work/tls.crt" >/dev/null
+ossl verify -CAfile "$work/ca.crt" "$work/tls.crt"
 
 mv "$work/ca.crt" "$work/tls.crt" "$work/tls.key" "$out/"
 chmod 0644 "$out/ca.crt" "$out/tls.crt"

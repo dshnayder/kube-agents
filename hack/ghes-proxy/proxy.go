@@ -54,6 +54,9 @@ const (
 	DefaultEnterpriseVersion = "3.17.0"
 	// DefaultMaxRewriteBytes is the default of Config.MaxRewriteBytes.
 	DefaultMaxRewriteBytes = 64 << 20
+	// MaxMaxRewriteBytes is the largest Config.MaxRewriteBytes: the proxy
+	// holds a body this large in memory, and the read limit adds one to it.
+	MaxMaxRewriteBytes = 1 << 30
 
 	enterpriseVersionHeader = "X-GitHub-Enterprise-Version"
 	apiPrefix               = "/api/v3"
@@ -91,20 +94,23 @@ var gitPathRE = regexp.MustCompile(`^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git/(
 var gitServices = map[string]bool{"git-upload-pack": true, "git-receive-pack": true}
 
 // classify maps an incoming request to its upstream, or returns false when the
-// proxy does not forward it.
+// proxy does not forward it. It decides on the escaped path, the bytes it
+// forwards: a decision on the decoded path would accept /api/v3%2Fuser as
+// /api/v3/user and then forward a path that does not start with a slash.
 func (p *proxy) classify(r *http.Request) (route, bool) {
 	escaped := r.URL.EscapedPath()
 	switch {
-	case r.URL.Path == graphQLPath:
+	case escaped == graphQLPath:
 		return p.target(routeAPI, p.cfg.UpstreamAPIHost, "/graphql", r.URL.RawQuery), true
-	case r.URL.Path == apiPrefix || strings.HasPrefix(r.URL.Path, apiPrefix+"/"):
+	case escaped == apiPrefix || strings.HasPrefix(escaped, apiPrefix+"/"):
 		rest := strings.TrimPrefix(escaped, apiPrefix)
 		if rest == "" {
 			rest = "/"
 		}
 		return p.target(routeAPI, p.cfg.UpstreamAPIHost, rest, r.URL.RawQuery), true
 	}
-	m := gitPathRE.FindStringSubmatch(r.URL.Path)
+	// The segment class has no %, so an escaped byte in a git path refuses it.
+	m := gitPathRE.FindStringSubmatch(escaped)
 	if m == nil || isDotSegment(m[1]) || isDotSegment(m[2]) {
 		return route{}, false
 	}
@@ -154,6 +160,9 @@ func NewHandler(cfg Config, transport http.RoundTripper, logger *log.Logger) htt
 	if cfg.MaxRewriteBytes <= 0 {
 		cfg.MaxRewriteBytes = DefaultMaxRewriteBytes
 	}
+	if cfg.MaxRewriteBytes > MaxMaxRewriteBytes {
+		cfg.MaxRewriteBytes = MaxMaxRewriteBytes
+	}
 	p := &proxy{cfg: cfg, logger: logger}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:        p.rewriteRequest,
@@ -170,15 +179,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	rt, ok := p.classify(r)
+	// Deferred, so that a request whose response copy aborts (ReverseProxy
+	// panics with http.ErrAbortHandler) still gets its line. Only the method,
+	// the route, the path and the status: no query string, no header and no
+	// body, because each of them can hold a credential.
+	defer func() {
+		p.logger.Printf("%s %s %s %d %dB %s", r.Method, routeName(rt, ok), r.URL.Path, rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+	}()
 	if !ok {
 		rec.Header().Set(enterpriseVersionHeader, p.cfg.EnterpriseVersion)
 		http.NotFound(rec, r)
-	} else {
-		p.rp.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), routeKey{}, rt)))
+		return
 	}
-	// Only the method, the route, the path and the status: no query string,
-	// no header and no body, because each of them can hold a credential.
-	p.logger.Printf("%s %s %s %d %dB %s", r.Method, routeName(rt, ok), r.URL.Path, rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+	p.rp.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), routeKey{}, rt)))
 }
 
 func routeName(rt route, ok bool) string {
@@ -306,10 +319,18 @@ func (p *proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 		err = uerr.Err
 	}
 	if !errors.Is(err, context.Canceled) {
-		p.logger.Printf("%s %s: upstream error: %v", r.Method, r.URL.Path, err)
+		// A transport error can quote the request URI (the HTTP/2 encoder
+		// does), so any query string in it is cut out.
+		p.logger.Printf("%s %s: upstream error: %s", r.Method, r.URL.Path, redactQuery(err.Error()))
 	}
 	w.WriteHeader(http.StatusBadGateway)
 }
+
+// queryRE is a query string inside an error message: from the ? to the next
+// space or quote.
+var queryRE = regexp.MustCompile(`\?[^\s"'\x60]*`)
+
+func redactQuery(s string) string { return queryRE.ReplaceAllString(s, "?<redacted>") }
 
 // rewriteFields are the JSON fields whose string values the proxy rewrites.
 // The agent reads html_url as the web URL of what it wrote, and the token

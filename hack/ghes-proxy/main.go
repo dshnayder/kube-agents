@@ -75,8 +75,8 @@ func parseOptions(args []string, getenv func(string) string, stderr io.Writer) (
 		return o, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
 	n, err := strconv.ParseInt(maxRewrite, 10, 64)
-	if err != nil || n <= 0 {
-		return o, fmt.Errorf("max-rewrite-bytes %q is not a positive integer", maxRewrite)
+	if err != nil || n <= 0 || n > MaxMaxRewriteBytes {
+		return o, fmt.Errorf("max-rewrite-bytes %q is not an integer from 1 to %d", maxRewrite, MaxMaxRewriteBytes)
 	}
 	o.cfg.MaxRewriteBytes = n
 	for name, v := range map[string]string{
@@ -113,15 +113,32 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdown)
-	}()
 	logger.Printf("ghes-proxy: listening on %s as %s, upstream %s and %s, version %s",
 		o.listen, o.cfg.PublicHost, o.cfg.UpstreamAPIHost, o.cfg.UpstreamWebHost, o.cfg.EnterpriseVersion)
-	if err := srv.ListenAndServeTLS(o.certFile, o.keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	start := func() error { return srv.ListenAndServeTLS(o.certFile, o.keyFile) }
+	if err := serve(ctx, srv, start, shutdownGrace); err != nil {
 		logger.Fatalf("ghes-proxy: %v", err)
 	}
+}
+
+// shutdownGrace is how long a stop waits for the requests in flight; the
+// Deployment's terminationGracePeriodSeconds must be longer.
+const shutdownGrace = 25 * time.Second
+
+// serve runs start until ctx is done, then shuts srv down and returns only
+// after the requests in flight have finished or grace has passed.
+// ListenAndServe returns as soon as Shutdown closes the listener, so main
+// must wait for Shutdown itself, or the process exits mid-request.
+func serve(ctx context.Context, srv *http.Server, start func() error, grace time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), grace)
+		defer cancel()
+		done <- srv.Shutdown(shutdown)
+	}()
+	if err := start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return <-done
 }

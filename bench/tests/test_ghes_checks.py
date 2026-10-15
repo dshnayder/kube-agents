@@ -340,6 +340,7 @@ def private_ca_server(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"https://localhost:{server.server_address[1]}", certs / "ca.crt"
+    # tls.crt sits beside ca.crt; the leaf test below reads it from there.
     server.shutdown()
     server.server_close()
 
@@ -376,3 +377,31 @@ def test_a_bad_ca_file_is_an_error_on_a_gitlab_run_too(monkeypatch, tmp_path):
     result = ledger_check().verify(30)
     assert result.status == "error"
     assert forges.FORGE_CA_FILE_ENV_VAR in result.reason
+
+
+def test_the_server_certificate_is_refused_as_the_ca(private_ca_server):
+    """make-certs.sh writes tls.crt beside ca.crt. The leaf loads as a
+    certificate, but no chain can be built from it, so every read would fail
+    with an error that names no setting: it is refused here instead."""
+    _, ca = private_ca_server
+    leaf = ca.parent / "tls.crt"
+    with pytest.raises(forges.UnknownForge, match="no CA certificate"):
+        forges.forge_ssl_context({forges.FORGE_CA_FILE_ENV_VAR: str(leaf)})
+
+
+def test_make_certs_shows_why_openssl_failed(tmp_path):
+    """A failed openssl step prints openssl's own message, not nothing."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "openssl").write_text("#!/bin/sh\necho 'unknown option -addext' >&2\nexit 1\n")
+    (fake / "openssl").chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "hack" / "ghes-proxy" / "make-certs.sh"), "localhost", str(tmp_path / "out")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{fake}:/usr/bin:/bin"},
+    )
+    assert result.returncode != 0
+    assert "unknown option -addext" in result.stderr
+    assert "'openssl req' failed" in result.stderr
+    assert not (tmp_path / "out" / "tls.key").exists()

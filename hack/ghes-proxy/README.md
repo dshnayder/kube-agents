@@ -4,7 +4,7 @@ The GHES proxy is an eval fixture. It is an HTTPS forwarding proxy that has the 
 
 ## Why it exists
 
-A build with GHES forge support can declare its GitHub forge at a GHES host. The eval lanes must test that path. A build without that support refuses a GitHub forge at a host other than github.com. No open-source GHES exists, and a real GHES instance costs too much to keep up to date. The proxy lets an eval install use a GHES host name, a private CA and the GHES URL layout, and it keeps the data on github.com, in the eval repositories that the lanes already use and reset.
+A release with GitHub Enterprise Server support can declare its GitHub forge at a GHES host. That support comes from gke-labs/kube-agents#3032 (the forge) and #3104 (the installer), which are not merged yet. The eval lanes must test that path. A build without that support refuses a GitHub forge at a host other than github.com. No open-source GHES exists, and a real GHES instance costs too much to keep up to date. The proxy lets an eval install use a GHES host name, a private CA and the GHES URL layout, and it keeps the data on github.com, in the eval repositories that the lanes already use and reset.
 
 The proxy does not copy what GHES does. It copies only what kube-agents reads: the API paths, the host in the URLs that the agent shows, and the version header. A test that passes through the proxy shows that kube-agents uses the GHES host and the GHES paths. It does not show that kube-agents works with each GHES release.
 
@@ -146,7 +146,7 @@ These steps are for GKE and Cloud DNS. They give the proxy an internal address i
 
    The command prints `200`. The check uses `--insecure` because the pod does not have the CA. The clients in the next step get it.
 
-7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as `INSTALL.md` tells for a GitHub Enterprise Server. This step needs a kube-agents build with GHES forge support; a build without it refuses the forge at admission. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
+7. Install a release with GitHub Enterprise Server support, and declare the forge at `ghes.eval.internal` with the CA in `caBundleRef`. A release without that support has no GHES section in `INSTALL.md`, and the `github` provider refuses both the host and `caBundleRef`. Until #3032 and #3104 merge, follow the "GitHub Enterprise Server" section of `INSTALL.md` on the #3032 branch. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
 
 8. If the cluster enforces NetworkPolicy, make sure that the platform agent pods and the token minter can reach the proxy's address on TCP 443, and that the proxy can reach github.com on TCP 443.
 

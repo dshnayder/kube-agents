@@ -17,12 +17,17 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
+	"fmt"
+	"math"
+	"net"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -211,6 +216,13 @@ func TestOtherPathsAreRefused(t *testing.T) {
 		{"POST", "/api/graphqlx"},
 		{"GET", "/api"},
 		{"GET", "/login/oauth/authorize"},
+		// An escaped slash: the decoded path reads as a forwarded one, the
+		// bytes do not.
+		{"GET", "/api/v3%2Fuser"},
+		{"GET", "/api%2Fv3/user"},
+		{"POST", "/api%2Fgraphql"},
+		{"GET", "/acme%2Finfra.git/info/refs?service=git-upload-pack"},
+		{"POST", "/acme/infra%2Egit/git-upload-pack"},
 	}
 	f := newFixture(t)
 	for _, tc := range cases {
@@ -490,6 +502,9 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 	f.do(t, "POST", "/api/v3/app/installations/1/access_tokens", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Bearer eyJSECRETjwt"}})
 	f.do(t, "POST", "/acme/infra.git/git-receive-pack", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Basic x-access-token:ghs_SECRETgit"}})
 	f.do(t, "GET", "/nothing?token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
+	// The escaped-slash request that once reached the HTTP/2 encoder, whose
+	// error quotes the whole request URI.
+	f.do(t, "GET", "/api/v3%2Fuser?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
 
 	// An upstream that cannot be reached: the transport's error names the
 	// URL, query string included.
@@ -509,7 +524,17 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 		t.Errorf("wrapped error: status %d", rec.Code)
 	}
 
-	logs := f.logs.String() + broken.logs.String() + wrapped.String()
+	// A transport error that quotes the request URI, query string included.
+	quoting := &syncBuffer{}
+	h = NewHandler(Config{PublicHost: publicHost, UpstreamAPIHost: "api.github.com", UpstreamWebHost: "github.com"},
+		quotingErrorTransport{}, log.New(quoting, "", 0))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v3/user?access_token=SECRETquery", nil))
+	if rec.Code != http.StatusBadGateway || !strings.Contains(quoting.String(), "?<redacted>") {
+		t.Errorf("quoting error: status %d, log %q", rec.Code, quoting.String())
+	}
+
+	logs := f.logs.String() + broken.logs.String() + wrapped.String() + quoting.String()
 	if !strings.Contains(logs, "/api/v3/user") || !strings.Contains(logs, "upstream error") {
 		t.Fatalf("the log lacks the expected lines:\n%s", logs)
 	}
@@ -521,6 +546,12 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 }
 
 type urlErrorTransport struct{}
+
+type quotingErrorTransport struct{}
+
+func (quotingErrorTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("invalid request :path %q", r.URL.RequestURI())
+}
 
 func (urlErrorTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, &url.Error{Op: "Get", URL: r.URL.String(), Err: errors.New("connection reset")}
@@ -543,9 +574,99 @@ func TestParseOptions(t *testing.T) {
 		{"-public-host", "ghes.example.internal/x"},
 		{"-public-host", "ghes.example.internal", "-upstream-api-host", "api.github.com/v3"},
 		{"-public-host", "ghes.example.internal", "-max-rewrite-bytes", "0"},
+		{"-public-host", "ghes.example.internal", "-max-rewrite-bytes", "9223372036854775807"},
+		{"-public-host", "ghes.example.internal", "-max-rewrite-bytes", strconv.Itoa(MaxMaxRewriteBytes + 1)},
 	} {
 		if _, err := parseOptions(args, func(string) string { return "" }, io.Discard); err == nil {
 			t.Errorf("parseOptions(%q) accepted", args)
 		}
+	}
+}
+
+func TestTheLargestRewriteCapStillRewrites(t *testing.T) {
+	// MaxRewriteBytes+1 must not wrap to a negative read limit, which would
+	// empty every JSON response.
+	f := newFixture(t, func(c *Config) { c.MaxRewriteBytes = math.MaxInt64 })
+	web := f.web.host()
+	f.api.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"html_url":"https://`+web+`/a"}`)
+	}
+	if got := string(readAll(t, f.do(t, "GET", "/api/v3/x", nil, nil).Body)); got != `{"html_url":"https://`+publicHost+`/a"}` {
+		t.Errorf("body %q", got)
+	}
+}
+
+func TestAnAbortedResponseIsStillLogged(t *testing.T) {
+	f := newFixture(t)
+	chunk := bytes.Repeat([]byte("p"), 64<<10)
+	f.web.handler = func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < 1000; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			time.Sleep(time.Millisecond)
+		}
+	}
+	conn, err := net.Dial("tcp", strings.TrimPrefix(f.front.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(conn, "POST /acme/infra.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+	buf := make([]byte, 128<<10)
+	if _, err := io.ReadAtLeast(conn, buf, 1); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(f.logs.String(), "POST git /acme/infra.git/git-upload-pack 200") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no access-log line for the aborted request:\n%s", f.logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestServeWaitsForTheRequestsInFlight(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "done")
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, srv, func() error { return srv.Serve(ln) }, 10*time.Second) }()
+
+	answer := make(chan string, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			answer <- "error: " + err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		answer <- string(b)
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-served:
+		t.Fatalf("serve returned (%v) with a request in flight", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if got := <-answer; got != "done" {
+		t.Errorf("the request in flight got %q", got)
+	}
+	if err := <-served; err != nil {
+		t.Errorf("serve: %v", err)
 	}
 }

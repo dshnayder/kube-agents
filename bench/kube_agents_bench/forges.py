@@ -241,6 +241,14 @@ def github_api_root(environ: Mapping[str, str] | None = None) -> str:
 
 @functools.lru_cache(maxsize=8)
 def _ssl_context_for(path: str) -> ssl.SSLContext:
+    # A server certificate loads as well as a CA does, and then every read
+    # fails on a chain it cannot build, with an error that names no setting.
+    # get_ca_certs() lists only CA:TRUE certificates, so an empty context that
+    # loaded the file and lists none got no CA from it.
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    probe.load_verify_locations(cafile=path)
+    if not probe.get_ca_certs():
+        raise ValueError("it holds no CA certificate (CA:TRUE); give the CA, for example ca.crt, not the server's tls.crt")
     context = ssl.create_default_context()
     context.load_verify_locations(cafile=path)
     return context

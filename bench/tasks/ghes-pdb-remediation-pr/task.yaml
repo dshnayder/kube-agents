@@ -47,13 +47,16 @@
 #  1. Deploy the proxy and its private DNS name on the eval cluster's VPC:
 #     hack/ghes-proxy/README.md, "Run it in a cluster with a private DNS name".
 #     In these steps the host is ghes.eval.internal and the CA is ca.crt.
-#  2. Install kube-agents from the build under test on a leased pool project,
-#     with the GitHub forge at ghes.eval.internal, caBundleRef set to a Secret
-#     that holds ca.crt, the repository entry
-#     https://ghes.eval.internal/gke-agentic/<project>-infra, and the chart's
-#     token minter pointed at the same host and CA (INSTALL.md, "GitHub
-#     Enterprise Server", in a build with GHES forge support). The GitHub App
-#     is the pool's github.com App.
+#  2. Install a release with GitHub Enterprise Server support (the forge in
+#     gke-labs/kube-agents#3032, the installer in #3104; neither is merged
+#     yet) on a leased pool project, with the GitHub forge at
+#     ghes.eval.internal, caBundleRef set to a Secret that holds ca.crt, the
+#     repository entry https://ghes.eval.internal/gke-agentic/<project>-infra,
+#     and the chart's token minter pointed at the same host and CA. Follow the
+#     "GitHub Enterprise Server" section of INSTALL.md in that release; a
+#     release without the support has no such section, and its github
+#     provider refuses the host and caBundleRef. The GitHub App is the pool's
+#     github.com App.
 #  3. Run the case from bench/ with the grading environment:
 #       export BENCH_FORGE=github BENCH_GITHUB_HOST=ghes.eval.internal
 #       export BENCH_GITHUB_TOKEN=<the pool's read-scoped installation token>
