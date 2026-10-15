@@ -317,10 +317,10 @@ forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github 
 these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
 the App on the instance:
 
-| Key                | Value                                                                                                         |
-| ------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `GITOPS_FORGE`     | `github`                                                                                                      |
-| `GITOPS_HOST`      | The instance's hostname                                                                                       |
+| Key                | Value                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`     | `github`                                                                                                     |
+| `GITOPS_HOST`      | The instance's hostname                                                                                      |
 | `GITOPS_CA_SECRET` | The name of the Secret that holds a private CA (default `github-forge-ca`); set only with `--gitops-ca-file` |
 
 `upgrade.sh` and `uninstall.sh` render the same forge from these keys. The generator writes
