@@ -699,6 +699,26 @@ class CreateProfileTest(unittest.TestCase):
             "user_md_field() changed; re-check the USER.md format written by create_profile",
         )
 
+    def test_stamps_target_cluster_identity_into_soul_md(self):
+        """SOUL.md is injected into the Cluster Agent system prompt on turn 1.
+        Stamping the target cluster identity there keeps the agent from spending
+        tool calls searching for USER.md when user_profile_enabled is false."""
+        (self.template / "SOUL.md").write_text(
+            "# Cluster Agent — Soul\n\n---\n\n## 1. Core Truths\n",
+            encoding="utf-8",
+        )
+        self.create()
+        soul = (self.profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", soul)
+        self.assertIn(f"- project: {self.PROJECT}", soul)
+        self.assertIn(f"- cluster: {self.CLUSTER}", soul)
+        self.assertIn(f"- location: {self.LOCATION}", soul)
+        # Re-scaffolding is idempotent and does not duplicate the section.
+        self.create()
+        soul_again = (self.profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(soul_again.count("## Target Cluster Identity"), 1)
+        self.assertEqual(soul_again, soul)
+
 
     # --- telemetry ---
     #

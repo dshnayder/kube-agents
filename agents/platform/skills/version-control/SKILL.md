@@ -59,7 +59,7 @@ revisions go **up** the same way, as a bundle, which is why a branch of five
 commits arrives as five commits. Nothing that came out of the repository is
 ever executed beside the credential.
 
-The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
+The script is `"$HERMES_HOME"/skills/version-control/scripts/vcs.py` (`scripts/vcs.py` inside the skill directory). Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
 forge that is. On an install that serves more than one forge, `owner/name` is
 refused: name the repository by its URL.

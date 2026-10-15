@@ -1030,6 +1030,52 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
 
+    def test_the_shipped_cluster_loop_stamps_target_cluster_identity_into_soul_md(self):
+        """When the real cluster SOUL.md template is synced onto a cluster profile,
+        the startup loop stamps the target cluster identity from config.yaml."""
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shutil.copy(_REPO / "agents" / "cluster" / "SOUL.md", template_dir / "SOUL.md")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            profile.mkdir(parents=True)
+            scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(scaffolded, sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", persona)
+        self.assertIn(f"- project: {self._IDENTITY['project']}", persona)
+        self.assertIn(f"- cluster: {self._IDENTITY['cluster']}", persona)
+        self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
+        self.assertEqual(persona.count("## Target Cluster Identity"), 1)
+
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.
 

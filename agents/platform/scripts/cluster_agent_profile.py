@@ -77,6 +77,9 @@ KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
 # What the reconcile engine and the roster read as "this profile is finished".
 USER_MD_NAME = "USER.md"
+SOUL_MD_NAME = "SOUL.md"
+SOUL_IDENTITY_HEADING = "## Target Cluster Identity"
+SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # The one connection attempt the scaffold makes after pinning the kubeconfig,
 # so an unreachable cluster is reported here, with the endpoint it was reached
 # over, rather than discovered by the first Cluster Agent run. `kubectl
@@ -172,6 +175,45 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
         data = {}
     data["cluster_identity"] = {"project": project, "cluster": cluster, "location": location}
     config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _stamp_soul_identity(home: Path, project: str, cluster: str, location: str) -> None:
+    """Stamp the target cluster identity directly into the profile's SOUL.md.
+
+    Hermes always injects SOUL.md into the system prompt via build_context_files_prompt(),
+    whereas USER.md is skipped when user_profile_enabled is false (the Cluster Agent
+    default) or when an external memory provider is active. Stamping project, cluster,
+    and location into SOUL.md gives the worker its identity in turn 1 without spending
+    tool calls searching for USER.md from its kanban task scratch workspace.
+    """
+    soul_path = home / SOUL_MD_NAME
+    if not soul_path.is_file():
+        return
+    text = soul_path.read_text(encoding="utf-8")
+    block = (
+        f"---\n\n{SOUL_IDENTITY_HEADING}\n\n"
+        f"- project: {project}\n"
+        f"- cluster: {cluster}\n"
+        f"- location: {location}\n"
+    )
+    pattern = re.compile(
+        rf"(?:---\n\n)?{re.escape(SOUL_IDENTITY_HEADING)}\n\n(?:- [^\n]+\n)+",
+        re.MULTILINE,
+    )
+    if pattern.search(text):
+        updated = pattern.sub(block, text, count=1)
+    elif SOUL_SECTION_1_ANCHOR in text:
+        updated = text.replace(
+            SOUL_SECTION_1_ANCHOR,
+            f"{block}\n{SOUL_SECTION_1_ANCHOR}",
+            1,
+        )
+    else:
+        updated = text.rstrip("\n") + f"\n\n{block}"
+    if updated != text:
+        tmp_path = soul_path.with_name(soul_path.name + ".tmp")
+        tmp_path.write_text(updated, encoding="utf-8")
+        os.replace(tmp_path, soul_path)
 
 
 def read_cluster_identity(home: Path) -> dict[str, str] | None:
@@ -466,8 +508,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     _pin_otel_endpoint(home, name)
 
     # 2b. Stamp this cluster's identity into the profile config as structured identity
-    #     metadata — never derived from the sanitized profile name.
+    #     metadata — never derived from the sanitized profile name — and into SOUL.md
+    #     so the worker sees its target cluster identity in the system prompt on turn 1.
     _inject_cluster_identity(home, project, cluster, location)
+    _stamp_soul_identity(home, project, cluster, location)
 
     # 2c. Link any plugin image volumes the operator mounted for this profile.
     # 2d. Apply the operator's config overlays: the cluster class overlay carrying

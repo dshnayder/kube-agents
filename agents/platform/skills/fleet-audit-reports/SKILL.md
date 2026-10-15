@@ -63,7 +63,7 @@ Answering "how many criticals are open?" that way spends tens of thousands of to
 When `report_query.py` says a stream has no record, that is the answer: do not search the directory
 for a file it did not find.
 
-`python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
+`python3 "$HERMES_HOME"/skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
 object per call.
 
 | Subcommand                          | Answers                                                               |

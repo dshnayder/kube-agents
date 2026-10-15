@@ -9,7 +9,7 @@ control plane or a node pool is the laggard, run the
 table rather than reasoning from memory:
 
 ```bash
-./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
+"$HERMES_HOME"/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
