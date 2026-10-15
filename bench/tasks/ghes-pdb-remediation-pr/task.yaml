@@ -19,11 +19,12 @@
 # (hack/eval/gitlab-cases.txt). A red here points at the GHES path, not at
 # the agent's remediation.
 #
-# RED ON MAIN, GREEN WITH THE GHES FORGE SUPPORT. With BENCH_FORGE=github and
+# RED WITHOUT GHES FORGE SUPPORT, GREEN WITH IT. With BENCH_FORGE=github and
 # BENCH_GITHUB_HOST=<ghes-host>, pull_request_opened accepts only a pull
 # request URL on that host (bench/kube_agents_bench/forges.py, proposal_refs).
-# - main: the operator refuses a `github` forge at a host other than
-#   github.com, so the install cannot declare the GHES forge. Install main with
+# - a build without GHES forge support (main at the time of writing): the
+#   operator refuses a `github` forge at a host other than github.com, so the
+#   install cannot declare the GHES forge. Install that build with
 #   the GitHub forge it accepts (github.com, the same repository) and grade
 #   with the same environment: the agent links a github.com pull request,
 #   pull_request_opened fails on "names no <ghes-host> pull request URL", and
@@ -41,7 +42,8 @@
 #     that holds ca.crt, the repository entry
 #     https://ghes.eval.internal/gke-agentic/<project>-infra, and the chart's
 #     token minter pointed at the same host and CA (INSTALL.md, "GitHub
-#     Enterprise Server"). The GitHub App is the pool's github.com App.
+#     Enterprise Server", in a build with GHES forge support). The GitHub App
+#     is the pool's github.com App.
 #  3. Run the case from bench/ with the grading environment:
 #       export BENCH_FORGE=github BENCH_GITHUB_HOST=ghes.eval.internal
 #       export BENCH_GITHUB_TOKEN=<the pool's read-scoped installation token>
@@ -52,9 +54,10 @@
 #  4. Check the proxy's log (kubectl -n ghes-proxy logs deploy/ghes-proxy):
 #     it shows `api` lines for /api/v3 and /api/graphql and `git` lines for
 #     git-receive-pack in the run's window.
-#  5. For the red, repeat steps 2 and 3 with the main build. Step 2 fails at
-#     admission with the GHES forge, so install main with the github.com forge
-#     on the same repository, and grade with the same step 3 environment.
+#  5. For the red, repeat steps 2 and 3 with a build without GHES forge
+#     support. Step 2 fails at admission with the GHES forge, so install that
+#     build with the github.com forge on the same repository, and grade with
+#     the same step 3 environment.
 #  6. Close the run's pull request (the eval reset does this before the next
 #     repetition), and delete the proxy and the DNS zone when done.
 #

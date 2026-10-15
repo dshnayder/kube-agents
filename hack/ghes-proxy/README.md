@@ -4,7 +4,7 @@ The GHES proxy is an eval fixture. It is an HTTPS forwarding proxy that has the 
 
 ## Why it exists
 
-kube-agents can declare its GitHub forge at a GHES host. The eval lanes must test that path. No open-source GHES exists, and a real GHES instance costs too much to keep up to date. The proxy lets an eval install use a GHES host name, a private CA and the GHES URL layout, and it keeps the data on github.com, in the eval repositories that the lanes already use and reset.
+A build with GHES forge support can declare its GitHub forge at a GHES host. The eval lanes must test that path. A build without that support refuses a GitHub forge at a host other than github.com. No open-source GHES exists, and a real GHES instance costs too much to keep up to date. The proxy lets an eval install use a GHES host name, a private CA and the GHES URL layout, and it keeps the data on github.com, in the eval repositories that the lanes already use and reset.
 
 The proxy does not copy what GHES does. It copies only what kube-agents reads: the API paths, the host in the URLs that the agent shows, and the version header. A test that passes through the proxy shows that kube-agents uses the GHES host and the GHES paths. It does not show that kube-agents works with each GHES release.
 
@@ -26,12 +26,12 @@ The proxy sends the `Authorization` header to the upstream unchanged: a Bearer t
 
 The proxy changes only these parts of a response:
 
-- In a JSON response from the API, the string value of each `html_url` and `access_tokens_url` field, at any depth. `https://github.com/` becomes `https://<host>/`, and `https://api.github.com/` becomes `https://<host>/api/v3/`. The agent shows `html_url` as the link to what it wrote. The token minter sends its token request to `access_tokens_url`.
+- In a JSON response from the API, the string value of each `html_url` and `access_tokens_url` field, at any depth. `https://github.com/` becomes `https://<host>/`, `https://api.github.com/graphql` becomes `https://<host>/api/graphql`, and all other `https://api.github.com/` URLs become `https://<host>/api/v3/`. The agent shows `html_url` as the link to what it wrote. The token minter sends its token request to `access_tokens_url`.
 - The `Location` header, with the same two host changes.
 - The URLs in the `Link` header, with the same two host changes.
 - It adds the header `X-GitHub-Enterprise-Version` (default `3.17.0`).
 
-All other bytes stay as GitHub sent them. The proxy does not change issue, comment or pull request bodies, or diff text, because the model reads that text. Other URL fields, for example `url` and `clone_url`, keep the github.com hosts. A JSON body larger than `-max-rewrite-bytes` goes through unchanged.
+All other bytes stay as GitHub sent them. The proxy does not change issue, comment or pull request bodies, or diff text, because the model reads that text. Other URL fields, for example `url` and `clone_url`, keep the github.com hosts. A JSON body larger than `-max-rewrite-bytes` goes through unchanged, and so does a JSON body that the upstream sends compressed in a form that the proxy cannot decode.
 
 The proxy does not follow redirects. It gives a redirect back to the client, with the `Location` header changed as above.
 
@@ -90,7 +90,7 @@ git -c http.sslCAInfo=$HOME/dev/ghes-proxy-certs/ca.crt \
   ls-remote https://ghes.eval.internal:8443/gke-labs/kube-agents.git HEAD
 ```
 
-The `html_url` in the first answer starts with `https://ghes.eval.internal:8443/`.
+The `html_url` in the first answer starts with `https://ghes.eval.internal:8443/`. The bench cannot grade links with a port (`BENCH_GITHUB_HOST` is a bare hostname), so an eval run uses the proxy on port 443, as in the cluster steps below.
 
 ## Run it in a cluster with a private DNS name
 
@@ -146,7 +146,7 @@ These steps are for GKE and Cloud DNS. They give the proxy an internal address i
 
    The command prints `200`. The check uses `--insecure` because the pod does not have the CA. The clients in the next step get it.
 
-7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as `INSTALL.md` tells for a GitHub Enterprise Server. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
+7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as `INSTALL.md` tells for a GitHub Enterprise Server. This step needs a kube-agents build with GHES forge support; a build without it refuses the forge at admission. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
 
 8. If the cluster enforces NetworkPolicy, make sure that the platform agent pods and the token minter can reach the proxy's address on TCP 443, and that the proxy can reach github.com on TCP 443.
 
