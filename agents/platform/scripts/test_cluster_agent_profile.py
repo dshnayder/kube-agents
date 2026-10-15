@@ -994,6 +994,57 @@ class ListReadyProfilesTest(unittest.TestCase):
         with self.assertRaises(OSError):
             cap.read_cluster_identity(p_dir)
 
+    def test_stamp_soul_identity_branches_and_cli_subcommand(self):
+        p = self.tmp / "cluster-soul"
+        p.mkdir()
+
+        # Missing SOUL.md is a safe no-op
+        cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
+        self.assertFalse((p / "SOUL.md").exists())
+
+        # Branch 1: Anchor present -> inserts before SOUL_SECTION_1_ANCHOR
+        (p / "SOUL.md").write_text(
+            "# SOUL.md\n\nIntro paragraph.\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n",
+            encoding="utf-8",
+        )
+        cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
+        first = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "---\n\n## Target Cluster Identity\n\n- project: proj-a\n- cluster: clus-a\n- location: us-central1\n\n---\n\n## 1. Core Truths",
+            first,
+        )
+
+        # Branch 2: Existing Target Cluster Identity block -> replaces in place without duplicating
+        cap._stamp_soul_identity(p, "proj-b", "clus-b", "europe-west1")
+        replaced = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(replaced.count("## Target Cluster Identity"), 1)
+        self.assertIn("- project: proj-b\n- cluster: clus-b\n- location: europe-west1\n", replaced)
+        self.assertNotIn("proj-a", replaced)
+
+        # Branch 3: Anchor missing and no existing block -> appends at the end
+        (p / "SOUL.md").write_text("# Custom SOUL without section 1 anchor\n", encoding="utf-8")
+        cap._stamp_soul_identity(p, "proj-c", "clus-c", "asia-east1")
+        appended = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertTrue(
+            appended.endswith(
+                "\n\n---\n\n## Target Cluster Identity\n\n- project: proj-c\n- cluster: clus-c\n- location: asia-east1\n"
+            )
+        )
+
+        # CLI subcommand `stamp-soul --profile-dir` reads config.yaml and stamps a fresh template SOUL.md
+        (p / "SOUL.md").write_text(
+            "# SOUL.md\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n",
+            encoding="utf-8",
+        )
+        (p / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-cli\n  cluster: clus-cli\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        args = cap.build_parser().parse_args(["stamp-soul", "--profile-dir", str(p)])
+        cap.cmd_stamp_soul(args)
+        cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
+
 
 if __name__ == "__main__":
     unittest.main()

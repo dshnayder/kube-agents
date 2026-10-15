@@ -1518,6 +1518,8 @@ fi
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
@@ -1526,9 +1528,10 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
         # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
         # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
-        # $d/config.yaml so existing cluster-* profiles keep their identity in SOUL.md.
-        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ]; then
-            "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; cfg, soul = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]); raw = yaml.safe_load(cfg.read_text(encoding='utf-8')); c = raw.get('cluster_identity') if isinstance(raw, dict) else None; c = c if isinstance(c, dict) else {}; p, cl, l = c.get('project'), c.get('cluster'), c.get('location'); anchor = '---\n\n## 1. Core Truths'; text = soul.read_text(encoding='utf-8'); sys.exit(0) if not (p and cl and l and anchor in text and '## Target Cluster Identity' not in text) else None; block = f'---\n\n## Target Cluster Identity\n\n- project: {p}\n- cluster: {cl}\n- location: {l}\n\n{anchor}'; t = soul.with_name(soul.name + '.tmp'); t.write_text(text.replace(anchor, block, 1), encoding='utf-8'); os.replace(t, soul)" "$d/config.yaml" "$d/SOUL.md" \
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
                 || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
         fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"

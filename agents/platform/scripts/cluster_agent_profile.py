@@ -766,6 +766,20 @@ def cmd_name(args: argparse.Namespace) -> None:
     print(profile_name(args.project, args.cluster, args.location))
 
 
+def cmd_stamp_soul(args: argparse.Namespace) -> None:
+    """Re-stamp ``SOUL.md`` in ``--profile-dir`` from its ``config.yaml`` ``cluster_identity``.
+
+    Called by ``docker-entrypoint.sh`` after force-syncing ``SOUL.md`` from
+    ``/opt/cluster-template/SOUL.md`` so existing ``cluster-*`` profiles keep
+    their stamped ``## Target Cluster Identity`` block across gateway restarts.
+    """
+    home = Path(args.profile_dir)
+    identity = read_cluster_identity(home)
+    if identity is None:
+        return
+    _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -787,13 +801,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
     )
+
+    stamp_parser = sub.add_parser(
+        "stamp-soul",
+        help="Re-stamp SOUL.md in an existing cluster profile home from its config.yaml cluster_identity",
+    )
+    stamp_parser.add_argument("--profile-dir", required=True, help="Path to the cluster profile home")
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
+    handlers = {
+        "create": cmd_create,
+        "delete": cmd_delete,
+        "list": cmd_list,
+        "name": cmd_name,
+        "stamp-soul": cmd_stamp_soul,
+    }
     handlers[args.command](args)
 
 

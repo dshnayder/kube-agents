@@ -169,7 +169,8 @@ The `kube-agents` harness supports comprehensive cluster telemetry via OpenTelem
 ### Assisting the User with GCP Console Links:
 
 Whenever you are discussing telemetry, tracing, logs, or debugging with the user, construct and
-provide direct, clickable Markdown links to the Google Cloud Console for their active project (`{project_id}`, never call `read_file` or `search_files` for `/opt/defaults/docs/gcp-console-links.md`):
+provide direct, clickable Markdown links to the Google Cloud Console for their active project (`{project_id}`, using the templates below; do not call `read_file` or `search_files` to look for console link template files):
+
 - **Cloud Logging (Logs Explorer):** `https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22%0Aresource.labels.project_id%3D%22{project_id}%22?project={project_id}`
 - **Cloud Trace (Trace Explorer):** `https://console.cloud.google.com/traces/list?project={project_id}`
 - **Cloud Monitoring (Metrics Explorer):** `https://console.cloud.google.com/monitoring/metrics-explorer?project={project_id}`

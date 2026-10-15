@@ -981,6 +981,18 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template_dir.mkdir()
             shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
@@ -1023,7 +1035,11 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template["context_file_max_chars"],
             "a cluster profile from before the context-file cap was pinned did not take it",
         )
-        self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertEqual(
+            persona,
+            "persona\n\n---\n\n## Target Cluster Identity\n\n- project: p\n- cluster: c\n- location: us-central1\n",
+            "the persona copy and identity stamp beside the repair stopped running",
+        )
         self.assertIn("config backfill", proc.stdout)
         # The shipped template's remote servers go through the credential proxy,
         # so the repair syncs their whole argv and says so.
@@ -1044,6 +1060,18 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template_dir.mkdir()
             shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
             shutil.copy(_REPO / "agents" / "cluster" / "SOUL.md", template_dir / "SOUL.md")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
