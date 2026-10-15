@@ -1175,6 +1175,18 @@ class BrokerHostCheckTest(unittest.TestCase):
         self.assertEqual(("cli", ("github.com", "www.github.com")), (forge.transport, forge.hosts))
 
 
+    def test_github_com_with_a_port_never_builds_an_enterprise_forge(self):
+        # A port does not make github.com, or a host GitHub runs, a GitHub Enterprise
+        # Server host: no minted write token and no private CA for it.
+        for host in ("github.com:443", "GITHUB.COM:8443", "www.github.com:443", "api.github.com:443",
+                     "acme.ghe.com:8443"):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                providers.Registry({"forges": [{"provider": "github", "host": host}]})
+        # A real instance on a port is still an instance.
+        [forge] = providers.Registry({"forges": [{"provider": "github", "host": "ghe.example.com:8443"}]}).forges
+        self.assertEqual(("http", ("ghe.example.com:8443",)), (forge.transport, forge.hosts))
+
+
 class GitHubDotComUnaffectedTest(unittest.TestCase):
     def test_a_github_com_install_builds_the_cli_forge_as_before(self):
         with mock.patch.dict(os.environ):

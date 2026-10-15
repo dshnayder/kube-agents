@@ -1083,8 +1083,9 @@ platformAgent:
     #     credentialsRef:         # required for gitlab: a Secret holding an access
     #       name: gitlab-token    # token under the key `token`, created out of band
     #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate;
-    #       key: ca.crt           # trusted for this host only, created out of band
+    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
+    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
+    #                             # forge, the token minter also gets it and trusts it for all of its calls
     forges: []
     # repositories:
     #   - forge: github
