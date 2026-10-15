@@ -217,6 +217,10 @@ func (p *proxy) modifyResponse(resp *http.Response) error {
 	if rt.kind != routeAPI || !isJSON(resp.Header.Get("Content-Type")) || resp.Header.Get("Content-Encoding") != "" {
 		return nil
 	}
+	// No body to rewrite: keep the upstream's Content-Length as it is.
+	if resp.Request.Method == http.MethodHead || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		return nil
+	}
 	return p.rewriteBody(resp)
 }
 
@@ -417,7 +421,9 @@ type statusRecorder struct {
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
-	if !r.wroteHeader {
+	// ReverseProxy forwards a 1xx reply (100 Continue) through WriteHeader
+	// before the final status; log the final one.
+	if !r.wroteHeader && code >= 200 {
 		r.status, r.wroteHeader = code, true
 	}
 	r.ResponseWriter.WriteHeader(code)

@@ -3,21 +3,30 @@
 # and runs by hand with the recipe below. The entry goes when a lane deploys
 # the GHES proxy and an install whose GitHub forge is at its host.
 #
-# WHAT THIS PROVES. The GitHub Enterprise Server path end to end: an install
-# whose GitHub forge is declared at a GHES host, with a private CA, opens its
-# remediation pull request through that host. The host is the GHES proxy
-# (hack/ghes-proxy), which forwards to github.com and gives back html_url
-# values on the GHES host. So the reply links the pull request at
-# https://<ghes-host>/<owner>/<repo>/pull/<n> only if every link of the chain
-# went through the instance: the broker's REST calls at /api/v3, its GraphQL
-# identity read at /api/graphql, its git push over smart HTTP with the
-# minted token, and the token minter's mint at /api/v3. The checks then read
-# the pull request from api.github.com, where the data is.
+# WHAT THIS PROVES. The GitHub Enterprise Server path, in two parts.
+# - The graded part: an install whose GitHub forge is declared at a GHES host,
+#   with a private CA, opens its remediation pull request through that host's
+#   REST API. The host is the GHES proxy (hack/ghes-proxy), which forwards to
+#   github.com and gives back html_url values on the GHES host, so the reply
+#   links the pull request at https://<ghes-host>/<owner>/<repo>/pull/<n> only
+#   when the broker created it through the instance. The checks then read the
+#   pull request from api.github.com, where the data is.
+# - The part the graded checks do not see: the GraphQL identity read at
+#   /api/graphql, the git push over smart HTTP, and the token minter's mint at
+#   /api/v3. A build that sent any of them straight to github.com would still
+#   pass, because github.com accepts them. Recipe step 4 checks them in the
+#   proxy's log. To make them graded, block egress to github.com and
+#   api.github.com from the platform agent and token minter pods, so that the
+#   proxy is the only way out.
 #
-# The task is pdb-remediation-pr's (same fixture, same prompt, same
-# safeguards), because that case already passes on github.com and on GitLab
-# (hack/eval/gitlab-cases.txt). A red here points at the GHES path, not at
-# the agent's remediation.
+# The task and the cluster safeguards are pdb-remediation-pr's (same fixture,
+# same prompt), because that case already passes on github.com and on GitLab
+# (hack/eval/gitlab-cases.txt). This case adds one safeguard,
+# no-other-github-writes, so that a by-hand run with no lane still grades the
+# writes; the inject lane appends the same check to every case. It has no
+# github.com baseline on this case, so a red on it alone needs a look at the
+# writes it names (a leftover platform-agent/ branch from a retry, for
+# example) before it is blamed on the GHES path.
 #
 # RED WITHOUT GHES FORGE SUPPORT, GREEN WITH IT. With BENCH_FORGE=github and
 # BENCH_GITHUB_HOST=<ghes-host>, pull_request_opened accepts only a pull

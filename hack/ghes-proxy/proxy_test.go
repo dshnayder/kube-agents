@@ -317,6 +317,18 @@ func TestBodiesAndDiffsAreLeftUnchanged(t *testing.T) {
 	}
 }
 
+func TestAHeadReplyKeepsItsContentLength(t *testing.T) {
+	f := newFixture(t)
+	f.api.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1234")
+	}
+	resp := f.do(t, "HEAD", "/api/v3/repos/acme/infra", nil, nil)
+	if resp.StatusCode != http.StatusOK || resp.ContentLength != 1234 {
+		t.Errorf("HEAD: status %d, Content-Length %d, want 200 and 1234", resp.StatusCode, resp.ContentLength)
+	}
+}
+
 func TestGzipJSONIsDecodedAndRewritten(t *testing.T) {
 	f := newFixture(t)
 	web := f.web.host()
