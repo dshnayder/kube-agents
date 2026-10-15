@@ -289,6 +289,7 @@ WATCHED_WORKFLOWS = (
     "Docs Build",
     "Documentation Checks",
     "Documentation Freshness Check",
+    "GHES Proxy Tests",
     "Installer Cross-OS Validation Matrix",
     "Operator Tests",
     "Prettier Check",

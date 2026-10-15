@@ -24,9 +24,10 @@
 # (hack/eval/gitlab-cases.txt). This case adds one safeguard,
 # no-other-github-writes, so that a by-hand run with no lane still grades the
 # writes; the inject lane appends the same check to every case. It has no
-# github.com baseline on this case, so a red on it alone needs a look at the
-# writes it names (a leftover platform-agent/ branch from a retry, for
-# example) before it is blamed on the GHES path.
+# github.com baseline on this case. A red on no-other-github-writes alone
+# needs a github.com baseline check (the same case on a github.com install)
+# before anyone blames the GHES path. Also look at the writes it names, for
+# example a leftover platform-agent/ branch from a retry.
 #
 # RED WITHOUT GHES FORGE SUPPORT, GREEN WITH IT. With BENCH_FORGE=github and
 # BENCH_GITHUB_HOST=<ghes-host>, pull_request_opened accepts only a pull
