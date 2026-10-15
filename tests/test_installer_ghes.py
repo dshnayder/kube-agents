@@ -125,6 +125,18 @@ class GhesFlagsTest(_Tmp):
                 self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
                 self.assertIn("a host that GitHub operates", proc.stdout + proc.stderr)
 
+    def test_gitlab_refuses_every_host_github_operates(self):
+        # The same list as the GitHub branch and the operator's gitlab
+        # provider, not only github.com and githubusercontent.com.
+        for host in ("acme.ghe.com", "acme.github.io", "acme.github.dev", "githubassets.com",
+                     "x.githubapp.com", "api.github.com", "raw.githubusercontent.com"):
+            with self.subTest(host=host):
+                proc = self._validate({"PARAM_GITOPS_FORGE": "gitlab", "PARAM_GITOPS_HOST": host,
+                                       "PARAM_GITOPS_HOST_FROM_FLAG": "true", "PARAM_GITOPS_REPO": "g/p",
+                                       "PARAM_GITLAB_TOKEN_SECRET": "gitlab-forge-token"})
+                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+                self.assertIn("is a GitHub host, not a GitLab one", proc.stdout + proc.stderr)
+
     def test_a_gitlab_host_is_refused(self):
         for host in ("gitlab.com", "www.gitlab.com"):
             with self.subTest(host=host):
@@ -686,6 +698,18 @@ class GhesHostMoveTest(_Tmp):
                           "--github-app-id=12", "--github-pem-path=/x/app.pem")
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
         self.assertIn("--kms-key", proc.stdout + proc.stderr)
+
+    def test_a_move_with_a_pem_alone_or_the_recorded_app_id_is_refused(self):
+        # --github-pem-path alone keeps the recorded App ID, and the recorded
+        # ID given again is the old App: neither is the new host's App.
+        for flags in (
+            ("--github-pem-path=/x/app.pem", "--kms-key=ghes-key"),
+            ("--github-app-id=1", "--github-pem-path=/x/app.pem", "--kms-key=ghes-key"),
+        ):
+            with self.subTest(flags=flags):
+                proc = self._move(self._GITHUB_COM, f"--gitops-host={_HOST}", "--gitops-org=platform", *flags)
+                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+                self.assertIn("not the recorded one", proc.stdout + proc.stderr)
 
     def test_a_move_with_a_new_app_and_a_new_key_is_accepted(self):
         proc = self._move(self._GITHUB_COM, f"--gitops-host={_HOST}", "--gitops-org=platform",

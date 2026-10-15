@@ -782,7 +782,7 @@ Do not edit the PlatformAgent with `kubectl edit`: the chart owns it, and the ne
 
 ##### Switch between github.com and a GitHub Enterprise Server
 
-The App and its key belong to one GitHub host, so a switch needs the App on the new host, and a Cloud KMS key that holds the new App's private key. `install.sh` imports a key only into a key that has no `ENABLED` version yet, so give a new key name. When `install.env` records a GitHub App, `install.sh` refuses a change of host without `--github-app-id` and a `--kms-key` (or `--kms-keyring`) other than the recorded one:
+The App and its key belong to one GitHub host, so a switch needs the App on the new host, and a Cloud KMS key that holds the new App's private key. `install.sh` imports a key only into a key that has no `ENABLED` version yet, so give a new key name. When `install.env` records a GitHub App, `install.sh` refuses a change of host unless `--github-app-id` gives an App ID other than the recorded one (`--github-pem-path` alone keeps the recorded ID) and `--kms-key` (or `--kms-keyring`) names a key other than the recorded one:
 
 ```bash
 ./install.sh --gitops-host="ghe.example.com" --gitops-ca-file="$HOME/secure/internal-ca.pem" \

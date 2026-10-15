@@ -467,6 +467,10 @@ PARAM_GITOPS_RECORDED_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
 PARAM_RECORDED_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
+# The App ID install.env records, for the same check: a move of GitHub host
+# needs another App ID, given by --github-app-id (PARAM_GITHUB_APP_ID_FROM_FLAG,
+# which --github-pem-path does not set).
+PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -4633,12 +4637,12 @@ validate_gitops_forge_flags() {
       print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${PARAM_GITOPS_HOST}')."
       return 1
     fi
-    case "$PARAM_GITOPS_HOST" in
-      github.com|*.github.com|githubusercontent.com|*.githubusercontent.com)
-        print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
-        return 1
-        ;;
-    esac
+    # Every domain where GitHub runs its own services, as the operator's
+    # gitlab provider refuses them (the github provider's ReservedDomains).
+    if [[ "$PARAM_GITOPS_HOST" =~ $GITHUB_RESERVED_HOST_RE ]]; then
+      print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+      return 1
+    fi
   fi
   if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
     if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
@@ -4799,10 +4803,14 @@ validate_github_forge_flags() {
   if [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ] && [ "${PARAM_GITOPS_RECORDED_FORGE:-github}" = "github" ]; then
     local recorded_host="${PARAM_GITOPS_RECORDED_HOST:-}"
     local default_ring="${DEFAULT_KMS_KEYRING:-github-token-minter-keyring}" default_key="${DEFAULT_KMS_KEY:-github-token-minter-key}"
+    # The new host's App: an App ID that --github-app-id gives and that is not
+    # the recorded one (a PEM alone, or the recorded ID given again, keeps the
+    # old App), and a KMS key other than the recorded one.
     if [ "$host" != "$recorded_host" ] &&
-      { [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" != "true" ] ||
+      { [ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" != "true" ] ||
+        [ "${PARAM_GITHUB_APP_ID:-}" = "${PARAM_RECORDED_GITHUB_APP_ID:-}" ] ||
         [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
-      print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
+      print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id (its App ID, not the recorded one) and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
       return 1
     fi
   fi
