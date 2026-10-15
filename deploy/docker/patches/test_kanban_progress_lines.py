@@ -926,6 +926,59 @@ FAILURE_LINES = {
 }
 
 
+class _MetadataAdapter(_Adapter):
+    """An adapter that records the metadata each post went out with."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.metadata = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.metadata.append(metadata)
+        return await super().send(chat_id, content, metadata)
+
+
+class _ChatNotifyStandIn(_MetadataAdapter):
+    """The chat.notify stand-in as kanban_progress_lines sees it: it has ``send_chat``."""
+
+    async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+        raise AssertionError("the terminal report goes through send, with the chat message in its metadata")
+
+
+class ChatNotifyAnswerTest(SlackQuietTerminalTest):
+    """Under next, a completed card's report through the chat.notify stand-in is laid out as an answer."""
+
+    def setUp(self):
+        super().setUp()
+        notify = SimpleNamespace(
+            chat_route=lambda adapter: callable(getattr(adapter, "send_chat", None)),
+            CHAT_METADATA_KEY="kage_chat",
+        )
+        gateway = sys.modules["gateway"]
+        gateway.kanban_chat_notify = notify
+        patcher = mock.patch.dict(sys.modules, {"gateway.kanban_chat_notify": notify})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_the_report_carries_its_answer(self):
+        adapter = _ChatNotifyStandIn()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.sent[-1][1], "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"],
+                         {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
+
+    async def test_an_actionable_report_and_a_failure_post_their_text_alone(self):
+        adapter = _ChatNotifyStandIn()
+        with mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
+            await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
+
+    async def test_todays_adapter_gets_the_metadata_it_always_got(self):
+        adapter = _MetadataAdapter()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertIsNone(adapter.metadata[-1])
+
+
 class SlackHeadsTest(unittest.IsolatedAsyncioTestCase):
     """KAGE_SLACK_UX on a Slack card: no line carries the board tag or ``Kanban <id>``.
 
@@ -1519,6 +1572,14 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
         self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
 
+    async def test_a_folded_completion_announces_a_pr_its_summary_alone_names(self):
+        # The folded row's message is the result alone; the summary still names the PR.
+        self._plan(shows=True, folds=True)
+        self.assertIsNone(await self._child(_Adapter(), payload={"summary": self.PR_NOTE}))
+        self.assertEqual(
+            self.announced, [("t_e0c1", f"seeded-a: 1.33.4 = default.\n{self.PR_NOTE}", 0)],
+        )
+
     async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
         for shows, folds in ((False, True), (True, False)):
             with self.subTest(shows=shows, folds=folds):
@@ -1641,6 +1702,17 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             [(text, sent) for _task, text, sent in self.announced],
             [("Checking seeded-a.", 1), (self.PR_NOTE, 1), (f"Done. {self.PR_NOTE}", 2)],
         )
+
+    async def test_an_opened_pr_in_the_summary_alone_is_announced(self):
+        adapter, report = _Adapter(), "Both overlays reconcile."
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "completed", ev, report, None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"{report}\n{self.PR_NOTE}"])
+
+    async def test_a_summary_already_in_the_message_is_scanned_once(self):
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", ev, f"Done. {self.PR_NOTE}", None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"Done. {self.PR_NOTE}"])
 
     async def test_a_long_note_is_scanned_whole(self):
         # The rolling line clips at 300 characters, cutting a url past it whole.

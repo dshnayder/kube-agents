@@ -166,9 +166,11 @@ What that workspace contains depends on the install, and `start` tells you which
   repository out of: use `list` and `fetch` (below) for that.
 - **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
   harness runs `checkout`, `add`, `commit` and `push` inside it.
+- **`none`** — no forge is configured; see [No forge configured](#no-forge-configured).
 
-Everything else is identical, including where you write manifests and what `finish` publishes. Where
-the two differ, this file says which mode it is talking about.
+Between `content` and `directory` everything else is identical, including where you write manifests
+and what `finish` publishes. Where the two differ, this file says which mode it is talking about.
+`none` differs throughout, and its own section says how.
 
 ### Step 1 — `start`
 
@@ -181,7 +183,8 @@ Before inspecting anything, claim the workspace:
 ```
 
 This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), makes
+configured repo in `$GITOPS_STATE_CONFIGMAP`, failing if ambiguous across multiple repos, and
+running with no forge when none is registered — see [No forge configured](#no-forge-configured)), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
@@ -237,8 +240,9 @@ manifest written anywhere else is a file the harness will never find — the fin
 manual one, or, for a fix the sweep would open, `finish` refuses until it is there. `start` scrubs that directory before handing it to you;
 `finish` does not, which is what lets the files you write in between survive.
 
-`mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
-workspace is empty rather than a checkout. Read it rather than guessing from what is on disk.
+`mode` is `content`, `directory` or `none`. Between the first two it changes one thing you can see:
+in `content` mode the workspace is empty rather than a checkout. Read it rather than guessing from
+what is on disk. `none` means no forge is configured; see [No forge configured](#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
@@ -405,7 +409,7 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3), the GCE
 compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2) and the networking
 stream (`networking_audit.py`, `governance/gcp_networking_fabric_sop.md` §2).
-The compliance, obtainability, stockout, cost, GCE compute and networking collectors may also give a target `checks_unevaluated`,
+The compliance, obtainability, stockout, cost, GCE compute, networking and upgrade collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
@@ -442,6 +446,9 @@ gives its `started_at` and `finished_at`. A timer without its input is absent. T
   comments could not be read, so a `/remediate` may be standing unanswered there (stderr says
   `comments could not be read`). Not a clean result; report it as
   [The clean run](#the-clean-run) says.
+- `{"status":"NO_FORGE","issue_url":null,…,"findings":4,"critical":2,"no_forge":"…","summary":"…"}`
+  — no forge is configured, so nothing was published; see
+  [No forge configured](#no-forge-configured).
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
@@ -451,6 +458,8 @@ real run plans. It
 resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
+With no forge configured, the dry run still validates the document the same way, but its preview
+shows the ledger and pull-request bodies a forge would get; the real run publishes neither.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. The one exception is a
@@ -519,6 +528,30 @@ A partial run with a new or changed gap is never `[SILENT]` — `finish` returns
 for it. A gap that is the same as on the stored previous run does not stop `silent_ok` on its own.
 Report the issue URL and say which clusters were not covered. See [The clean run](#the-clean-run)
 for the full rule.
+
+### No forge configured
+
+An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (and no `--repo`) has
+no forge to write a ledger to. The audit runs anyway:
+
+- `start` skips the credential, the labels and the ledger lookup, and prints `"mode": "none"`,
+  `"repo": null`, `"issue": null`, a `no_forge` note, and a `workspace` path to an empty directory. Pass that `workspace` to the collector as the SOP says. There is no repository, so
+  `declared_intent_repos` lists only `context_repos`, and `fetch`, `list`, `grep` and `remediate`
+  have nothing to act on: do not run them.
+- Run every check as the SOP says and write the findings document as usual. A `manifest`
+  remediation is still a valid way to describe a fix, but nothing opens it as a pull request.
+- `finish` validates the document as usual, then writes it to the report store instead of a ledger
+  and prints `status: "NO_FORGE"`, `issue_url: null`, `new` and `resolved` against the previous
+  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`. A previous finding the
+  collector still flags is held, as on a ledger: it stays in the store and is not resolved. If the
+  store write fails, the note and the summary say so.
+
+**Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
+does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
+`[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
+names the most severe findings with the object each one is about, the ids held for the collector,
+the coverage gaps, and that no forge is configured. Do not report the run as
+failed, and do not invent an issue URL.
 
 ## The findings document
 
@@ -645,7 +678,8 @@ field, and publishes nothing:
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
     `--context`/`--project` and the namespace or resource it targeted. It must name one of
-    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, a call back
+    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
+    `fleet_upgrade_report.py`; `echo`, `cat`, `python3 -c`, a call back
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
 
@@ -1263,7 +1297,8 @@ Two rules follow, and they are the whole rule:
 - On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
   report, and every report carries `issue_url` in full, with every URL in `prs_opened` and
   `prs_still_open`: a fix already waiting for review answers "was a fix proposed?" as much as one
-  this run opened.
+  this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
+  [No forge configured](#no-forge-configured)).
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and

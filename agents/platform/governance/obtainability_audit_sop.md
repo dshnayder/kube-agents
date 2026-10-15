@@ -171,7 +171,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 
 #### 3.3 Multi-replica workload with no PodDisruptionBudget (`no-pdb`)
 
-**This audit owns PodDisruptionBudgets** — both their absence (here) and their shape (3.4). The Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.8) defers to these two and reports only the non-PDB reasons a node cannot be drained, so one PDB never carries two verdicts in two ledgers.
+**This audit owns PodDisruptionBudgets** — both their absence (here) and their shape (3.4). The Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.8) defers to these two and reports only the non-PDB reasons a node cannot be drained, so one PDB never carries two verdicts in two ledgers. The one sanctioned pairing is the weekly upgrade audit's 3.11 `upgrade-blocked` (`security_patch_orchestrator_sop.md`): it names a drain-blocking budget again only on a cluster that is behind, as the reason that cluster's upgrade would be held, and its remediation points at this audit's `blocking-pdb` finding for the same budget rather than carrying a fix of its own.
 
 - **Command:** derived from `$STATE`; confirmed with the object-scoped read.
 - **Flag when:** a Deployment or StatefulSet has `spec.replicas >= 2` and no PDB in the same namespace whose `spec.selector` matches `spec.template.metadata.labels`. Evaluate the selector properly (`matchLabels` **and** `matchExpressions`); never match on names.
@@ -528,8 +528,9 @@ One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `pr
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no new or changed coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
+- On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full, except a `NO_FORGE` run, which has none (below).
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
 
 What to report in each case:
 
