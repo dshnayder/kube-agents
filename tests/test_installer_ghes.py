@@ -785,6 +785,26 @@ class GhesForgeQuestionTest(_Tmp):
         self.assertIn("asked=0", proc.stdout)
 
 
+class GhesSourcingTest(unittest.TestCase):
+    """The helpers source cleanly: a constant declared readonly twice prints
+    "readonly variable" and fails under set -e, which stops every front door."""
+
+    def test_installer_common_and_install_sh_source_under_set_e(self):
+        body = (
+            f'set -e\nsource "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'echo "minter=$GITHUB_MINTER_DEPLOYMENT"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("")
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                                  env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+                                  stdin=subprocess.DEVNULL, timeout=60)
+        self.assertNotIn("readonly variable", proc.stderr)
+        self.assertIn("minter=github-token-minter", proc.stdout, proc.stderr)
+        self.assertEqual(_INSTALLER_COMMON.read_text().count("GITHUB_MINTER_DEPLOYMENT="), 1)
+
+
 class GhesInterviewAndHelpTest(unittest.TestCase):
 
     def test_help_describes_the_ghes_flags(self):

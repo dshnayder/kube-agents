@@ -81,7 +81,9 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 # The GitHub token minter's Deployment, and the Secret its App ID is read from
-# (refuse_apply_dropping_live_gitops, live_github_app_id).
+# (refuse_apply_dropping_live_gitops, live_github_app_id). install.sh also
+# restarts the Deployment after it writes a GitHub Enterprise Server's CA
+# Secret, because the minter reads its CA when it starts.
 readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
 readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 
@@ -148,11 +150,6 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The chart's GitHub token minter Deployment. install.sh restarts it after it
-# writes a GitHub Enterprise Server's CA Secret, because the minter reads its
-# CA when it starts.
-# shellcheck disable=SC2034  # read by install.sh
-readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
 # The design document a spec.mode switch points the operator at.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
 # The Slack app setup page's allowlist section, which says how to find a
