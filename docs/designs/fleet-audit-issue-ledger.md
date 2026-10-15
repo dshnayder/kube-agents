@@ -1026,7 +1026,14 @@ coverage, and nothing else:
   finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. `finish`
   cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
   of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
-  channel, and the next scheduled run with the same gaps does not report it.
+  channel, and the next scheduled run with the same gaps does not report it. The first-install
+  audits count as scheduled runs: the `oobe` job marks each one due, and it stores its record like
+  any other. The comparison uses each gap's sentence as written. The sentence comes from the run's
+  findings document: the reason the worker writes for a cluster it could not read
+  (`scope.skipped`) or read only in part (`limitations`), plus the checks that did not run, which
+  `finish` adds. Some reasons carry an error message, for example the first line of a failed
+  `get-credentials`, so a message that varies from run to run reads as a changed gap and is
+  reported again. No stream guarantees a stable gap sentence.
 
 The rule first said that a partial run is never silent, with no exception. That rule made a gap
 that does not go away speak on every scheduled run. Measured over one installation's streams, the
