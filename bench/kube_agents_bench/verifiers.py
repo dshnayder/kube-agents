@@ -1925,7 +1925,7 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         context = forges.forge_ssl_context()
     except forges.UnknownForge as exc:
         raise OSError(str(exc)) from exc
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
+    handlers: list[Any] = [_NoRedirect]
     if context is not None:
         # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
         # self-managed GitLab or the GHES proxy.
