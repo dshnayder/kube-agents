@@ -354,6 +354,9 @@ github.com, it refuses both.
   file.
 - A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
   GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
+- A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys, and drops
+  `GITHUB_PEM_PATH`.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 

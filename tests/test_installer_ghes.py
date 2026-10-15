@@ -625,11 +625,143 @@ class GhesCASecretTest(_Tmp):
         self.assertLess(start, source.index('local slow_rollouts=()'))
 
 
+class GhesGenerateOnlyHandoffTest(_Tmp):
+    """The generate-only handoff names the CA Secret and the minter restart,
+    which only a run that applies does itself."""
+
+    def _handoff(self, assignments):
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{assignments}\n'
+            f'print_generate_only_handoff "{_REPO_ROOT}" p c us-central1 "{self._tmp}/terraform.tfvars" 2>&1\n'
+        )
+        return _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}))
+
+    def test_ghes_with_a_ca_prints_both_steps(self):
+        proc = self._handoff(f"GITOPS_FORGE=github GITOPS_HOST={_HOST} GITOPS_CA_SECRET=github-forge-ca")
+        out = proc.stdout + proc.stderr
+        self.assertIn("kubectl create secret generic github-forge-ca -n kubeagents-system", out)
+        self.assertIn("kubectl rollout restart deployment/github-token-minter -n kubeagents-system", out)
+
+    def test_github_com_and_gitlab_print_no_minter_step(self):
+        for assignments in ("GITOPS_FORGE= GITOPS_HOST= GITOPS_CA_SECRET=",
+                            "GITOPS_FORGE=gitlab GITOPS_HOST=gitlab.example.com GITOPS_CA_SECRET=gitlab-forge-ca"):
+            with self.subTest(assignments=assignments):
+                proc = self._handoff(assignments)
+                self.assertNotIn("rollout restart deployment/github-token-minter", proc.stdout + proc.stderr)
+
+
+class GhesHostMoveTest(_Tmp):
+    """A recorded GitHub App and its KMS key are the recorded host's: a move
+    of host without the new host's App and a new key is refused."""
+
+    # Borrowed, not inherited: a subclass would run every test above again.
+    _run_install_func = GhesFlagsTest._run_install_func
+
+    _GITHUB_COM = "GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=1\nKMS_KEY=github-token-minter-key\n"
+    _GHES = (f"GITOPS_FORGE=github\nGITOPS_HOST={_HOST}\nGITOPS_CA_SECRET=github-forge-ca\nGITOPS_ORG=platform\n"
+             "GITOPS_REPO=infra\nGITHUB_APP_ID=12\nKMS_KEY=ghes-key\n")
+
+    def _move(self, recorded, *flags):
+        return self._run_install_func(
+            f"parse_args {' '.join(shlex.quote(f) for f in flags)}\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc host=[$PARAM_GITOPS_HOST]"',
+            install_env=recorded,
+        )
+
+    def test_a_move_that_keeps_the_recorded_app_is_refused(self):
+        for recorded, flags in (
+            (self._GITHUB_COM, (f"--gitops-host={_HOST}", "--gitops-org=platform")),
+            (self._GHES, ("--gitops-host=github.com",)),
+            (self._GHES, ("--gitops-host=ghe2.acme.corp",)),
+        ):
+            with self.subTest(flags=flags):
+                proc = self._move(recorded, *flags)
+                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+                self.assertIn("an App belongs to one GitHub host", proc.stdout + proc.stderr)
+
+    def test_a_move_with_a_new_app_and_the_old_key_is_refused(self):
+        proc = self._move(self._GITHUB_COM, f"--gitops-host={_HOST}", "--gitops-org=platform",
+                          "--github-app-id=12", "--github-pem-path=/x/app.pem")
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("--kms-key", proc.stdout + proc.stderr)
+
+    def test_a_move_with_a_new_app_and_a_new_key_is_accepted(self):
+        proc = self._move(self._GITHUB_COM, f"--gitops-host={_HOST}", "--gitops-org=platform",
+                          "--github-app-id=12", "--github-pem-path=/x/app.pem", "--kms-key=ghes-key")
+        self.assertIn(f"rc=0 host=[{_HOST}]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_the_recorded_host_keeps_its_app(self):
+        for recorded in (self._GITHUB_COM, self._GHES):
+            with self.subTest(recorded=recorded):
+                proc = self._move(recorded)
+                self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_a_fresh_install_with_an_app_in_the_shell_is_not_a_move(self):
+        # An install.env that records no App: an exported GITHUB_APP_ID is
+        # this run's, not a recorded one.
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"parse_args --gitops-host={_HOST} --gitops-org=platform\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc app=$PARAM_GITHUB_APP_ID"'
+        )
+        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+                                               "GITHUB_APP_ID": "77"})
+        proc = _run_installer_bash(body, env)
+        self.assertIn("rc=0 app=77", proc.stdout, proc.stderr + proc.stdout)
+
+
+class GhesForgeQuestionTest(_Tmp):
+    """The forge question: each choice, and a bad host asked again."""
+
+    def _ask(self, choice, hosts, ca_answers=None, extra=""):
+        answers = " ".join(shlex.quote(h) for h in hosts)
+        cas = " ".join(shlex.quote(c) for c in (ca_answers or [""] * len(hosts)))
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"HOSTS=({answers}); CAS=({cas}); n=0; c=0\n"
+            f'prompt_menu() {{ local var="${{!#}}"; printf -v "$var" %s {shlex.quote(choice)}; echo "menu: $2|$3|$4"; }}\n'
+            "prompt_read() {\n"
+            '  case "$1" in\n'
+            '    *hostname*) printf -v "$2" %s "${HOSTS[$n]}"; n=$((n+1)) ;;\n'
+            '    *CA*) printf -v "$2" %s "${CAS[$c]}"; c=$((c+1)) ;;\n'
+            "  esac\n"
+            "}\n"
+            "has_controlling_tty() { return 0; }\n"
+            f"PARAM_NON_INTERACTIVE=false PARAM_GITOPS_FORGE_GIVEN=false PARAM_GITOPS_FORGE=github {extra}\n"
+            "ask_gitops_forge\n"
+            'echo "forge=$PARAM_GITOPS_FORGE host=[$PARAM_GITOPS_HOST] ca=[$PARAM_GITOPS_CA_FILE] asked=$n"\n'
+        )
+        return _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}))
+
+    def test_the_menu_offers_three_forges(self):
+        proc = self._ask("1", [])
+        self.assertIn("menu: GitHub (github.com)|GitHub Enterprise Server (a GitHub host that you run)|"
+                      "GitLab (gitlab.com or self-managed)", proc.stdout, proc.stderr)
+
+    def test_github_com(self):
+        proc = self._ask("1", [], extra=f"PARAM_GITOPS_HOST={_HOST}")
+        self.assertIn("forge=github host=[] ca=[] asked=0", proc.stdout, proc.stderr)
+
+    def test_ghes_with_a_ca(self):
+        ca = self._ca()
+        proc = self._ask("2", [_HOST], [str(ca)])
+        self.assertIn(f"forge=github host=[{_HOST}] ca=[{ca}] asked=1", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_ghes_asks_a_bad_host_again(self):
+        proc = self._ask("2", ["acme.ghe.com", _HOST])
+        self.assertIn(f"forge=github host=[{_HOST}] ca=[] asked=2", proc.stdout, proc.stderr + proc.stdout)
+        self.assertIn("a host that GitHub operates", proc.stdout + proc.stderr)
+
+    def test_gitlab(self):
+        proc = self._ask("3", [])
+        self.assertIn("forge=gitlab", proc.stdout, proc.stderr)
+        self.assertIn("asked=0", proc.stdout)
+
+
 class GhesInterviewAndHelpTest(unittest.TestCase):
-    def test_the_forge_question_offers_ghes(self):
-        source = _INSTALL_SH.read_text()
-        self.assertIn('"GitHub Enterprise Server (a GitHub host that you run)"', source)
-        self.assertIn('prompt_read "GitHub Enterprise Server hostname', source)
 
     def test_help_describes_the_ghes_flags(self):
         proc = subprocess.run(["bash", str(_INSTALL_SH), "--help"], capture_output=True, text=True,

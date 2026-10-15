@@ -1053,7 +1053,9 @@ load_install_env() {
   unset PLATFORM_AGENT_MODE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
-  # install the file records as GitHub. --gitops-forge is the per-run way in.
+  # install the file records as GitHub, and an inherited GITOPS_HOST would
+  # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
+  # --gitops-host are the per-run way in.
   unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
@@ -1348,8 +1350,8 @@ github_account_type() {
 # This exits, so it is the wrong entry point for anything that can still
 # re-prompt: install.sh calls github_account_type directly and settles the value
 # before provisioning starts. An inconclusive lookup is never fatal — an
-# unreachable api.github.com must not block a provision that is otherwise fine.
-# HOST and CA_FILE are the GitHub Enterprise Server's, as for
+# unreachable api.github.com (or instance) must not block a provision that is
+# otherwise fine. HOST and CA_FILE are the GitHub Enterprise Server's, as for
 # github_account_type: the organization is looked up on the install's GitHub
 # host, never on github.com for an instance.
 check_github_org_is_organization() {

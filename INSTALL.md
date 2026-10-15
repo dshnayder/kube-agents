@@ -742,14 +742,14 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 Rules:
 
-- `--gitops-host` is the instance's hostname: a lowercase DNS name with at least two labels, with no scheme, port or path. `--gitops-forge=github` is the default, so you can omit it. The installer refuses a host under a domain where GitHub runs its own services (`github.com`, `githubusercontent.com`, `githubassets.com`, `githubapp.com`, `github.io`, `github.dev`, `ghe.com`), and `gitlab.com`. `github.com` itself means github.com: it is the default and needs no flag.
+- `--gitops-host` is the instance's hostname: a lowercase DNS name with at least two labels, with no scheme, port or path. `--gitops-forge=github` is the default, so you can omit it, unless `install.env` records `GITOPS_FORGE=gitlab`. The installer refuses a host under a domain where GitHub runs its own services (`github.com`, `githubusercontent.com`, `githubassets.com`, `githubapp.com`, `github.io`, `github.dev`, `ghe.com`), and `gitlab.com`. `github.com` itself means github.com: it is the default and needs no flag.
 - `--gitops-org` and `--gitops-repo` are the organization and the repository name on the instance, not a URL. A non-interactive install needs `--gitops-org`.
 - `--github-app-id` and `--github-pem-path` are the App on the instance. The installer imports the key into Cloud KMS before the apply, as on github.com ([Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md)).
 - Give `--gitops-ca-file` only when a private CA signed the instance's certificate. The installer refuses it without `--gitops-host`. It checks a regular file before the apply, and after the apply it stores it in the Secret `github-forge-ca` (key `ca.crt`) in the agent's namespace. The credential broker trusts the CA for the instance's host only, and reads it on each call. The token minter trusts the CA for all of its outbound calls, and reads it when it starts, so the installer restarts the minter after it writes the Secret.
 - Interactively, `./install.sh` asks where the GitOps repository lives. Choose "GitHub Enterprise Server", and give the hostname and, when it asks, the CA file.
 - The organization check asks the instance (`https://<host>/api/v3/users/<org>`), with the CA when the CA file is a regular file. It sends no credential. On an instance in private mode it gets `401`, says that it cannot verify the organization, and goes on. `SKIP_GITHUB_ORG_CHECK=true` skips it.
 - `install.env` records `GITOPS_FORGE=github`, `GITOPS_HOST` and `GITOPS_CA_SECRET` with the GitHub keys, so `upgrade.sh` and `uninstall.sh` render the same forge. The CA file's path is never recorded.
-- `--dry-run` and `--generate-only` check the flags and a regular CA file, and do not create the Secret. After `lifecycle.sh apply` from a generate-only run, create the Secret and restart the minter yourself:
+- `--dry-run` and `--generate-only` check the flags and a regular CA file, and do not create the Secret. On a first install, generate-only writes the forge keys into `install.env`. Over an existing `install.env` it does not change them, so set `GITOPS_FORGE=github`, `GITOPS_HOST` and, for a private CA, `GITOPS_CA_SECRET` there before `lifecycle.sh apply`; otherwise the next `upgrade.sh` renders github.com. After `lifecycle.sh apply` from a generate-only run, create the Secret and restart the minter yourself (the handoff prints these commands too):
 
   ```bash
   kubectl create secret generic github-forge-ca -n kubeagents-system --from-file=ca.crt=/path/to/ca.pem \
@@ -774,8 +774,9 @@ Do not edit the PlatformAgent with `kubectl edit`: the chart owns it, and the ne
 #### Upgrade, switch and teardown
 
 - **Upgrade.** Run `upgrade.sh`, as in [Upgrading](#upgrading). It renders the forge from `install.env`.
-- **Teardown.** Run `uninstall.sh`, as in [Teardown & Cleanup](#teardown--cleanup). The Secret `github-forge-ca` goes with the namespace. The App on the instance and the KMS key ring and key stay (a key ring or key cannot be deleted).
-- **Change the host or the CA.** Run `install.sh` again with the new `--gitops-host` or `--gitops-ca-file`. An applied run records the change in `install.env`.
+- **Teardown.** Run `uninstall.sh`, as in [Teardown & Cleanup](#teardown--cleanup). On a cluster the install created, the Secret `github-forge-ca` goes with the cluster. On a cluster that stays, delete it with `kubectl delete secret github-forge-ca -n kubeagents-system`. The App on the instance and the KMS key ring and key stay (a key ring or key cannot be deleted).
+- **Change the CA.** Run `install.sh` again with the new `--gitops-ca-file`. An applied run records the change in `install.env`, writes the Secret and restarts the minter.
+- **Change the host.** A new host, github.com or another GitHub Enterprise Server, needs the App on that host and a new KMS key: see the next section.
 
 ##### Switch between github.com and a GitHub Enterprise Server
 

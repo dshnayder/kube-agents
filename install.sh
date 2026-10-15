@@ -369,6 +369,13 @@ bootstrap_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  # Whether the file records a GitHub App: the App belongs to the GitHub host
+  # the file records, so validate_github_forge_flags refuses to carry it to
+  # another host. Read from the file, not the variable, which the shell can
+  # also set.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_APP="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -453,10 +460,13 @@ PARAM_GITHUB_APP_FROM_FLAG="false"
 # The forge and host install.env records, before any flag changes them. A
 # GitHub Enterprise Server host is recorded with GITOPS_FORGE=github, a
 # self-managed GitLab host with GITOPS_FORGE=gitlab, so a host is kept only
-# for the forge that recorded it. The GitHub App belongs to one GitHub host
-# too, so a recorded App is kept only on the host that recorded it.
+# for the forge that recorded it. The GitHub App and its KMS key belong to one
+# GitHub host too: validate_github_forge_flags refuses a change of host that
+# keeps the recorded App or key (INSTALL_ENV_RECORDS_GITHUB_APP).
 PARAM_GITOPS_RECORDED_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
+PARAM_RECORDED_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -3692,6 +3702,14 @@ print_generate_only_handoff() {
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+  # A GitHub Enterprise Server's private CA: a run that applies writes the
+  # Secret and restarts the minter after the apply; this route does neither.
+  if [ "${GITOPS_FORGE:-github}" != "gitlab" ] && [ -n "${GITOPS_HOST:-}" ] && [ -n "${GITOPS_CA_SECRET:-}" ]; then
+    local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    echo -e "${C_BOLD}4. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
+    echo -e "    kubectl create secret generic ${GITOPS_CA_SECRET} -n ${ns} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    echo -e "    kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${ns}"
+  fi
 }
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
@@ -4711,6 +4729,21 @@ validate_github_forge_flags() {
       ;;
   esac
   local host="${PARAM_GITOPS_HOST:-}"
+  # The App was created on the GitHub host install.env records, and its KMS
+  # key holds that App's private key. On another host the minter would sign
+  # as an App the host does not know, and install.sh imports a key only into
+  # a key with no ENABLED version, so a move of host needs the new host's App
+  # and a new key.
+  if [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ] && [ "${PARAM_GITOPS_RECORDED_FORGE:-github}" = "github" ]; then
+    local recorded_host="${PARAM_GITOPS_RECORDED_HOST:-}"
+    local default_ring="${DEFAULT_KMS_KEYRING:-github-token-minter-keyring}" default_key="${DEFAULT_KMS_KEY:-github-token-minter-key}"
+    if [ "$host" != "$recorded_host" ] &&
+      { [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" != "true" ] ||
+        [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
+      print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
+      return 1
+    fi
+  fi
   if [ -z "$host" ]; then
     # github.com presents a certificate that the public CAs sign, and a
     # private CA must never vouch for it.
@@ -4793,6 +4826,51 @@ apply_gitlab_token_secret() {
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
     print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
+  fi
+}
+
+# The forge question, asked only when nothing has settled the forge: github.com,
+# a GitHub Enterprise Server (its host and an optional CA file, asked until
+# the validator accepts them), or GitLab, whose own questions follow in main.
+ask_gitops_forge() {
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
+    local forge_choice="1"
+    [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
+    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+    prompt_menu "Where does the GitOps repository live?" \
+      "GitHub (github.com)" \
+      "GitHub Enterprise Server (a GitHub host that you run)" \
+      "GitLab (gitlab.com or self-managed)" \
+      forge_choice
+    if [ "$forge_choice" = "3" ]; then
+      PARAM_GITOPS_FORGE="gitlab"
+    elif [ "$forge_choice" = "2" ]; then
+      PARAM_GITOPS_FORGE="github"
+      # The instance's host and its CA, asked until the validator accepts
+      # them. The CA prompt has no default, so empty stays a way to answer
+      # "a public CA signed it" on every pass.
+      while true; do
+        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE=""
+          if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+          fi
+        fi
+        if [ -n "${PARAM_GITOPS_HOST:-}" ] && validate_gitops_forge_flags; then
+          break
+        fi
+        [ -z "${PARAM_GITOPS_HOST:-}" ] && print_error "A GitHub Enterprise Server install needs the instance's hostname."
+        has_controlling_tty || exit 1
+      done
+      # A github.com spelling clears the host: the install is then github.com.
+      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+        print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
+      fi
+    else
+      PARAM_GITOPS_FORGE="github"
+      PARAM_GITOPS_HOST=""
+    fi
   fi
 }
 
@@ -6565,46 +6643,7 @@ main() {
 
   # The forge comes first: a GitLab repository has no GitHub organization, App
   # or token minter, so the GitHub interview below does not apply to it.
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
-    local forge_choice="1"
-    [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
-    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
-    prompt_menu "Where does the GitOps repository live?" \
-      "GitHub (github.com)" \
-      "GitHub Enterprise Server (a GitHub host that you run)" \
-      "GitLab (gitlab.com or self-managed)" \
-      forge_choice
-    if [ "$forge_choice" = "3" ]; then
-      PARAM_GITOPS_FORGE="gitlab"
-    elif [ "$forge_choice" = "2" ]; then
-      PARAM_GITOPS_FORGE="github"
-      # The instance's host and its CA, asked until the validator accepts
-      # them. The CA prompt has no default, so empty stays a way to answer
-      # "a public CA signed it" on every pass.
-      while true; do
-        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-          if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-          fi
-        fi
-        if [ -n "${PARAM_GITOPS_HOST:-}" ] && validate_gitops_forge_flags; then
-          break
-        fi
-        [ -z "${PARAM_GITOPS_HOST:-}" ] && print_error "A GitHub Enterprise Server install needs the instance's hostname."
-        has_controlling_tty || exit 1
-      done
-      # A github.com spelling clears the host: the install is then github.com.
-      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
-        print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
-      fi
-    else
-      PARAM_GITOPS_FORGE="github"
-      PARAM_GITOPS_HOST=""
-    fi
-  fi
-
+  ask_gitops_forge
   if [ "$PARAM_GITOPS_FORGE" = "gitlab" ]; then
     # No GitHub org and no minter: write_tfvars_from_state renders neither for
     # GitLab, and the CR names the forge and its token Secret instead.
