@@ -560,9 +560,9 @@ class GitLabPrivateCATest(unittest.TestCase):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         proc = self._run_body(
-            # After the source, as the main path sets it: sourcing install.sh
-            # clears an inherited GITOPS_CA_SECRET.
-            f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+            # After the source, as the main path sets them: sourcing install.sh
+            # clears an inherited GITOPS_FORGE and GITOPS_CA_SECRET.
+            f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
             'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
         )
         self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -587,7 +587,7 @@ class GitLabPrivateCATest(unittest.TestCase):
                 ca = self._tmp / f"{name}.pem"
                 ca.write_text(content)
                 proc = self._run_body(
-                    f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+                    f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
                     'create_gitops_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
                 )
                 # A one-shot source is read after the apply has named the
@@ -599,12 +599,12 @@ class GitLabPrivateCATest(unittest.TestCase):
                 self.assertEqual([], self._ca_secrets())
 
     def test_without_a_file_a_missing_secret_is_named_and_an_existing_one_kept(self):
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
                               'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("kubectl create secret generic gitlab-forge-ca", proc.stdout + proc.stderr)
         self.assertEqual([], self._ca_secrets())
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
                               'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
                               STUB_SECRET_EXISTS_RC="0")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -1064,7 +1064,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["gitlab_ca_secret_name", "gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
-        self.assertIn("!local.gitops_is_gitlab && (local.github_org", self.main)
+        self.assertIn("!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org", self.main)
         self.assertIn("credentialsRef = { name = var.gitlab_token_secret_name }", self.main)
         self.assertIn('role = "gitops"', self.main)
 

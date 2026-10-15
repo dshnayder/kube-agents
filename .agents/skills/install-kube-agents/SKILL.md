@@ -412,20 +412,24 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
 
 ### GitHub Enterprise Server
 
-If the operator's GitOps repository is on a GitHub Enterprise Server (a GitHub instance at a host they run, not github.com), `install.sh`, `upgrade.sh` and `uninstall.sh` cannot install, upgrade or remove it yet: they regenerate `terraform.tfvars` from `install.env`, which has no keys for the instance, and the installer's organization check asks github.com. Do not run them for this install, now or later. Tell the operator this, and follow [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server) with them: the Terraform + Helm method. Its steps and their order:
+If the operator's GitOps repository is on a GitHub Enterprise Server (a GitHub instance at a host they run, not github.com), `install.sh`, `upgrade.sh` and `uninstall.sh` install, upgrade and remove it, with `--gitops-host` and, for a private CA, `--gitops-ca-file`. Follow [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server) with them. Its steps and their order:
 
-1. Decide the cluster. A new cluster goes into the project's `default` VPC network (the composition has no network variable). If the instance is reachable only from another VPC or a Shared VPC, the operator creates the cluster in that VPC and installs with `create_cluster = false`.
-2. On an existing cluster, check the network path now (DNS and HTTPS on port 443) with the two `kubectl run` commands in INSTALL.md. A private instance needs a route, firewall rules and, for a private DNS zone, a Cloud DNS forwarding zone; those are the operator's to set up.
-3. Create the GitHub App on the instance (not on github.com), with the same permissions as on github.com and no webhook, installed on the organization, the GitOps repository and each context repository.
-4. Create the Cloud KMS key ring and key, and import the App's private key with `minty tools import-pk` (minty `v2.7.1`), before the apply: the apply waits for the minter, which is not Ready without the key. If the key already exists (a switch or a reinstall), skip the two create commands, read the new version with `gcloud kms keys versions list`, and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values`. The exact commands are in INSTALL.md. Do not run the token minter guide's Path 2 step 2.
-5. Write `ghes.auto.tfvars` in `terraform/examples/full-install`: `enable_github_minter`, `github_repo` (`owner/name` on the instance, not a URL), `github_app_id`, and all of `extra_helm_values` (Terraform does not merge it across files), with `github = null` and the forge with `provider = "github"`.
-6. Create the CA Secret, if a private CA signed the certificate. On an existing cluster, before the apply. On a new cluster, after the apply: run the network check, create the Secret, then `kubectl rollout restart deployment/github-token-minter -n kubeagents-system`.
-7. `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply` (step 6's new-cluster half comes after this).
-8. Check the minter's `SOURCE_SYSTEM_API_BASE_URL` and the gitops-state ConfigMap's `github_host`.
+1. Decide the cluster. A new cluster goes into the project's `default` VPC network (the installer has no network setting). If the instance is reachable only from another VPC or a Shared VPC, the operator creates the cluster in that VPC, and you install onto it with `--gke-cluster-name`.
+2. On an existing cluster, check the network path now (DNS and HTTPS on port 443) with the two `kubectl run` commands in INSTALL.md. On a new cluster, run them right after the install. A private instance needs a route, firewall rules and, for a private DNS zone, a Cloud DNS forwarding zone; those are the operator's to set up.
+3. The operator creates the GitHub App on the instance (not on github.com), with the same permissions as on github.com and no webhook, installed on the organization, the GitOps repository and each context repository, and downloads its private key. The repository must exist and belong to an organization.
+4. Run `install.sh --dry-run` with `--gitops-host=<host>`, `--gitops-org`, `--gitops-repo` (the name, not a URL), `--github-app-id`, `--github-pem-path` and, only for a private CA, `--gitops-ca-file=<regular PEM file>`. Show the operator the summary. Then run it without `--dry-run`. The installer imports the App's key into Cloud KMS before the apply, writes the CA into the Secret `github-forge-ca` after the apply, and restarts the token minter so that it reads the CA.
+5. Check the minter's `SOURCE_SYSTEM_API_BASE_URL` and the gitops-state ConfigMap's `github_host` with the commands in INSTALL.md.
 
-To upgrade it: move the checkout to the release (change a pinned `image_tag`), apply `charts/kube-agents/crds/`, then `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`. To remove it: `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy` from the checkout that holds `ghes.auto.tfvars`. To switch a github.com install to an instance, apply the new CRDs first. An extra repository is registered by its full URL on the instance.
+Rules for the agent:
 
-Ask the operator for: the instance's hostname (no scheme, path or port; port 443 only), the organization and repository on it, the App ID, the CA file if a private CA signed the certificate, whether the cluster exists, and which VPC reaches the instance. An install serves one GitHub host, so this install has no github.com repositories.
+- `--gitops-host` is a lowercase hostname with no scheme, path or port. Do not give it for github.com. The installer refuses a host under `github.com`, `githubusercontent.com`, `ghe.com` or another domain where GitHub runs its own services, and `gitlab.com`.
+- Do not give `--gitops-ca-file` when a public CA signed the certificate. Do not use `/dev/stdin` or a process substitution for it.
+- The organization check asks the instance with the CA and sends no credential. On an instance in private mode it warns that it cannot verify the organization and goes on.
+- To upgrade, run `upgrade.sh`. To remove, run `uninstall.sh`. Both read the forge from `install.env` (`GITOPS_FORGE=github`, `GITOPS_HOST`, `GITOPS_CA_SECRET`).
+- A switch between github.com and an instance needs the App on the new host and a new `--kms-key`, because `install.sh` imports a key only into a key with no `ENABLED` version. INSTALL.md, "Switch between github.com and a GitHub Enterprise Server", gives the command. `--gitops-host=github.com` switches back.
+- With `--generate-only`, the operator creates the CA Secret and restarts the minter after `lifecycle.sh apply`; INSTALL.md gives the commands.
+
+Ask the operator for: the instance's hostname (port 443 only), the organization and repository on it, the App ID and the path of its private key, the CA file if a private CA signed the certificate, whether the cluster exists, and which VPC reaches the instance. An install serves one GitHub host, so this install has no github.com repositories. If the operator does not want `install.sh`, INSTALL.md also has the Terraform + Helm method.
 
 ## GitOps Repository on GitLab
 

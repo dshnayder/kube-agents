@@ -306,17 +306,20 @@ class GhesInstallEnvTest(_Tmp):
     def test_switching_github_com_to_ghes_records_it(self):
         dest = self._tmp / "install.env"
         dest.write_text("PROJECT_ID=p\nGITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=1\nMEMORY=file\n")
+        dest.write_text(dest.read_text() + "KMS_KEY=github-token-minter-key\n")
         proc = self._bash(
             f"export GITOPS_FORGE=github GITOPS_HOST={_HOST} GITOPS_CA_SECRET=github-forge-ca "
-            "GITOPS_ORG=platform GITOPS_REPO=infra GITHUB_APP_ID=12\n"
+            "GITOPS_ORG=platform GITOPS_REPO=infra GITHUB_APP_ID=12 KMS_KEY=ghes-minter-key\n"
             f'record_gitops_forge_keys "{dest}"\n'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         text = dest.read_text()
         for line in ("PROJECT_ID=p", "MEMORY=file", "GITOPS_FORGE=github", f"GITOPS_HOST={_HOST}",
                      "GITOPS_CA_SECRET=github-forge-ca", "GITOPS_ORG=platform", "GITOPS_REPO=infra",
-                     "GITHUB_APP_ID=12"):
+                     "GITHUB_APP_ID=12", "KMS_KEY=ghes-minter-key"):
             self.assertIn(line + "\n", text)
+        # The new App's key replaces the old App's; upgrade.sh renders it.
+        self.assertNotIn("KMS_KEY=github-token-minter-key", text)
         self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o600")
         self.assertIn(f"GitHub Enterprise Server {_HOST}", proc.stdout)
 
@@ -348,7 +351,7 @@ class GhesInstallEnvTest(_Tmp):
                 self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                 text = dest.read_text()
                 self.assertIn(f"GITOPS_HOST={host}\n", text)
-                self.assertIn(f"GITOPS_CA_SECRET={secret}\n", text)
+                self.assertRegex(text, rf"GITOPS_CA_SECRET=({secret}|'{secret}')\n")
 
     def test_an_unchanged_ghes_install_env_is_not_rewritten(self):
         dest = self._tmp / "install.env"

@@ -2054,6 +2054,10 @@ record_gitops_forge_keys() {
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair.
   local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
+  # switch of host names the new App's key (--kms-key), and the next
+  # upgrade.sh must render that key and not the old App's.
+  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -2074,6 +2078,8 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+    write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
+    write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$file"
@@ -4521,12 +4527,15 @@ validate_gitops_forge_flags() {
   # A host and a CA Secret that install.env recorded for the other forge are
   # that install's, not this run's: a switch of forge drops them. A host given
   # by flag is this run's and is judged below.
-  local recorded_forge="${PARAM_GITOPS_RECORDED_FORGE:-github}"
-  if [ "$recorded_forge" != "$forge" ]; then
+  # Only a forge the file names: a file with no GITOPS_FORGE records no host,
+  # and a host the interview just asked for is this run's.
+  local recorded_forge="${PARAM_GITOPS_RECORDED_FORGE:-}"
+  if [ -n "$recorded_forge" ] && [ "$recorded_forge" != "$forge" ]; then
     local recorded_label="GitLab" forge_label="GitLab"
     [ "$recorded_forge" = "gitlab" ] || recorded_label="GitHub Enterprise Server"
     [ "$forge" = "gitlab" ] || forge_label="GitHub"
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ]; then
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ] &&
+      [ "$PARAM_GITOPS_HOST" = "${PARAM_GITOPS_RECORDED_HOST:-}" ]; then
       print_info "Dropping the recorded ${recorded_label} host '${PARAM_GITOPS_HOST}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_HOST=""
     fi
