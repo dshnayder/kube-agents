@@ -2160,11 +2160,12 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
     write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
     write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
-    # The path of the App's private key, never the key: this run's
-    # --github-pem-path, or the path install.env recorded. A run that cannot
-    # import the key (no PEM file yet, or no Go) leaves the import to a later
-    # run, and that run reads the path from here. Written only when set, so a
-    # file that recorded none gets no empty line.
+    # The path of the App's private key, never the key: the path this run
+    # uses (--github-pem-path, the PEM prompt, or the path install.env
+    # recorded). A rewrite of the forge keys must not drop a key the operator
+    # keeps: a later run reads the path from here when it must import the key
+    # again, for example after the KMS key version is disabled. Written only
+    # when set, so a file that recorded none gets no empty line.
     if [ -n "${GITHUB_PEM_PATH:-}" ]; then
       write_env_var "$tmp" GITHUB_PEM_PATH "$GITHUB_PEM_PATH"
     fi
