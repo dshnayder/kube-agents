@@ -146,7 +146,8 @@ verification_spec:
   # Read the row by hand when it renders: it names
   # seeded-reliability/kustomization.yaml and the `resources:` line.
   # The worker wrote the file the prompt asks for, through the file tool or
-  # the shell, so a green is the guard's and not a worker that wrote
+  # a shell or Python command that names the path with a write marker, so a
+  # green is the guard's and not a worker that wrote
   # `manual` instead. The path covers the pool's clusters/seeded-a/ and a
   # dev fleet's clusters/<prefix>-seeded-a/, in the clone or the scratch
   # tree.
@@ -161,10 +162,19 @@ verification_spec:
           tool_names: ["write_file", "patch"]
           arguments:
             path: '.*clusters/[^/]*seeded-a/seeded-reliability/pdb\.yaml'
+        # Without after_result_pattern the check reads Hermes's one-line
+        # rendering of each command, which drops a redirect, puts a heredoc
+        # on one line and shows a chain as its first command only. With it,
+        # the check reads each tagged `terminal` and `execute_code` call as
+        # typed. The pattern never matches a result, and no forbidden
+        # pattern is set, so it opens no window and grades nothing by
+        # itself. The required pattern: a write marker and the path in one
+        # command (a redirect, tee, cp, mv, install, or a Python write).
         - type: worker_commands
+          after_result_pattern: "(?!)"
           required_patterns:
             [
-              '(>|\btee\b|\bcp\b|\bmv\b|write_text)[^\n]*clusters/[^/\s]*seeded-a/seeded-reliability/pdb\.yaml',
+              '(?s)(?=.*(>|\btee\b|\bcp\b|\bmv\b|\binstall\b|write_text|\.write\(|open\()).*clusters/[^/\s''"]*seeded-a/seeded-reliability/pdb\.yaml',
             ]
   # The red on main: `finish` opens a pull request that adds only the new
   # file. github_writes passes on a write, so it sits under `none`. The case
