@@ -72,9 +72,26 @@ locals {
   gitops_is_gitlab = var.gitops_forge == "gitlab"
   gitlab_forges = [merge(
     { name = "gitlab", provider = "gitlab", credentialsRef = { name = var.gitlab_token_secret_name } },
-    var.gitops_host != "" ? { host = var.gitops_host } : {}
+    var.gitops_host != "" ? { host = var.gitops_host } : {},
+    var.gitlab_ca_secret_name != "" ? { caBundleRef = { name = var.gitlab_ca_secret_name } } : {}
   )]
   gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
+
+  # A GitHub Enterprise Server GitOps repository: the github forge at
+  # gitops_host, declared through the same lists, because the deprecated
+  # github alias has no host and always means github.com. The organization is
+  # the forge's namespace and the repository is named on it; caBundleRef names
+  # the Secret with the instance's private CA, which the credential broker and
+  # the chart's token minter both read. The chart points the minter at
+  # https://<host>/api/v3 from this declaration. github = null removes the
+  # alias from the release values. A github.com install (gitops_host empty)
+  # renders the alias, as before.
+  gitops_is_ghes = !local.gitops_is_gitlab && var.gitops_host != ""
+  ghes_forges = [merge(
+    { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
+    var.github_ca_secret_name != "" ? { caBundleRef = { name = var.github_ca_secret_name } } : {}
+  )]
+  ghes_repositories = [{ forge = "github", repository = local.github_repo_name, role = "gitops" }]
 
   # The CR's spec.integration, as one local so the tests can read it.
   platform_agent_integration = merge(
@@ -98,7 +115,10 @@ locals {
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
-    (!local.gitops_is_gitlab && (local.github_org != "" || var.github_repo != "")) ? {
+    local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
+    local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
+    local.gitops_is_ghes ? { github = null } : {},
+    (!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
       github = merge(
         local.github_org != "" ? { org = local.github_org } : {},
         var.github_repo != "" ? { gitRepo = var.github_repo } : {}
@@ -308,6 +328,32 @@ check "slack_tokens_present" {
   }
 }
 
+# A warning rather than a refusal, for the same reason as slack_tokens_present:
+# an exclusion written before its project joins the scope, or left after it
+# leaves, is a legitimate order of operations. A misspelled one is not, and
+# its only other trace is the drift_pubsub_source_projects output: the
+# subtraction removes nothing, and the project's audit logs leave for the
+# host topic against the operator's stated intent, with the apply green.
+# An exclude.projects glob the plan cannot evaluate. regexall errors on a
+# pattern RE2 rejects and on nothing else (zero matches is an empty list), so
+# can() over it is false exactly for the entries the export local would
+# silently match nothing with. A warning rather than a refusal, like the
+# check below: the reconcile may well apply the same glob, and the operator
+# has drift_pubsub_source_exclude_projects to name the project by ID.
+check "drift_scope_exclude_globs_compile" {
+  assert {
+    condition     = alltrue([for pattern in local.drift_pubsub_scope_exclude_patterns : can(regexall(pattern, ""))])
+    error_message = "scope.exclude.projects carries ${join(", ", [for i, pattern in local.drift_pubsub_scope_exclude_patterns : var.scope.exclude.projects[i] if !can(regexall(pattern, ""))])}, which the plan cannot match: its bracket class does not translate to a pattern Terraform's regex accepts (a reversed or empty range, or an unbalanced bracket). The reconcile may still drop the project it means from the scope, while the plan keeps that project's drift sink. Rewrite the entry, or name the project in drift_pubsub_source_exclude_projects."
+  }
+}
+
+check "drift_source_exclusions_name_listed_projects" {
+  assert {
+    condition     = length(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects))) == 0
+    error_message = "drift_pubsub_source_exclude_projects names ${join(", ", sort(tolist(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects)))))}, which the scope does not list beyond the host (scope_export_projects: ${join(", ", module.kube_agents_iam.scope_export_projects)}), so the entry excludes nothing. A misspelled project ID keeps its sink; check the spelling against SCOPE_PROJECTS."
+  }
+}
+
 # Bearer token for the pod-local Session KV server on 127.0.0.1:8699. Both the
 # sandbox container (which serves and calls it) and the credential-proxy
 # container (whose event watcher posts to it) read this one value.
@@ -368,6 +414,34 @@ module "gke_cluster" {
   resource_labels = {
     "kube-agents-host" = "true"
   }
+
+  # The DESTROY order, not the apply one. Terraform destroys dependents before
+  # dependencies, so the cluster has to depend on the drift ingress for its
+  # teardown to precede the topic's deletion. The control plane emits mutating
+  # audit records for as long as it is up -- measured at ~4 minutes past the
+  # point the topic used to go -- and each one that lands on a missing topic
+  # mails every project owner (#2426). sink_drain cannot cover that: it is a
+  # fixed timer and a teardown's length varies with the cluster.
+  #
+  # Passed as a value rather than named in depends_on, and the difference is
+  # load-bearing. A module-level depends_on defers every data source inside
+  # the module while the target has a planned change. Here that would reach
+  # data.google_container_cluster.existing, which exists when create_cluster
+  # is false and is where cluster_endpoint comes from -- so an ordinary edit
+  # to the ingress would leave provider "helm" (providers.tf) without a host,
+  # and a helm provider that cannot reach the cluster reports every release as
+  # absent: the plan plans helm_release.kube_agents and cert_manager as
+  # creates, and the apply trips over a name still in use. An input reaches
+  # only the gate the two cluster resources depend on, so the data source
+  # stays outside the edge and the destroy order is unchanged.
+  #
+  # try(...[0]..., null), not one(...[*]...): the ingress is count-gated and
+  # this has to resolve to null when it is off, but a splat over the module
+  # reaches its close node and so source_projects, which comes from
+  # kube-agents-iam and therefore from the cluster -- a cycle. Indexing the
+  # single output depends on that output alone, which is why teardown_gate
+  # has to name everything the ordering covers.
+  create_after = try(module.drift_pubsub[0].teardown_gate, null)
 
   depends_on = [google_project_service.required]
 }
@@ -519,7 +593,8 @@ module "chat_pubsub" {
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
-# and pull subscription, and the sink-writer and detector IAM. The three names
+# and pull subscription, and the sink-writer IAM from the module, with the
+# detector's own subscription IAM below rather than inside it. The three names
 # are composition variables, as the stockout trio's are, because a second
 # install in the project has to be able to name its own -- lifecycle.sh's
 # guard_drift_adoption refuses an apply that would otherwise find all three
@@ -534,6 +609,39 @@ module "chat_pubsub" {
 # helm_release precondition below, because the harness block that carries
 # enabled is written only when this flag is on, so the composition would
 # otherwise accept the second variable and silently do nothing with it.
+# The per-project override arrives as a JSON string (the variable says why: a
+# TF_VAR_ line that is blanked exports "", which a map refuses) and the module
+# takes a map; "" is no override.
+locals {
+  # The exclusions as a set, from the comma- or space-separated string a
+  # TF_VAR_ line can carry; blank is none.
+  drift_pubsub_source_exclude_projects = toset([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p if p != ""])
+  # The scope's own exclusions, globs included. scope_export_projects already
+  # leaves out a project an exact scope.exclude.projects entry names; a glob
+  # it cannot, because the IAM module's set is also what it binds, and a glob
+  # there is the reconcile's to apply at runtime (_excluded_by in
+  # agents/platform/scripts/cluster_agent_reconcile.py, fnmatchcase against
+  # the project ID; docs/designs/multi-project-scope.md section 3). The export
+  # list is a plan-time list of names, so a glob can be matched here, one
+  # anchored regex per entry with fnmatch's * ? [seq] and [!seq] carried
+  # over by substitution, and the project the reconcile drops from the scope
+  # is the one that gets no sink. An exact entry matches its own regex too,
+  # which changes nothing. The substitution is byte-wise, not a translation:
+  # an entry whose bracket class RE2 rejects (a reversed or empty range, an
+  # unbalanced bracket) compiles to nothing and would match nothing in
+  # silence, so check "drift_scope_exclude_globs_compile" names it.
+  drift_pubsub_scope_exclude_patterns = [
+    for entry in var.scope.exclude.projects :
+    "^${replace(replace(replace(entry, "*", ".*"), "?", "."), "[!", "[^")}$"
+  ]
+  drift_pubsub_source_projects = sort([
+    for project in module.kube_agents_iam.scope_export_projects : project
+    if !contains(local.drift_pubsub_source_exclude_projects, project)
+    && !anytrue([for pattern in local.drift_pubsub_scope_exclude_patterns : can(regex(pattern, project))])
+  ])
+  drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))
+}
+
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
@@ -557,6 +665,23 @@ module "drift_pubsub" {
   # fails on an unbindable Logging agent, or whose teardown still mails, has
   # only this composition to lengthen them in.
   logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
+  # The drift ingress follows the scope: one sink per project the plan lists
+  # in it from the declaration alone, into this install's topic, so a change
+  # on a scoped project's cluster reaches the detector like one on the
+  # management cluster's. scope_export_projects, not the pool's set: a
+  # container member the Asset index skips for one plan would otherwise lose
+  # its sink and the records until the next plan (the output's description).
+  # Less the scope's own exclusions, a glob there matched here as the
+  # reconcile matches it, and less drift_pubsub_source_exclude_projects, the
+  # per-project way to keep
+  # reading a project's clusters without exporting its logs, for a project
+  # where the applying identity cannot mint the Logging agent or write the
+  # sink. Empty on an install with no declared scope, where the module creates
+  # the host's sink alone. The per-project override is the host's
+  # sink_writer_identity_override for a source project, keyed by its ID, and
+  # reaches here the same way.
+  source_projects                       = local.drift_pubsub_source_projects
+  source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides
 
   # Defers data.google_project.this inside the module to apply time whenever
   # any member of required_apis has a planned change, which makes the sink's
@@ -1018,10 +1143,43 @@ resource "helm_release" "kube_agents" {
     }
 
     # The reverse: GitLab inputs under the default forge would be dropped,
-    # applying a CR with no GitOps repository and no error.
+    # applying a CR with no GitOps repository and no error. gitops_host is
+    # the github forge's too: a GitHub Enterprise Server host.
     precondition {
-      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "")
-      error_message = "gitlab_repo and gitops_host apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitlab_ca_secret_name == "")
+      error_message = "gitlab_repo and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+    }
+
+    # A GitHub Enterprise Server's CA belongs to the github forge at a host:
+    # github.com presents a certificate the public CAs sign, and a private CA
+    # must never vouch for it.
+    precondition {
+      condition     = var.github_ca_secret_name == "" || local.gitops_is_ghes
+      error_message = "github_ca_secret_name is for a GitHub Enterprise Server: set gitops_host to its hostname, with gitops_forge = \"github\". github.com uses the public CAs."
+    }
+
+    # The github forge at gitops_host is a GitHub Enterprise Server. A host
+    # where GitHub runs its own services is refused, as the operator refuses
+    # it; github.com is the default and needs no host; and a GitLab host is
+    # not GitHub's.
+    precondition {
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+    }
+
+    # On a GitHub Enterprise Server, github_repo is required, as owner/name
+    # on the instance: the forge is declared with the owner as its namespace,
+    # and the composition reads a URL on github.com only.
+    precondition {
+      condition     = !local.gitops_is_ghes || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$", var.github_repo))
+      error_message = "With gitops_host set, github_repo is required, as owner/name on the GitHub Enterprise Server, not a URL."
+    }
+
+    # A private CA is for a self-managed GitLab only: gitlab.com presents a
+    # certificate the public CAs sign, and a private CA must never vouch for it.
+    precondition {
+      condition     = var.gitlab_ca_secret_name == "" || !contains(["", "gitlab.com", "www.gitlab.com"], var.gitops_host)
+      error_message = "gitlab_ca_secret_name is for a self-managed GitLab: set gitops_host to its hostname. gitlab.com uses the public CAs."
     }
 
     # What this refuses is an install that asks for the detector without the

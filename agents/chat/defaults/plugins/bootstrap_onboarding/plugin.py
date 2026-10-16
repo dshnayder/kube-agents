@@ -1,9 +1,12 @@
+import importlib.util
 import json
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -28,7 +31,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# The jobs that can post the report: oobe's delivery stage (agents/chat/scripts/oobe.py), and the
+# old delivery job, which still delivers on an install whose oobe removed itself before this image,
+# and again after a rollback to an image from before the fold. Each one present is bound.
+DELIVERY_JOB_IDS = ("oobe", "bootstrap-inventory-delivery")
 # Only adapters with a durable destination may own the one-time report. Use a
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
@@ -71,7 +77,12 @@ GREETED_MARKER = ".bootstrap_greeted"
 # written_at (epoch seconds, stamped at apply) is refused with a warning, so
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
-# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION)}.
+# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION),
+# "report": str (required with from_report)}.
+# The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
+# the opening turn's report check, run on the file the request's "report" names
+# rather than the real report, so a case never puts a file where onboarding
+# reads one.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
@@ -79,11 +90,27 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 # True tells the plugin to greet as if this turn made the chat the home channel.
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
+EVAL_VARIANT_FROM_REPORT = "from_report"
+EVAL_KEY_REPORT = "report"
+# A bare file name beside the real report that nothing in onboarding reads.
+EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
 # Longer than one case's apply, run and destroy.
 EVAL_REQUEST_MAX_AGE_SECONDS = 3600
+
+# The ranked report, where bootstrap_delivery.py reads it. With the shell
+# sandbox on it is on the sandbox pod's data volume, which this pod does not
+# mount, so its presence is read across with sandbox_exec, as delivery does.
+REPORT_NAME = "INVENTORY.md"
+SANDBOX_HOME = "/opt/data"
+# The image's copy, not $HERMES_HOME/scripts on the volume.
+SANDBOX_EXEC_PATH = Path("/opt/defaults/scripts/sandbox_exec.py")
+SANDBOX_EXEC_MODULE = "_kube_agents_sandbox_exec"
+# The opening turn waits on this read. A slower sandbox greets as "in progress",
+# which stays true: delivery posts the report once it can read it.
+REPORT_CHECK_TIMEOUT_SECONDS = 5
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -132,7 +159,7 @@ def _load_instructions(data_dir: Path, name: str, fallback: str) -> str:
     return fallback
 
 
-def _bind_delivery_to_origin(**kwargs: Any) -> bool:
+def _bind_delivery_to_origin(**kwargs: Any) -> list:
     """Point the delivery job at the chat this turn originated from.
 
     The delivery cron job runs with no session identity of its own, so it can
@@ -140,7 +167,7 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
     persist here from the live session. Bound BEFORE ``.user_aligned`` is
     touched so the job never fires against a stale target.
 
-    Returns True only when a real chat origin was persisted. A False return
+    Returns the jobs a real chat origin was persisted on. An empty return
     means this turn has nowhere to deliver to (a CLI/API session with no chat
     id, or the cron API is unavailable), and the caller must NOT mark human
     presence: the delivery job would then fire while still set to
@@ -148,22 +175,29 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
     void.
     """
     if get_session_env is None or update_job is None:
-        return False
+        return []
     try:
         platform = get_session_env("HERMES_SESSION_PLATFORM") or str(kwargs.get("platform") or "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
         if not (platform and chat_id) or platform.lower() == "cron":
-            return False
+            return []
         origin: Dict[str, str] = {"platform": platform, "chat_id": str(chat_id)}
         if thread_id:
             origin["thread_id"] = str(thread_id)
-        update_job(DELIVERY_JOB_ID, {"deliver": "origin", "origin": origin})
-        logger.info("Bound %s delivery to %s (chat_id=%s)", DELIVERY_JOB_ID, platform, chat_id)
-        return True
     except Exception as e:
-        logger.warning("Could not bind %s origin: %s", DELIVERY_JOB_ID, e)
-        return False
+        logger.warning("Could not read the chat origin: %s", e)
+        return []
+    bound = []
+    for job_id in DELIVERY_JOB_IDS:
+        try:
+            # update_job answers None for a job not in the store.
+            if update_job(job_id, {"deliver": "origin", "origin": origin}) is not None:
+                bound.append(job_id)
+                logger.info("Bound %s delivery to %s (chat_id=%s)", job_id, platform, chat_id)
+        except Exception as e:
+            logger.warning("Could not bind %s origin: %s", job_id, e)
+    return bound
 
 
 def _set_home_channel_if_unset(**kwargs: Any) -> bool:
@@ -217,9 +251,9 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
     """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn. Else it returns two values:
-    whether the greeting is the completed variant, and whether to greet as if
-    this turn set the home channel. The file stays for the stack's destroy
-    step, so a retry of the same turn greets again.
+    whether to give the completed greeting, and whether to greet as if this
+    turn set the home channel. The file stays for the stack's destroy step, so
+    a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -228,6 +262,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
             home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
+            report_name = str(request.get(EVAL_KEY_REPORT) or "")
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -256,9 +291,52 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
                 EVAL_REQUEST_MAX_AGE_SECONDS,
             )
             continue
+        if variant == EVAL_VARIANT_FROM_REPORT and not EVAL_REPORT_NAME.match(report_name):
+            logger.warning("Ignoring %s: %s names no report file matching %s.", marker, EVAL_KEY_REPORT, EVAL_REPORT_NAME.pattern)
+            continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
+        if variant == EVAL_VARIANT_FROM_REPORT:
+            return _report_ready(data_dir, report_name), home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
+
+
+def _load_sandbox_exec() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(SANDBOX_EXEC_MODULE, SANDBOX_EXEC_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {SANDBOX_EXEC_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
+    """Whether the ranked report, or the eval seam's ``name``, is written where
+    delivery reads the report.
+
+    Never raises. A sandbox read that fails or outlasts
+    REPORT_CHECK_TIMEOUT_SECONDS is False, and so is anything that keeps this
+    from telling whether the sandbox is on, after a look at the local path.
+    """
+    try:
+        sandbox_exec = _load_sandbox_exec()
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except Exception as e:
+        logger.warning("Could not tell whether the shell sandbox is on; checking %s locally: %s", name, e)
+        in_sandbox = False
+    if not in_sandbox:
+        try:
+            return (data_dir / name).exists()
+        except OSError:
+            return False
+    try:
+        report = sandbox_exec.read_bytes(
+            f"{SANDBOX_HOME}/{name}", max_bytes=1, timeout=REPORT_CHECK_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        logger.warning("Could not read %s in the shell sandbox; greeting as in progress: %s", name, e)
+        return False
+    return report is not None
 
 
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
@@ -333,11 +411,16 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # job can only ever fire once it already knows where to send the report.
     # An unbindable turn is not an onboarding turn: leave every marker alone
     # so the next real chat turn primes the flow instead.
-    if not _bind_delivery_to_origin(**kwargs):
+    bound = _bind_delivery_to_origin(**kwargs)
+    if not bound:
         logger.info("No deliverable chat origin on this turn; leaving onboarding unprimed.")
         return None
 
     home_channel_set = _set_home_channel_if_unset(**kwargs)
+
+    # Before .user_aligned and the trigger: once either is in place, delivery
+    # can claim the report and move it aside before this read lands.
+    report_ready = _report_ready(data_dir)
 
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
@@ -345,11 +428,12 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch .user_aligned: %s", e)
 
+    # Only the first: trigger_job also enables a job, and the old entry ships disabled beside oobe.
     if trigger_job is not None:
         try:
-            trigger_job(DELIVERY_JOB_ID)
+            trigger_job(bound[0])
         except Exception as e:
-            logger.warning("Could not trigger %s: %s", DELIVERY_JOB_ID, e)
+            logger.warning("Could not trigger %s: %s", bound[0], e)
 
     # Last, so that a failure above retries on the next turn rather than
     # burning the one-shot. A failure HERE only costs a repeated greeting.
@@ -358,7 +442,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
 
-    return _greeting(data_dir, (data_dir / "INVENTORY.md").exists(), home_channel_set)
+    return _greeting(data_dir, report_ready, home_channel_set)
 
 
 def register(ctx: Any) -> None:

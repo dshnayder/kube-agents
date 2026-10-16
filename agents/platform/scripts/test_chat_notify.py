@@ -55,6 +55,20 @@ class CommandTest(unittest.TestCase):
             for text in ("- pod crashlooping", "--- Daily report", "-1 nodes down", "--thread=spaces/X/threads/Y", "-"):
                 self.assertEqual(chat_notify.command("google_chat", text)[-2:], ["--", text])
 
+    def test_an_update_key_rides_the_gateway_path_only(self):
+        # The event alert's key, which lets its triage edit it in place under
+        # next; hermes send has no such key.
+        with mock.patch.dict(os.environ, ROUTED):
+            self.assertEqual(
+                chat_notify.command("google_chat", "alert", update=chat_notify.alert_update_key("k8s-evt-1")),
+                ["a2a", "notify", "--platform", "google_chat", "--update", "alert-k8s-evt-1", "--", "alert"],
+            )
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}):
+            self.assertEqual(
+                chat_notify.command("google_chat", "alert", update=chat_notify.alert_update_key("k8s-evt-1")),
+                ["hermes", "send", "--json", "--to", "google_chat", "alert"],
+            )
+
     def test_a_caller_deadline_becomes_the_cli_wait(self):
         with mock.patch.dict(os.environ, ROUTED):
             argv = chat_notify.command("google_chat", "x", wait_seconds=12.7)
@@ -129,9 +143,12 @@ class SessionKVCallersTest(unittest.TestCase):
         answer = json.dumps({"message_id": "spaces/H/messages/X.X", "thread_id": "spaces/H/threads/REAL"})
         with mock.patch.dict(os.environ, ROUTED), \
                 mock.patch.object(self.skv.subprocess, "run", return_value=_completed(answer)) as run:
-            thread = self.skv._post_initial_alert("google_chat", "Warning: pod crashlooping")
+            thread = self.skv._post_initial_alert("google_chat", "Warning: pod crashlooping", "k8s-evt-9")
         self.assertEqual(run.call_args.args[0][:4], ["a2a", "notify", "--platform", "google_chat"])
         self.assertEqual(thread, "spaces/H/threads/REAL")
+        # Its own update key, so the triage can edit this alert in place.
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--update") + 1], chat_notify.alert_update_key("k8s-evt-9"))
 
     def test_the_relay_replies_on_a_known_thread_through_the_gateway(self):
         with mock.patch.dict(os.environ, ROUTED), \
@@ -167,17 +184,14 @@ class SessionKVCallersTest(unittest.TestCase):
     def test_the_relay_files_an_exit_3_leg_as_delivered_and_does_not_log_it_undelivered(self):
         skv = self.skv
         with mock.patch.object(skv, "enabled_chat_platforms", return_value=["google_chat"]), \
-                mock.patch.object(skv, "_gateway_api_token", return_value=""), \
                 mock.patch.object(skv, "_ensure_session_row"), \
-                mock.patch.object(skv, "_create_gateway_session", return_value=True), \
-                mock.patch.object(skv, "_run_relay_turn", return_value="composed report"), \
                 mock.patch.object(skv, "_lookup_session_routing", return_value=("", "", "")), \
                 mock.patch.object(skv, "_lookup_platform_threads", return_value={}), \
                 mock.patch.object(skv, "_slack_audit_headline", return_value=None), \
                 mock.patch.object(skv, "_send_to_chat", return_value=skv.ALERT_SENT_WITHOUT_THREAD), \
                 self.assertLogs(skv.logger, level="WARNING") as logs:
             result = skv.relay_cron_report("sess", "audit", "job", "Audit", "report")
-        self.assertEqual(result, (None, "", []))
+        self.assertEqual(result, (None, []))
         self.assertFalse([line for line in logs.output if "not delivered" in line], logs.output)
         self.assertTrue([line for line in logs.output if "treated as delivered" in line], logs.output)
 
@@ -287,6 +301,118 @@ class OtherCallersTest(unittest.TestCase):
             rec._notify("created 1 profile(s): demo")
         self.assertEqual(run.call_args.args[0][:4], ["a2a", "notify", "--platform", "google_chat"])
 
+
+
+
+SLACK_ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "slack"}
+
+
+class SlackRouteTest(unittest.TestCase):
+    """Slack's half: the same switch, a ts for a thread, and Block Kit through the gateway."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("SESSION_KV_DB_PATH", os.path.join(tempfile.mkdtemp(), "sessions.db"))
+        import session_kv_server  # noqa: F401
+        cls.skv = sys.modules["session_kv_server"]
+
+    def test_a_slack_target_goes_through_the_gateway_with_its_ts(self):
+        with mock.patch.dict(os.environ, SLACK_ROUTED):
+            argv = chat_notify.command("slack:C0HOME:1700000000.000100", "drift on prod")
+        self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "C0HOME/1700000000.000100", "--", "drift on prod"])
+
+    def test_a_slack_thread_carries_its_own_channel(self):
+        # A today-era DM thread: the gateway refuses a non-home channel, so the
+        # follow-up is not posted into home.
+        with mock.patch.dict(os.environ, SLACK_ROUTED):
+            argv = chat_notify.command("slack:D0DM:1700000000.000200", "follow-up")
+        self.assertEqual(argv[argv.index("--thread") + 1], "D0DM/1700000000.000200")
+
+    def test_slack_threads_come_from_the_answer_or_the_ts(self):
+        self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2", "thread_id": "1.1"}), "1.1")
+        # The Hermes path names only the message; on Slack its ts is the root.
+        self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2"}), "2.2")
+
+    def test_chat_command(self):
+        self.assertEqual(
+            chat_notify.chat_command("slack", "1.1", "3 findings", "/tmp/c.json"),
+            ["a2a", "notify", "--platform", "slack", "--chat-file", "/tmp/c.json", "--thread", "1.1", "--", "3 findings"],
+        )
+        self.assertNotIn("--thread", chat_notify.chat_command("slack", "", "x", "/tmp/c.json"))
+        argv = chat_notify.chat_command("slack", "", "x", "/tmp/c.json", 27.5)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "27s")
+
+    CHAT = {"schema": "kube-agents.chat/v1", "headline": "Security audit: 2 critical findings",
+            "choices": [{"text": "Look at the first one", "primary": True}]}
+
+    def _gateway_post(self, returncode, stdout, thread=""):
+        seen = {}
+
+        def run(argv, **_kwargs):
+            path = argv[argv.index("--chat-file") + 1]
+            with open(path, encoding="utf-8") as handle:
+                seen["chat"] = json.load(handle)
+            seen["path"], seen["argv"] = path, argv
+            return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
+
+        with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
+            post = self.skv._post_audit_chat_via_gateway("platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
+        return post, seen
+
+    def test_the_gateway_card_keeps_its_buttons(self):
+        # The gateway draws a chat message's choices itself, so nothing is stripped.
+        _post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        self.assertEqual(seen["chat"], self.CHAT)
+
+    def test_the_cli_gives_up_before_the_subprocess_bound(self):
+        _post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        argv = seen["argv"]
+        self.assertIn("--timeout", argv)
+        self.assertLess(int(argv[argv.index("--timeout") + 1].rstrip("s")), 30)
+
+    def test_the_audit_card_goes_through_the_gateway_and_threads_on_its_answer(self):
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        self.assertEqual(post, self.skv.AuditPost("1.5"))
+        self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertEqual(seen["argv"][-2:], ["--", "3 findings"])
+        self.assertFalse(os.path.exists(seen["path"]), "the chat file was left behind")
+
+    def test_the_audit_card_replies_on_a_known_thread(self):
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "1.6", "thread_id": "1.1"}), thread="1.1")
+        self.assertEqual(post, self.skv.AuditPost("1.1"))
+        self.assertIn("--thread", seen["argv"])
+
+    def test_the_audit_card_falls_back_to_text_on_a_refusal_or_an_unknown_outcome(self):
+        for code in (1, chat_notify.NOTIFY_OUTCOME_UNKNOWN):
+            post, seen = self._gateway_post(code, "")
+            self.assertIsNone(post, f"exit {code}")
+            self.assertFalse(os.path.exists(seen["path"]))
+
+    def test_the_audit_report_takes_the_gateway_as_a_chat_message_when_slack_is_routed(self):
+        # No broker relay under next (slack_blocks_post is not configured),
+        # so without the routed check the report would never try a card.
+        headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
+        with mock.patch.dict(os.environ, SLACK_ROUTED), \
+                mock.patch.object(self.skv.slack_blocks_post, "configured", return_value=False), \
+                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue") as blocks, \
+                mock.patch.object(self.skv.slack_audit_report, "chat_from_issue", return_value=(self.CHAT, "t")), \
+                mock.patch.object(self.skv, "_post_audit_chat_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
+            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
+        self.assertEqual(post, self.skv.AuditPost("9.9"))
+        self.assertEqual(via.call_args.args[2:4], (self.CHAT, "t"))
+        blocks.assert_not_called()
+
+    def test_the_audit_report_keeps_block_kit_when_slack_is_not_routed(self):
+        headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}), \
+                mock.patch.object(self.skv.slack_blocks_post, "configured", return_value=True), \
+                mock.patch.object(self.skv.slack_audit_report, "chat_from_issue") as chat, \
+                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
+                mock.patch.object(self.skv.slack_blocks_post, "post", return_value="4.4") as post_blocks:
+            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
+        self.assertEqual(post, self.skv.AuditPost("4.4"))
+        self.assertEqual(post_blocks.call_args.args[:3], ("C1", "t", [{"type": "divider"}]))
+        chat.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

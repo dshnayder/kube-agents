@@ -69,17 +69,38 @@ streaming and tool progress are skipped and only the turn's final reply comes
 back, through ``send``. ``edit_message`` is left at the base default
 (unsupported), which tells the rolling progress line to post each note anew;
 attachments are not posted (there is no file route), and say so in the log.
+
+Chat messages
+-------------
+Under ``next`` the gateway lays a card's post out from a
+``kube-agents.chat/v1`` object and composes nothing
+(``docs/designs/spec-a2a-payloads.md``, "Card work after the task ends"). The
+``today`` presenters' gateway patches (``slack_ux_status``, ``slack_ux_moments``,
+``slack_ux_incident``, ``slack_ux_failure``, ``kanban_progress_lines``) reach a
+Slack card through this stand-in as well, and :func:`chat_route` tells them
+they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
+state into a chat message (``agents/platform/scripts/chat_message.py``) and
+hand it to :meth:`ChatNotifyAdapter.send_chat`, with an ``update`` key for a
+message that is edited in place (the thread's plan, a card's question, the
+alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
+--chat-file`` and ``--update``; the text stays the fallback, and a gateway that
+does not read them posts the text. A failure wake's reply with a Try again
+offer (``slack_ux_failure.chat_for``) is laid out the same way.
+:func:`conversation_ask` reads back the kind of ask the hermes-bridge recorded
+on the conversation's route, which the plan's ``mark`` keeps while its cards run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
 import os
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from typing import Any, Dict, Optional
@@ -144,6 +165,9 @@ CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
+# The Slack platform value, whose home threads go out channel-qualified
+# (ChatNotifyAdapter.notify_target).
+SLACK_PLATFORM = "slack"
 RUNNER_CONVERSATION_ATTR = "_kage_chat_notify_conversation_adapter"
 # Where a gateway conversation's route is read back: session-kv's routing
 # table, the same database and key kanban_event_routing reads
@@ -159,6 +183,15 @@ API_SERVER_HOST = "127.0.0.1"
 API_SERVER_PORT = 8642
 API_SERVER_MODEL = "model-default"
 API_SERVER_KEY_ENV = "API_SERVER_KEY"
+# The keys a gateway patch puts a chat message and its update key under in
+# send()'s metadata (see "Chat messages" above), and the route record's ask.
+CHAT_METADATA_KEY = "kage_chat"
+UPDATE_METADATA_KEY = "kage_update"
+CONVERSATION_ASK_KEY = "ask"
+# The chat message's file for `a2a notify --chat-file`: written mode 0600 by
+# tempfile, removed once the command returns.
+CHAT_FILE_PREFIX = "kage-chat-"
+CHAT_FILE_SUFFIX = ".json"
 
 # routed_since's answer, read or written once per process.
 _routed_since: Optional[float] = None
@@ -191,6 +224,11 @@ def conversation_platform() -> str:
 def is_conversation(sub: Optional[dict]) -> bool:
     """Whether ``sub`` is addressed to a gateway conversation (its thread is a conversation key)."""
     return str((sub or {}).get("thread_id") or "").strip().startswith(CONVERSATION_KEY_PREFIXES)
+
+
+def chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is a stand-in that carries chat messages (:meth:`ChatNotifyAdapter.send_chat`)."""
+    return callable(getattr(adapter, "send_chat", None))
 
 
 def active_platforms(names: set) -> set:
@@ -307,6 +345,308 @@ def fresh_events(claim: Optional[dict], now: Optional[float] = None) -> Optional
     return claim
 
 
+#: How long a fanned-out child's answer waits for its parent's answer to post
+#: before it is posted anyway: the parent's answer is the one the thread
+#: wants, but a parent whose answer never posts must not swallow what its
+#: child found. Measured from the child's completion, and long enough for a
+#: fleet-wide fan-out whose children finish far apart (the parent completes
+#: only after its last child settles).
+FOLD_HOLD_SECONDS = 2 * 3600
+#: Parent statuses that mean it is still working toward its answer. A blocked
+#: parent (failed, gave up, or waiting on the user) releases the child's
+#: answer at once.
+FOLD_WAITING_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "running", "review"})
+#: Parent statuses that mean it has completed (kanban_children_settled's
+#: settled set).
+FOLD_DONE_STATUSES = frozenset({"done", "archived"})
+#: kanban_children_settled's record of the card each worker's card was
+#: created by.
+WORKER_CHILDREN_TABLE = "kanban_worker_children"
+#: (task id, event id, message) already logged, so a hold re-read on every
+#: tick logs once, and a later drop of the same event logs once too.
+#: Bounded: cleared when it grows past this.
+_FOLD_LOGGED: set = set()
+_FOLD_LOGGED_MAX = 4096
+
+_SUB_WHERE = "task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?"
+
+
+def _sub_args(task_id: str, sub: dict) -> tuple:
+    return (task_id, sub.get("platform") or "", sub.get("chat_id") or "", sub.get("thread_id") or "")
+
+
+def _sub_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
+    """How far ``task_id``'s subscription on ``sub``'s thread has delivered, or
+    None when it has none: the durable cursor, or a sent ping past it."""
+    try:
+        row = conn.execute(
+            f"SELECT last_event_id, last_ping_event_id FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+            _sub_args(task_id, sub),
+        ).fetchone()
+    except sqlite3.OperationalError:  # a base without the ping column
+        row = conn.execute(f"SELECT last_event_id, 0 FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+                           _sub_args(task_id, sub)).fetchone()
+    return None if row is None else max(int(row[0] or 0), int(row[1] or 0))
+
+
+def _durable_cursor(conn: Any, task_id: str, sub: dict) -> Optional[int]:
+    """The subscription's durable cursor alone (``last_event_id``), or None.
+    Not ping-inclusive: a ping that posted before its wake failed leaves this
+    behind, and that is exactly the case where the cursor did not move."""
+    row = conn.execute(f"SELECT last_event_id FROM kanban_notify_subs WHERE {_SUB_WHERE}",
+                       _sub_args(task_id, sub)).fetchone()
+    return None if row is None else int(row[0] or 0)
+
+
+def _fold_parent(conn: Any, child_id: str, sub: dict) -> Optional[tuple]:
+    """``(status, completed_event_id, delivered_cursor)`` for the card that
+    created ``child_id``, when that card is subscribed to the same thread; else
+    None. ``completed_event_id`` is the id of the parent's latest ``completed``
+    event (0 when it has none), ``delivered_cursor`` how far the parent's own
+    subscription has delivered.
+
+    A child its parent gates (a ``task_links`` edge from the parent, the
+    continuation kanban_children_settled exempts) is never folded: it runs
+    after its parent completes, so its answer is the answer.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT c.creator_id FROM {WORKER_CHILDREN_TABLE} c WHERE c.child_id = ?"
+            " AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)",
+            (child_id,),
+        ).fetchone()
+        if not row:
+            return None
+        parent = row[0]
+        task = conn.execute("SELECT status FROM tasks WHERE id = ?", (parent,)).fetchone()
+        if not task:
+            return None
+        delivered = _sub_cursor(conn, parent, sub)
+        if delivered is None:
+            # No subscription: the notifier drops one after delivering an
+            # archived card's last events, and also after repeated send
+            # failures, and the row does not say which. Nothing proves the
+            # parent's answer posted, so the child's does not fold.
+            return None
+        done = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (parent,),
+        ).fetchone()
+        return task[0], int((done[0] if done else 0) or 0), delivered
+    except sqlite3.Error as exc:
+        # No children table on an install without kanban_children_settled,
+        # or a schema change: deliver as upstream would.
+        logger.debug("kanban notifier: fan-out fold skipped for %s: %s", child_id, exc)
+        return None
+
+
+def _rewind(conn: Any, sub: dict, claimed: int, to: int) -> bool:
+    """Move the subscription's cursor back from ``claimed`` to ``to`` (CAS)."""
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify.rewind_notify_cursor(
+        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "", claimed_cursor=claimed, old_cursor=to,
+    )
+
+
+def _advance(conn: Any, sub: dict, frm: int, to: int) -> bool:
+    """Advance the subscription's durable cursor from ``frm`` to ``to`` (CAS:
+    only if no other writer moved it, so it never goes backwards)."""
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify.rewind_notify_cursor(
+        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "", claimed_cursor=frm, old_cursor=to,
+    )
+
+
+def _log_once(task_id: str, event_id: int, message: str, *args: Any) -> None:
+    key = (task_id, event_id, message)
+    if key in _FOLD_LOGGED:
+        logger.debug(message, *args)
+        return
+    if len(_FOLD_LOGGED) >= _FOLD_LOGGED_MAX:
+        _FOLD_LOGGED.clear()
+    _FOLD_LOGGED.add(key)
+    logger.info(message, *args)
+
+
+#: The line a child's answer opens with when it arrives after its parent's has
+#: posted, so it reads as a late finding and not a duplicate.
+LATE_RESULT_LEAD = "Late result from {title}:"
+#: The line a child's answer opens with when the hold runs out while its
+#: parent is still working: the parent's fuller answer may still follow.
+INTERIM_RESULT_LEAD = "Interim result from {title} (the full answer is still being put together):"
+
+
+def _late(ev: Any, claim: dict, title: str, template: str = LATE_RESULT_LEAD) -> tuple:
+    """``(event, claim)`` with the answer led by ``template``. The completion
+    text is the event's run summary, or the card's result when the event has
+    none (upstream's ``_fmt_completed``), so both are led."""
+    lead = template.format(title=title or "a subtask")
+    payload = dict(getattr(ev, "payload", None) or {})
+    if payload.get("summary"):
+        payload["summary"] = f"{lead}\n{payload['summary']}"
+        ev = dataclasses.replace(ev, payload=payload) if dataclasses.is_dataclass(ev) else ev
+    task = claim.get("task")
+    if task is not None and getattr(task, "result", None) and dataclasses.is_dataclass(task):
+        claim = dict(claim, task=dataclasses.replace(task, result=f"{lead}\n{task.result}"))
+    return ev, claim
+
+
+def _title(conn: Any, child: str, claim: dict) -> str:
+    """The child card's title: from the claim's task, else the board."""
+    title = getattr(claim.get("task"), "title", None)
+    if title:
+        return str(title)
+    try:
+        row = conn.execute("SELECT title FROM tasks WHERE id = ?", (child,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    return (row[0] if row else "") or ""
+
+
+def _folds_into_row(conn: Any, sub: dict) -> bool:
+    """Whether ``kanban_progress_lines.deliver`` folds this card's completion into its plan row.
+
+    True when ``KAGE_SLACK_UX`` is on for the subscription's platform and the
+    card's nearest fanned-out ancestor is still open on the same thread, the
+    two things that delivery reads (its ``_slack_quiet`` and
+    ``FANNED_OUT_ANCESTOR_SQL``). Delivered then, the completion settles the
+    card's row and posts nothing, so it needs no hold; held, its row would
+    stay running after the answer posts, since the drop that follows never
+    reaches the plan. Anything that goes wrong reads as no, which holds as
+    before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier, kanban_progress_lines
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+            import kanban_progress_lines
+        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+            return False
+        params = (
+            sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(kanban_progress_lines.FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
+    except Exception as exc:  # noqa: BLE001 — fail towards the hold
+        logger.debug("kanban notifier: reading %s's plan fold failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
+    """``claim`` with a fanned-out child's answer folded into its parent's.
+
+    A worker that fans a question out to child cards completes its own card
+    with the synthesis, and kanban_children_settled holds that completion until
+    the children settle. Each child inherited the thread's subscription
+    (kanban_auto_subscribe), so without this the thread gets every child's
+    answer and then the parent's: the same answer, two or more times. Routed
+    delivery only (the A2A gateway's platforms); the Hermes path and its own
+    Slack fold are untouched.
+
+    For a child's ``completed`` event whose parent is subscribed to the same
+    thread:
+
+    - the parent's own ``completed`` (a later event) has been delivered on that
+      thread: the child's event is dropped, and its cursor moved past it, so
+      neither its post nor its wake runs;
+    - the parent is still working and the child's completion folds into its
+      plan row (:func:`_folds_into_row`): it delivers, so its row settles, and
+      ``kanban_progress_lines`` posts nothing for it;
+    - the parent is still working, or has completed but its answer has not
+      posted yet, for under FOLD_HOLD_SECONDS: the child's event is held.
+      Events before it deliver, and the claim stops just before it, so the
+      next tick reads it again;
+    - otherwise (the parent blocked, failed or gave up, its answer came before
+      the child's, its subscription is gone, or the hold ran out): it delivers
+      as upstream would, so nothing a child found is lost when its parent's
+      answer does not post. One that arrives after the parent's answer has
+      posted opens with "Late result from <card title>:", and one whose hold
+      ran out while the parent still works opens with "Interim result from
+      <card title> …", so neither reads as a duplicate.
+
+    Every other event kind (blocked, gave_up, crashed, progress) delivers.
+
+    Two claim models are handled: kanban_notify_delivery's read-only claim (the
+    durable cursor is still at ``old_cursor``; a hold writes nothing and a drop
+    with nothing left to deliver advances the cursor), and upstream's committed
+    claim (the cursor already moved; a hold rewinds it and a drop writes
+    nothing). Which one ran is read from the subscription's row.
+    """
+    if not claim:
+        return claim
+    sub = claim.get("sub") or {}
+    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+        return claim
+    child = sub.get("task_id") or ""
+    events = list(claim.get("events") or [])
+    now = time.time() if now is None else now
+    kept: list = []
+    dropped = late = False
+    for index, ev in enumerate(events):
+        if getattr(ev, "kind", "") != "completed":
+            kept.append(ev)
+            continue
+        parent = _fold_parent(conn, child, sub)
+        if parent is None:
+            kept.append(ev)
+            continue
+        status, parent_done, delivered = parent
+        event_id = int(getattr(ev, "id"))
+        later = parent_done > event_id
+        if later and delivered >= parent_done:
+            _log_once(child, event_id, "kanban notifier: %s's answer folded into its parent's, already posted; not posted", child)
+            dropped = True
+            continue
+        waiting = status in FOLD_WAITING_STATUSES or (status in FOLD_DONE_STATUSES and later)
+        if status in FOLD_WAITING_STATUSES and _folds_into_row(conn, sub):
+            kept.append(ev)
+            continue
+        if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
+            committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
+            if committed:
+                try:
+                    rewound = _rewind(conn, sub, int(claim["cursor"]), event_id - 1)
+                except Exception as exc:
+                    rewound = False
+                    logger.warning("kanban notifier: could not hold %s's answer for its parent: %s", child, exc)
+                if not rewound:
+                    logger.warning("kanban notifier: could not hold %s's answer for its parent; posting it", child)
+                    kept.extend(events[index:])
+                    break
+            _log_once(child, event_id, "kanban notifier: holding %s's answer until its parent's posts (parent %s)",
+                      child, status)
+            if not kept:
+                return None
+            return dict(claim, events=kept, cursor=event_id - 1)
+        lead = None
+        if parent_done and not later and delivered >= parent_done:
+            lead = LATE_RESULT_LEAD
+        elif waiting:
+            # The hold ran out with the parent still working toward its answer.
+            lead = INTERIM_RESULT_LEAD
+        if lead:
+            ev, claim = _late(ev, claim, _title(conn, child, claim), lead)
+            late = True
+        kept.append(ev)
+    if late:
+        claim = dict(claim, events=kept)
+    if not dropped:
+        return claim
+    if kept:
+        return dict(claim, events=kept)
+    # Nothing left to deliver, so deliver() will not run to advance the cursor:
+    # under the read-only claim, move it past the dropped answer here, or the
+    # next tick reads and drops it again.
+    if _durable_cursor(conn, child, sub) != int(claim.get("cursor") or 0):
+        try:
+            _advance(conn, sub, int(claim.get("old_cursor") or 0), int(claim["cursor"]))
+        except Exception as exc:
+            logger.warning("kanban notifier: could not move %s's cursor past its folded answer: %s", child, exc)
+    return None
+
+
 class ChatNotifyAdapter(BasePlatformAdapter):
     """Send-only adapter for a platform the A2A gateway holds; posts via ``a2a notify``."""
 
@@ -320,8 +660,22 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             self.set_message_handler(handler_factory())
 
     def notify_target(self, chat_id: str, thread: str) -> list:
-        """The argv that addresses the post: a home-channel thread, or none for a new one."""
-        return ["--thread", thread] if thread else []
+        """The argv that addresses the post: a home-channel thread, or none for a new one.
+
+        A Slack thread is a bare ts, which names no channel, so it goes out
+        qualified by the card's own channel ("<channel>/<ts>"); the gateway
+        posts it only when that channel is home. Without that, a card filed in
+        a DM or another channel (under today, delivered after the switch to
+        next) would report into home. A Slack thread with no channel is not
+        sent at all. Chat's thread names its space, which the gateway checks.
+        """
+        if not thread:
+            return []
+        if self.platform.value == SLACK_PLATFORM:
+            if not chat_id:
+                raise LookupError(f"Slack thread {thread} has no channel")
+            return ["--thread", f"{chat_id}/{thread}"]
+        return ["--thread", thread]
 
     def route_down(self) -> bool:
         return time.monotonic() < self._route_down_until
@@ -388,6 +742,43 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         logger.info("chat.notify: %s not posted (no file route): %s", kind, file_name or "attachment")
         return SendResult(success=False, error="attachments are not posted over chat.notify")
 
+    async def send_chat(self, chat_id: str, content: str, chat: Optional[dict], update: str = "",
+                        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
+
+        ``update`` names the message: a later send with the same key, in the
+        same conversation, edits it in place.
+        """
+        extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
+        return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
+
+    def _chat_args(self, content: str, metadata: Optional[Dict[str, Any]]) -> tuple:
+        """``(argv, chat file)`` for the metadata's chat message and update key; the file is the caller's to remove.
+
+        The chat message rides only with a text fallback. A failure wake's reply
+        that carries none of its own is laid out by ``slack_ux_failure.chat_for``.
+        """
+        meta = metadata or {}
+        chat = meta.get(CHAT_METADATA_KEY)
+        update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
+        if chat is None and self.platform.value == SLACK_PLATFORM:
+            chat = _failure_chat(content)
+        argv, path = [], ""
+        if isinstance(chat, dict) and str(content or "").strip():
+            # Serialized before the file exists, so a value JSON cannot hold leaves no file behind.
+            body = json.dumps(chat, ensure_ascii=False)
+            fd, path = tempfile.mkstemp(prefix=CHAT_FILE_PREFIX, suffix=CHAT_FILE_SUFFIX)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+            except OSError:
+                os.unlink(path)
+                raise
+            argv += ["--chat-file", path]
+        if update:
+            argv += ["--update", update]
+        return argv, path
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         thread = str((metadata or {}).get("thread_id") or "").strip()
@@ -397,7 +788,24 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         except LookupError as exc:
             logger.warning("chat.notify: %s; the card's report is not posted", exc)
             return SendResult(success=False, error=str(exc))
+        try:
+            chat_argv, chat_file = self._chat_args(content, metadata)
+        except (OSError, TypeError, ValueError) as exc:
+            # The text is the deliverable: a chat message that cannot be written posts without it.
+            logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
+            chat_argv, chat_file = [], ""
+        argv += chat_argv
         argv += ["--", content]
+        try:
+            return await self._notify(argv, chat_id)
+        finally:
+            if chat_file:
+                try:
+                    os.unlink(chat_file)
+                except OSError as exc:
+                    logger.debug("chat.notify: removing %s failed: %s", chat_file, exc)
+
+    async def _notify(self, argv: list, chat_id: str) -> SendResult:
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -431,19 +839,45 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
 
 
-def conversation_context(session_id: str) -> str:
-    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+def _failure_chat(content: str) -> Optional[dict]:
+    """``slack_ux_failure.chat_for``'s chat message for a marked failure reply, or None."""
+    try:
+        from gateway import slack_ux_failure
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import slack_ux_failure
+        except ImportError:
+            return None
+    try:
+        return slack_ux_failure.chat_for(content)
+    except Exception as exc:  # noqa: BLE001 - the reply still posts as text
+        logger.warning("chat.notify: laying out the failure reply failed: %s", exc)
+        return None
+
+
+def _route(session_id: str) -> dict:
+    """The conversation route ``session_id`` holds, as the bridge recorded it, or {}."""
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DEFAULT_DB
     if not session_id or not os.path.exists(path):
-        return ""
+        return {}
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SESSION_KV_TIMEOUT_SECONDS)) as conn:
             row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
         route = (json.loads(row[0]) if row and row[0] else {}).get(CONVERSATION_ROUTE_KEY)
     except Exception as exc:  # noqa: BLE001 - an unreadable route is a failed send, said in the log
         logger.warning("chat.notify: route for %s unreadable: %s", session_id, exc)
-        return ""
-    return str(route.get("context_id") or "") if isinstance(route, dict) else ""
+        return {}
+    return route if isinstance(route, dict) else {}
+
+
+def conversation_context(session_id: str) -> str:
+    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+    return str(_route(session_id).get("context_id") or "")
+
+
+def conversation_ask(session_id: str) -> str:
+    """The kind of ask the conversation ``session_id`` routes was last asked (a ``mark.ask`` token), or ""."""
+    return str(_route(session_id).get(CONVERSATION_ASK_KEY) or "")
 
 
 class ConversationNotifyAdapter(ChatNotifyAdapter):
@@ -470,6 +904,10 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
         return ["--conversation", thread, "--context", context]
+
+    def ask(self, chat_id: str) -> str:
+        """The kind of ask the conversation was last asked, which the plan's mark keeps while cards run."""
+        return conversation_ask(chat_id)
 
     async def handle_message(self, event: Any) -> None:
         if not getattr(event, "internal", False):

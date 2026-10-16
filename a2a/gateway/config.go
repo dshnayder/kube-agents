@@ -43,6 +43,10 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 // to (notify.go); the operator renders it from googleChat.homeChannel.
 const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 
+// envSlackHomeChannel carries the Slack home channel's id the chat.notify
+// route posts to; the operator renders it from slack.homeChannel.
+const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -86,6 +90,10 @@ const (
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
 // 1800s), restated here because the two halves of one contract must agree.
 const defaultTaskDeadline = 30 * time.Minute
+
+// defaultSessionMaxLifetime is what SessionMaxLifetime means when unset; the
+// field's comment carries the rationale.
+const defaultSessionMaxLifetime = 4 * time.Hour
 
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
@@ -140,6 +148,10 @@ type Config struct {
 	// a chat.notify proactive post lands (notify.go). Empty leaves the route
 	// serving conversation requests only.
 	GchatHomeChannel string
+	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
+	// the one place a Slack chat.notify home post may land (notify.go). Empty
+	// leaves the route serving conversation requests only.
+	SlackHomeChannel string
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -266,10 +278,32 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the session's last activity: a
-	// verified turn, or an executor ending a live task (decided 8/24: 30
-	// minutes, config-backed; the task's end counts since 2026-09-30).
+	// IdleTTL is the reap threshold since the session's last user message
+	// (decided 8/24: 30 minutes, config-backed; spec-chatops-gateway.md,
+	// Session lifecycle). The answer to that message does not move it: with
+	// one pod serving every turn, the pod is the conversation's, and a
+	// conversation nobody has spoken in for the TTL is idle however recently
+	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
+
+	// SessionReuse keeps one pod per conversation across turns
+	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
+	// idle goes to it, and only a conversation with no live pod gets a new
+	// one. Off, every turn is a fresh pod, as before 10/9, and the pods
+	// spawned are never handed a second task. Either way the gateway only
+	// reuses pods spawned with the flag, so turning it on never reaches a
+	// pod an older gateway spawned.
+	SessionReuse bool
+
+	// SessionMaxLifetime bounds a reused session pod's whole life
+	// (A2A_SESSION_MAX_LIFETIME, 4h by default), as its activeDeadlineSeconds.
+	// A one-task pod's deadline is TaskDeadline plus a grace, which a pod
+	// serving many turns cannot have; this is the backstop in its place, and
+	// a per-task overdue check in the reap scan bounds a wedged task inside
+	// it (Gateway.taskOverdue). A pod near the end of its lifetime is not
+	// handed another task. Never below TaskDeadline plus twice the grace, so
+	// the pod deadline and the overdue check cannot fire together.
+	SessionMaxLifetime time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
 	// salt is SESSION_KV_SALT, the one the install already provisions into
@@ -294,9 +328,11 @@ type Config struct {
 	// pod-level activeDeadlineSeconds it sizes above it, and two knobs for
 	// one contract would drift. Unset means 1800s, the adapter's own
 	// default. The adapter kills the harness and publishes the terminal at
-	// this deadline; the pod deadline (this plus a fixed grace) is the
-	// backstop that hands a wedged ADAPTER to Sweep instead of letting it
-	// hold its bus credential indefinitely. Raising it buys longer tasks at
+	// this deadline; for a pod that serves one task, the pod deadline (this
+	// plus a fixed grace) is the backstop that hands a wedged ADAPTER to
+	// Sweep instead of letting it hold its bus credential indefinitely. A
+	// reused pod's backstop is SessionMaxLifetime plus the reap scan's
+	// overdue check at the same bound (Gateway.taskOverdue). Raising it buys longer tasks at
 	// the price of how long a wedged worker can hold a cap slot; lowering
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
@@ -429,9 +465,10 @@ type Config struct {
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
 	// bounds HOW MANY - without it, one mapped user's afternoon can fill the
-	// namespace. At the cap a new delegation (or a session-routed first ask)
-	// is refused with a chat reply naming the numbers; nothing queues,
-	// nothing drops silently.
+	// namespace. At the cap the session pod idle longest is evicted to make
+	// room, and its conversation told; only with none idle is the new
+	// delegation (or session-routed turn) refused, with a chat reply naming
+	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
@@ -450,7 +487,10 @@ type Config struct {
 	// parent's depth plus one, and a turn already at the bound may not
 	// delegate again. One child at a time means the chain is a line, and
 	// this bounds its length: a harness that delegates in a loop stops at
-	// the bound instead of walking the session cap.
+	// the bound instead of walking the session cap. Since a wake's pod has
+	// no delegate tool (delegateToolFor), a chain from a stock worker is a
+	// human turn and its child, so the bound is the backstop for a worker
+	// that delegates without the tool, not the everyday limit.
 	//
 	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
 	// it: 0 would be "delegation off", which is a different switch
@@ -543,6 +583,7 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
+	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for
@@ -711,6 +752,17 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_TASK_DEADLINE_SECONDS %q: need an integer >= 60; a sub-minute deadline kills pods mid-cold-start", deadlineSecs)
 	}
 	cfg.TaskDeadline = time.Duration(secs) * time.Second
+
+	cfg.SessionReuse = os.Getenv("A2A_SESSION_REUSE") != "false"
+	lifetime := envOr("A2A_SESSION_MAX_LIFETIME", defaultSessionMaxLifetime.String())
+	lt, err := time.ParseDuration(lifetime)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q: %w", lifetime, err)
+	}
+	if floor := cfg.TaskDeadline + 2*podDeadlineGrace; lt < floor {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q is under %v, A2A_TASK_DEADLINE_SECONDS plus twice the pod deadline grace; a pod that cannot outlive one task cannot serve a conversation", lifetime, floor)
+	}
+	cfg.SessionMaxLifetime = lt
 
 	askTTL := envOr("A2A_ASK_TTL", defaultAskTTL.String())
 	at, err := time.ParseDuration(askTTL)

@@ -19,9 +19,12 @@ and `gcloud artifacts repositories list`),
 so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
-§1 scopes this to "every project the agent can see", so a bare invocation
-reads the active project plus every listed project, whether or not it holds a
-cluster -- a project whose last cluster was deleted is where its disks and
+§1 scopes this to the install's declared scope when the agent passes one
+(`--scope-projects`, from the platform_control fleet_scope tool); on a sandbox
+whose operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED) a bare
+invocation refuses rather than lists; and otherwise, on a checkout or an
+install with no scope, a bare invocation reads the active project plus every
+listed project, whether or not it holds a cluster -- a project whose last cluster was deleted is where its disks and
 addresses are left behind -- rather than auditing only the active gcloud
 project; `--project` overrides discovery for a scoped run. Each project's
 cluster listing runs in a pool before the clusters are read, and its disk,
@@ -91,6 +94,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The rc a refused kubeconfig directory stands for in the credentials
+# result: gcloud was not run through it, and the note is the error.
+KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
 # The exit status a `Run` reports for a command `subprocess.run` killed on
 # its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
@@ -124,6 +130,33 @@ NO_PROJECT_IN_SCOPE_ERROR = (
     "no project in scope: there is no active gcloud project and `gcloud projects list` "
     "returned none, so this credential sees nothing to audit"
 )
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."
@@ -139,25 +172,11 @@ DETAIL_EXCERPT_CHARS = 200
 # rather than a read that failed; otherwise every non-GKE project a credential
 # can see is a permanent `gate-failed` target. Copied from `collect.py`.
 API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "has not been used in project")
-# The project an API refusal names, which gcloud gives by number ("has not been
-# used in project 123456789", "consumer: projects/123456789"). The refusal is
-# the consumer project's, and with a quota project set (`billing/quota_project`)
-# that is not the project being listed.
-REFUSED_PROJECT_NUMBER_RE = re.compile(r"\bprojects?[ /](\d+)\b")
-# The project *id* a refusal names, when it names one rather than a number,
-# in gcloud's phrasings: `project <id> before`, `Project <id> is not found`,
-# `projects/<id>`, then punctuation, a quote or the end. A project id is 6-30
-# lowercase letters, digits and hyphens, starting with a letter and not ending
-# in a hyphen. Used only to say which project a refusal was about.
-REFUSED_PROJECT_ID_RE = re.compile(
-    r"\b(?i:projects?)[ /]['\"\[]?([a-z][a-z0-9-]{4,28}[a-z0-9])"
-    r"(?=\s+(?:before|is|was|has|does)\b|['\"\],.;:)]|\s*$)"
-)
-# English words of id shape that gcloud's prose puts where an id could sit
-# ("... on this project either."): never read as the project a refusal names.
-REFUSED_PROJECT_ID_STOPWORDS = frozenset({"before", "either", "itself", "number", "should", "settings"})
-# The read `refusal_names_project` makes to turn a project id into the number
-# a refusal names. `collect_fleet` answers a repeat of it from the first answer.
+# Which project a refusal names, and whether it is the listed project's own:
+# `collect.refusal_owner`, the one rule the collectors share (the regexes and
+# the reasoning live beside it); `refusal_owner` below reads it from there.
+# The read it makes to turn a project id into the number a refusal names;
+# `collect_fleet` answers a repeat of it from the first answer.
 PROJECT_DESCRIBE_ARGV = ["gcloud", "projects", "describe"]
 # The zone or region and name in a PV's disk handle
 # (`projects/p/zones/us-central1-a/disks/data-1`, `.../regions/r/disks/n`).
@@ -348,14 +367,6 @@ REPLACED_POD_PATTERNS = {
 # 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137.
 USAGE_ALIGNMENT_S = 300
 MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
-# Where `credential_proxy_client` lives: the shared scripts dir in the image
-# (see docker-entrypoint.sh), then the same directory in a source checkout.
-# `audit_report.py` appends the same three.
-SHARED_SCRIPT_DIRS = (
-    "/opt/defaults/scripts",
-    "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
-)
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
 NO_SESSION_MESSAGE = (
     "no Cloud Monitoring session: neither the credential broker's relay nor ADC "
@@ -996,14 +1007,17 @@ def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
 
 def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) -> tuple[Path, Run]:
     kc = kubeconfig_path(project, cluster, location)
-    kc.parent.mkdir(parents=True, exist_ok=True)
+    from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
 
-    env = {**os.environ, "KUBECONFIG": str(kc)}
-    result = run(
-        ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project],
-        env=env,
-    )
-    return kc, result
+    argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
+    note = prepare_kubeconfig(kc)
+    if note:
+        # The directory is not this run's to write through: gcloud is not
+        # run through it, and the refusal is the result, as the shared rule's
+        # other callers return it.
+        log(f"{project}/{location}/{cluster}: {note}")
+        return kc, Run(argv, KUBECONFIG_REFUSED_RC, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, "KUBECONFIG": str(kc)})
 
 
 def target_name(project: str, location: str, name: str) -> str:
@@ -1018,14 +1032,19 @@ def target_name(project: str, location: str, name: str) -> str:
 
 
 class NoProjectInScope(Exception):
-    """Discovery named no project at all, which is not a fleet of empty projects."""
+    """The run has no project to read, which is not a fleet of empty projects:
+    discovery named none, or, under a declared scope, the holder refused the
+    run (nothing readable, the flags missing on a scoped sandbox, or a
+    `--project` the scope does not list) and the message says which."""
 
 
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
-    """§1's project scope: "every project the agent can see". A `--project`
-    override skips discovery entirely, for a scoped or a test run; otherwise
-    this names the active project plus every other listed project, and lists
-    none of them -- `collect.py`'s `discover_fleet` takes the same scope.
+    """§1's project scope. A `--project` override skips discovery entirely,
+    for a scoped or a test run; the declared scope the SOP passed from the
+    fleet_scope tool (`--scope-projects`) is the sweep as given, nothing
+    listed; otherwise this names the active project plus every other listed
+    project, "every project the agent can see", and lists none of them --
+    `collect.py`'s `discover_fleet` takes the same scope.
 
     A listed project holding no cluster stays in scope on purpose. §3.4-§3.6
     and §3.14 look for disks, addresses, forwarding rules and repositories,
@@ -1037,7 +1056,8 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     once, in its pool.
 
     The second value is set when the scope is provably short of the fleet --
-    `--project` skipped discovery, `gcloud projects list` failed, or it
+    `--project` skipped discovery, a declared project the install could not
+    read was passed as `--scope-unread`, `gcloud projects list` failed, or it
     answered without naming the active project -- and
     `collect_fleet` turns it into an `UNENUMERATED_PROJECTS_TARGET` entry, so
     the loss is a row the document has to account for rather than a fleet that
@@ -1046,7 +1066,20 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     Raises `NoProjectInScope` when there is no active project and the listing
     failed or named none: that credential sees nothing, which is not a fleet."""
     if cli_project:
+        override_error = declared_scope.override_error(cli_project)
+        if override_error:
+            raise NoProjectInScope(override_error)
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
+
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is no fleet, reported as such
+        # rather than widened to the listing.
+        if not declared_scope.projects:
+            raise NoProjectInScope(declared_scope.empty_error())
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return list(declared_scope.projects), declared_scope.note()
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -1127,42 +1160,19 @@ class IncompleteEnumeration(RuntimeError):
 
 
 def refusal_names_project(project: str, stderr: str, *, run: RunFn) -> bool:
-    """Whether an API-disabled refusal is `project`'s own. Only then is it the
-    answer "no cluster can exist here": a refusal from a quota project with the
-    API off names that project instead, and read as this one's it marked every
-    project cluster-free, so `finish` closed an audit that read no cluster. A
-    refusal naming no project, or one this project's number cannot be read
-    for, is a failed read."""
-    return refusal_owner(project, stderr, run=run)[0]
+    """Whether an API-disabled refusal is `project`'s own; the one rule is
+    `collect.refusal_names_project`, which carries the reasoning."""
+    from collect import refusal_names_project as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def refusal_owner(project: str, stderr: str, *, run: RunFn) -> tuple[bool, str]:
-    """`refusal_names_project`'s answer, with why when it is no: which project
-    the refusal named, or that this project's number could not be read. The
-    two call for different fixes -- a quota-project setting, or the describe
-    permission -- and collapsing them sent the operator after the wrong one."""
-    numbers = set(REFUSED_PROJECT_NUMBER_RE.findall(stderr))
-    if not numbers:
-        # The keyword case-insensitively, as `REFUSED_PROJECT_ID_RE` reads it:
-        # `Project acme` names acme as surely as `project acme` does.
-        if re.search(rf"\b(?i:projects?)[ /]['\"\[]?{re.escape(project)}(?![\w-])", stderr):
-            return True, ""
-        others = sorted(set(REFUSED_PROJECT_ID_RE.findall(stderr)) - REFUSED_PROJECT_ID_STOPWORDS - {project})
-        if others:
-            return False, f"the refusal names another project ({', '.join(map(repr, others))}), so it cannot be tied to {project!r}"
-        return False, f"the refusal names no project, so it cannot be tied to {project!r}"
-    described = run([*PROJECT_DESCRIBE_ARGV, project, "--format", "value(projectNumber)"])
-    if described.rc != 0:
-        return False, (
-            f"`gcloud projects describe {project}` failed (rc={described.rc}), so the refusal's project "
-            f"number could not be compared with this project's: "
-            f"{described.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
-        )
-    if numbers == {described.stdout.strip()}:
-        return True, ""
-    return False, (
-        f"the Kubernetes Engine API is off in a project other than {project!r}, such as a quota project"
-    )
+    """`refusal_names_project`'s answer with why when it is no; the one rule
+    is `collect.refusal_owner`."""
+    from collect import refusal_owner as shared  # noqa: PLC0415 -- the one rule for an API refusal's owner, in collect.py
+
+    return shared(project, stderr, run=run)
 
 
 def _describing_once(run: RunFn) -> RunFn:
@@ -1280,9 +1290,8 @@ def default_monitoring_session() -> SessionFn:
     materializes one.
     """
     if os.environ.get(CREDENTIAL_PROXY_URL_ENV):
-        for directory in SHARED_SCRIPT_DIRS:
-            if directory not in sys.path:
-                sys.path.append(directory)
+        # SHARED_SCRIPT_DIRS is already on sys.path: the module-level import of
+        # fleet_scope_args put it there.
         import credential_proxy_client
 
         return credential_proxy_client.ApiSession()
@@ -5294,8 +5303,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             emitted = emit("idle-workload", hit)
             # Without this the retracted impact never reaches a reader.
             # `adopt_arm_impact` adopts the collector's sentence only for
-            # candidates that mark it authoritative, and the pass `finish` plans
-            # for reusing last run's prose on byte-identical evidence would reuse
+            # candidates that mark it authoritative, and `carry_unchanged_findings`,
+            # which reuses last run's prose on byte-identical evidence, would reuse
             # it -- which for a workload idle for a month is every run. The
             # findings that stood down three Deployments would go on
             # publishing "a workload nobody is calling" forever with the constant
@@ -6240,11 +6249,12 @@ def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline:
 
 def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     """Whether a target's error is the discovery entry's note on what a run
-    skipped -- a `--project` scope or a filtered listing -- rather than a
-    failure that explains why nothing was collected."""
+    skipped -- a `--project` scope, a filtered listing, or the declared
+    projects the install could not read -- rather than a failure that explains
+    why nothing was collected."""
     if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
         return False
-    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
@@ -6268,7 +6278,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         projects, partial_discovery = get_target_projects(project, run=run)
     except NoProjectInScope as exc:
         # No active project and a `projects list` that answered with nothing:
-        # the credential sees no project, which is not an empty fleet. Projects
+        # the credential sees no project, which is not an empty fleet. Or, under
+        # a declared scope, nothing readable, the flags missing on a scoped
+        # sandbox, or a --project the scope does not list: the same top-level
+        # error, with the reason the holder gave. Projects
         # that were listed but hold no cluster do not land here: their project
         # reads still run, and only a run that reads nothing at all ends in
         # `NOTHING_COLLECTED_ERROR` below. The manifest contract's top-level `error`, as
@@ -6339,6 +6352,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             return _prefetch_compute(p, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
         except Exception as exc:  # noqa: BLE001 — see crashed_project_error
             return ProjectCrash(crashed_project_error(p, exc))
+
+    # The shared kubeconfig directory, made usable once before the pool opens
+    # (`collect.usable_kubeconfig_dir`, the one rule): the first wave's threads
+    # would otherwise race one another's move-aside and log it as a refusal.
+    if clusters:
+        from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+        shared_note = usable_kubeconfig_dir(KUBECONFIG_DIR)
+        if shared_note:
+            log(f"{KUBECONFIG_DIR}: {shared_note}")
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     prefetched: dict[str, dict[tuple[str, ...], Run] | ProjectCrash | None] = {}
@@ -6488,7 +6511,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
         "--workspace",
         help=(
@@ -6501,6 +6525,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

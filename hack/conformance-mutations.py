@@ -57,7 +57,8 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
+    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
+    #: and B1-gke-mcp-overlay-copy-redundant.
     must_survive: bool = False
 
 
@@ -475,6 +476,183 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-mcp-write-tool-allowed",
+        "agents/platform/scripts/mcp_policy.py",
+        ('        "list_operations",\n    }\n)\n',
+         '        "list_operations",\n        "patch_k8s_resource",\n    }\n)\n'),
+        "test_B1_the_broker_refuses_every_gke_mcp_write_tool",
+        "add the one write tool a workflow seems to need to the gke read set -- "
+        "every Platform Agent can then patch any workload in the fleet on the "
+        "broker's credential",
+    ),
+    Mutation(
+        "B1-mcp-server-reached-directly",
+        "deploy/shared/defaults/config.yaml",
+        ('      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"\n',
+         '      - "https://container.googleapis.com/mcp"\n'),
+        "test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential",
+        "point the gke server back at Google to debug a relay problem and leave "
+        "it there -- the call then runs on whatever credential the agent "
+        "container has, past every allowlist",
+    ),
+    Mutation(
+        "B1-mcp-relay-opened-to-the-sandbox",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_B1_only_the_gateway_reaches_the_mcp_relay",
+        "let the shell sandbox call MCP tools too, for a skill script -- every "
+        "model-authored command then has a GKE read path it never had",
+    ),
+    Mutation(
+        "B1-mcp-relay-path-drift",
+        "k8s-operator/internal/controller/platformagent_broker_split.go",
+        ('\tmcpRelayPath = "/v1/mcp"\n', '\tmcpRelayPath = "/v1/mcp-relay"\n'),
+        "test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route",
+        "rename the route on one side only -- every mcp-remote child then dials "
+        "a 404 and the gke tools stop working with no policy refusal to read",
+    ),
+    Mutation(
+        "C1-watcher-token-in-the-agent-container",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('              name: agent-credential-proxy-token\n              readOnly: true\n',
+         '              name: agent-credential-proxy-token\n              readOnly: true\n'
+         '            - mountPath: /var/run/secrets/kubeagents/watcher-proxy\n'
+         '              name: watcher-credential-proxy-token\n'
+         '              readOnly: true\n'),
+        "test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth",
+        "mount the watcher token beside the chat token in platform-agent so a "
+        "skill can reuse it -- the model's container then holds a token that "
+        "reads every fleet cluster's events and objects through the broker",
+    ),
+    Mutation(
+        "C1-watcher-audience-on-the-chat-token",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("                  audience: kubeagents-credential-proxy-chat\n",
+         "                  audience: kubeagents-credential-proxy-watcher\n"),
+        "test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth",
+        "project the watcher audience on the Hermes container's own token to "
+        "save a volume -- under its old name, the model's container then holds "
+        "the watcher role and a check keyed on the volume name never sees it",
+    ),
+    Mutation(
+        "C1-watcher-cluster-read-relays-master-auth",
+        "agents/platform/scripts/watcher_policy.py",
+        ('CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})\n',
+         'CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate", "clientCertificate", "clientKey"})\n'),
+        "test_C1_the_watcher_cluster_read_never_relays_a_client_credential",
+        "keep the client certificate too, in case a future watcher talks to the "
+        "control plane directly -- every watcher-token holder then gets a key "
+        "for each fleet cluster that has client certificate issuance on",
+    ),
+    Mutation(
+        "C1-watcher-route-allows-a-list",
+        "agents/platform/scripts/watcher_policy.py",
+        ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
+         '_EVENTS_LIST = re.compile(r"api/v1/(events|pods)")\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "let the watcher list pods too, for a richer triage message -- the "
+        "events-only route becomes a fleet-wide pod dump on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-legacy-watch-path",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})\n',
+         'REFUSED_PATH_SEGMENTS = frozenset({"proxy"})\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "drop `watch` from the refused segments as a leftover of an older API -- "
+        "the server still serves watch/secrets, and the named-GET rule reads it "
+        "as an object called `secrets`",
+    ),
+    Mutation(
+        "C1-watcher-subscription-unpinned",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not subscription or match.group("sub") != subscription:\n',
+         '        if not subscription:\n'),
+        "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
+        "drop the equality check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach",
+    ),
+    Mutation(
+        "C1-watcher-routes-opened-to-chat",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),\n",
+         "    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER, CALLER_ROLE_CHAT)),\n"),
+        "test_C1_only_the_watcher_role_reaches_the_watcher_routes",
+        "let the gateway's chat token read fleet objects for a new tool -- the "
+        "Hermes container then reaches every fleet API server through the broker",
+    ),
+    Mutation(
+        "C1-drift-default-subscription-drift",
+        "k8s-operator/internal/controller/platformagent_broker_split.go",
+        ('\tdriftDetectorDefaultSubscription = "platform-agent-drift-audit-sub"\n',
+         '\tdriftDetectorDefaultSubscription = "platform-agent-drift-sub"\n'),
+        "test_C1_the_operator_pins_the_drift_detectors_own_default_subscription",
+        "rename the default on one side -- the broker then refuses every pull "
+        "the detector makes on an install that never named a subscription",
+    ),
+    Mutation(
+        "B1-gke-mcp-allowlist-inverted",
+        "agents/cluster/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "turn the Cluster Agent's allowlist into a denylist, the way a denylist "
+        "author would spell it -- the reads are now hidden and the eight write "
+        "tools, create_cluster among them, are offered to every cluster profile",
+    ),
+    Mutation(
+        "B1-gke-mcp-write-tool-in-shared-defaults",
+        "deploy/shared/defaults/config.yaml",
+        ("        - check_k8s_auth\n", "        - check_k8s_auth\n        - create_cluster\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "re-offer create_cluster in the shared defaults alone. The platform "
+        "overlay is untouched, so only an assertion against the merged config "
+        "the image builds sees the union carry it to the Platform Agent",
+    ),
+    Mutation(
+        "B1-gke-mcp-unmodelled-profile",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "give the Chat Agent the gke server by copying the entry without its "
+        "filter -- a profile the test does not build is a profile it would "
+        "otherwise never read",
+    ),
+    Mutation(
+        "B1-gke-mcp-native-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    url: "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "reach the same server through Hermes' native HTTP transport instead "
+        "of mcp-remote, under a new name -- no argv for a URL match to find",
+    ),
+    Mutation(
+        "B1-gke-mcp-respelt-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp/"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "copy the entry with a trailing slash on the URL -- the same endpoint, "
+        "and not byte-equal to the canonical spelling",
+    ),
+    Mutation(
+        # The platform overlay's copy of the allowlist is redundant with the
+        # shared defaults' one once the two are merged, and Hermes lets
+        # `include` win over `exclude`. Pinned as deliberate: a suite that went
+        # red here would be asserting the source file, not the profile.
+        "B1-gke-mcp-overlay-copy-redundant",
+        "agents/platform/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "invert the platform overlay's copy alone; the merged config still "
+        "carries the shared defaults' allowlist, and include wins",
+        must_survive=True,
+    ),
+    Mutation(
         "B1-slack-remove-allowlist-widened",
         "agents/platform/scripts/credential_proxy.py",
         ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
@@ -660,8 +838,8 @@ Mutation(
     Mutation(
         "C1-gateway-sa-exemption",
         "charts/kube-agents/files/redactor.py",
-        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
-         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        ('r"+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"+@"'),
         "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
         "simplify the e-mail pattern by dropping the service-account exemption; "
         "every IAM principal in a tool result then reaches the model as "
@@ -758,6 +936,24 @@ Mutation(
         ("run: make skills-check", "run: make skills-check || true"),
         "test_C4_upstream_skills_are_pinned_and_verified",
         "keep the step but discard its exit code, so a lock mismatch reports green",
+    ),
+    Mutation(
+        "C4-skills-check-blank-line-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a blank line inside the step, valid YAML that GitHub honours, "
+        "which a reader that stops at the first blank line would miss",
+    ),
+    Mutation(
+        "C4-skills-check-comment-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n      # note\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a comment at the step's own indent; YAML still reads it as a "
+        "key of the step",
     ),
     Mutation(
         "C4-skills-check-skips-lock",
@@ -966,14 +1162,6 @@ Mutation(
          'safe_hint = log_hint if log_hint else "unknown"'),
         "test_D1_a_log_hint_cannot_forge_a_record",
         "log the hint raw, which is the state the sanitiser was added to fix",
-    ),
-    Mutation(
-        "D1-gateway-role-reaches-secrets",
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ('Resources: []string{"pods"},', 'Resources: []string{"pods", "secrets"},'),
-        "test_D1_no_product_role_can_write_the_identity_table",
-        "let the gateway's spawner Role read and write Secrets beside pods, "
-        "which is the shortcut that puts its own identity table in its hands",
     ),
     Mutation(
         "D1-platform-role-reaches-secrets",
@@ -1445,7 +1633,7 @@ Mutation(
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
          "        - namespaceSelector: {}\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "drop the matchLabels from the inject fence's collector peer, the edit "
         "that reads as \"admit Prometheus wherever it runs\" and admits every "
         "pod in every namespace to the gateway's metrics port",
@@ -1454,7 +1642,7 @@ Mutation(
         "C1-a2a-gateway-collector-to-a-door-port",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "point the inject fence's collector rule at the inject door's port, so "
         "the collector's namespace reaches a task-submission endpoint guarded "
         "by its bearer token alone",
@@ -1465,17 +1653,29 @@ Mutation(
         ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
          "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
          "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
-        "add a second rule beside the collector's, admitting every pod in the "
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
+        "add a rule beside the collector's and the operator's, admitting every pod in the "
         "namespace to the A2A door's port: the 'an in-cluster caller needs the "
         "door' edit made without the decision the fence's comment asks for",
+    ),
+    Mutation(
+        "C1-a2a-gateway-operator-peer-without-its-pod-selector",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kubeagents-system\n"
+         "          podSelector:\n            matchLabels:\n              app.kubernetes.io/name: kube-agents-operator\n",
+         "        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kubeagents-system\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
+        "drop the podSelector from the inject fence's operator peer, the edit "
+        "that reads as \"the operator's namespace is ours anyway\" and admits "
+        "every pod in it, the agent's own sandbox included on a single-namespace "
+        "install, to the gateway's metrics port",
     ),
     Mutation(
         "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
         "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
         ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
          "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
-        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
         "move the inject fence's selector to an app.kubernetes.io/name key the "
         "gateway pod carries with another value, the half-done label migration: "
         "the fence still names the Deployment, selects no pod, and the API "
@@ -1776,10 +1976,20 @@ Mutation(
         "then posts as the install's bot for a second principal",
     ),
     Mutation(
+        "A3-bridge-sends-a-slack-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.slack",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the Slack notify subject, "
+        "so a task the bridge runs can make the Slack bot post to the home "
+        "channel without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "
