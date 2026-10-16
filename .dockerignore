@@ -34,12 +34,17 @@ venv/
 **/.terraform/
 **/*.tfstate
 **/*.tfstate.*
-# An install also writes its variables (`terraform.tfvars`) and override files,
-# which name the project, the cluster and the state bucket.
+# An install also writes its variables (`terraform.tfvars`, through a `.tmp`
+# file that an interrupted run can leave) and override files, which name the
+# project, the cluster and the state bucket and can hold secrets.
 **/*.tfvars
 !**/*.tfvars.example
-**/terraform.tfvars.json
+**/*.tfvars.json
+**/*.tfvars.tmp
 **/*_override.tf
+**/*_override.tf.json
+**/override.tf
+**/override.tf.json
 
 # Local configuration files (except tracked default .env)
 .env
