@@ -1100,7 +1100,8 @@ while a pull request now exists that did not before.
 that passes `--scheduled` can get `true`. **An on-demand run is never silent:** a run a person asked
 for — a kanban card naming the stream, or a request straight from chat — does not pass the flag, so
 its `silent_ok` is always false, and it reports its outcome and its ledger URL. Every SOP's close
-section says so.
+section says so. The one limit: an on-demand run that goes through `hermes cron run` (below) uses
+the cron prompt, so it counts as a scheduled run and can be silent.
 
 The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
 `agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do

@@ -404,7 +404,7 @@ One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_ope
 
 What to report in each case:
 
-- `silent_ok: true` → `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the helper commented, closed the ledger issue **as completed**, and closed every open remediation PR for this stream; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which of those happened in one line and give the issue URL.
+- `silent_ok: true` → `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the helper commented, closed the ledger issue **as completed**, and closed every open remediation PR for this stream; on `UPDATED` the ledger was rewritten but nothing moved.
 - `status: "CLEAN"` with `resolved: > 0` → the fleet is fully patched and no longer behind its channel. Report the issue URL and how many findings closed with it. On a patch audit this is the sentence someone has been waiting for, and silence would bury it.
 - `status: "CLEAN"` with `partial: true` → nothing reproduced, but the ledger and its PRs stay open on incomplete coverage. One line reporting the clean result and the `coverage_gaps`, then the issue URL.
 - `status: "HELD"` → zero findings, but the ledger stayed open because the run did not account for findings it was carrying (`start` listed them under `carried`; `unaccounted` names the ones held): one line reporting the clean result, the held ids and the issue URL, then stop. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
