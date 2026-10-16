@@ -376,6 +376,13 @@ bootstrap_install_env() {
   if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
     INSTALL_ENV_RECORDS_GITHUB_APP="true"
   fi
+  # The same for the App's private key path. The file is sourced after the
+  # shell's environment, so GITHUB_PEM_PATH is the file's value when the file
+  # assigns it; when it does not, the value is one the shell exported for this
+  # run, which counts as given, like --github-pem-path.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -473,7 +480,12 @@ PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
 PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 # The private key path install.env records, and whether --github-pem-path gave
 # this run's: on a move of GitHub host the recorded path is the old App's key.
-PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+# Only a path the file records (INSTALL_ENV_RECORDS_GITHUB_PEM_PATH): a path
+# exported in the shell is this run's.
+PARAM_RECORDED_GITHUB_PEM_PATH=""
+if [ "${INSTALL_ENV_RECORDS_GITHUB_PEM_PATH:-false}" = "true" ]; then
+  PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+fi
 PARAM_GITHUB_PEM_PATH_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the

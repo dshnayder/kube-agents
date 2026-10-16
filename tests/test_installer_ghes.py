@@ -812,6 +812,39 @@ class GhesPemPathTest(_Tmp):
         proc = self._validate_move(*moved, "--github-pem-path=/keys/ghe2-app.pem")
         self.assertIn("rc=0 pem=[/keys/ghe2-app.pem]", proc.stdout, proc.stderr + proc.stdout)
 
+    def test_a_path_exported_in_the_shell_is_this_runs_on_a_move(self):
+        # The file records no path (the state after an import), and the
+        # operator exports one for this run: it is given, like the flag, and
+        # the move keeps it.
+        recorded = self._RECORDED.replace("GITHUB_PEM_PATH=/keys/ghes-app.pem\n", "")
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text(recorded)
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "parse_args --gitops-host=ghe2.acme.corp --gitops-org=platform --github-app-id=34 --kms-key=ghe2-key\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc pem=[$PARAM_GITHUB_PEM_PATH]"'
+        )
+        proc = _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITHUB_PEM_PATH": "/keys/ghe2-app.pem"}))
+        self.assertIn("rc=0 pem=[/keys/ghe2-app.pem]", proc.stdout, proc.stderr + proc.stdout)
+        self.assertNotIn("Dropping the recorded GITHUB_PEM_PATH", proc.stdout)
+
+    def test_a_recorded_path_beats_an_export_and_is_still_dropped_on_a_move(self):
+        # The file's value wins over the shell's (the file is sourced last),
+        # so it is the recorded one, and a move drops it.
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text(self._RECORDED)
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "parse_args --gitops-host=ghe2.acme.corp --gitops-org=platform --github-app-id=34 --kms-key=ghe2-key\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc pem=[$PARAM_GITHUB_PEM_PATH]"'
+        )
+        proc = _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITHUB_PEM_PATH": "/keys/other.pem"}))
+        self.assertIn("rc=0 pem=[]", proc.stdout, proc.stderr + proc.stdout)
+
     def test_the_same_host_keeps_the_recorded_path(self):
         proc = self._validate_move()
         self.assertIn("rc=0 pem=[/keys/ghes-app.pem]", proc.stdout, proc.stderr + proc.stdout)
