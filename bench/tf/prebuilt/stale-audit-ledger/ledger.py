@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Open and close the stale ledger of bench/tasks/fleet-audit-clean-close-reads-clean.
+"""Open and close the stale ledger of two fleet-audit cases.
+
+The cases are bench/tasks/fleet-audit-clean-close-reads-clean (mode `seed`) and
+bench/tasks/fleet-audit-on-demand-run-reports (mode `seed-gap`).
 
 main.tf runs this in the shell sandbox as `python3 - <mode> <audit id> [<repo>]`.
 The sandbox is where the audit worker runs `audit_report.py`, so the forge and
@@ -26,6 +29,12 @@ that ledger. A clean run of the stream does not see that cluster, so nothing
 holds the ledger open and the run closes it. Exits 1 when the stream already
 has an open ledger (the harness reset closes it before the run), or when the
 stored record does not pass the check that `finish` makes.
+
+seed-gap: opens one ledger for the stream that a coverage gap opened: no
+finding, the retired cluster checked in full, and a second invented cluster
+under `scope.skipped`. It writes the stored record of that ledger with the gap.
+A clean run with full coverage closes it with nothing new, nothing resolved and
+no gap, which is the run that `finish` calls quiet when it is scheduled.
 
 teardown: closes, as not planned, each open ledger of the stream whose body
 names the invented cluster. Only this case writes that name.
@@ -50,14 +59,25 @@ RETIRED_OBJECT = "Deployment/eval-retired-model-server"
 STALE_CHECK = "model-image-floating-tag"
 STALE_SEVERITY = "minor"
 SEED_STATUS = "OPENED"
+# The cluster the gap ledger's previous run could not read. Invented, as above.
+UNREACHABLE_CLUSTER = "eval-unreachable-cluster"
+UNREACHABLE_REASON = "control plane unreachable"
+GAP_SEED_STATUS = "CLEAN"
 TEARDOWN_REASON = "not-planned"
-MODES = ("seed", "teardown")
+SEED_MODE = "seed"
+SEED_GAP_MODE = "seed-gap"
+TEARDOWN_MODE = "teardown"
+MODES = (SEED_MODE, SEED_GAP_MODE, TEARDOWN_MODE)
 # audit_report's mark on a memory seeded from the ledger, not read from the store.
 SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
 
 
-def stale_document(audit_report, audit_id):
-    """The document of a run that found one finding on the retired cluster."""
+def stale_document(audit_report, audit_id, gap=False):
+    """The document of a run that found one finding on the retired cluster.
+
+    With `gap`, the document of a run that found nothing and could not read
+    `UNREACHABLE_CLUSTER`.
+    """
     checks = [
         {
             "check": check,
@@ -99,9 +119,11 @@ def stale_document(audit_report, audit_id):
                     "checks_run": checks,
                 }
             ],
-            "skipped": [],
+            "skipped": (
+                [{"cluster": UNREACHABLE_CLUSTER, "reason": UNREACHABLE_REASON}] if gap else []
+            ),
         },
-        "findings": [finding],
+        "findings": [] if gap else [finding],
     }
     with tempfile.TemporaryDirectory() as scratch:
         path = Path(scratch) / "findings.json"
@@ -109,8 +131,11 @@ def stale_document(audit_report, audit_id):
         return audit_report.load_findings(str(path), audit_id)
 
 
-def seed(audit_report, audit_id, repo, now):
-    """Open the stale ledger and store its record. Returns the issue URL."""
+def seed(audit_report, audit_id, repo, now, gap=False):
+    """Open the stale ledger and store its record. Returns the issue URL.
+
+    With `gap`, the ledger is one that a coverage gap opened (mode `seed-gap`).
+    """
     number, *_ = audit_report.find_existing_issue(repo, audit_id)
     if number is not None:
         sys.exit(
@@ -118,15 +143,21 @@ def seed(audit_report, audit_id, repo, now):
             "reset closes it before this stack runs; a run over it would not start from "
             "the stale ledger this case grades."
         )
-    data = stale_document(audit_report, audit_id)
+    data = stale_document(audit_report, audit_id, gap=gap)
+    gaps = audit_report.coverage_gaps(data)
     rendered = audit_report.render_issue_body(data, generated_at=now, audit_id=audit_id)
+    title = (
+        audit_report.coverage_issue_title(audit_id, gaps)
+        if gap
+        else audit_report.issue_title(audit_id, data["findings"])
+    )
     audit_report.ensure_labels(repo, audit_id)
     opened = (
         audit_report.forge(
             "issue-create",
             repo,
             {
-                "title": audit_report.issue_title(audit_id, data["findings"]),
+                "title": title,
                 "body": rendered.body,
                 "labels": ["agent:audit", f"audit:{audit_id}"],
             },
@@ -139,12 +170,12 @@ def seed(audit_report, audit_id, repo, now):
         sys.exit(f"ERROR: the forge opened no issue for {audit_id} in {repo}: {opened}")
     ids = audit_report.parse_delta_block(rendered.body)
     payload = {
-        "status": SEED_STATUS,
+        "status": GAP_SEED_STATUS if gap else SEED_STATUS,
         "issue_url": url,
         "new": len(ids),
         "resolved": 0,
-        "partial": False,
-        "coverage_gaps": [],
+        "partial": bool(gaps),
+        "coverage_gaps": gaps,
         "silent_ok": False,
     }
     audit_report.write_report(
@@ -202,8 +233,10 @@ def main(argv):
 
     mode, audit_id = argv[1], argv[2]
     repo = audit_report.resolve_repo(audit_id, argv[3] if len(argv) > 3 else None)
-    if mode == "seed":
-        url = seed(audit_report, audit_id, repo, datetime.now(timezone.utc))
+    if mode in (SEED_MODE, SEED_GAP_MODE):
+        url = seed(
+            audit_report, audit_id, repo, datetime.now(timezone.utc), gap=mode == SEED_GAP_MODE
+        )
         print(f"Opened the stale {audit_id} ledger {url} and stored its record.")
     else:
         closed = teardown(audit_report, audit_id, repo)

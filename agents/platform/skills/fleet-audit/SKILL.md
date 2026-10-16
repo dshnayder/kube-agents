@@ -59,7 +59,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `/opt/data/profiles/platform/governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
   1. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
   2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding. A candidate your document leaves out is not published: `finish` reports it under `unpublished_candidates`, and holds it on the ledger if an earlier run already carried it.
-  3. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
+  3. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`, without `--scheduled`: this run is on demand.
 - **Run `start` first, by its full path, and read the SOP at the full path it prints as `sop`. Do not search for the SOP.** On a kanban card your working directory is the card's own workspace, not the profile home, so a relative path such as `governance/…` or `./skills/…`, or a `search_files`, finds nothing there.
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
@@ -390,8 +390,13 @@ cannot make: write them, and `finish` has nothing else to reject.
   --findings-file <findings_path> \
   [--repo "<owner>/<repo>"] \
   [--manifest-file <path> | --no-collector-manifest "<why>"] \
-  [--decline-fix <finding-id> "<why>" ...]
+  [--decline-fix <finding-id> "<why>" ...] \
+  [--scheduled]
 ```
+
+Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
+and only a scheduled run can get `silent_ok: true` (see [The clean run](#the-clean-run)). Do not
+pass it on a run that a person asked for.
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
 design says what the manifest holds), and on such a stream one of the two is **required**:
@@ -527,7 +532,7 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
   findings or when a maintainer who has checked them closes the ledger.
 
 A partial run with a new or changed gap is never `[SILENT]` — `finish` returns `silent_ok: false`
-for it. A gap that is the same as on the stored previous run does not stop `silent_ok` on its own.
+for it. A gap that is the same as on the last stored scheduled run does not stop `silent_ok` on its own.
 Report the issue URL and say which clusters were not covered. See [The clean run](#the-clean-run)
 for the full rule.
 
@@ -550,7 +555,8 @@ no forge to write a ledger to. The audit runs anyway:
 
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
-`[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
+`[SILENT]`. Otherwise, and on every on-demand run (where `silent_ok` is always `false`), your final
+response is `summary` verbatim. It
 names the most severe findings with the object each one is about, the ids held for the collector,
 the coverage gaps, and that no forge is configured. Do not report the run as
 failed, and do not invent an issue URL.
@@ -1302,9 +1308,9 @@ Two rules follow, and they are the whole rule:
   this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
   [No forge configured](#no-forge-configured)).
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
-  channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card or straight from chat, they are waiting on the answer and
-  `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
+  channel want this?". `finish` returns `true` only when it gets `--scheduled`, and only the cron
+  prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight
+  from chat, do not pass it: `silent_ok` is then always `false`. Report the outcome and the ledger URL.
 
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
 
@@ -1315,8 +1321,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
   that is the same as on the stored previous run was said on the run that got it, and is still in
   the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
-  stored record, every gap counts as new. `finish` cannot tell a scheduled run from an on-demand
-  one, so a gap first seen on an on-demand run is not reported again by the next scheduled run.
+  stored record, every gap counts as new. A scheduled run compares its gaps with the last
+  scheduled run, so a gap first seen on an on-demand run is still reported by the next scheduled run.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a

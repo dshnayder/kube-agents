@@ -953,10 +953,24 @@ class BaseTestCase(unittest.TestCase):
         Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
         return audit_report.write_run_record(audit, repo, list(context))
 
-    def run_finish(self, doc, argv_extra=(), audit=AUDIT):
+    def run_finish(self, doc, argv_extra=(), audit=AUDIT, scheduled=True):
+        """Run `finish` on `doc`.
+
+        `scheduled` is True by default, so `finish` gets `--scheduled`: most
+        tests here check the scheduled verdict, which only a scheduled run
+        can get. A test of an on-demand run gives False.
+        """
         findings_file = self.write_findings(doc)
         return self.run_main(
-            ["finish", "--audit", audit, "--findings-file", findings_file, *argv_extra]
+            [
+                "finish",
+                "--audit",
+                audit,
+                "--findings-file",
+                findings_file,
+                *(["--scheduled"] if scheduled else []),
+                *argv_extra,
+            ]
         )
 
     def git_add_calls(self, recorder):
@@ -2707,6 +2721,31 @@ class TestAuditCatalogue(unittest.TestCase):
             for audit_id in sorted(audit_report.AUDITS)
             if "Run the collector" in (sop_dir / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
         ]
+
+    def test_every_audit_cron_prompt_passes_scheduled_to_finish(self):
+        """Only the cron prompt makes a run scheduled (#1929).
+
+        `finish` gives `silent_ok: true` only with `--scheduled`, and the SOP
+        is the same for a scheduled run and an on-demand run. So the cron
+        prompt is the one place that can say "this run is scheduled". An SOP
+        whose `finish` command carried the flag would make every on-demand
+        run of that stream able to go silent again.
+        """
+        jobs = self.cron_jobs()
+        sop_dir = self.sop_dir()
+        for audit_id, spec in sorted(audit_report.AUDITS.items()):
+            with self.subTest(audit=audit_id):
+                self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
+                self.assertIn(
+                    "pass --scheduled to finish",
+                    jobs[audit_id]["prompt"],
+                    f"the {audit_id} prompt does not make its run scheduled",
+                )
+                self.assertNotIn(
+                    "--scheduled",
+                    (sop_dir / spec.sop).read_text(encoding="utf-8"),
+                    f"{spec.sop} passes --scheduled, so an on-demand run passes it too",
+                )
 
     def test_cron_prompts_name_the_real_collector_invocation(self):
         """A prompt pointing at a renamed or moved collector script is worse
@@ -15863,6 +15902,182 @@ class TestSilentVerdict(HarnessTestCase):
                 )
 
 
+class TestOnDemandRunIsNeverSilent(HarnessTestCase):
+    """Only a run that passes `--scheduled` can get `silent_ok: true` (#1929).
+
+    On 2026-09-23 two on-demand reruns against an unchanged ledger got
+    `silent_ok: true`, and the worker answered `[SILENT]`. The SOP said that
+    an on-demand run is never silent, but the worker followed the flag. So
+    `finish` is vocal by default, and the cron prompt passes `--scheduled`.
+    """
+
+    def finish_json(self, doc, *, scheduled, body_doc=None):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view(
+                {"body": published_body(body_doc or doc, generated_at=NOW)}
+            ),
+        }
+        self.assertEqual(self.run_finish(doc, scheduled=scheduled), 0, self.err)
+        return self.stdout_json()
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def test_the_parser_reads_scheduled_and_its_default_is_false(self):
+        base = ["finish", "--audit", AUDIT, "--findings-file", "f.json"]
+        self.assertFalse(audit_report.build_parser().parse_args(base).scheduled)
+        self.assertTrue(
+            audit_report.build_parser().parse_args([*base, "--scheduled"]).scheduled
+        )
+
+    def test_an_unchanged_clean_run_on_demand_is_not_silent(self):
+        out = self.finish_json(make_doc(findings=[]), scheduled=False)
+        self.assertEqual((out["new"], out["resolved"], out["partial"]), (0, 0, False))
+        self.assertFalse(out["silent_ok"])
+
+    def test_the_same_clean_run_when_scheduled_is_silent(self):
+        out = self.finish_json(make_doc(findings=[]), scheduled=True)
+        self.assertTrue(out["silent_ok"])
+
+    def test_an_unchanged_findings_run_on_demand_is_not_silent(self):
+        # The shape of #1929: a rerun that rewrites the ledger with the same
+        # findings. `major` is below the automatic floor, so no pull request
+        # is opened and nothing else makes the run speak.
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        out = self.finish_json(doc, scheduled=False)
+        self.assertEqual((out["status"], out["new"], out["resolved"]), ("UPDATED", 0, 0))
+        self.assertEqual((out["prs_opened"], out["prs_closed"]), ([], []))
+        self.assertFalse(out["silent_ok"])
+
+    def test_the_same_findings_run_when_scheduled_is_silent(self):
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertTrue(self.finish_json(doc, scheduled=True)["silent_ok"])
+
+    def test_a_clean_run_that_closes_a_gap_ledger_on_demand_is_not_silent(self):
+        # The shape of the eval case fleet-audit-on-demand-run-reports: a
+        # ledger that a coverage gap opened, with no finding, and a run with
+        # full coverage that closes it. Nothing is new or resolved, and a gap
+        # that cleared is not news, so on a scheduled run this is silent.
+        partial = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        gap_doc = make_doc(findings=[], skipped=partial)
+        self.seed_report(
+            published_body(gap_doc, generated_at=NOW),
+            coverage_gaps=audit_report.coverage_gaps(gap_doc),
+            status="CLEAN",
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(findings=[]), scheduled=False), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["status"], out["resolved"], out["partial"]), ("CLEAN", 0, False))
+        self.assertTrue(self.harness.forge_calls("issue-close"))
+        self.assertFalse(out["silent_ok"])
+
+    def test_the_stored_record_says_whether_the_run_was_scheduled(self):
+        self.finish_json(make_doc(findings=[make_finding(fid="a", severity="major")]), scheduled=False)
+        self.assertIs(self.stored()[audit_report.RUN_SCHEDULED_KEY], False)
+        self.finish_json(make_doc(findings=[make_finding(fid="a", severity="major")]), scheduled=True)
+        self.assertIs(self.stored()[audit_report.RUN_SCHEDULED_KEY], True)
+
+
+class TestScheduledCoverageBaseline(HarnessTestCase):
+    """A scheduled run compares its gaps with the last stored scheduled run.
+
+    Before `finish` knew the run kind, it compared with the last stored run
+    of either kind. A gap first seen on an on-demand run went to the person
+    who asked, and the next scheduled run with the same gap was silent, so
+    the channel never got it.
+    """
+
+    PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+
+    def setUp(self):
+        super().setUp()
+        # A previous scheduled run with full coverage and the same finding.
+        self.finding = make_finding(fid="a", severity="major")
+        body = published_body(make_doc(findings=[self.finding]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def finish_partial(self, scheduled):
+        doc = make_doc(findings=[self.finding], skipped=self.PARTIAL)
+        self.assertEqual(self.run_finish(doc, scheduled=scheduled), 0, self.err)
+        return self.stdout_json()
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def test_a_gap_first_seen_on_demand_is_reported_by_the_next_scheduled_run(self):
+        on_demand = self.finish_partial(scheduled=False)
+        self.assertTrue(on_demand["partial"])
+        self.assertFalse(on_demand["silent_ok"])
+        # The on-demand run keeps the scheduled baseline as it was.
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_COVERAGE_GAPS_KEY], [])
+
+        first_scheduled = self.finish_partial(scheduled=True)
+        self.assertEqual((first_scheduled["new"], first_scheduled["resolved"]), (0, 0))
+        self.assertFalse(first_scheduled["silent_ok"])
+        self.assertEqual(
+            self.stored()[audit_report.SCHEDULED_COVERAGE_GAPS_KEY],
+            first_scheduled["coverage_gaps"],
+        )
+
+        # The channel has the gap now, so the same gap is not news again.
+        self.assertTrue(self.finish_partial(scheduled=True)["silent_ok"])
+
+    def test_the_issue_gets_the_partial_all_clear_once_for_both_run_kinds(self):
+        # The channel hears only scheduled runs, but every run comments on the
+        # issue. So the scheduled run after the on-demand run speaks, and it
+        # does not post the same comment on the issue again.
+        self.seed_report(
+            published_body(make_doc(findings=[]), generated_at=NOW),
+            coverage_gaps=[],
+            status="CLEAN",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+            },
+        )
+        clean = make_doc(findings=[], skipped=self.PARTIAL)
+        self.assertEqual(self.run_finish(clean, scheduled=False), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("issue-comment", number=42)), 1)
+        self.assertEqual(self.run_finish(clean, scheduled=True), 0, self.err)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        self.assertEqual(len(self.harness.forge_calls("issue-comment", number=42)), 1)
+        self.assertIn("no partial all-clear comment is posted", self.err)
+
+    def test_scheduled_gaps_baseline_reads_old_and_new_records(self):
+        baseline = audit_report.scheduled_gaps_baseline
+        self.assertIsNone(baseline(None))
+        # A record from before the run kind was stored: its gaps are read as
+        # a scheduled run's.
+        self.assertEqual(baseline({"coverage_gaps": ["a"]}), ["a"])
+        # A record seeded from the ledger lists no gaps.
+        self.assertIsNone(baseline({"status": "CLEAN"}))
+        self.assertEqual(
+            baseline({"scheduled": False, "coverage_gaps": ["b"], "scheduled_coverage_gaps": ["a"]}),
+            ["a"],
+        )
+        self.assertIsNone(
+            baseline({"scheduled": False, "coverage_gaps": ["b"], "scheduled_coverage_gaps": None})
+        )
+
+    def test_coverage_changed_uses_the_scheduled_baseline_only_when_scheduled(self):
+        memory = {"scheduled": False, "coverage_gaps": ["a"], "scheduled_coverage_gaps": []}
+        self.assertFalse(audit_report.coverage_changed(["a"], memory))
+        self.assertTrue(audit_report.coverage_changed(["a"], memory, scheduled=True))
+        memory = {"scheduled": False, "coverage_gaps": ["a"], "scheduled_coverage_gaps": None}
+        self.assertTrue(audit_report.coverage_changed(["a"], memory, scheduled=True))
+
+
 class TestStandingCoverageGap(HarnessTestCase):
     """A coverage gap that did not change since the stored run is not news.
 
@@ -24649,7 +24864,7 @@ class TestReportStore(HarnessTestCase):
         ledger body the recorder serves is only what GitHub would return."""
         findings_file = self.write_findings(doc)
         return BaseTestCase.run_main(
-            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file]
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file, "--scheduled"]
         )
 
     def body_reads(self):
@@ -25516,11 +25731,14 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(code, 0, self.err)
         return self.stdout_json()
 
-    def finish(self, doc):
+    def finish(self, doc, scheduled=True):
         self.start()
         path = audit_report.findings_path_for(AUDIT)
         Path(path).write_text(json.dumps(doc), encoding="utf-8")
-        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path]
+            + (["--scheduled"] if scheduled else [])
+        )
         self.assertEqual(code, 0, self.err)
         return self.stdout_json()
 
@@ -25622,6 +25840,15 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
         self.assertFalse(fixed["silent_ok"])
+
+    def test_an_unchanged_run_on_demand_is_not_silent(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+        unchanged = self.finish(doc, scheduled=False)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        self.assertFalse(unchanged["silent_ok"])
+        latest = json.loads((self.store() / "latest.json").read_text())
+        self.assertIs(latest[audit_report.RUN_SCHEDULED_KEY], False)
 
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
