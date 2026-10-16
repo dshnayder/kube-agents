@@ -396,7 +396,8 @@ cannot make: write them, and `finish` has nothing else to reject.
 
 Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
 and only a scheduled run can get `silent_ok: true` (see [The clean run](#the-clean-run)). Do not
-pass it on a run that a person asked for.
+pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
+carry the same sentence as the shipped jobs in its prompt.
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
 design says what the manifest holds), and on such a stream one of the two is **required**:
@@ -1319,10 +1320,13 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   swallowing this one would leave the operator hearing only bad news.
 - **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
-  that is the same as on the stored previous run was said on the run that got it, and is still in
+  that is the same as on the last stored scheduled run was said on the run that got it, and is still in
   the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
   stored record, every gap counts as new. A scheduled run compares its gaps with the last
   scheduled run, so a gap first seen on an on-demand run is still reported by the next scheduled run.
+- **A scheduled run whose findings are not those of the last scheduled run** — an on-demand run saw
+  a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it:
+  report the issue URL and say that the ledger changed since the last scheduled run.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a

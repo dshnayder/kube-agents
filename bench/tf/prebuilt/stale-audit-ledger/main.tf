@@ -32,8 +32,8 @@
 # devops-bench applies this stack, so each repetition starts from the ledger
 # this stack opens.
 #
-# The cluster, project and object names are invented names only this case
-# uses. The destroy closes each open ledger of the stream whose body names the
+# The cluster, project and object names are invented names that only the two
+# cases of this stack use. The destroy closes each open ledger of the stream whose body names the
 # invented cluster. A ledger that the run closed is already closed.
 
 terraform {

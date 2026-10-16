@@ -76,7 +76,8 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   finds a new or changed coverage gap is never silent even when both counters are zero, because "I
   found nothing" and "I could not look" are different statements and only one of them is
   reassuring (§7.4). A gap that is the same as on the stored previous run does not make the run
-  speak again (§7.4 says why). `silent_ok` is the _scheduled_ verdict: only a run that passes
+  speak again (§7.4 says why); for a scheduled run, the previous run is the last stored scheduled
+  run. `silent_ok` is the _scheduled_ verdict: only a run that passes
   `--scheduled` can get `true`, so an operator-dispatched run always reports (§7.5).
 
 ### Tier 2 — remediation pull requests
@@ -597,10 +598,10 @@ When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_
 `uncorroborated_findings` join the line; they are absent on every other run
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.6).
 
-`publish_s`, `inspect_s` and `collect_s` are timing data in seconds, and nothing decides on them.
-
 The last example, `silent_ok: true`, is possible only on a run that passed `--scheduled` (§7.5).
 Without the flag, `silent_ok` is false on every line.
+
+`publish_s`, `inspect_s` and `collect_s` are timing data in seconds, and nothing decides on them.
 `publish_s` is the time `finish` used to publish. `inspect_s` is the time from `start` to `finish`,
 read from the in-flight note that `start` wrote, and is absent when that note gives no start time.
 Because the note carries no run identity, a run that outlives the lease (or an operator release) and
@@ -1110,18 +1111,24 @@ flag would make every on-demand run of its stream able to go silent. A scheduled
 forgets the flag reports a run that could have been silent. That is noise in the channel, and it
 costs less than an answer that a person never gets.
 
-The rule was first the other way round. `finish` saw a findings document, not the provenance of the
-run, so it returned the scheduled verdict for every run, and the on-demand half of the rule lived
-in the SOPs only. That did not hold (#1929). On 2026-09-23, two on-demand reruns of
-`security-patch-orchestrator` from the chat front door ran against a ledger that already carried
-the same findings. `finish` returned `silent_ok: true`, and the worker answered `[SILENT]`. The
-person who asked got no answer and no ledger URL. The worker followed the flag over the SOP, as on
-2026-08-03 it had followed its own arithmetic over the SOP. A rule that the agent applies correctly
-most of the time is a rule the harness should apply, so `finish` now applies it. The harness cannot
-know that a person is waiting, but the cron prompt knows that no person is, so the default is
-vocal and the scheduled run is the one that says what it is. An earlier attempt made the
-dispatcher pass an `--on-demand` flag instead. Then an on-demand path that forgot the flag went
-silent again, so it was not taken.
+Why the harness and not the SOP: the SOP rule alone does not hold. A worker that reads
+`silent_ok: true` on an on-demand rerun that moved nothing can follow the flag over the SOP and
+answer `[SILENT]`, and then the person who asked gets no answer and no ledger URL. A rule that the
+agent applies correctly most of the time is a rule the harness should apply. The harness cannot
+know that a person is waiting, but the cron prompt knows that no person is. So the default is
+vocal, and the scheduled run is the one that says what it is: an on-demand path that forgets a
+flag then reports, and does not go silent.
+
+The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
+the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
+last scheduled run published (`scheduled_published_ids`: its findings, the postures it withheld,
+and the held ids) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+values there, and an on-demand run copies them from the record before it. A scheduled run whose
+published ids differ from `scheduled_published_ids` is not silent, also when its delta against
+the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
+the channel. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
+that a scheduled run reported (`scheduled_reported_under_gap`). A record written before `finish`
+stored these keys gives no published-id baseline, and the run uses only its delta, as before.
 
 The Platform Agent's `AGENTS.md` adds one more case: "run the `<x>` cron job now" is answered with
 `hermes cron run <job-id>`, which marks the job due for the next `profile-cron-tick` instead of

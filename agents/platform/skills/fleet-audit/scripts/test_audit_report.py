@@ -2723,7 +2723,7 @@ class TestAuditCatalogue(unittest.TestCase):
         ]
 
     def test_every_audit_cron_prompt_passes_scheduled_to_finish(self):
-        """Only the cron prompt makes a run scheduled (#1929).
+        """Only the cron prompt makes a run scheduled.
 
         `finish` gives `silent_ok: true` only with `--scheduled`, and the SOP
         is the same for a scheduled run and an on-demand run. So the cron
@@ -15903,12 +15903,12 @@ class TestSilentVerdict(HarnessTestCase):
 
 
 class TestOnDemandRunIsNeverSilent(HarnessTestCase):
-    """Only a run that passes `--scheduled` can get `silent_ok: true` (#1929).
+    """Only a run that passes `--scheduled` can get `silent_ok: true`.
 
-    On 2026-09-23 two on-demand reruns against an unchanged ledger got
-    `silent_ok: true`, and the worker answered `[SILENT]`. The SOP said that
-    an on-demand run is never silent, but the worker followed the flag. So
-    `finish` is vocal by default, and the cron prompt passes `--scheduled`.
+    An on-demand rerun against an unchanged ledger got `silent_ok: true`, and
+    the worker answered `[SILENT]`. The SOP said that an on-demand run is
+    never silent, but the worker followed the flag. So `finish` is vocal by
+    default, and the cron prompt passes `--scheduled`.
     """
 
     def finish_json(self, doc, *, scheduled, body_doc=None):
@@ -15941,7 +15941,7 @@ class TestOnDemandRunIsNeverSilent(HarnessTestCase):
         self.assertTrue(out["silent_ok"])
 
     def test_an_unchanged_findings_run_on_demand_is_not_silent(self):
-        # The shape of #1929: a rerun that rewrites the ledger with the same
+        # The failing shape: a rerun that rewrites the ledger with the same
         # findings. `major` is below the automatic floor, so no pull request
         # is opened and nothing else makes the run speak.
         doc = make_doc(findings=[make_finding(fid="a", severity="major")])
@@ -16076,6 +16076,84 @@ class TestScheduledCoverageBaseline(HarnessTestCase):
         self.assertTrue(audit_report.coverage_changed(["a"], memory, scheduled=True))
         memory = {"scheduled": False, "coverage_gaps": ["a"], "scheduled_coverage_gaps": None}
         self.assertTrue(audit_report.coverage_changed(["a"], memory, scheduled=True))
+
+
+class TestScheduledFindingsBaseline(HarnessTestCase):
+    """A scheduled run compares its published ids with the last scheduled run.
+
+    The delta compares with the last stored run of either kind. Without this
+    rule, a finding that an on-demand run saw first, new or resolved, went to
+    the person who asked, and the next scheduled run counted 0 new and 0
+    resolved and was silent, so the channel never got it.
+    """
+
+    PARTIAL = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+
+    def setUp(self):
+        super().setUp()
+        # `major` is below the automatic floor, so no pull request opens.
+        self.a = make_finding(fid="a", severity="major")
+        self.c = make_finding(fid="c", severity="major", obj="Namespace/c")
+        body = published_body(make_doc(findings=[self.a, self.c]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def finish(self, findings, *, scheduled, skipped=None):
+        doc = make_doc(findings=findings, skipped=skipped)
+        self.assertEqual(self.run_finish(doc, scheduled=scheduled), 0, self.err)
+        return self.stdout_json()
+
+    def test_an_unchanged_scheduled_run_is_silent(self):
+        self.assertTrue(self.finish([self.a, self.c], scheduled=True)["silent_ok"])
+
+    def test_a_finding_first_seen_on_demand_is_reported_by_the_next_scheduled_run(self):
+        new = make_finding(fid="b", severity="major", obj="Namespace/b")
+        on_demand = self.finish([self.a, self.c, new], scheduled=False)
+        self.assertEqual(on_demand["new"], 1)
+        first = self.finish([self.a, self.c, new], scheduled=True)
+        self.assertEqual((first["new"], first["resolved"]), (0, 0))
+        self.assertFalse(first["silent_ok"])
+        self.assertTrue(self.finish([self.a, self.c, new], scheduled=True)["silent_ok"])
+
+    def test_a_finding_first_resolved_on_demand_is_reported_by_the_next_scheduled_run(self):
+        on_demand = self.finish([self.a], scheduled=False)
+        self.assertEqual(on_demand["resolved"], 1)
+        first = self.finish([self.a], scheduled=True)
+        self.assertEqual((first["new"], first["resolved"]), (0, 0))
+        self.assertFalse(first["silent_ok"])
+        self.assertTrue(self.finish([self.a], scheduled=True)["silent_ok"])
+
+    def test_an_id_first_dropped_under_a_gap_on_demand_is_reported_again_when_scheduled(self):
+        on_demand = self.finish([self.a], scheduled=False, skipped=self.PARTIAL)
+        (dropped,) = on_demand[audit_report.UNREPORTED_UNDER_GAP_KEY]
+        first = self.finish([self.a], scheduled=True, skipped=self.PARTIAL)
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(first[audit_report.UNREPORTED_UNDER_GAP_KEY], [dropped])
+        second = self.finish([self.a], scheduled=True, skipped=self.PARTIAL)
+        self.assertTrue(second["silent_ok"])
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, second)
+
+    def test_a_record_without_the_key_keeps_the_old_rule(self):
+        self.assertIsNone(audit_report.scheduled_published_baseline({"current_ids": ["a"]}))
+        self.assertIsNone(audit_report.scheduled_published_baseline(None))
+        self.assertEqual(
+            audit_report.scheduled_reported_baseline({"reported_under_gap": ["a"]}), {"a"}
+        )
+        self.assertEqual(
+            audit_report.scheduled_reported_baseline(
+                {"scheduled": False, "reported_under_gap": ["a"]}
+            ),
+            set(),
+        )
 
 
 class TestStandingCoverageGap(HarnessTestCase):
@@ -25840,6 +25918,19 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
         self.assertFalse(fixed["silent_ok"])
+
+    def test_a_change_first_seen_on_demand_is_reported_by_the_next_scheduled_run(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        on_demand = self.finish(make_doc(findings=THREE_SEVERITIES[1:]), scheduled=False)
+        self.assertEqual(on_demand["resolved"], 1)
+        latest = json.loads((self.store() / "latest.json").read_text())
+        first = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((first["new"], first["resolved"]), (0, 0))
+        self.assertFalse(first["silent_ok"])
+        # The on-demand run kept the scheduled baselines.
+        self.assertIsNotNone(latest[audit_report.SCHEDULED_PUBLISHED_IDS_KEY])
+        self.assertEqual(latest[audit_report.SCHEDULED_COVERAGE_GAPS_KEY], [])
+        self.assertTrue(self.finish(make_doc(findings=THREE_SEVERITIES[1:]))["silent_ok"])
 
     def test_an_unchanged_run_on_demand_is_not_silent(self):
         doc = make_doc(findings=THREE_SEVERITIES)

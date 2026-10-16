@@ -37,7 +37,7 @@ A clean run with full coverage closes it with nothing new, nothing resolved and
 no gap, which is the run that `finish` calls quiet when it is scheduled.
 
 teardown: closes, as not planned, each open ledger of the stream whose body
-names the invented cluster. Only this case writes that name.
+names the invented cluster. Only the two cases of this stack write that name.
 """
 
 import json

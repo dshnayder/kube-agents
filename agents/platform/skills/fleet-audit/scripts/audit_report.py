@@ -1228,6 +1228,17 @@ RUN_SCHEDULED_KEY = "scheduled"
 # its gaps with the last scheduled run and not with the on-demand run. None
 # when no record shows the gaps of a scheduled run.
 SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
+# On the stored envelope only: the finding ids that the last scheduled run
+# published (its findings, the postures it withheld, and the held ids). Kept
+# and copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
+# published ids are not these speaks, so a finding that an on-demand run saw
+# first, new or resolved, still reaches the channel. None when no record
+# shows them; the run then uses only the delta against the last run.
+SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
+# On the stored envelope only: the ids under `REPORTED_UNDER_GAP_KEY` that a
+# scheduled run reported. A scheduled run does not report these again; an id
+# that only an on-demand run reported is still news to the channel.
+SCHEDULED_REPORTED_UNDER_GAP_KEY = "scheduled_reported_under_gap"
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -2770,6 +2781,8 @@ def report_envelope(
     reported_under_gap: list[str] | None = None,
     scheduled: bool = False,
     scheduled_coverage_gaps: list[str] | None = None,
+    scheduled_published_ids: list[str] | None = None,
+    scheduled_reported_under_gap: list[str] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -2806,6 +2819,9 @@ def report_envelope(
     `scheduled` records whether the run was a scheduled run (`finish
     --scheduled`). `scheduled_coverage_gaps` is the gap list of the last
     scheduled run (`next_scheduled_gaps`), or None when no record shows it.
+    `scheduled_published_ids` is the id set the last scheduled run published
+    (`next_scheduled_value`), or None. `scheduled_reported_under_gap` is the
+    part of `reported_under_gap` that a scheduled run reported.
     """
     return {
         "audit_id": audit_id,
@@ -2830,6 +2846,10 @@ def report_envelope(
         SCHEDULED_COVERAGE_GAPS_KEY: (
             list(scheduled_coverage_gaps) if scheduled_coverage_gaps is not None else None
         ),
+        SCHEDULED_PUBLISHED_IDS_KEY: (
+            sorted(set(scheduled_published_ids)) if scheduled_published_ids is not None else None
+        ),
+        SCHEDULED_REPORTED_UNDER_GAP_KEY: sorted(set(scheduled_reported_under_gap or [])),
         "ledger_held_open": ledger_held_open,
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
@@ -7379,6 +7399,45 @@ def next_scheduled_gaps(
     if scheduled:
         return list(gaps)
     return scheduled_gaps_baseline(memory)
+
+
+def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
+    """The ids the last scheduled run published, as `memory` shows them, or None.
+
+    None for no record and for a record written before `finish` stored this
+    key: a scheduled run then uses only its delta against the last run, which
+    is the rule that applied before.
+    """
+    stored = (memory or {}).get(SCHEDULED_PUBLISHED_IDS_KEY)
+    return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def scheduled_reported_baseline(memory: dict | None) -> set[str]:
+    """The ids under `reported_under_gap` that a scheduled run reported.
+
+    A record written before `finish` knew the run kind has no
+    `SCHEDULED_REPORTED_UNDER_GAP_KEY`, and its `reported_under_gap` is read
+    as a scheduled run's, as `scheduled_gaps_baseline` reads its gaps.
+    """
+    memory = memory or {}
+    if SCHEDULED_REPORTED_UNDER_GAP_KEY in memory:
+        stored = memory.get(SCHEDULED_REPORTED_UNDER_GAP_KEY) or []
+    elif RUN_SCHEDULED_KEY not in memory:
+        stored = memory.get(REPORTED_UNDER_GAP_KEY) or []
+    else:
+        stored = []
+    return {str(fid) for fid in stored}
+
+
+def next_scheduled_value(scheduled: bool, own: Iterable[str], stored: list[str] | None):
+    """What this run stores for a "last scheduled run" key.
+
+    A scheduled run stores its own value. An on-demand run stores the value
+    it read, so it does not change what the next scheduled run compares with.
+    """
+    if scheduled:
+        return sorted(set(own))
+    return stored
 
 
 def coverage_changed(
@@ -16219,10 +16278,10 @@ def handle_remediate(args: argparse.Namespace) -> None:
     )
 
 
-def previous_no_forge_ids(audit_id: str) -> list[str] | None:
-    """The finding ids the previous run with no forge stored; None when unknowable.
+def previous_no_forge_record(audit_id: str) -> dict | None:
+    """The envelope the previous run with no forge stored; None when unknowable.
 
-    `[]` when the store holds no envelope for this key at all: the run is
+    `{}` when the store holds no envelope for this key at all: the run is
     first, and everything it finds is new. There is no public ledger to hold
     the record against, so an envelope is trusted on its own when a run with
     no forge wrote it for this key under this id scheme. `latest.json` first;
@@ -16239,7 +16298,7 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
         pass
     present = [path for path in candidates if path.exists()]
     if not present:
-        return []
+        return {}
     for path in present:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -16252,7 +16311,7 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
             and _ledger_key(envelope.get("repo")) == _ledger_key(NO_FORGE_REPO)
             and envelope.get("id_scheme") == ID_SCHEME
         ):
-            return [str(fid) for fid in ids]
+            return envelope
     log(
         f"WARNING: no report store record for {audit_id} was written by a run with no "
         f"forge under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
@@ -16357,7 +16416,10 @@ def _finish_without_forge(
     unpublished = unpublished_candidates(accounted, manifest)
     wholly_dropped = wholly_unpublished_checks(accounted, manifest)
     current_ids = finding_ids(findings)
-    previous_ids = previous_no_forge_ids(audit_id)
+    record = previous_no_forge_record(audit_id)
+    previous_ids = (
+        None if record is None else [str(fid) for fid in record.get("current_ids") or []]
+    )
     delta_known = previous_ids is not None
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
@@ -16372,6 +16434,12 @@ def _finish_without_forge(
     resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(stored_ids))
     if not delta_known:
         new_ids, resolved_ids = [], []
+    # A scheduled run speaks when its ids are not the last scheduled run's,
+    # so a change that an on-demand run saw first still reaches the channel.
+    scheduled_ids = scheduled_published_baseline(record)
+    ids_moved = (
+        scheduled and scheduled_ids is not None and set(stored_ids) != set(scheduled_ids)
+    )
     payload = {
         "status": NO_FORGE_STATUS,
         "issue_url": None,
@@ -16384,7 +16452,13 @@ def _finish_without_forge(
         # run could vouch for what it saw. Only a scheduled run can be quiet.
         "silent_ok": scheduled
         and not (
-            not delta_known or new_ids or resolved_ids or gaps or unpublished or wholly_dropped
+            not delta_known
+            or new_ids
+            or resolved_ids
+            or ids_moved
+            or gaps
+            or unpublished
+            or wholly_dropped
         ),
         "partial": bool(gaps),
         "coverage_gaps": gaps,
@@ -16419,7 +16493,8 @@ def _finish_without_forge(
             rendered_ids=stored_ids,
             delta_known=delta_known,
             scheduled=scheduled,
-            scheduled_coverage_gaps=gaps if scheduled else None,
+            scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, record),
+            scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),
         ),
         now,
     )
@@ -16492,7 +16567,7 @@ def findings_predate_run(path: str, audit_id: str) -> str | None:
 def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Only a scheduled run can be silent. The cron prompt passes
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
-    # False and the person who asked gets an answer (#1929).
+    # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
     data = load_findings(args.findings_file, audit_id)
     stale_since = findings_predate_run(args.findings_file, audit_id)
@@ -16959,16 +17034,43 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Withheld over a scheme bump, as `resolved` is: the ids on the two sides
     # are spelled differently, so every stored id would look missing.
     published_ids = held_exclude | held_ids
+    # The channel hears only scheduled runs. So a scheduled run compares with
+    # the ids the last scheduled run published, and subtracts only what a
+    # scheduled run reported. A finding that an on-demand run saw first, new,
+    # resolved or dropped under a gap, is then still news to the channel.
+    scheduled_ids = scheduled_published_baseline(memory)
+    scheduled_reported = scheduled_reported_baseline(memory) - published_ids
+    ids_moved = (
+        scheduled
+        and not stale_scheme
+        and scheduled_ids is not None
+        and published_ids != set(scheduled_ids)
+    )
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
     } - published_ids
-    unreported_under_gap = (
-        sorted(set(previous_ids) - published_ids - already_reported)
-        if gaps and not stale_scheme
-        else []
-    )
+    if scheduled:
+        dropped_since = set(previous_ids) | set(scheduled_ids or [])
+        unreported_under_gap = (
+            sorted(dropped_since - published_ids - scheduled_reported)
+            if gaps and not stale_scheme
+            else []
+        )
+    else:
+        unreported_under_gap = (
+            sorted(set(previous_ids) - published_ids - already_reported)
+            if gaps and not stale_scheme
+            else []
+        )
     # What the stored record says this run and earlier runs reported.
     reported_under_gap = sorted(already_reported | set(unreported_under_gap))
+    # The part of it that a scheduled run reported.
+    next_scheduled_reported = (
+        sorted(scheduled_reported | set(unreported_under_gap))
+        if scheduled
+        else sorted(scheduled_reported)
+    )
+    next_scheduled_ids = next_scheduled_value(scheduled, published_ids, scheduled_ids)
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -17448,6 +17550,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "silent_ok": scheduled
             and not (
                 clean_resolved
+                or ids_moved
                 or coverage_moved
                 or unreported_under_gap
                 or prs_closed
@@ -17540,6 +17643,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 reported_under_gap=reported_under_gap,
                 scheduled=scheduled,
                 scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, memory),
+                scheduled_published_ids=next_scheduled_ids,
+                scheduled_reported_under_gap=next_scheduled_reported,
             ),
             now,
             ledger_unchanged=body_untouched,
@@ -17934,10 +18039,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         #
         # This is the *scheduled* verdict, and only a run that passed
         # `--scheduled` can get True. A person who asked for a run is
-        # waiting for an answer. The SOPs said so, but on 2026-09-23 a
-        # worker followed `silent_ok: true` on two on-demand reruns and
-        # answered `[SILENT]` (#1929), so `finish` now says False for
-        # every run without the flag.
+        # waiting for an answer. A worker can follow `silent_ok: true` over
+        # the SOP's on-demand rule, so `finish` says False for every run
+        # without the flag.
         #
         # A lost memory is never silent either. Its delta is withheld, so
         # `new == 0` here means "not known", not "nothing new": the ids this
@@ -17952,6 +18056,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         "silent_ok": scheduled
         and not (
             not delta_known
+            or ids_moved
             or reported_new
             or reported_resolved
             or coverage_moved
@@ -18010,6 +18115,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             reported_under_gap=reported_under_gap,
             scheduled=scheduled,
             scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, memory),
+            scheduled_published_ids=next_scheduled_ids,
+            scheduled_reported_under_gap=next_scheduled_reported,
         ),
         now,
     )

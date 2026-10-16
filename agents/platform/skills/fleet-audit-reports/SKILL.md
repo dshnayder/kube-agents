@@ -22,7 +22,7 @@ configured, the repository directory is `no_forge/local`:
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
-`ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
+`ledger_held_open`, `scheduled`, `scheduled_coverage_gaps`, `scheduled_published_ids`, `scheduled_reported_under_gap`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
 `document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
