@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
-	httpstransport "github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/transport/https"
+	gkehttpstransport "github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/transport/gkehttps"
 )
 
 const (
@@ -128,20 +128,20 @@ func main() {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
 	}
 
-	gcpTokens := httpstransport.NewGCPTokenSource(httpstransport.GCPTokenConfig{
+	gcpTokens := gkehttpstransport.NewGCPTokenSource(gkehttpstransport.GCPTokenConfig{
 		WIFAudience:       os.Getenv("CREDENTIAL_PROXY_WIF_AUDIENCE"),
 		WIFServiceAccount: os.Getenv("CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"),
 		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
 	})
 
-	upstream, err := httpstransport.NewTransport(httpstransport.Config{
+	upstream, err := gkehttpstransport.NewTransport(gkehttpstransport.Config{
 		InClusterServerURL: *kubeAPIServer,
 		InClusterCAFile:    *kubeCAFile,
 		InClusterTokenFile: *kubeTokenFile,
 		TokenProvider:      gcpTokens,
 	})
 	if err != nil {
-		log.Fatalf("failed to initialize upstream HTTPS transport: %v", err)
+		log.Fatalf("failed to initialize upstream gke-https transport: %v", err)
 	}
 
 	metrics := k8sapiproxy.NewMetrics()

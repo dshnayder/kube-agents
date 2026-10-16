@@ -19,7 +19,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Go module                                | [`k8s-api-proxy/go.mod`](../../k8s-api-proxy/go.mod) (`github.com/gke-labs/kube-agents/k8s-api-proxy`)                               |
 | Core HTTP handler and L7 policy          | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
 | Pluggable upstream transport interface   | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
-| HTTPS / GKE upstream transport           | [`k8s-api-proxy/pkg/transport/https/`](../../k8s-api-proxy/pkg/transport/https/)                                                     |
+| GKE HTTPS upstream transport (`gke-https`) | [`k8s-api-proxy/pkg/transport/gkehttps/`](../../k8s-api-proxy/pkg/transport/gkehttps/)                                               |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
 | Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
@@ -51,7 +51,7 @@ Today, `kube-agents` places a Python `argv` shim at `/opt/credential-proxy/bin/k
 - **Canonical Kubernetes API parsing**: `kube-proxy` parses every HTTP request with `k8s.io/apiserver/pkg/endpoints/request.RequestInfoFactory`—the exact code `kube-apiserver` uses to resolve API groups, versions, resources, subresources, and verbs.
 - **Safe `Secret` discovery without payload disclosure**: When `kubectl` reads `v1/secrets`, `kube-proxy` rewrites the request to `PartialObjectMetadata` and redacts `.data`, `.stringData`, and `kubectl.kubernetes.io/last-applied-configuration` on the response. Agents can verify whether a `Secret` exists and inspect its labels and timestamps without ever seeing secret values.
 - **Zero child processes per request**: `kube-proxy` is a stateless Go HTTP reverse proxy. It replaces ~102 MiB per-command child processes with multiplexed HTTP/2 streams.
-- **Reusable library with pluggable transport**: `k8s-api-proxy` separates the pure `http.Handler` policy engine (`pkg/k8sapiproxy`) from the upstream `http.RoundTripper` transport (`pkg/transport/https`). Other sandbox runtimes and managed platforms can import `pkg/k8sapiproxy` directly and supply their own upstream transport.
+- **Reusable library with pluggable transport**: `k8s-api-proxy` separates the pure `http.Handler` policy engine (`pkg/k8sapiproxy`) from the upstream `http.RoundTripper` transport (`pkg/transport/gkehttps`). Other sandbox runtimes and managed platforms can import `pkg/k8sapiproxy` directly and supply their own upstream transport.
 
 ---
 
@@ -89,8 +89,8 @@ Three architectural decisions govern the design:
 
 1. **Enforce policy on the Kubernetes HTTP API wire protocol, not on `kubectl` `argv`.**
    Every `kubectl` command ultimately sends standard Kubernetes REST requests (`/api/v1/...`, `/apis/<group>/<version>/...`) to `kube-apiserver`. Parsing the HTTP method, URL path, and query parameters with `k8s.io/apiserver/pkg/endpoints/request.RequestInfoFactory` eliminates CLI flag-parsing ambiguity and enforces the exact resource, subresource, and verb boundaries that `kube-apiserver` evaluates.
-2. **Separate the core HTTP handler (`pkg/k8sapiproxy`) from the upstream transport (`pkg/transport/https`).**
-   `pkg/k8sapiproxy` is a pure Go `http.Handler` that depends only on the Go standard library, `k8s.io/apimachinery`, and `k8s.io/apiserver`. It accepts an `UpstreamTransport` interface (`RoundTripForCluster(ctx, clusterID, req)`) and knows nothing about how upstream tokens are minted or how cluster endpoints are dialed. For `kube-agents`, `pkg/transport/https` implements `UpstreamTransport` over standard HTTPS using in-cluster `ServiceAccount` credentials and GKE Workload Identity OAuth tokens. Other environments can import `pkg/k8sapiproxy` and plug in custom RPC or Unix-socket transports without modifying the handler.
+2. **Separate the core HTTP handler (`pkg/k8sapiproxy`) from the upstream transport (`pkg/transport/gkehttps`).**
+   `pkg/k8sapiproxy` is a pure Go `http.Handler` that depends only on the Go standard library, `k8s.io/apimachinery`, and `k8s.io/apiserver`. It accepts an `UpstreamTransport` interface (`RoundTripCluster(ctx, clusterID, req)`) and knows nothing about how upstream tokens are minted or how cluster endpoints are dialed. For `kube-agents`, `pkg/transport/gkehttps` (`gke-https`) implements `UpstreamTransport` over HTTPS using GKE control-plane discovery (`container.googleapis.com`), in-cluster `ServiceAccount` credentials, and GKE Workload Identity OAuth tokens. Other environments can import `pkg/k8sapiproxy` and plug in generic kubeconfig transports, custom RPC tunnels, or Unix-socket transports without modifying the handler.
 3. **Keep `k8s-api-proxy` as an independent Go submodule in `gke-labs/kube-agents`.**
    Following the existing pattern of `k8s-operator/go.mod` and `a2a/go.mod`, `k8s-api-proxy/go.mod` defines `module github.com/gke-labs/kube-agents/k8s-api-proxy`. External projects can import `github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy` without pulling in the rest of `kube-agents`, and the repository builds a dedicated `kube-proxy` container image alongside `agent-sandbox` and `credential-proxy`.
 
@@ -106,7 +106,7 @@ k8s-api-proxy/
 ├── go.sum
 ├── cmd/
 │   └── k8s-api-proxy/
-│       └── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/transport/https
+│       └── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/transport/gkehttps
 └── pkg/
     ├── k8sapiproxy/
     │   ├── handler.go            # Core http.Handler: auth -> route -> RequestInfo -> policy -> proxy
@@ -116,8 +116,8 @@ k8s-api-proxy/
     │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   └── transport.go          # UpstreamTransport interface
     └── transport/
-        └── https/
-            ├── transport.go      # HTTPS UpstreamTransport for in-cluster and fleet GKE clusters
+        └── gkehttps/
+            ├── transport.go      # GKE HTTPS UpstreamTransport (gke-https) for in-cluster and fleet GKE clusters
             └── gke_discovery.go  # Resolves gke_<project>_<location>_<cluster> via container.googleapis.com
 ```
 
@@ -181,7 +181,7 @@ type Config struct {
 sequenceDiagram
     participant K as Stock kubectl (in <agent>-shell pod)
     participant P as kube-proxy (pkg/k8sapiproxy)
-    participant T as HTTPS Transport (pkg/transport/https)
+    participant T as GKE HTTPS Transport (pkg/transport/gkehttps)
     participant A as Target kube-apiserver
 
     K->>P: GET /clusters/gke_proj_loc_clu/api/v1/namespaces/default/secrets<br/>Authorization: Bearer <projected-sa-token>
@@ -316,9 +316,9 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
 
-### 9. Pluggable HTTPS transport (`pkg/transport/https`)
+### 9. Pluggable GKE HTTPS transport (`pkg/transport/gkehttps`)
 
-`pkg/transport/https` implements `k8sapiproxy.UpstreamTransport` for `kube-agents`:
+`pkg/transport/gkehttps` (`gke-https`) implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
 
 1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME` when `KUBERNETES_SERVICE_HOST` is used)**:
    - Uses `https://kubernetes.default.svc` with `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` and the proxy pod's GCP OAuth token (or mounted Kubernetes `ServiceAccount` token).

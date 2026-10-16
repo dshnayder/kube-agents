@@ -1,4 +1,4 @@
-package https
+package gkehttps
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Config configures the HTTPS UpstreamTransport.
+// Config configures the GKE HTTPS UpstreamTransport.
 type Config struct {
 	InClusterServerURL  string
 	InClusterCAFile     string
