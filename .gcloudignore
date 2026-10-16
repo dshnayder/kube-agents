@@ -31,6 +31,12 @@ k8s-operator/bin/
 .terraform/
 *.tfstate
 *.tfstate.*
+# An install also writes its variables (`terraform.tfvars`) and override files,
+# which name the project, the cluster and the state bucket.
+*.tfvars
+!*.tfvars.example
+terraform.tfvars.json
+*_override.tf
 
 # Local configuration files (except tracked default .env)
 .env
