@@ -62,7 +62,7 @@ AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
 # list, as the GKE_* variables do.
 # Where the scope answer is written for the collectors, root-owned (step 4).
 SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -635,6 +635,43 @@ if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
   log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
   log "they are not configured, and the version-control verbs cannot reach the"
   log "broker."
+fi
+
+if [ -n "${KUBE_PROXY_URL:-}" ]; then
+  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
+  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
+  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/broker-token/token}"
+  clear_symlinks_under_data "$DATA/.kubeconfig"
+  displace_if_not_a_regular_file "$DATA/.kubeconfig"
+  cat >"$DATA/.kubeconfig" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: ${default_ctx}
+  cluster:
+    server: ${KUBE_PROXY_URL%/}/clusters/${default_ctx}
+    certificate-authority: ${ca_file}
+users:
+- name: kube-proxy-caller
+  user:
+    tokenFile: ${token_file}
+contexts:
+- name: ${default_ctx}
+  context:
+    cluster: ${default_ctx}
+    user: kube-proxy-caller
+current-context: ${default_ctx}
+EOF
+  chown agent:agent "$DATA/.kubeconfig"
+  chmod 0600 "$DATA/.kubeconfig"
+  install -d -m 0755 -o root -g root /home/agent/.kube
+  ln -sf "$DATA/.kubeconfig" /home/agent/.kube/config
+  if id -u hermes >/dev/null 2>&1; then
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.kube
+    cp "$DATA/.kubeconfig" /home/hermes/.kube/config
+    chown hermes:hermes /home/hermes/.kube/config
+    chmod 0600 /home/hermes/.kube/config
+  fi
 fi
 
 log "ready; starting $*"

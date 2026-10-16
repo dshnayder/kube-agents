@@ -791,6 +791,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 11b. Reconcile the Kubernetes API proxy: its TLS Secret, Service, Deployment,
+	// and NetworkPolicy.
+	if err := r.reconcileKubeProxy(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 11e. Refuse an allowlist destination the policy will not render.
 	//
 	// Immediately before the workload, deliberately: an operator who asked for
@@ -2275,6 +2281,10 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+	if err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+		return err
+	}
+
 	// Before the StatefulSet, because an install that predates agentDataStorageSize
 	// has a claim the template can no longer resize.
 	r.growShellSandboxDataClaim(ctx, agent)

@@ -100,6 +100,7 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 		shellSandboxCredentialProxyTokenVolume: true,
 		shellSandboxHermesHomeVolume:           true,
 		gitopsStateVolumeName:                  true,
+		kubeProxyCAVolumeName:                  true,
 	}
 	byName := map[string]corev1.Volume{}
 	for _, v := range pod.Volumes {
@@ -756,10 +757,9 @@ func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
 		t.Errorf("expected ingress only on %d, got %#v", shellSandboxPort, in.Ports)
 	}
 
-	// Egress: DNS and the credential proxy. Anything else reachable from here is
-	// a path out of the sandbox that the incident this design answers used.
-	if len(np.Spec.Egress) != 2 {
-		t.Fatalf("expected exactly two egress rules (DNS, credential proxy), got %d", len(np.Spec.Egress))
+	// Egress: DNS, the credential proxy, and the Kubernetes API proxy.
+	if len(np.Spec.Egress) != 3 {
+		t.Fatalf("expected exactly three egress rules (DNS, credential proxy, kube proxy), got %d", len(np.Spec.Egress))
 	}
 	for i, rule := range np.Spec.Egress {
 		if len(rule.To) == 0 {
@@ -772,6 +772,10 @@ func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
 	proxy := np.Spec.Egress[1]
 	if proxy.Ports[0].Port.IntValue() != credentialProxyPort {
 		t.Errorf("expected the credential proxy port %d, got %#v", credentialProxyPort, proxy.Ports[0].Port)
+	}
+	kubeProxy := np.Spec.Egress[2]
+	if kubeProxy.Ports[0].Port.IntValue() != int(kubeProxyPort) {
+		t.Errorf("expected the kube proxy port %d, got %#v", kubeProxyPort, kubeProxy.Ports[0].Port)
 	}
 }
 

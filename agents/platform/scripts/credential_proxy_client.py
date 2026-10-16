@@ -640,6 +640,210 @@ def implicit_kubectl_context(argv: list[str]) -> str:
     return shell_context() or ""
 
 
+STOCK_KUBECTL_BINARY = Path("/usr/local/bin/kubectl")
+DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/broker-token/token"
+
+
+def build_kube_proxy_kubeconfig(
+    context: str,
+    proxy_url: str | None = None,
+    ca_file: str | None = None,
+    token_file: str | None = None,
+) -> str:
+    """Build a kubeconfig document that routes `context` through `k8s-api-proxy`."""
+    import yaml
+
+    resolved_url = (proxy_url or os.environ.get("KUBE_PROXY_URL", "")).strip().rstrip("/")
+    resolved_ca = (
+        ca_file
+        or os.environ.get("KUBE_PROXY_CA_FILE", "")
+        or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    resolved_token = (
+        token_file
+        or os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    doc = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [
+            {
+                "name": context,
+                "cluster": {
+                    "server": f"{resolved_url}/clusters/{context}",
+                    "certificate-authority": resolved_ca,
+                },
+            }
+        ],
+        "users": [
+            {
+                "name": "kube-proxy-caller",
+                "user": {
+                    "tokenFile": resolved_token,
+                },
+            }
+        ],
+        "contexts": [
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": "kube-proxy-caller",
+                },
+            }
+        ],
+        "current-context": context,
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+def _caller_default_kubeconfig_path() -> Path:
+    """Return the default kubeconfig path for the active sandbox user."""
+    if os.geteuid() == 1001:
+        return Path("/home/hermes/.kube/config")
+    return Path("/opt/data/.kubeconfig")
+
+
+def merge_context_into_default_kubeconfig(context: str) -> None:
+    """Register `context` in the default kubeconfig while preserving `current-context`."""
+    import yaml
+
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    path = _caller_default_kubeconfig_path()
+    try:
+        if not path.is_file() or path.stat().st_uid != os.geteuid():
+            return
+        doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, yaml.YAMLError, RecursionError):
+        return
+    if not isinstance(doc, dict):
+        return
+    ca_file = (
+        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    token_file = (
+        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    clusters = list(doc.get("clusters") or [])
+    clusters = [c for c in clusters if isinstance(c, dict) and c.get("name") != context]
+    clusters.append(
+        {
+            "name": context,
+            "cluster": {
+                "server": f"{proxy_url}/clusters/{context}",
+                "certificate-authority": ca_file,
+            },
+        }
+    )
+    doc["clusters"] = clusters
+    users = list(doc.get("users") or [])
+    users = [
+        u for u in users if isinstance(u, dict) and u.get("name") != "kube-proxy-caller"
+    ]
+    users.append(
+        {
+            "name": "kube-proxy-caller",
+            "user": {"tokenFile": token_file},
+        }
+    )
+    doc["users"] = users
+    contexts = list(doc.get("contexts") or [])
+    contexts = [c for c in contexts if isinstance(c, dict) and c.get("name") != context]
+    contexts.append(
+        {
+            "name": context,
+            "context": {
+                "cluster": context,
+                "user": "kube-proxy-caller",
+            },
+        }
+    )
+    doc["contexts"] = contexts
+    try:
+        _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+    except OSError:
+        pass
+
+
+def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
+    """Rewrite a `get-credentials` kubeconfig to route through `k8s-api-proxy`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip()
+    if not proxy_url:
+        return generated
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return generated
+    merge_context_into_default_kubeconfig(target.context_name)
+    return build_kube_proxy_kubeconfig(target.context_name, proxy_url=proxy_url)
+
+
+def ensure_kubeconfig_uses_kube_proxy(path: Path) -> None:
+    """Upgrade an existing GKE kubeconfig file to route through `k8s-api-proxy`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_KUBECONFIG_BYTES:
+            return
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    context = read_current_context(text)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return
+    expected_server = f"{proxy_url}/clusters/{target.context_name}"
+    if expected_server in text and "kube-proxy-caller" in text:
+        return
+    try:
+        _replace_file(
+            path, build_kube_proxy_kubeconfig(target.context_name, proxy_url=proxy_url)
+        )
+    except OSError:
+        pass
+
+
+def exec_kubectl_via_kube_proxy(argv: list[str]) -> int:
+    """Run stock `kubectl` directly against `k8s-api-proxy`."""
+    rewritten = list(argv)
+    flag_pinned = False
+    for index, argument in enumerate(rewritten):
+        if argument == END_OF_FLAGS:
+            break
+        if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
+            flag_pinned = True
+            ensure_kubeconfig_uses_kube_proxy(Path(rewritten[index + 1]))
+        elif argument.startswith(f"{KUBECONFIG_FLAG}="):
+            flag_pinned = True
+            _, _, value = argument.partition("=")
+            ensure_kubeconfig_uses_kube_proxy(Path(value))
+
+    kubeconfig_env = os.environ.get("KUBECONFIG", "").strip()
+    if kubeconfig_env:
+        for entry in kubeconfig_env.split(os.pathsep):
+            if entry.strip():
+                ensure_kubeconfig_uses_kube_proxy(Path(entry.strip()))
+    elif not flag_pinned:
+        ctx_flag = kubectl_context_flag(rewritten)
+        if ctx_flag is not None:
+            if parse_gke_context(ctx_flag) is not None:
+                merge_context_into_default_kubeconfig(ctx_flag)
+        else:
+            pinned = shell_context()
+            if pinned:
+                merge_context_into_default_kubeconfig(pinned)
+                rewritten = [rewritten[0], f"{CONTEXT_FLAG}={pinned}", *rewritten[1:]]
+
+    os.execv(str(STOCK_KUBECTL_BINARY), [str(STOCK_KUBECTL_BINARY), *rewritten[1:]])
+    return 1
+
+
 def land_implicit_kubeconfig(generated: str) -> None:
     """File a context-less get-credentials' kubeconfig, and say how to use it.
 
@@ -847,6 +1051,8 @@ def execute(
     if payload.get("truncated"):
         print("credential proxy output truncated", file=sys.stderr)
     generated = payload.get("kubeconfig")
+    if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
+        generated = rewrite_kubeconfig_for_kube_proxy(generated)
     if implicit_destination and generated:
         land_implicit_kubeconfig(generated)
     if destination is not None and generated:
@@ -1382,6 +1588,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     invoked_as = os.path.basename(sys.argv[0])
+    if (
+        invoked_as == "kubectl"
+        and os.environ.get("KUBE_PROXY_URL", "").strip()
+        and STOCK_KUBECTL_BINARY.is_file()
+    ):
+        raise SystemExit(exec_kubectl_via_kube_proxy(["kubectl", *sys.argv[1:]]))
     if invoked_as in set(SUPPORTED_EXECUTABLES):
         endpoint = os.getenv("CREDENTIAL_PROXY_URL")
         if endpoint is None:
@@ -1393,6 +1605,12 @@ if __name__ == "__main__":
         args = parse_args()
         endpoint = args.endpoint
         argv = [args.executable, *args.arguments]
+        if (
+            argv[0] == "kubectl"
+            and os.environ.get("KUBE_PROXY_URL", "").strip()
+            and STOCK_KUBECTL_BINARY.is_file()
+        ):
+            raise SystemExit(exec_kubectl_via_kube_proxy(argv))
         stdin = read_stdin_if_requested(argv)
     raise SystemExit(
         execute(

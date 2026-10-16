@@ -14129,5 +14129,60 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
         )
 
 
+class KubeProxyClientTest(unittest.TestCase):
+    """Tests for kubeconfig rewriting and context registration with k8s-api-proxy."""
+
+    CONTEXT = "gke_demo-project_us-central1_cluster-a"
+
+    def test_rewrite_kubeconfig_for_kube_proxy(self):
+        raw = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KUBE_PROXY_URL": "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443",
+                "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+                "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/broker-token/token",
+            },
+            clear=False,
+        ):
+            rewritten = credential_proxy_client.rewrite_kubeconfig_for_kube_proxy(raw)
+
+        self.assertIn(
+            f"server: https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443/clusters/{self.CONTEXT}",
+            rewritten,
+        )
+        self.assertIn(
+            "certificate-authority: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            rewritten,
+        )
+        self.assertIn(
+            "tokenFile: /var/run/secrets/kubeagents/broker-token/token",
+            rewritten,
+        )
+        self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(rewritten))
+
+    def test_ensure_kubeconfig_uses_kube_proxy_upgrades_legacy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "kubeconfig.yaml"
+            kc.write_text(
+                f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+                "clusters:\n- name: old\n  cluster:\n    server: https://10.0.0.1\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                },
+                clear=False,
+            ):
+                credential_proxy_client.ensure_kubeconfig_uses_kube_proxy(kc)
+            updated = kc.read_text(encoding="utf-8")
+            self.assertIn(
+                f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
+                updated,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
