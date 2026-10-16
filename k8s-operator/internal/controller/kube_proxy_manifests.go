@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,6 +30,9 @@ import (
 
 const (
 	kubeProxyPort             int32 = 8443
+	kubeProxyMetricsPort      int32 = 8444
+	kubeProxyMetricsPortName        = "kube-metrics"            // #nosec G101 -- Container port name, not a credential
+	kubeProxyMetricsPortEnv         = "KUBE_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not a credential
 	kubeProxyImageEnvVar            = "KUBE_PROXY_IMAGE"
 	kubeProxyRepositoryName         = "kube-proxy"
 	kubeProxyTLSSecretSuffix        = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
@@ -91,7 +95,17 @@ func buildKubeProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	return svc
 }
 
-func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+func kubeProxyOTelEnvVars(agent *agentv1alpha1.PlatformAgent, endpoint string, disabled bool) []corev1.EnvVar {
+	envs := otelTelemetryEnvVars("platform", agent.Name, agent.Namespace, endpoint, disabled)
+	for i := range envs {
+		if envs[i].Name == "OTEL_SERVICE_NAME" {
+			envs[i].Value = kubeProxyName(agent)
+		}
+	}
+	return envs
+}
+
+func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
 	for k, v := range kubeProxySelector(agent) {
@@ -119,6 +133,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploy
 
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
+		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
 		{Name: "KUBE_PROXY_TLS_CERT_FILE", Value: kubeProxyTLSMountPath + "/tls.crt"},
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
@@ -129,6 +144,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploy
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}
+	envVars = append(envVars, kubeProxyOTelEnvVars(agent, otlpEndpoint, otlpDisabled)...)
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
@@ -182,11 +198,18 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploy
 		Image:           resolveKubeProxyImage(),
 		ImagePullPolicy: pullPolicy,
 		Env:             envVars,
-		Ports: []corev1.ContainerPort{{
-			Name:          "https",
-			ContainerPort: kubeProxyPort,
-			Protocol:      corev1.ProtocolTCP,
-		}},
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          "https",
+				ContainerPort: kubeProxyPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			{
+				Name:          kubeProxyMetricsPortName,
+				ContainerPort: kubeProxyMetricsPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
@@ -269,13 +292,23 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{
-				From: callers,
-				Ports: []networkingv1.NetworkPolicyPort{{
-					Protocol: &tcp,
-					Port:     ptr.To(intstr.FromInt32(kubeProxyPort)),
-				}},
-			}},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: callers,
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: &tcp,
+						Port:     ptr.To(intstr.FromInt32(kubeProxyPort)),
+					}},
+				},
+				{
+					From: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+						},
+					}},
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyMetricsPort)},
+				},
+			},
 		},
 	}
 	withCommonLabels(np, agent)
@@ -387,14 +420,14 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 	return r.Update(ctx, existing)
 }
 
-func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
 	if err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
 		return err
 	}
 
 	objs := []client.Object{
 		buildKubeProxyService(agent),
-		buildKubeProxyDeployment(agent),
+		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled),
 		buildKubeProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {

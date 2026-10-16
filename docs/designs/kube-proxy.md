@@ -331,11 +331,27 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
    - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 5-minute TTL and automatic invalidation on connection failure.
    - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request.
 
-### 10. Deployment topology in `kube-agents`
+### 10. Observability: Prometheus metrics and OpenTelemetry tracing (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`)
+
+`kube-proxy` exposes Prometheus metrics on a dedicated metrics-only HTTP listener (`KUBE_PROXY_METRICS_PORT=8444`, port name `kube-metrics`) and exports OpenTelemetry trace spans via OTLP HTTP:
+
+1. **Prometheus metrics (`/metrics` on port `8444`)**:
+   - All label values come from closed vocabularies so caller-supplied paths or CRD resource names cannot increase series cardinality.
+   - `kubeagents_kube_proxy_requests_total` (`verb`, `resource`, `subresource`, `mode`, `dry_run`, `outcome`, `status_code`): Total Kubernetes API requests processed by `kube-proxy`.
+   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`).
+   - `kubeagents_kube_proxy_secrets_redacted_total` (`action`): Total `core/v1` `Secret` redaction actions (`accept_header_rewritten` and `payload_scrubbed`).
+   - `kubeagents_kube_proxy_request_duration_seconds` (`verb`, `resource`, `outcome`): Histogram of request durations in seconds.
+   - `kubeagents_kube_proxy_in_flight_requests`: Gauge of requests currently in flight.
+   - `process_start_time_seconds`: Gauge of the process start timestamp since the Unix epoch in seconds.
+2. **OpenTelemetry distributed tracing**:
+   - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
+   - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
+
+### 11. Deployment topology in `kube-agents`
 
 The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and ClusterIP Service** alongside `<agent>-credential-proxy` ([`k8s-operator/internal/controller/kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)):
 
-- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` and `<agent>-gateway` pods.
+- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` and `<agent>-gateway` pods, and admits `gmp-system` on port `8444`.
 - **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, and `<agent>-kube-proxy.<namespace>.svc`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
 - **Upstream identity**: `<agent>-kube-proxy` uses the same Workload Identity / Workload Identity Federation configuration as `<agent>-credential-proxy` to authenticate upstream to `kube-apiserver` and `container.googleapis.com`.
 - **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765`. `<agent>-shell` receives `KUBE_PROXY_URL=https://<agent>-kube-proxy:8443` and routes all `kubectl` operations through `<agent>-kube-proxy`.

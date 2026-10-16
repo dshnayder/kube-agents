@@ -1764,3 +1764,47 @@ func TestShellSandboxCarriesTheEventWatcherSwitch(t *testing.T) {
 		})
 	}
 }
+
+func TestKubeProxyObservabilityManifests(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	dep := buildKubeProxyDeployment(agent, "http://otel-collector.observability.svc:4318", false)
+	c := dep.Spec.Template.Spec.Containers[0]
+
+	envs := make(map[string]string, len(c.Env))
+	for _, e := range c.Env {
+		envs[e.Name] = e.Value
+	}
+	if got := envs[kubeProxyMetricsPortEnv]; got != "8444" {
+		t.Errorf("%s = %q, want 8444", kubeProxyMetricsPortEnv, got)
+	}
+	if got := envs["OTEL_SERVICE_NAME"]; got != kubeProxyName(agent) {
+		t.Errorf("OTEL_SERVICE_NAME = %q, want %q", got, kubeProxyName(agent))
+	}
+	if got := envs["OTEL_EXPORTER_OTLP_ENDPOINT"]; got != "http://otel-collector.observability.svc:4318" {
+		t.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT = %q, want custom collector", got)
+	}
+
+	var hasMetricsPort bool
+	for _, p := range c.Ports {
+		if p.Name == kubeProxyMetricsPortName && p.ContainerPort == kubeProxyMetricsPort {
+			hasMetricsPort = true
+		}
+	}
+	if !hasMetricsPort {
+		t.Errorf("expected container port %s=%d on kube-proxy container, got %#v", kubeProxyMetricsPortName, kubeProxyMetricsPort, c.Ports)
+	}
+
+	disabledDep := buildKubeProxyDeployment(agent, "", true)
+	disabledEnvs := make(map[string]string)
+	for _, e := range disabledDep.Spec.Template.Spec.Containers[0].Env {
+		disabledEnvs[e.Name] = e.Value
+	}
+	if got := disabledEnvs["OTEL_SDK_DISABLED"]; got != "true" {
+		t.Errorf("OTEL_SDK_DISABLED = %q, want true when telemetry is disabled", got)
+	}
+
+	np := buildKubeProxyNetworkPolicy(agent)
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 ingress rules on kube-proxy NetworkPolicy (callers + gmp-system), got %d", len(np.Spec.Ingress))
+	}
+}

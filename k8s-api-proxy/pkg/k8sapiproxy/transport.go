@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // CallerIdentity describes an authenticated sandbox caller.
@@ -63,4 +65,6 @@ type Config struct {
 	DefaultClusterID string
 	Mode             Mode
 	RedactSecrets    bool
+	Metrics          *Metrics
+	TracerProvider   trace.TracerProvider
 }

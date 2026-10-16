@@ -15,11 +15,29 @@ import (
 
 var validClusterIDPattern = regexp.MustCompile(`^(in-cluster|gke_[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+|kind-[a-z0-9._-]+)\z`)
 
+// RejectionReason classifies why a request was refused by kube-proxy.
+// Every value comes from a closed vocabulary for Prometheus labels and OpenTelemetry attributes.
+type RejectionReason string
+
+const (
+	ReasonNone                     RejectionReason = ""
+	ReasonUnauthenticated          RejectionReason = "unauthenticated"
+	ReasonProtocolUpgradeBlocked   RejectionReason = "protocol_upgrade_blocked"
+	ReasonInvalidRoute             RejectionReason = "invalid_route"
+	ReasonDiscoveryPathBlocked     RejectionReason = "discovery_path_blocked"
+	ReasonAuthResourceBlocked      RejectionReason = "auth_resource_blocked"
+	ReasonSecretSubresourceBlocked RejectionReason = "secret_subresource_blocked"
+	ReasonSubresourceBlocked       RejectionReason = "subresource_blocked"
+	ReasonDryRunRequired           RejectionReason = "dry_run_required"
+	ReasonVerbBlocked              RejectionReason = "verb_blocked"
+)
+
 // PolicyError represents an HTTP error returned by the proxy policy engine.
 type PolicyError struct {
-	Code    int
-	Reason  metav1.StatusReason
-	Message string
+	Code            int
+	Reason          metav1.StatusReason
+	RejectionReason RejectionReason
+	Message         string
 }
 
 func (e *PolicyError) Error() string {
@@ -61,9 +79,10 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 func NormalizeAndExtractCluster(rawPath, urlPath, defaultClusterID string) (string, string, *PolicyError) {
 	if urlPath == "" || !strings.HasPrefix(urlPath, "/") {
 		return "", "", &PolicyError{
-			Code:    http.StatusBadRequest,
-			Reason:  metav1.StatusReasonBadRequest,
-			Message: "kube-proxy rejected request: path must start with '/'",
+			Code:            http.StatusBadRequest,
+			Reason:          metav1.StatusReasonBadRequest,
+			RejectionReason: ReasonInvalidRoute,
+			Message:         "kube-proxy rejected request: path must start with '/'",
 		}
 	}
 
@@ -74,16 +93,18 @@ func NormalizeAndExtractCluster(rawPath, urlPath, defaultClusterID string) (stri
 		lower := strings.ToLower(candidate)
 		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%2e") || strings.Contains(lower, "%00") || strings.Contains(candidate, `\`) {
 			return "", "", &PolicyError{
-				Code:    http.StatusBadRequest,
-				Reason:  metav1.StatusReasonBadRequest,
-				Message: "kube-proxy rejected request: percent-encoded path separators or dot segments are not permitted",
+				Code:            http.StatusBadRequest,
+				Reason:          metav1.StatusReasonBadRequest,
+				RejectionReason: ReasonInvalidRoute,
+				Message:         "kube-proxy rejected request: percent-encoded path separators or dot segments are not permitted",
 			}
 		}
 		if strings.Contains(candidate, "//") {
 			return "", "", &PolicyError{
-				Code:    http.StatusBadRequest,
-				Reason:  metav1.StatusReasonBadRequest,
-				Message: "kube-proxy rejected request: empty path segments ('//') are not permitted",
+				Code:            http.StatusBadRequest,
+				Reason:          metav1.StatusReasonBadRequest,
+				RejectionReason: ReasonInvalidRoute,
+				Message:         "kube-proxy rejected request: empty path segments ('//') are not permitted",
 			}
 		}
 	}
@@ -94,9 +115,10 @@ func NormalizeAndExtractCluster(rawPath, urlPath, defaultClusterID string) (stri
 		for _, seg := range segments {
 			if seg == "." || seg == ".." {
 				return "", "", &PolicyError{
-					Code:    http.StatusBadRequest,
-					Reason:  metav1.StatusReasonBadRequest,
-					Message: "kube-proxy rejected request: relative dot segments ('.' or '..') are not permitted",
+					Code:            http.StatusBadRequest,
+					Reason:          metav1.StatusReasonBadRequest,
+					RejectionReason: ReasonInvalidRoute,
+					Message:         "kube-proxy rejected request: relative dot segments ('.' or '..') are not permitted",
 				}
 			}
 		}
@@ -104,17 +126,19 @@ func NormalizeAndExtractCluster(rawPath, urlPath, defaultClusterID string) (stri
 		if segments[0] == "clusters" {
 			if len(segments) < 2 || segments[1] == "" {
 				return "", "", &PolicyError{
-					Code:    http.StatusBadRequest,
-					Reason:  metav1.StatusReasonBadRequest,
-					Message: "kube-proxy rejected request: missing cluster ID after /clusters/",
+					Code:            http.StatusBadRequest,
+					Reason:          metav1.StatusReasonBadRequest,
+					RejectionReason: ReasonInvalidRoute,
+					Message:         "kube-proxy rejected request: missing cluster ID after /clusters/",
 				}
 			}
 			clusterID := segments[1]
 			if !validClusterIDPattern.MatchString(clusterID) {
 				return "", "", &PolicyError{
-					Code:    http.StatusBadRequest,
-					Reason:  metav1.StatusReasonBadRequest,
-					Message: fmt.Sprintf("kube-proxy rejected request: invalid cluster ID %q", clusterID),
+					Code:            http.StatusBadRequest,
+					Reason:          metav1.StatusReasonBadRequest,
+					RejectionReason: ReasonInvalidRoute,
+					Message:         fmt.Sprintf("kube-proxy rejected request: invalid cluster ID %q", clusterID),
 				}
 			}
 			remaining := "/" + strings.Join(segments[2:], "/")
@@ -160,18 +184,20 @@ func IsCoreV1Secret(info *request.RequestInfo) bool {
 func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *request.RequestInfo) *PolicyError {
 	if HasUpgradeHeader(r) {
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: "kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonProtocolUpgradeBlocked,
+			Message:         "kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
 		}
 	}
 
 	if !info.IsResourceRequest {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			return &PolicyError{
-				Code:    http.StatusForbidden,
-				Reason:  metav1.StatusReasonForbidden,
-				Message: fmt.Sprintf("kube-proxy policy blocked HTTP method %q on non-resource path %q: only GET and HEAD are permitted on discovery paths. This is a permission boundary, not an error to work around.", r.Method, info.Path),
+				Code:            http.StatusForbidden,
+				Reason:          metav1.StatusReasonForbidden,
+				RejectionReason: ReasonDiscoveryPathBlocked,
+				Message:         fmt.Sprintf("kube-proxy policy blocked HTTP method %q on non-resource path %q: only GET and HEAD are permitted on discovery paths. This is a permission boundary, not an error to work around.", r.Method, info.Path),
 			}
 		}
 		if _, ok := allowedDiscoveryPaths[info.Path]; ok {
@@ -181,34 +207,38 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 			return nil
 		}
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked non-resource path %q: only standard Kubernetes discovery and health paths are permitted. This is a permission boundary, not an error to work around.", info.Path),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonDiscoveryPathBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked non-resource path %q: only standard Kubernetes discovery and health paths are permitted. This is a permission boundary, not an error to work around.", info.Path),
 		}
 	}
 
 	if isBlockedAuthResource(info) {
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked resource %q in group %q: authentication and authorization review APIs are not permitted. This is a permission boundary, not an error to work around.", info.Resource, info.APIGroup),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonAuthResourceBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked resource %q in group %q: authentication and authorization review APIs are not permitted. This is a permission boundary, not an error to work around.", info.Resource, info.APIGroup),
 		}
 	}
 
 	if redactSecrets && IsCoreV1Secret(info) && info.Subresource != "" {
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked subresource %q on secrets: Secret subresources are not permitted. This is a permission boundary, not an error to work around.", info.Subresource),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonSecretSubresourceBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked subresource %q on secrets: Secret subresources are not permitted. This is a permission boundary, not an error to work around.", info.Subresource),
 		}
 	}
 
 	if info.Subresource != "" {
 		if _, blocked := blockedSubresources[info.Subresource]; blocked {
 			return &PolicyError{
-				Code:    http.StatusForbidden,
-				Reason:  metav1.StatusReasonForbidden,
-				Message: fmt.Sprintf("kube-proxy policy blocked subresource %q on resource %q: this subresource is not permitted. This is a permission boundary, not an error to work around.", info.Subresource, info.Resource),
+				Code:            http.StatusForbidden,
+				Reason:          metav1.StatusReasonForbidden,
+				RejectionReason: ReasonSubresourceBlocked,
+				Message:         fmt.Sprintf("kube-proxy policy blocked subresource %q on resource %q: this subresource is not permitted. This is a permission boundary, not an error to work around.", info.Subresource, info.Resource),
 			}
 		}
 		if err := evaluateSubresourceByMode(mode, r, info); err != nil {
@@ -222,9 +252,10 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 			return nil
 		}
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonVerbBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
 		}
 
 	case "", ModeReadOnlyWithDryRun:
@@ -232,20 +263,22 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 			return nil
 		}
 		if info.Verb == "create" || info.Verb == "update" || info.Verb == "patch" {
-			if hasStrictDryRunAll(r) {
+			if HasStrictDryRunAll(r) {
 				enforceDryRunQuery(r)
 				return nil
 			}
 			return &PolicyError{
-				Code:    http.StatusForbidden,
-				Reason:  metav1.StatusReasonForbidden,
-				Message: fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access (pass --dry-run=server for non-persisted validation). This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+				Code:            http.StatusForbidden,
+				Reason:          metav1.StatusReasonForbidden,
+				RejectionReason: ReasonDryRunRequired,
+				Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access (pass --dry-run=server for non-persisted validation). This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
 			}
 		}
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonVerbBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
 		}
 
 	case ModeReadWrite:
@@ -254,17 +287,19 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 			return nil
 		default:
 			return &PolicyError{
-				Code:    http.StatusForbidden,
-				Reason:  metav1.StatusReasonForbidden,
-				Message: fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: verb is not permitted. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+				Code:            http.StatusForbidden,
+				Reason:          metav1.StatusReasonForbidden,
+				RejectionReason: ReasonVerbBlocked,
+				Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: verb is not permitted. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
 			}
 		}
 
 	default:
 		return &PolicyError{
-			Code:    http.StatusForbidden,
-			Reason:  metav1.StatusReasonForbidden,
-			Message: fmt.Sprintf("kube-proxy policy blocked request: unknown proxy mode %q", mode),
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonVerbBlocked,
+			Message:         fmt.Sprintf("kube-proxy policy blocked request: unknown proxy mode %q", mode),
 		}
 	}
 }
@@ -285,7 +320,7 @@ func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.Request
 		if info.Verb == "get" {
 			return nil
 		}
-		if (mode == "" || mode == ModeReadOnlyWithDryRun) && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") && hasStrictDryRunAll(r) {
+		if (mode == "" || mode == ModeReadOnlyWithDryRun) && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") && HasStrictDryRunAll(r) {
 			return nil
 		}
 		if mode == ModeReadWrite && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") {
@@ -301,13 +336,15 @@ func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.Request
 		}
 	}
 	return &PolicyError{
-		Code:    http.StatusForbidden,
-		Reason:  metav1.StatusReasonForbidden,
-		Message: fmt.Sprintf("kube-proxy policy blocked verb %q on subresource \"%s/%s\": this subresource operation is not permitted. This is a permission boundary, not an error to work around.", info.Verb, info.Resource, info.Subresource),
+		Code:            http.StatusForbidden,
+		Reason:          metav1.StatusReasonForbidden,
+		RejectionReason: ReasonSubresourceBlocked,
+		Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on subresource \"%s/%s\": this subresource operation is not permitted. This is a permission boundary, not an error to work around.", info.Verb, info.Resource, info.Subresource),
 	}
 }
 
-func hasStrictDryRunAll(r *http.Request) bool {
+// HasStrictDryRunAll returns true when the request query string strictly specifies dryRun=All.
+func HasStrictDryRunAll(r *http.Request) bool {
 	if r == nil || r.URL == nil {
 		return false
 	}

@@ -110,4 +110,26 @@ spec:
     - port: 9096
       path: /metrics
       interval: 30s
+---
+{{- /*
+The Kubernetes API proxy's metrics-only listener (kubeProxyMetricsPort in the
+operator): Kubernetes API requests, rejected requests by reason, Secret
+redaction counts, and request latency histograms.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-kube-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  endpoints:
+    - port: 8444
+      path: /metrics
+      interval: 30s
 {{- end }}
