@@ -15335,6 +15335,42 @@ class TestCarryUnchangedFindings(unittest.TestCase):
             )
             audit_report.degrade_missing_remediations([finding], Path(tmp))
         self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+        # Each note of the Kustomize pass, whichever reason it gives.
+        for name, probe in self.kustomize_probes().items():
+            with self.subTest(kustomize=name):
+                finding = self.before(
+                    remediation={"kind": "manifest", "path": "apps/web/pdb.yaml", "note": "n"}
+                )
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(len(audit_report.degrade_unlisted_kustomize_additions([finding], probe)), 1)
+                self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]), finding["remediation"])
+
+    def kustomize_probes(self):
+        """A probe for each reason the Kustomize pass gives, with no git and no broker."""
+
+        class Probe(audit_report._WorkingTreeProbe):
+            def __init__(self, committed, text, unanswered=""):
+                super().__init__("acme/fleet", Path("."))
+                self._answers, self._text, self._why = committed, text, unanswered
+
+            def committed(self, path):
+                self.unanswered = self._why if self._why and path.endswith("pdb.yaml") else ""
+                if self._why == "all":
+                    self.unanswered = "no answer"
+                    return True
+                return self._answers.get(path, False)
+
+            def read_committed(self, path):
+                self.unanswered = "" if self._text is not None else "cannot read"
+                return self._text
+
+        root = {"apps/web/kustomization.yaml": True}
+        return {
+            "unlisted": Probe(root, "resources: []\n"),
+            "unread": Probe(root, None),
+            "unseen": Probe({}, None, "all"),
+            "new file unchecked": Probe(root, "resources: []\n", "listing failed"),
+        }
 
     def test_a_carried_gcloud_note_is_normalised(self):
         stale = self.before(
@@ -24273,10 +24309,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     The clean-over-a-gap run's JSON line now carries `unreported_under_gap`: the
     previous ledger listed a finding and this run, with a gap, does not publish it.
     The Kustomize pass is recorded
-    the same way: for each `manifest` fix, `finish` asks git in one `ls-tree`
-    if the file and each possible kustomization are at the audited commit.
-    That adds two git calls to the findings transcript, one for each of its
-    `manifest` fixes. Nothing else moved.
+    the same way: `finish` asks git in one `ls-tree` a run if each
+    `manifest` fix's file and each possible kustomization for it are at the
+    audited commit. That adds one git call to the findings transcript.
+    Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every
@@ -25419,7 +25455,7 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         workspace.read_text = mock.MagicMock(side_effect=RuntimeError("e" * 2500))
         self.assertEqual(self.degrade_via_workspace(workspace, [finding]), ["pdb-fix"])
         note = finding["remediation"]["note"]
-        self.assertIn("could not check", note)
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
         self.assertNotIn("```", note)
         self.assert_fence_survives_the_clip(note)
 
@@ -25485,6 +25521,30 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         session.__enter__.return_value = Lost(self.overlay())
         with self.assertRaises(audit_report.BrokerUnavailable):
             self.degrade_with_open(lambda *_a, **_k: session)
+
+    def test_a_retried_open_that_succeeds_clears_the_outage(self):
+        """The Config Connector scan opens the probe twice when the first open
+        fails; a second open that succeeds answers for the first."""
+        import urllib.error
+
+        session = mock.MagicMock()
+        session.__enter__.return_value = FakeBrokerWorkspace(self.overlay())
+        attempts = iter([urllib.error.URLError("[Errno 111] Connection refused"), session])
+
+        def flapping(*_args, **_kwargs):
+            answer = next(attempts)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(self.PDB)
+        with patch.object(credential_proxy_client.Workspace, "open", flapping), contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNotNone(probe.broker() or probe.broker())
+            self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        self.assertIn("does not list it", finding["remediation"]["note"])
 
     def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
@@ -25606,9 +25666,40 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
         note = finding["remediation"]["note"]
-        self.assertIn(f"could not check whether `{self.KUSTOMIZATION}` lists the file", note)
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}` to check whether it lists the file", note)
         self.assertIn("exit 128", note)
         self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_a_kustomization_this_process_cannot_decode_degrades_and_says_so(self):
+        """`git show` decodes strictly, so a Latin-1 byte in the kustomization
+        raised `UnicodeDecodeError` and ended `finish` FATAL."""
+        root = self.clone({**self.overlay(), self.KUSTOMIZATION: "resources: []\n"})
+        (root / self.KUSTOMIZATION).write_bytes("# caf\u00e9\nresources:\n- deployment.yaml\n".encode("latin-1"))
+        subprocess.run(["git", "commit", "-qam", "latin-1"], cwd=root, check=True, capture_output=True)
+        self.write(root, self.PDB)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
+        self.assertIn("UnicodeDecodeError", note)
+
+    def test_one_git_listing_answers_every_fix(self):
+        """One `ls-tree` a run, not one a fix."""
+        root = self.clone(self.overlay())
+        other = "clusters/prod/apps/web/web-pdb.yaml"
+        self.write(root, self.PDB)
+        self.write(root, other)
+        calls = []
+        real = audit_report.git
+
+        def counting(args, **kwargs):
+            calls.append(list(args))
+            return real(args, **kwargs)
+
+        self.patch_attr("git", counting)
+        findings = [kustomize_fix(self.PDB, fid="a"), kustomize_fix(other, fid="b")]
+        self.assertEqual(self.degrade(root, findings), ["a"])
+        self.assertEqual(len([c for c in calls if "ls-tree" in c]), 1)
 
     def test_a_failed_git_listing_degrades_and_says_so(self):
         root = self.clone(self.overlay())
@@ -25700,7 +25791,7 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], fail={self.KUSTOMIZATION}), ["pdb-fix"])
         note = finding["remediation"]["note"]
-        self.assertIn("could not check", note)
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
         self.assertIn(f"cannot read {self.KUSTOMIZATION}", note)
 
     def test_content_mode_degrades_when_the_listing_of_the_file_fails(self):
@@ -25708,7 +25799,13 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         list it, so the fix degrades with the reason."""
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], list_fails={self.PDB}), ["pdb-fix"])
-        self.assertIn("listing failed", finding["remediation"]["note"])
+        note = finding["remediation"]["note"]
+        self.assertIn("listing failed", note)
+        # The kustomization was read; only whether the file is new is open,
+        # and the note says so rather than that the kustomization was unread.
+        self.assertIn(f"could not check whether `{self.PDB}` is already in the repository", note)
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it.", note)
+        self.assertNotIn("could not read", note)
 
     def test_content_mode_keeps_a_file_outside_any_root(self):
         finding = kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")

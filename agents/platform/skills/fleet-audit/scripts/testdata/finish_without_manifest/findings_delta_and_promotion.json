@@ -73,17 +73,7 @@
    "clusters/Kustomization",
    "kustomization.yaml",
    "kustomization.yml",
-   "Kustomization"
-  ],
-  [
-   "git",
-   "--literal-pathspecs",
-   "ls-tree",
-   "-z",
-   "--full-tree",
-   "--name-only",
-   "HEAD",
-   "--",
+   "Kustomization",
    "clusters/stage-eu/psp.yaml",
    "clusters/stage-eu/kustomization.yaml",
    "clusters/stage-eu/kustomization.yml",
@@ -206,7 +196,6 @@
   null,
   null,
   "<TMP>/gitops/compliance-audit/acme__fleet",
-  "<TMP>/gitops/compliance-audit/acme__fleet",
   null,
   null,
   null,
@@ -275,7 +264,6 @@
    "name": "severity:minor",
    "repository": "acme/fleet"
   },
-  null,
   null,
   {
    "labels": [

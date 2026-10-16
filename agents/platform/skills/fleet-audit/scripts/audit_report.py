@@ -1434,6 +1434,8 @@ DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run t
 # The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
 # fix that Config Connector reverts.
 KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
+# The sentence every note of `degrade_unlisted_kustomize_additions` holds.
+KUSTOMIZE_NOTE_MARK = "A new file in a Kustomize root renders only if its kustomization lists it."
 # Text that `finish` itself writes into a remediation note. A note that holds
 # one of these is not the worker's wording, and `carry_unchanged_findings`
 # does not copy it: the pass that wrote it runs again on each run and writes
@@ -1443,6 +1445,7 @@ HARNESS_NOTE_MARKS = (
     DECLINED_FIX_NOTE.split("{", 1)[0],
     DEGRADED_REMEDIATION_TAIL,
     KCC_REVERTED_NOTE_MARK,
+    KUSTOMIZE_NOTE_MARK,
 )
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
@@ -13456,7 +13459,15 @@ def _broker_outage(exc: BaseException) -> bool:
 
     True for no answer at all (`broker_lost`), and for a server error or a
     too-many-requests status anywhere in the cause chain. False for any
-    other status, which is the broker refusing the question."""
+    other status, which is the broker refusing the question.
+
+    This differs from `broker_lost` on purpose, and only the Kustomize pass
+    uses it. `broker_lost` reads every HTTP status as an answer, which is
+    right where one refused call costs one finding. Here a refused answer
+    degrades the fix, and the probe asks the same broker for every fix in
+    the run: a transient 503 or 429 read as a refusal turns every `manifest`
+    fix in the run `manual`, also in a repository with no kustomization. So
+    these statuses stop the command, and the worker runs it again."""
     try:
         if broker_lost(exc):
             return True
@@ -13527,6 +13538,8 @@ class _RepositoryProbe:
 
                 self._session = credential_proxy_client.Workspace.open(proxy_endpoint(), self.repo)
                 self._workspace = self._session.__enter__()
+                # A retry that opened answers for the failed open before it.
+                self.outage = None
             except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
                 self.unavailable = f"{type(exc).__name__}: {exc}"
                 self.note_outage(exc)
@@ -13612,11 +13625,17 @@ class _RepositoryProbe:
             return
         # `--full-tree` makes the paths relative to the top of the clone,
         # wherever the process stands; literal, so no path is read as a glob.
-        listed = git(
-            ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", "--name-only", AUDITED_REF, "--", *wanted],
-            check=False,
-            cwd=self.root,
-        )
+        try:
+            listed = git(
+                ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", "--name-only", AUDITED_REF, "--", *wanted],
+                check=False,
+                cwd=self.root,
+            )
+        except UnicodeDecodeError as exc:
+            # A name this process cannot decode leaves every path unanswered.
+            for path in wanted:
+                self._committed[path] = (True, f"git ls-tree: {type(exc).__name__}: {exc}")
+            return
         # `-z`: names end in NUL and are not quoted, so a non-ASCII path matches.
         found = set((listed.stdout or "").split("\0"))
         why = f"git ls-tree: exit {listed.returncode}" if listed.returncode != 0 else ""
@@ -13632,7 +13651,13 @@ class _RepositoryProbe:
         the broker session. On None, `unanswered` says why."""
         self.unanswered = ""
         if not content_mode():
-            shown = git(["show", f"{AUDITED_REF}:{path}"], check=False, cwd=self.root)
+            try:
+                shown = git(["show", f"{AUDITED_REF}:{path}"], check=False, cwd=self.root)
+            except UnicodeDecodeError as exc:
+                # Text this process cannot decode is an unread file, as for a
+                # failed call: the fix degrades with the reason.
+                self.unanswered = f"git show {AUDITED_REF}:{path}: {type(exc).__name__}: {exc}"
+                return None
             if shown.returncode != 0:
                 self.unanswered = f"git show {AUDITED_REF}:{path}: exit {shown.returncode}"
                 return None
@@ -14255,17 +14280,21 @@ def degrade_unlisted_kustomize_additions(
     is a readable file inside the repository. Returns the degraded ids.
     """
     degraded: list[str] = []
+    # One question to git for every fix's file and every place a
+    # kustomization can be for it, in directory mode: one call a run.
+    asked: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") == "manifest" and remediation.get("path"):
+            path = PurePosixPath(str(remediation["path"]))
+            asked += [str(path)] + [str(parent / marker) for parent in path.parents for marker in KUSTOMIZATION_FILE_NAMES]
+    probe.ask_committed(asked)
     for finding in findings:
         remediation = finding.get("remediation") or {}
         raw = str(remediation.get("path") or "")
         if remediation.get("kind") != "manifest" or not raw:
             continue
         path = PurePosixPath(raw)
-        # One question to git for the file and every place a kustomization
-        # can be, in directory mode.
-        probe.ask_committed(
-            [str(path)] + [str(parent / marker) for parent in path.parents for marker in KUSTOMIZATION_FILE_NAMES]
-        )
         committed = probe.committed(str(path))
         probe.raise_if_lost(f"checking whether a kustomization lists {path}")
         if committed and not probe.unanswered:
@@ -14286,30 +14315,37 @@ def degrade_unlisted_kustomize_additions(
         if listed:
             continue
         line = f"`- {entry}`"
-        # A kustomization that was read is there, so only these two are open.
-        why = unread or unchecked_new
         if unseen:
             # The probe saw no kustomization, so the note names none.
             reason = (
                 f"could not check whether the directory of `{path}` is under a "
-                f"kustomization ({unseen}). A new file in a Kustomize root renders "
-                "only if its kustomization lists it. If its directory or a parent "
-                "directory holds a kustomization, make sure that `resources:` there "
-                "lists the file, then apply the recommendation above by hand"
+                f"kustomization ({unseen}). {KUSTOMIZE_NOTE_MARK} If its directory or "
+                "a parent directory holds a kustomization, make sure that `resources:` "
+                "there lists the file, then apply the recommendation above by hand"
             )
-        elif why:
+        elif unread:
             reason = (
-                f"could not check whether `{kustomization}` lists the file `{path}` ({why}). "
-                f"A new file in a Kustomize root renders only if its kustomization lists it. "
-                f"Make sure that `resources:` in `{kustomization}` has the line {line}, "
-                "then apply the recommendation above by hand"
+                f"could not read `{kustomization}` to check whether it lists the file "
+                f"`{path}` ({unread}). {KUSTOMIZE_NOTE_MARK} Make sure that `resources:` "
+                f"in `{kustomization}` has the line {line}, then apply the "
+                "recommendation above by hand"
+            )
+        elif unchecked_new:
+            # The kustomization was read and does not list the file; only
+            # whether the file is new is open.
+            reason = (
+                f"could not check whether `{path}` is already in the repository "
+                f"({unchecked_new}). `{kustomization}` does not list it. "
+                f"{KUSTOMIZE_NOTE_MARK} If the file is new, add it and add the line "
+                f"{line} under `resources:` in `{kustomization}`, then apply the "
+                "recommendation above by hand"
             )
         else:
             reason = (
                 f"did not open a {noun} for this fix. `{path}` is a new file in the "
-                f"Kustomize root `{directory}`, and `{kustomization}` does not list it, "
-                "so the file alone renders nothing. To apply the fix, add the file and "
-                f"add the line {line} under `resources:` in `{kustomization}`"
+                f"Kustomize root `{directory}`, and `{kustomization}` does not list it. "
+                f"{KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line "
+                f"{line} under `resources:` in `{kustomization}`"
             )
         fid = str(finding.get("id", ""))
         note = str(remediation.get("note", "")).strip()
