@@ -42,7 +42,9 @@ spec:
             - name: https
               containerPort: 8443
           # A TCP probe: the proxy answers 404 to every path it does not
-          # forward, health paths included.
+          # forward, health paths included. The server's handshake-EOF line
+          # for each probe is dropped from the log (main.go,
+          # probeNoiseFilter).
           readinessProbe:
             tcpSocket:
               port: https

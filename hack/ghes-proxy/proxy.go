@@ -182,9 +182,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Deferred, so that a request whose response copy aborts (ReverseProxy
 	// panics with http.ErrAbortHandler) still gets its line. Only the method,
 	// the route, the path and the status: no query string, no header and no
-	// body, because each of them can hold a credential.
+	// body, because each of them can hold a credential. The path is the
+	// escaped one, so a %0A in it cannot start a second log line.
 	defer func() {
-		p.logger.Printf("%s %s %s %d %dB %s", r.Method, routeName(rt, ok), r.URL.Path, rec.status, rec.written, time.Since(start).Round(time.Millisecond))
+		p.logger.Printf("%s %s %s %d %dB %s", r.Method, routeName(rt, ok), r.URL.EscapedPath(), rec.status, rec.written, time.Since(start).Round(time.Millisecond))
 	}()
 	if !ok {
 		rec.Header().Set(enterpriseVersionHeader, p.cfg.EnterpriseVersion)
@@ -244,7 +245,7 @@ func (p *proxy) rewriteBody(resp *http.Response) error {
 	}
 	if int64(len(head)) > p.cfg.MaxRewriteBytes {
 		// Too large to hold: send it on as it is, the bytes read first.
-		p.logger.Printf("%s: JSON body larger than %d bytes, not rewritten", resp.Request.URL.Path, p.cfg.MaxRewriteBytes)
+		p.logger.Printf("%s: JSON body larger than %d bytes, not rewritten", resp.Request.URL.EscapedPath(), p.cfg.MaxRewriteBytes)
 		resp.Body = struct {
 			io.Reader
 			io.Closer
@@ -321,7 +322,7 @@ func (p *proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 	if !errors.Is(err, context.Canceled) {
 		// A transport error can quote the request URI (the HTTP/2 encoder
 		// does), so any query string in it is cut out.
-		p.logger.Printf("%s %s: upstream error: %s", r.Method, r.URL.Path, redactQuery(err.Error()))
+		p.logger.Printf("%s %s: upstream error: %s", r.Method, r.URL.EscapedPath(), redactQuery(err.Error()))
 	}
 	w.WriteHeader(http.StatusBadGateway)
 }

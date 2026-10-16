@@ -230,7 +230,15 @@ def github_api_root(environ: Mapping[str, str] | None = None) -> str:
     if not raw:
         return GITHUB_API_ROOT
     root = raw.rstrip("/")
-    if not _API_ROOT_RE.match(root):
+    valid = bool(_API_ROOT_RE.match(root))
+    if valid:
+        # The regex takes up to five digits; urllib refuses a port over 65535,
+        # and the read would then fail with an error that names no setting.
+        try:
+            urllib.parse.urlsplit(root).port
+        except ValueError:
+            valid = False
+    if not valid:
         raise UnknownForge(
             f"{GITHUB_API_ROOT_ENV_VAR}={raw!r} is not an https URL with a host and an "
             "optional port and path (e.g. https://ghes.example.com/api/v3); this check "

@@ -670,3 +670,40 @@ func TestServeWaitsForTheRequestsInFlight(t *testing.T) {
 		t.Errorf("serve: %v", err)
 	}
 }
+
+func TestAnEncodedNewlineCannotForgeALogLine(t *testing.T) {
+	f := newFixture(t)
+	forged := "%0APOST%20git%20/acme/infra.git/git-receive-pack%20200%2042B%201ms"
+	f.do(t, "GET", "/api/v3/x"+forged, nil, nil)
+	f.do(t, "GET", "/nothing"+forged, nil, nil)
+	broken := newFixture(t, func(c *Config) { c.UpstreamAPIHost = "127.0.0.1:1" })
+	broken.do(t, "GET", "/api/v3/y"+forged, nil, nil)
+	for name, logs := range map[string]string{"proxy": f.logs.String(), "broken upstream": broken.logs.String()} {
+		for _, line := range strings.Split(strings.TrimRight(logs, "\n"), "\n") {
+			if strings.HasPrefix(line, "POST git") {
+				t.Errorf("%s: a forged line reached the log: %q", name, line)
+			}
+		}
+	}
+	if n := strings.Count(f.logs.String(), "\n"); n != 2 {
+		t.Errorf("want one log line for each of 2 requests, got %d:\n%s", n, f.logs.String())
+	}
+	if !strings.Contains(f.logs.String(), "/api/v3/x%0APOST") {
+		t.Errorf("the log does not show the escaped path:\n%s", f.logs.String())
+	}
+}
+
+func TestTheProbeHandshakeLineIsDropped(t *testing.T) {
+	var out bytes.Buffer
+	l := log.New(probeNoiseFilter{&out}, "", 0)
+	l.Printf("http: TLS handshake error from 10.0.0.7:41234: EOF")
+	l.Printf("http: TLS handshake error from 10.0.0.7:41235: remote error: tls: bad certificate")
+	l.Printf("http: TLS handshake error from 10.0.0.7:41236: EOF trailing")
+	got := out.String()
+	if strings.Contains(got, "41234") {
+		t.Errorf("the probe EOF line was kept:\n%s", got)
+	}
+	if !strings.Contains(got, "bad certificate") || !strings.Contains(got, "41236") {
+		t.Errorf("another handshake error was dropped:\n%s", got)
+	}
+}

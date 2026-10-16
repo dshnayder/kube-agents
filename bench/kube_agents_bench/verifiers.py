@@ -59,6 +59,7 @@ import json
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -2760,6 +2761,16 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             if attempt == _FORGE_READ_ATTEMPTS:
                 if isinstance(exc, http.client.HTTPException):
                     raise OSError(f"{type(exc).__name__}: {exc}") from exc
+                reason = getattr(exc, "reason", exc)
+                if context is not None and isinstance(reason, ssl.SSLCertVerificationError):
+                    # With BENCH_FORGE_CA_FILE set, a certificate failure is
+                    # most likely that file (an old or another CA); name it,
+                    # or the error reads as if no CA file was set at all.
+                    raise OSError(
+                        f"{forges.FORGE_CA_FILE_ENV_VAR}="
+                        f"{os.environ.get(forges.FORGE_CA_FILE_ENV_VAR, '')!r} does not verify "
+                        f"{urllib.parse.urlsplit(url).netloc}: {reason}"
+                    ) from exc
                 raise
             time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
     raise AssertionError("unreachable")

@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -108,8 +109,10 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		// No read or write timeout for the whole request: a pack can take
 		// minutes to stream. The server's own errors (TLS handshakes, bad
-		// requests) carry no header value.
-		ErrorLog: logger,
+		// requests) carry no header value. The kubelet's TCP probes close
+		// before a TLS hello, which the server logs as a handshake EOF; that
+		// line is dropped (see probeNoiseFilter).
+		ErrorLog: log.New(probeNoiseFilter{logger.Writer()}, "", log.LstdFlags|log.LUTC),
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
@@ -141,4 +144,20 @@ func serve(ctx context.Context, srv *http.Server, start func() error, grace time
 		return err
 	}
 	return <-done
+}
+
+// probeNoiseFilter drops the server's "TLS handshake error from <addr>: EOF"
+// lines: a TCP probe connects and closes without a TLS hello, every period,
+// and nothing else produces that exact line. Every other handshake error (a
+// bad certificate, a protocol mismatch) carries its cause and still goes
+// through. The probes stay TCP because the proxy answers 404 to every path it
+// does not forward, so it has no health path to probe over HTTPS.
+type probeNoiseFilter struct{ w io.Writer }
+
+func (f probeNoiseFilter) Write(p []byte) (int, error) {
+	line := strings.TrimRight(string(p), "\n")
+	if strings.Contains(line, "http: TLS handshake error from ") && strings.HasSuffix(line, ": EOF") {
+		return len(p), nil
+	}
+	return f.w.Write(p)
 }

@@ -170,6 +170,8 @@ def test_the_api_root_stays_api_github_com_unless_named():
         (forges.GITHUB_API_ROOT_ENV_VAR, f"{HOST}/api/v3"),
         (forges.GITHUB_API_ROOT_ENV_VAR, f"https://{HOST}/api/v3?x=1"),
         (forges.GITHUB_API_ROOT_ENV_VAR, f"https://user@{HOST}/api/v3"),
+        (forges.GITHUB_API_ROOT_ENV_VAR, f"https://{HOST}:65536/api/v3"),
+        (forges.GITHUB_API_ROOT_ENV_VAR, f"https://{HOST}:99999/api/v3"),
         (forges.FORGE_CA_FILE_ENV_VAR, "/nonexistent/ca.crt"),
     ],
 )
@@ -405,3 +407,29 @@ def test_make_certs_shows_why_openssl_failed(tmp_path):
     assert "unknown option -addext" in result.stderr
     assert "'openssl req' failed" in result.stderr
     assert not (tmp_path / "out" / "tls.key").exists()
+
+
+def test_a_ca_file_that_does_not_verify_the_host_is_named(private_ca_server, tmp_path, monkeypatch):
+    """Another CA (a ca.crt from an earlier make-certs.sh run) loads as a CA
+    and then fails every read; the error names BENCH_FORGE_CA_FILE, so it does
+    not read the same as a run with no CA file at all."""
+    url, _ = private_ca_server
+    other = tmp_path / "other"
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "hack" / "ghes-proxy" / "make-certs.sh"), "localhost", str(other), "1"],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(verifiers, "_FORGE_READ_RETRY_PAUSE_SEC", 0)
+    monkeypatch.setenv(forges.FORGE_CA_FILE_ENV_VAR, str(other / "ca.crt"))
+    with pytest.raises(OSError) as raised:
+        verifiers._http_get_json(f"{url}/repos/a/b", "ghs_fake", 5)
+    message = str(raised.value)
+    assert forges.FORGE_CA_FILE_ENV_VAR in message
+    assert "does not verify localhost:" in message
+
+    # With no CA file set, the error stays urllib's own.
+    monkeypatch.delenv(forges.FORGE_CA_FILE_ENV_VAR)
+    with pytest.raises(OSError) as raised:
+        verifiers._http_get_json(f"{url}/repos/a/b", "ghs_fake", 5)
+    assert forges.FORGE_CA_FILE_ENV_VAR not in str(raised.value)
