@@ -178,8 +178,8 @@ that stays unreadable therefore keeps the job ticking without effect until it ca
 
 `oobe.py` reads no repository list: it starts the four audits on every install. An audit on an
 install with no GitOps repository runs without a forge: it keeps its findings in the report store
-and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit` skill's "No
-forge configured"). The installer's "GitOps repository connection skipped" line says so too.
+and, when the run changed something, posts a chat summary, with no ledger issue and no pull request
+(the `fleet-audit` skill's "No forge configured"). The installer's "GitOps repository connection skipped" line says the same.
 
 A `managed_repos` value the audits cannot use (one that does not parse, or names a forge type the
 image does not serve), or one that cannot be read at all, is not checked here either. Each audit's
@@ -274,9 +274,8 @@ times. It rides with the audits stage, whose eval case covers both.
    onboarding cases drive `oobe`.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
-Eval case `oobe-first-run-audits` (domain `fleet-audits`; parked out of `hack/eval/nightly-cases.txt`
-since 2026-10-09, its `KNOWN_UNREGISTERED` entry in `scripts/validate_bench_cases.py` says why;
-each repetition waits for the previous one's four audits to finish). The stack
+Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
+off the infra lock; each repetition waits for the previous one's four audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
