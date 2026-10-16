@@ -377,7 +377,8 @@ github.com, it refuses both.
   `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
   the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
   recorded path, because it is the old App's key: give the new App's key with
-  `--github-pem-path`. A run that does not need the file (the KMS key already has an `ENABLED`
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
   version and the file is gone) records no path.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
