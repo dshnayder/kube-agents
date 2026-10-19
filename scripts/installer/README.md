@@ -396,8 +396,8 @@ Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) als
 that would render GitOps off while the minter is running, and prints the lines to set with the
 live values filled in. A minter that this install did not make (one made by hand, by
 `make deploy-github`, or by another Helm release: the `kube-agents` release record has
-`githubMinter.enabled` false, and the Deployment carries no Helm annotations for this release)
-is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
+`githubMinter.enabled` false, the Deployment carries no Helm annotations for this release, and
+the install's Terraform state holds no `module.github_minter`) is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
 minter, the run refuses when its `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not name the
 PlatformAgent's live GitOps repository, or when it cannot read the PlatformAgent or that
 repository, because the apply would take the repository out of the PlatformAgent or point it at

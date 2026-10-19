@@ -2191,7 +2191,7 @@ print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "
     say=print_warning
     lead="An applying run would be refused: "
   fi
-  # A minter that this install did not make. Two signals, and both must say
+  # A minter that this install did not make. Three signals, and all must say
   # so: the release record (helm get values) has githubMinter.enabled false,
   # which the chart's minter and the composition's minter module (its service
   # account and Cloud KMS key) both follow, and the Deployment carries no
@@ -2210,7 +2210,18 @@ except ValueError:
     sys.exit(0)
 print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else "false")
 ' 2>/dev/null) || true)"
-  if [ "$record_minter" = "false" ] &&
+  # A third signal for the composition's half: the minter module (its service
+  # account, Cloud KMS key and their bindings) must not be in this install's
+  # Terraform state. An apply that turned the minter off and stopped after
+  # the Helm release, before the module's destroy, leaves the record false and
+  # the module in state, and the next apply would destroy it under a minter
+  # made by hand on the same names. A state that cannot be read keeps the
+  # refusals further down.
+  local state_rc=0
+  if [ "$record_minter" = "false" ]; then
+    tf_state_manages_module "module.github_minter" >/dev/null 2>&1 || state_rc=$?
+  fi
+  if [ "$record_minter" = "false" ] && [ "$state_rc" -eq 1 ] &&
     owner="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
       get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" \
       -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}/{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null) )" &&
@@ -3346,6 +3357,34 @@ managed = any(
 )
 sys.exit(0 if managed else 1)
 ' "$1" "$2" "$TF_STATE_RC_UNREADABLE"
+}
+
+# Whether this install's Terraform state manages any resource in module $1
+# (for example module.github_minter, which the state records as
+# module.github_minter[0]): managed mode, with at least one instance. Returns
+# 1 when it does not or there is no state, and TF_STATE_RC_UNREADABLE when the
+# state could not be read or parsed, which a caller must not read as "no".
+tf_state_manages_module() {
+  local state
+  state=$(tf_state_read) || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+module, unreadable = sys.argv[1], int(sys.argv[2])
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(unreadable)
+def in_module(address):
+    address = address or ""
+    return address == module or address.startswith(module + "[") or address.startswith(module + ".")
+managed = any(
+    in_module(r.get("module"))
+    and r.get("mode") == "managed"
+    and len(r.get("instances", [])) > 0
+    for r in doc.get("resources", [])
+)
+sys.exit(0 if managed else 1)
+' "$1" "$TF_STATE_RC_UNREADABLE"
 }
 
 # The account ids of every google_service_account this install's state

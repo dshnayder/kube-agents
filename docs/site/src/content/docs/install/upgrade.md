@@ -510,9 +510,10 @@ change of the new release.
   not ask for `GITHUB_APP_ID`. It refuses when `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not
   name the PlatformAgent's GitOps repository, or when it cannot read the PlatformAgent or the
   repository it names. The run decides that the minter is not this install's only when the
-  `kube-agents` release record has `githubMinter.enabled` false and the minter's Deployment carries
-  no Helm annotations for that release; with no release (a first install), it applies the check
-  above.
+  `kube-agents` release record has `githubMinter.enabled` false, the minter's Deployment carries no
+  Helm annotations for that release, and the install's Terraform state holds no minter module (its
+  service account and Cloud KMS key); with no release (a first install), or a state it cannot
+  read, it applies the check above.
 
 - **The chart's minter would land on another minter.** This run renders the chart's own token
   minter, but a minter that this install did not make runs under the same names, and Helm does not

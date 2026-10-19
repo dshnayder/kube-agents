@@ -139,7 +139,8 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
 class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
     def _run(self, keys, git_repo="sackheads/ka-test-infra", org="sackheads", app_id_b64="NTMxOTE1NA==",
              mode="", context_present=True, minter=True, integration=None, minter_read_fails=False,
-             record_minter=True, minter_owner="kube-agents/kubeagents-system", cr_read_fails=False):
+             record_minter=True, minter_owner="kube-agents/kubeagents-system", cr_read_fails=False,
+             minter_module_in_state="absent"):
         if integration is None:
             integration = {"github": {"gitRepo": git_repo, "org": org}} if git_repo else {}
         cr = json.dumps({"items": [{"spec": {"integration": integration}}]})
@@ -182,6 +183,23 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
                                 f" printf '%s' '{record}'; exit 0 ;;\n"
                                 "esac\nexit 1\n")
             helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+            # The Terraform state object (gcloud storage cat): "absent" (no
+            # state), "present" (the minter module is in it), "other" (state
+            # without the module), or "unreadable".
+            gcloud = bin_dir / "gcloud"
+            state = {"present": {"resources": [{"module": "module.github_minter[0]", "mode": "managed",
+                                                "type": "google_service_account", "name": "minter",
+                                                "instances": [{"attributes": {}}]}]},
+                     "other": {"resources": [{"mode": "managed", "type": "helm_release", "name": "kube_agents",
+                                              "instances": [{"attributes": {}}]}]}}
+            if minter_module_in_state in state:
+                (bin_dir / "state.json").write_text(json.dumps(state[minter_module_in_state]))
+                gcloud.write_text(f'#!/usr/bin/env bash\n[ "$1 $2" = "storage cat" ] && cat "{bin_dir}/state.json"\n')
+            elif minter_module_in_state == "absent":
+                gcloud.write_text("#!/usr/bin/env bash\necho 'ERROR: The following URLs matched no objects or files' >&2\nexit 1\n")
+            else:
+                gcloud.write_text("#!/usr/bin/env bash\necho 'ERROR: HTTPError 503' >&2\nexit 1\n")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "r",
                    "GITOPS_ORG": "", "GITOPS_REPO": "", "GITHUB_APP_ID": "", "GITOPS_FORGE": "",
                    "TFVARS_ENABLE_GITHUB_MINTER": "false", "KUBE_AGENTS_REMOVE_GITOPS": ""}
@@ -429,6 +447,22 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         proc = self._run(keys, mode="warn", **self._FOREIGN)
         self.assertIn("rc=0", proc.stdout)
         self.assertIn("WARN: An applying run would be refused", proc.stdout)
+
+    def test_a_minter_module_left_in_the_terraform_state_keeps_the_refusal(self):
+        # An apply that turned the minter off and stopped after the Helm
+        # release leaves the record false and the module (service account,
+        # Cloud KMS key) in state: the next apply would destroy it under a
+        # minter made by hand on the same names. A state that cannot be read
+        # cannot rule that out.
+        for in_state in ("present", "unreadable"):
+            with self.subTest(in_state=in_state):
+                proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                                 minter_module_in_state=in_state, **self._FOREIGN)
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("destroy the minter", proc.stdout)
+        proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                         minter_module_in_state="other", **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
 
     def test_any_sign_that_the_minter_is_this_installs_keeps_the_refusal(self):
         # The record says this install renders the minter, or it cannot be
