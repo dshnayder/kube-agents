@@ -302,7 +302,7 @@ When `Config.RedactSecrets` is enabled (the default) and `RequestInfo` matches c
 3. **Response body scrubber (Layer 2 — defense in depth)**:
    - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` inspects the JSON payload and scrubs sensitive payloads while preserving `Secret` key names:
      - Top-level and `items[*]` `.data` and `.stringData` keys are collected (along with any key names recorded in `metadata.managedFields[*].fieldsV1["f:data"]` and `["f:stringData"]`), `.stringData` is removed, and `.data` is populated with `"REDACTED"` values for each key so `kubectl get secret -o yaml` and `kubectl describe secret` display the key names without exposing secret bytes.
-     - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`) is deleted.
+     - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`) is deleted, and `kubeagents.x-k8s.io/redacted: "true (secret data values are redacted by kube-proxy)"` is added so `kubectl describe secret` explicitly indicates redaction.
    - If a `secrets` response cannot be parsed as valid JSON, `kube-proxy` fails closed and returns `502 Bad Gateway` rather than forwarding unverified bytes.
 
 ### 8. Header sanitization and streaming (`pkg/k8sapiproxy/headers.go`)

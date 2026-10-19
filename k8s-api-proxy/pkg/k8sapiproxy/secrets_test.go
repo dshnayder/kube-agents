@@ -99,6 +99,9 @@ func TestScrubSecretResponse(t *testing.T) {
 		if annotations["app.kubernetes.io/managed-by"] != "helm" {
 			t.Errorf("expected non-sensitive annotation to be preserved")
 		}
+		if annotations[redactedAnnotationKey] != redactedAnnotationValue {
+			t.Errorf("expected redaction annotation %q=%q, got %v", redactedAnnotationKey, redactedAnnotationValue, annotations[redactedAnnotationKey])
+		}
 	})
 
 	t.Run("normalizes PartialObjectMetadata to Secret and populates data keys from managedFields", func(t *testing.T) {

@@ -18,6 +18,8 @@ const (
 	partialObjectListAccept     = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 	tableAccept                 = "application/json;as=Table;g=meta.k8s.io;v=v1"
 	redactedSecretValue         = "REDACTED"
+	redactedAnnotationKey       = "kubeagents.x-k8s.io/redacted"
+	redactedAnnotationValue     = "true (secret data values are redacted by kube-proxy)"
 )
 
 // RewriteSecretRequestHeaders rewrites Accept and Accept-Encoding headers on core/v1 Secret requests
@@ -125,7 +127,8 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 		}
 	}
 
-	if !callerWantsPartial && (isSecretObject || (kind == "" && obj["metadata"] != nil && obj["items"] == nil && obj["rows"] == nil)) && len(dataKeys) > 0 {
+	isSecretItem := isSecretObject || (kind == "" && obj["metadata"] != nil && obj["items"] == nil && obj["rows"] == nil)
+	if !callerWantsPartial && isSecretItem && len(dataKeys) > 0 {
 		redactedData := make(map[string]any, len(dataKeys))
 		for _, k := range dataKeys {
 			redactedData[k] = redactedSecretValue
@@ -134,11 +137,18 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 	}
 
 	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if annotations, ok := meta["annotations"].(map[string]any); ok {
+		annotations, _ := meta["annotations"].(map[string]any)
+		if annotations != nil {
 			delete(annotations, lastAppliedConfigAnnotation)
-			if len(annotations) == 0 {
-				delete(meta, "annotations")
+		}
+		if !callerWantsPartial && isSecretItem {
+			if annotations == nil {
+				annotations = make(map[string]any, 1)
 			}
+			annotations[redactedAnnotationKey] = redactedAnnotationValue
+			meta["annotations"] = annotations
+		} else if annotations != nil && len(annotations) == 0 {
+			delete(meta, "annotations")
 		}
 	}
 
