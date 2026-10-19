@@ -400,7 +400,15 @@ func TestSetupOTelDisabledOrUnset(t *testing.T) {
 
 func TestAuditLogging(t *testing.T) {
 	var auditBuf bytes.Buffer
-	auditLogger := NewAuditLogger(&auditBuf)
+	jsonSink := NewJSONAuditSink(&auditBuf)
+
+	var recordedEvents []AuditEvent
+	customSink := AuditSinkFunc(func(_ context.Context, event AuditEvent) {
+		recordedEvents = append(recordedEvents, event)
+		if len(recordedEvents) == 1 && event.Caller != nil {
+			event.Caller.Username = "mutated-by-sink"
+		}
+	})
 
 	exporter := &recordingSpanExporter{}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
@@ -435,7 +443,7 @@ func TestAuditLogging(t *testing.T) {
 		Mode:             ModeReadOnlyWithDryRun,
 		RedactSecrets:    true,
 		TracerProvider:   tp,
-		AuditLogger:      auditLogger,
+		AuditSink:        NewMultiAuditSink(customSink, jsonSink),
 	})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
@@ -564,5 +572,15 @@ func TestAuditLogging(t *testing.T) {
 	if e4["level"] != "WARN" || e4["outcome"] != OutcomeRejectedAuth || e4["rejection_reason"] != string(ReasonUnauthenticated) ||
 		e4["status_code"] != float64(http.StatusUnauthorized) {
 		t.Errorf("unexpected audit entry[4]: %#v", e4)
+	}
+
+	if len(recordedEvents) != 5 {
+		t.Fatalf("custom AuditSink recorded %d events, want 5", len(recordedEvents))
+	}
+	if recordedEvents[0].Verb != "get" || recordedEvents[0].Resource != "pods" || recordedEvents[0].ClusterID != "gke_my-proj_us-central1_my-cluster" {
+		t.Errorf("unexpected typed AuditEvent[0]: %+v", recordedEvents[0])
+	}
+	if recordedEvents[1].Caller == nil || recordedEvents[1].Caller.Username != "system:serviceaccount:default:shell" {
+		t.Errorf("custom sink mutation leaked into subsequent AuditEvent.Caller: %+v", recordedEvents[1].Caller)
 	}
 }

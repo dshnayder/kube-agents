@@ -146,7 +146,7 @@ func main() {
 
 	metrics := k8sapiproxy.NewMetrics()
 	startMetricsListener(ctx, *metricsPort, metrics, slog.Default())
-	auditLogger := k8sapiproxy.NewAuditLogger(os.Stdout)
+	auditSink := k8sapiproxy.NewJSONAuditSink(os.Stdout)
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 		Authenticator:    authn,
@@ -156,7 +156,7 @@ func main() {
 		RedactSecrets:    *redactSecrets,
 		Metrics:          metrics,
 		TracerProvider:   tp,
-		AuditLogger:      auditLogger,
+		AuditSink:        auditSink,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)

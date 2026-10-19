@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -14,6 +15,85 @@ import (
 
 // AuditEventType is the structured event_type value emitted on every Kubernetes API audit log record.
 const AuditEventType = "k8s_api_audit"
+
+// AuditEvent describes one Kubernetes API request processed by the proxy.
+// Request bodies, response bodies, and authentication tokens are excluded.
+type AuditEvent struct {
+	Timestamp       time.Time
+	ClusterID       string
+	Caller          *CallerIdentity
+	HTTPMethod      string
+	Path            string
+	UserAgent       string
+	Verb            string
+	APIGroup        string
+	APIVersion      string
+	Resource        string
+	Subresource     string
+	Namespace       string
+	Name            string
+	Mode            Mode
+	DryRun          bool
+	SecretRedacted  bool
+	Outcome         string
+	RejectionReason RejectionReason
+	StatusCode      int
+	Duration        time.Duration
+	TraceID         string
+	SpanID          string
+}
+
+// AuditSink records structured Kubernetes API audit events.
+// Implementations must be safe for concurrent use by multiple goroutines.
+type AuditSink interface {
+	Record(ctx context.Context, event AuditEvent)
+}
+
+// AuditSinkFunc adapts a function to the AuditSink interface.
+type AuditSinkFunc func(ctx context.Context, event AuditEvent)
+
+// Record calls f(ctx, event).
+func (f AuditSinkFunc) Record(ctx context.Context, event AuditEvent) {
+	if f != nil {
+		f(ctx, event)
+	}
+}
+
+type noopAuditSink struct{}
+
+func (noopAuditSink) Record(context.Context, AuditEvent) {}
+
+// NoopAuditSink returns an AuditSink that discards all audit events.
+func NoopAuditSink() AuditSink {
+	return noopAuditSink{}
+}
+
+type multiAuditSink struct {
+	sinks []AuditSink
+}
+
+func (m multiAuditSink) Record(ctx context.Context, event AuditEvent) {
+	for _, s := range m.sinks {
+		s.Record(ctx, cloneAuditEvent(event))
+	}
+}
+
+// NewMultiAuditSink returns an AuditSink that forwards each AuditEvent to all non-nil sinks.
+func NewMultiAuditSink(sinks ...AuditSink) AuditSink {
+	filtered := make([]AuditSink, 0, len(sinks))
+	for _, s := range sinks {
+		if s != nil {
+			filtered = append(filtered, s)
+		}
+	}
+	if len(filtered) == 0 {
+		return NoopAuditSink()
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return multiAuditSink{sinks: filtered}
+}
 
 // NewAuditLogger constructs a structured JSON slog.Logger for Kubernetes API audit events.
 // Request and response bodies and authentication credentials are never written to the audit log.
@@ -24,6 +104,98 @@ func NewAuditLogger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+}
+
+// NewJSONAuditSink constructs an AuditSink that writes newline-delimited JSON audit records to w.
+// If w is nil, it writes to os.Stdout.
+func NewJSONAuditSink(w io.Writer) AuditSink {
+	return NewSlogAuditSink(NewAuditLogger(w))
+}
+
+type slogAuditSink struct {
+	logger *slog.Logger
+}
+
+// NewSlogAuditSink wraps a structured slog.Logger as an AuditSink.
+// If logger is nil, it writes JSON records to os.Stdout.
+func NewSlogAuditSink(logger *slog.Logger) AuditSink {
+	if logger == nil {
+		logger = NewAuditLogger(os.Stdout)
+	}
+	return slogAuditSink{logger: logger}
+}
+
+func (s slogAuditSink) Record(ctx context.Context, event AuditEvent) {
+	if s.logger == nil {
+		return
+	}
+
+	attrs := make([]slog.Attr, 0, 20)
+	attrs = append(attrs,
+		slog.String("event_type", AuditEventType),
+		slog.String("mode", sanitizeModeLabel(event.Mode)),
+		slog.String("outcome", event.Outcome),
+		slog.Int("status_code", event.StatusCode),
+		slog.String("http_method", event.HTTPMethod),
+		slog.String("path", event.Path),
+		slog.String("verb", event.Verb),
+		slog.String("resource", event.Resource),
+		slog.Bool("dry_run", event.DryRun),
+		slog.Bool("secret_redacted", event.SecretRedacted),
+		slog.Int64("duration_ms", event.Duration.Milliseconds()),
+	)
+
+	if event.ClusterID != "" {
+		attrs = append(attrs, slog.String("cluster", event.ClusterID))
+	}
+	if event.APIGroup != "" {
+		attrs = append(attrs, slog.String("api_group", event.APIGroup))
+	}
+	if event.APIVersion != "" {
+		attrs = append(attrs, slog.String("api_version", event.APIVersion))
+	}
+	if event.Subresource != "" {
+		attrs = append(attrs, slog.String("subresource", event.Subresource))
+	}
+	if event.Namespace != "" {
+		attrs = append(attrs, slog.String("namespace", event.Namespace))
+	}
+	if event.Name != "" {
+		attrs = append(attrs, slog.String("name", event.Name))
+	}
+	if event.RejectionReason != ReasonNone {
+		attrs = append(attrs, slog.String("rejection_reason", string(event.RejectionReason)))
+	}
+	if event.Caller != nil {
+		if event.Caller.Username != "" {
+			attrs = append(attrs, slog.String("caller_username", event.Caller.Username))
+		}
+		if event.Caller.UID != "" {
+			attrs = append(attrs, slog.String("caller_uid", event.Caller.UID))
+		}
+		if len(event.Caller.Groups) > 0 {
+			attrs = append(attrs, slog.Any("caller_groups", event.Caller.Groups))
+		}
+	}
+	if event.UserAgent != "" {
+		attrs = append(attrs, slog.String("user_agent", event.UserAgent))
+	}
+	if event.TraceID != "" {
+		attrs = append(attrs, slog.String("trace_id", event.TraceID))
+	}
+	if event.SpanID != "" {
+		attrs = append(attrs, slog.String("span_id", event.SpanID))
+	}
+
+	level := slog.LevelInfo
+	switch event.Outcome {
+	case OutcomeRejectedAuth, OutcomeRejectedRoute, OutcomeRejectedPolicy:
+		level = slog.LevelWarn
+	case OutcomeUpstreamError:
+		level = slog.LevelError
+	}
+
+	s.logger.LogAttrs(ctx, level, "kube-proxy audit", attrs...)
 }
 
 type auditEntry struct {
@@ -43,8 +215,24 @@ type auditEntry struct {
 	span           trace.Span
 }
 
-func logAuditEvent(ctx context.Context, logger *slog.Logger, entry auditEntry) {
-	if logger == nil {
+func cloneCallerIdentity(caller *CallerIdentity) *CallerIdentity {
+	if caller == nil {
+		return nil
+	}
+	return &CallerIdentity{
+		Username: caller.Username,
+		UID:      caller.UID,
+		Groups:   slices.Clone(caller.Groups),
+	}
+}
+
+func cloneAuditEvent(event AuditEvent) AuditEvent {
+	event.Caller = cloneCallerIdentity(event.Caller)
+	return event
+}
+
+func logAuditEvent(ctx context.Context, sink AuditSink, entry auditEntry) {
+	if sink == nil {
 		return
 	}
 
@@ -75,78 +263,41 @@ func logAuditEvent(ctx context.Context, logger *slog.Logger, entry auditEntry) {
 		}
 	}
 
-	attrs := make([]slog.Attr, 0, 20)
-	attrs = append(attrs,
-		slog.String("event_type", AuditEventType),
-		slog.String("mode", sanitizeModeLabel(entry.mode)),
-		slog.String("outcome", entry.outcome),
-		slog.Int("status_code", entry.statusCode),
-		slog.String("http_method", entry.httpMethod),
-		slog.String("path", entry.path),
-		slog.String("verb", verb),
-		slog.String("resource", resource),
-		slog.Bool("dry_run", entry.dryRun),
-		slog.Bool("secret_redacted", entry.secretRedacted),
-		slog.Int64("duration_ms", entry.duration.Milliseconds()),
-	)
-
-	if entry.clusterID != "" {
-		attrs = append(attrs, slog.String("cluster", entry.clusterID))
-	}
-	if apiGroup != "" {
-		attrs = append(attrs, slog.String("api_group", apiGroup))
-	}
-	if apiVersion != "" {
-		attrs = append(attrs, slog.String("api_version", apiVersion))
-	}
-	if subresource != "" {
-		attrs = append(attrs, slog.String("subresource", subresource))
-	}
-	if namespace != "" {
-		attrs = append(attrs, slog.String("namespace", namespace))
-	}
-	if name != "" {
-		attrs = append(attrs, slog.String("name", name))
-	}
-	if entry.reason != ReasonNone {
-		attrs = append(attrs, slog.String("rejection_reason", string(entry.reason)))
-	}
-	if entry.caller != nil {
-		if entry.caller.Username != "" {
-			attrs = append(attrs, slog.String("caller_username", entry.caller.Username))
-		}
-		if entry.caller.UID != "" {
-			attrs = append(attrs, slog.String("caller_uid", entry.caller.UID))
-		}
-		if len(entry.caller.Groups) > 0 {
-			attrs = append(attrs, slog.Any("caller_groups", entry.caller.Groups))
-		}
-	}
-	if entry.userAgent != "" {
-		attrs = append(attrs, slog.String("user_agent", entry.userAgent))
-	}
+	var traceID, spanID string
 	if entry.span != nil {
 		sc := entry.span.SpanContext()
 		if sc.IsValid() {
-			attrs = append(attrs,
-				slog.String("trace_id", sc.TraceID().String()),
-				slog.String("span_id", sc.SpanID().String()),
-			)
+			traceID = sc.TraceID().String()
+			spanID = sc.SpanID().String()
 		}
 	}
 
-	level := slog.LevelInfo
-	switch entry.outcome {
-	case OutcomeRejectedAuth, OutcomeRejectedRoute, OutcomeRejectedPolicy:
-		level = slog.LevelWarn
-	case OutcomeUpstreamError:
-		level = slog.LevelError
+	event := AuditEvent{
+		Timestamp:       time.Now().UTC(),
+		ClusterID:       entry.clusterID,
+		Caller:          cloneCallerIdentity(entry.caller),
+		HTTPMethod:      entry.httpMethod,
+		Path:            entry.path,
+		UserAgent:       entry.userAgent,
+		Verb:            verb,
+		APIGroup:        apiGroup,
+		APIVersion:      apiVersion,
+		Resource:        resource,
+		Subresource:     subresource,
+		Namespace:       namespace,
+		Name:            name,
+		Mode:            entry.mode,
+		DryRun:          entry.dryRun,
+		SecretRedacted:  entry.secretRedacted,
+		Outcome:         entry.outcome,
+		RejectionReason: entry.reason,
+		StatusCode:      entry.statusCode,
+		Duration:        entry.duration,
+		TraceID:         traceID,
+		SpanID:          spanID,
 	}
 
-	if r := recover(); r != nil {
-		panic(r)
-	}
-	logger.LogAttrs(ctx, level, "kube-proxy audit", attrs...)
+	sink.Record(ctx, event)
 }
 
 func auditPathForRequest(r *http.Request, cleanPath string) string {

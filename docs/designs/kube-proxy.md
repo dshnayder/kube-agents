@@ -114,6 +114,7 @@ k8s-api-proxy/
     │   ├── secrets.go            # PartialObjectMetadata rewrite + Secret response redaction
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
     │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
+    │   ├── audit.go              # AuditSink interface, AuditEvent struct, and JSON/slog audit sinks
     │   └── transport.go          # UpstreamTransport interface
     └── transport/
         └── gkehttps/
@@ -150,6 +151,12 @@ type UpstreamTransport interface {
 	RoundTripCluster(ctx context.Context, clusterID string, req *http.Request) (*http.Response, error)
 }
 
+// AuditSink records structured Kubernetes API audit events.
+// Implementations must be safe for concurrent use by multiple goroutines.
+type AuditSink interface {
+	Record(ctx context.Context, event AuditEvent)
+}
+
 // Mode controls which Kubernetes API verbs the proxy permits.
 type Mode string
 
@@ -167,11 +174,12 @@ const (
 
 // Config configures the k8sapiproxy HTTP handler.
 type Config struct {
-	Authenticator      CallerAuthenticator
-	Upstream           UpstreamTransport
-	DefaultClusterID   string
-	Mode               Mode
-	RedactSecrets      bool
+	Authenticator    CallerAuthenticator
+	Upstream         UpstreamTransport
+	DefaultClusterID string
+	Mode             Mode
+	RedactSecrets    bool
+	AuditSink        AuditSink
 }
 ```
 
@@ -346,8 +354,9 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 2. **OpenTelemetry distributed tracing**:
    - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
    - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
-3. **Structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
-   - For every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes), `kube-proxy` emits a structured JSON audit record (`event_type: "k8s_api_audit"`) via `log/slog` with `cluster`, `caller_username`, `caller_uid`, `caller_groups`, `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `mode`, `outcome`, `rejection_reason`, `secret_redacted`, `status_code`, `duration_ms`, `user_agent`, `trace_id`, and `span_id`.
+3. **Pluggable audit sink and structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
+   - `pkg/k8sapiproxy` defines the `AuditSink` interface (`Record(ctx context.Context, event AuditEvent)`), `AuditSinkFunc`, and `NewMultiAuditSink` so OSS deployments and hosted services can route typed `AuditEvent` records to different backends.
+   - By default (`NewJSONAuditSink(os.Stdout)`), `kube-proxy` emits a newline-delimited JSON audit record (`event_type: "k8s_api_audit"`) via `log/slog` for every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes) with `cluster`, `caller_username`, `caller_uid`, `caller_groups`, `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `mode`, `outcome`, `rejection_reason`, `secret_redacted`, `status_code`, `duration_ms`, `user_agent`, `trace_id`, and `span_id`.
    - Request and response bodies and authentication credentials are never written to the audit log.
 
 ### 11. Deployment topology in `kube-agents`

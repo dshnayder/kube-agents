@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -47,9 +46,9 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		metrics = NewMetrics()
 	}
 
-	auditLogger := cfg.AuditLogger
-	if auditLogger == nil {
-		auditLogger = NewAuditLogger(os.Stdout)
+	auditSink := cfg.AuditSink
+	if auditSink == nil {
+		auditSink = NewJSONAuditSink(os.Stdout)
 	}
 
 	factory := NewRequestInfoFactory()
@@ -62,7 +61,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		redactSecrets:    cfg.RedactSecrets,
 		metrics:          metrics,
 		tracerProvider:   cfg.TracerProvider,
-		auditLogger:      auditLogger,
+		auditSink:        auditSink,
 		factory:          factory,
 	}
 
@@ -128,7 +127,7 @@ type proxyHandler struct {
 	redactSecrets    bool
 	metrics          *Metrics
 	tracerProvider   trace.TracerProvider
-	auditLogger      *slog.Logger
+	auditSink        AuditSink
 	factory          *request.RequestInfoFactory
 	reverseProxy     *httputil.ReverseProxy
 }
@@ -164,7 +163,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.recordRejection(ReasonUnauthenticated, verbLabel, resLabel, subLabel, h.mode)
 		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedAuth, http.StatusUnauthorized, duration)
 		finishRequestSpan(span, OutcomeRejectedAuth, ReasonUnauthenticated, http.StatusUnauthorized)
-		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+		logAuditEvent(r.Context(), h.auditSink, auditEntry{
 			httpMethod: r.Method,
 			path:       auditPathForRequest(r, ""),
 			userAgent:  userAgent,
@@ -187,7 +186,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
 		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, policyErr.Code, duration)
 		finishRequestSpan(span, OutcomeRejectedRoute, policyErr.RejectionReason, policyErr.Code)
-		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+		logAuditEvent(r.Context(), h.auditSink, auditEntry{
 			caller:     caller,
 			httpMethod: r.Method,
 			path:       auditPathForRequest(r, ""),
@@ -220,7 +219,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.recordRejection(ReasonInvalidRoute, verbLabel, resLabel, subLabel, h.mode)
 		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, http.StatusBadRequest, duration)
 		finishRequestSpan(span, OutcomeRejectedRoute, ReasonInvalidRoute, http.StatusBadRequest)
-		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+		logAuditEvent(r.Context(), h.auditSink, auditEntry{
 			caller:     caller,
 			clusterID:  clusterID,
 			httpMethod: r.Method,
@@ -247,7 +246,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
 		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedPolicy, policyErr.Code, duration)
 		finishRequestSpan(span, OutcomeRejectedPolicy, policyErr.RejectionReason, policyErr.Code)
-		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+		logAuditEvent(r.Context(), h.auditSink, auditEntry{
 			caller:         caller,
 			clusterID:      clusterID,
 			httpMethod:     r.Method,
@@ -289,7 +288,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	duration := time.Since(start)
 	h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, outcome, rec.statusCode, duration)
 	finishRequestSpan(span, outcome, ReasonNone, rec.statusCode)
-	logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+	logAuditEvent(r.Context(), h.auditSink, auditEntry{
 		caller:         caller,
 		clusterID:      clusterID,
 		httpMethod:     r.Method,
