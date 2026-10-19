@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -45,6 +47,11 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		metrics = NewMetrics()
 	}
 
+	auditLogger := cfg.AuditLogger
+	if auditLogger == nil {
+		auditLogger = NewAuditLogger(os.Stdout)
+	}
+
 	factory := NewRequestInfoFactory()
 
 	h := &proxyHandler{
@@ -55,6 +62,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		redactSecrets:    cfg.RedactSecrets,
 		metrics:          metrics,
 		tracerProvider:   cfg.TracerProvider,
+		auditLogger:      auditLogger,
 		factory:          factory,
 	}
 
@@ -120,6 +128,7 @@ type proxyHandler struct {
 	redactSecrets    bool
 	metrics          *Metrics
 	tracerProvider   trace.TracerProvider
+	auditLogger      *slog.Logger
 	factory          *request.RequestInfoFactory
 	reverseProxy     *httputil.ReverseProxy
 }
@@ -138,10 +147,12 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.metrics.decInFlight()
 
 	dryRun := HasStrictDryRunAll(r)
+	userAgent := r.UserAgent()
 	spanCtx, span := startRequestSpan(h.tracerProvider, r, h.mode)
 	r = r.WithContext(spanCtx)
 
-	if _, err := h.authenticator.AuthenticateRequest(r); err != nil {
+	caller, err := h.authenticator.AuthenticateRequest(r)
+	if err != nil {
 		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
 		WriteStatusError(
 			w,
@@ -149,9 +160,22 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			metav1.StatusReasonUnauthorized,
 			fmt.Sprintf("kube-proxy caller authentication failed: %v", err),
 		)
+		duration := time.Since(start)
 		h.metrics.recordRejection(ReasonUnauthenticated, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedAuth, http.StatusUnauthorized, time.Since(start))
+		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedAuth, http.StatusUnauthorized, duration)
 		finishRequestSpan(span, OutcomeRejectedAuth, ReasonUnauthenticated, http.StatusUnauthorized)
+		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+			httpMethod: r.Method,
+			path:       auditPathForRequest(r, ""),
+			userAgent:  userAgent,
+			mode:       h.mode,
+			dryRun:     dryRun,
+			outcome:    OutcomeRejectedAuth,
+			reason:     ReasonUnauthenticated,
+			statusCode: http.StatusUnauthorized,
+			duration:   duration,
+			span:       span,
+		})
 		return
 	}
 
@@ -159,9 +183,23 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if policyErr != nil {
 		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
 		WriteStatusError(w, policyErr.Code, policyErr.Reason, policyErr.Message)
+		duration := time.Since(start)
 		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, policyErr.Code, time.Since(start))
+		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, policyErr.Code, duration)
 		finishRequestSpan(span, OutcomeRejectedRoute, policyErr.RejectionReason, policyErr.Code)
+		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+			caller:     caller,
+			httpMethod: r.Method,
+			path:       auditPathForRequest(r, ""),
+			userAgent:  userAgent,
+			mode:       h.mode,
+			dryRun:     dryRun,
+			outcome:    OutcomeRejectedRoute,
+			reason:     policyErr.RejectionReason,
+			statusCode: policyErr.Code,
+			duration:   duration,
+			span:       span,
+		})
 		return
 	}
 
@@ -178,9 +216,24 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			metav1.StatusReasonBadRequest,
 			fmt.Sprintf("kube-proxy failed to parse Kubernetes API request path %q: %v", cleanPath, err),
 		)
+		duration := time.Since(start)
 		h.metrics.recordRejection(ReasonInvalidRoute, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, http.StatusBadRequest, time.Since(start))
+		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, http.StatusBadRequest, duration)
 		finishRequestSpan(span, OutcomeRejectedRoute, ReasonInvalidRoute, http.StatusBadRequest)
+		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+			caller:     caller,
+			clusterID:  clusterID,
+			httpMethod: r.Method,
+			path:       cleanPath,
+			userAgent:  userAgent,
+			mode:       h.mode,
+			dryRun:     dryRun,
+			outcome:    OutcomeRejectedRoute,
+			reason:     ReasonInvalidRoute,
+			statusCode: http.StatusBadRequest,
+			duration:   duration,
+			span:       span,
+		})
 		return
 	}
 
@@ -190,9 +243,26 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if policyErr := EvaluatePolicy(h.mode, h.redactSecrets, outReq, info); policyErr != nil {
 		WriteStatusError(w, policyErr.Code, policyErr.Reason, policyErr.Message)
+		duration := time.Since(start)
 		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedPolicy, policyErr.Code, time.Since(start))
+		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedPolicy, policyErr.Code, duration)
 		finishRequestSpan(span, OutcomeRejectedPolicy, policyErr.RejectionReason, policyErr.Code)
+		logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+			caller:         caller,
+			clusterID:      clusterID,
+			httpMethod:     r.Method,
+			path:           cleanPath,
+			userAgent:      userAgent,
+			info:           info,
+			mode:           h.mode,
+			dryRun:         dryRun,
+			secretRedacted: secretRedacted,
+			outcome:        OutcomeRejectedPolicy,
+			reason:         policyErr.RejectionReason,
+			statusCode:     policyErr.Code,
+			duration:       duration,
+			span:           span,
+		})
 		return
 	}
 
@@ -216,8 +286,25 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rec.statusCode >= http.StatusInternalServerError {
 		outcome = OutcomeUpstreamError
 	}
-	h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, outcome, rec.statusCode, time.Since(start))
+	duration := time.Since(start)
+	h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, outcome, rec.statusCode, duration)
 	finishRequestSpan(span, outcome, ReasonNone, rec.statusCode)
+	logAuditEvent(r.Context(), h.auditLogger, auditEntry{
+		caller:         caller,
+		clusterID:      clusterID,
+		httpMethod:     r.Method,
+		path:           cleanPath,
+		userAgent:      userAgent,
+		info:           info,
+		mode:           h.mode,
+		dryRun:         dryRun,
+		secretRedacted: secretRedacted,
+		outcome:        outcome,
+		reason:         ReasonNone,
+		statusCode:     rec.statusCode,
+		duration:       duration,
+		span:           span,
+	})
 }
 
 type statusRecorder struct {

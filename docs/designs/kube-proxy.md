@@ -331,9 +331,9 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
    - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 5-minute TTL and automatic invalidation on connection failure.
    - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request.
 
-### 10. Observability: Prometheus metrics and OpenTelemetry tracing (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`)
+### 10. Observability: Prometheus metrics, OpenTelemetry tracing, and audit logging (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`, `pkg/k8sapiproxy/audit.go`)
 
-`kube-proxy` exposes Prometheus metrics on a dedicated metrics-only HTTP listener (`KUBE_PROXY_METRICS_PORT=8444`, port name `kube-metrics`) and exports OpenTelemetry trace spans via OTLP HTTP:
+`kube-proxy` exposes Prometheus metrics on a dedicated metrics-only HTTP listener (`KUBE_PROXY_METRICS_PORT=8444`, port name `kube-metrics`), exports OpenTelemetry trace spans via OTLP HTTP, and writes a structured JSON audit log entry for every Kubernetes API request:
 
 1. **Prometheus metrics (`/metrics` on port `8444`)**:
    - All label values come from closed vocabularies so caller-supplied paths or CRD resource names cannot increase series cardinality.
@@ -346,6 +346,9 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 2. **OpenTelemetry distributed tracing**:
    - The operator injects `OTEL_SERVICE_NAME=<agent>-kube-proxy`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and `OTEL_RESOURCE_ATTRIBUTES` (or `OTEL_SDK_DISABLED=true` when the cluster has no collector).
    - For every Kubernetes API request, `kube-proxy` extracts incoming W3C `traceparent`/`tracestate` headers before header sanitization, starts a server span (`k8s.api.proxy <verb> <resource>`), records structured attributes (`k8s.cluster.id`, `k8s.verb`, `k8s.resource`, `k8s.subresource`, `k8s.namespace`, `k8s.dry_run`, `kube_proxy.mode`, `kube_proxy.outcome`, `kube_proxy.rejection_reason`, `kube_proxy.secret_redacted`, `http.response.status_code`), and wraps the upstream round trip in a child client span (`k8s.api.upstream`).
+3. **Structured JSON audit logging (`pkg/k8sapiproxy/audit.go`)**:
+   - For every Kubernetes API request (excluding `/_kube_proxy/healthz` health probes), `kube-proxy` emits a structured JSON audit record (`event_type: "k8s_api_audit"`) via `log/slog` with `cluster`, `caller_username`, `caller_uid`, `caller_groups`, `http_method`, `path`, `verb`, `api_group`, `api_version`, `resource`, `subresource`, `namespace`, `name`, `dry_run`, `mode`, `outcome`, `rejection_reason`, `secret_redacted`, `status_code`, `duration_ms`, `user_agent`, `trace_id`, and `span_id`.
+   - Request and response bodies and authentication credentials are never written to the audit log.
 
 ### 11. Deployment topology in `kube-agents`
 

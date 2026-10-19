@@ -3,6 +3,7 @@ package k8sapiproxy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"go.opentelemetry.io/otel/trace"
@@ -67,4 +68,5 @@ type Config struct {
 	RedactSecrets    bool
 	Metrics          *Metrics
 	TracerProvider   trace.TracerProvider
+	AuditLogger      *slog.Logger
 }
