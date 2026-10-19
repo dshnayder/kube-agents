@@ -17,6 +17,7 @@ const (
 	partialObjectMetadataAccept = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
 	partialObjectListAccept     = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 	tableAccept                 = "application/json;as=Table;g=meta.k8s.io;v=v1"
+	redactedSecretValue         = "REDACTED"
 )
 
 // RewriteSecretRequestHeaders rewrites Accept and Accept-Encoding headers on core/v1 Secret requests
@@ -127,7 +128,7 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 	if !callerWantsPartial && (isSecretObject || (kind == "" && obj["metadata"] != nil && obj["items"] == nil && obj["rows"] == nil)) && len(dataKeys) > 0 {
 		redactedData := make(map[string]any, len(dataKeys))
 		for _, k := range dataKeys {
-			redactedData[k] = ""
+			redactedData[k] = redactedSecretValue
 		}
 		obj["data"] = redactedData
 	}

@@ -86,10 +86,10 @@ func TestScrubSecretResponse(t *testing.T) {
 		}
 		dataMap, ok := parsed["data"].(map[string]any)
 		if !ok {
-			t.Fatalf("expected data key map to be preserved with empty values, got %v", parsed["data"])
+			t.Fatalf("expected data key map to be preserved with REDACTED values, got %v", parsed["data"])
 		}
-		if dataMap["password"] != "" || dataMap["token"] != "" {
-			t.Errorf("expected data keys to have empty redacted values, got %v", dataMap)
+		if dataMap["password"] != "REDACTED" || dataMap["token"] != "REDACTED" {
+			t.Errorf("expected data keys to have REDACTED values, got %v", dataMap)
 		}
 		if _, hasStringData := parsed["stringData"]; hasStringData {
 			t.Errorf("expected stringData field to be removed")
@@ -138,8 +138,8 @@ func TestScrubSecretResponse(t *testing.T) {
 			t.Fatalf("expected 3 data keys from managedFields, got %v", parsed["data"])
 		}
 		for _, k := range []string{"ca.crt", "tls.crt", "tls.key"} {
-			if val, exists := dataMap[k]; !exists || val != "" {
-				t.Errorf("data[%q] = %q (exists=%v), want empty string", k, val, exists)
+			if val, exists := dataMap[k]; !exists || val != "REDACTED" {
+				t.Errorf("data[%q] = %q (exists=%v), want REDACTED", k, val, exists)
 			}
 		}
 	})
