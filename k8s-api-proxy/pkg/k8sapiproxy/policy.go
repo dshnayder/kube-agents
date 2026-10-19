@@ -182,16 +182,15 @@ func IsCoreV1Secret(info *request.RequestInfo) bool {
 
 // EvaluatePolicy enforces the L7 Kubernetes API policy on r and info.
 func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *request.RequestInfo) *PolicyError {
-	if HasUpgradeHeader(r) {
-		return &PolicyError{
-			Code:            http.StatusForbidden,
-			Reason:          metav1.StatusReasonForbidden,
-			RejectionReason: ReasonProtocolUpgradeBlocked,
-			Message:         "kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
-		}
-	}
-
 	if !info.IsResourceRequest {
+		if HasUpgradeHeader(r) {
+			return &PolicyError{
+				Code:            http.StatusForbidden,
+				Reason:          metav1.StatusReasonForbidden,
+				RejectionReason: ReasonProtocolUpgradeBlocked,
+				Message:         "kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
+			}
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			return &PolicyError{
 				Code:            http.StatusForbidden,
@@ -243,6 +242,15 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 		}
 		if err := evaluateSubresourceByMode(mode, r, info); err != nil {
 			return err
+		}
+	}
+
+	if HasUpgradeHeader(r) {
+		return &PolicyError{
+			Code:            http.StatusForbidden,
+			Reason:          metav1.StatusReasonForbidden,
+			RejectionReason: ReasonProtocolUpgradeBlocked,
+			Message:         "kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
 		}
 	}
 

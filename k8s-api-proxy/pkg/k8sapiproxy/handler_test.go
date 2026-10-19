@@ -141,8 +141,9 @@ func TestHandlerEndToEnd(t *testing.T) {
 		}
 		var out map[string]any
 		_ = json.Unmarshal(rec.Body.Bytes(), &out)
-		if _, hasData := out["data"]; hasData {
-			t.Errorf("expected data field to be stripped")
+		dataMap, ok := out["data"].(map[string]any)
+		if !ok || dataMap["key"] != "" {
+			t.Errorf("expected data field key to be preserved with empty value, got %v", out["data"])
 		}
 	})
 }

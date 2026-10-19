@@ -187,7 +187,20 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 		}
 	}
 
-	// 8. Arbitrary custom resource name to verify cardinality bounding.
+	// 8. Rejected pod exec with Upgrade header records resource="pods" and subresource="exec".
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods/p1/exec?command=whoami", nil)
+		req.Header.Set("Authorization", "Bearer valid-token")
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "SPDY/3.1")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("POST pods/exec status = %d, want 403", rec.Code)
+		}
+	}
+
+	// 9. Arbitrary custom resource name to verify cardinality bounding.
 	{
 		req := httptest.NewRequest(http.MethodGet, "/apis/example.com/v1/namespaces/default/CallerSuppliedUnboundedResource42", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
@@ -209,6 +222,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="unauthenticated",resource="unknown",subresource="none",verb="get"} 1`,
 		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="dry_run_required",resource="configmaps",subresource="none",verb="create"} 1`,
 		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="verb_blocked",resource="pods",subresource="none",verb="delete"} 1`,
+		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="subresource_blocked",resource="pods",subresource="exec",verb="create"} 1`,
 		`kubeagents_kube_proxy_secrets_redacted_total{action="accept_header_rewritten"} 1`,
 		`kubeagents_kube_proxy_secrets_redacted_total{action="payload_scrubbed"} 1`,
 		`kubeagents_kube_proxy_in_flight_requests 0`,

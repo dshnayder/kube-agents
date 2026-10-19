@@ -637,33 +637,59 @@ if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
   log "broker."
 fi
 
-if [ -n "${KUBE_PROXY_URL:-}" ]; then
-  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
-  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
-  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/broker-token/token}"
-  clear_symlinks_under_data "$DATA/.kubeconfig"
-  displace_if_not_a_regular_file "$DATA/.kubeconfig"
-  cat >"$DATA/.kubeconfig" <<EOF
+write_kube_proxy_kubeconfig() {
+  local target_file="$1"
+  local ctx="$2"
+  cat >"$target_file" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
-- name: ${default_ctx}
+- name: ${ctx}
   cluster:
-    server: ${KUBE_PROXY_URL%/}/clusters/${default_ctx}
+    server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
     certificate-authority: ${ca_file}
 users:
 - name: kube-proxy-caller
   user:
     tokenFile: ${token_file}
 contexts:
-- name: ${default_ctx}
+- name: ${ctx}
   context:
-    cluster: ${default_ctx}
+    cluster: ${ctx}
     user: kube-proxy-caller
-current-context: ${default_ctx}
+current-context: ${ctx}
 EOF
-  chown agent:agent "$DATA/.kubeconfig"
-  chmod 0600 "$DATA/.kubeconfig"
+  chown agent:agent "$target_file"
+  chmod 0600 "$target_file"
+}
+
+if [ -n "${KUBE_PROXY_URL:-}" ]; then
+  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
+  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
+  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/broker-token/token}"
+  clear_symlinks_under_data "$DATA/.kubeconfig"
+  displace_if_not_a_regular_file "$DATA/.kubeconfig"
+  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx"
+  for kc in \
+    "$DATA/kubeconfig.yaml" \
+    "$DATA/.kube/config" \
+    "$DATA"/.kubeconfigs/kubeconfig*.yaml \
+    "$DATA"/profiles/*/kubeconfig.yaml \
+    "$DATA"/profiles/*/.kubeconfigs/kubeconfig*.yaml; do
+    if [ -L "$kc" ] || [ ! -f "$kc" ]; then
+      continue
+    fi
+    if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
+      kc_ctx="$(sed -n 's/^current-context:[[:space:]]*//p' "$kc" | head -n 1 | tr -d "'\"[:space:]")"
+      if [ -z "$kc_ctx" ]; then
+        kc_ctx="$default_ctx"
+      fi
+      case "$kc_ctx" in
+      *[!A-Za-z0-9._:-]* | "") continue ;;
+      esac
+      write_kube_proxy_kubeconfig "$kc" "$kc_ctx"
+    fi
+  done
   install -d -m 0755 -o root -g root /home/agent/.kube
   ln -sf "$DATA/.kubeconfig" /home/agent/.kube/config
   if id -u hermes >/dev/null 2>&1; then

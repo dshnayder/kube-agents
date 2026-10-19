@@ -104,21 +104,32 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 		return
 	}
 
+	dataKeys := collectSecretDataKeys(obj)
 	delete(obj, "data")
 	delete(obj, "stringData")
 
 	kind, _ := obj["kind"].(string)
 	apiVersion, _ := obj["apiVersion"].(string)
 
+	isSecretObject := (apiVersion == "v1" && kind == "Secret")
 	if !callerWantsPartial && apiVersion == "meta.k8s.io/v1" {
 		switch kind {
 		case "PartialObjectMetadata":
 			obj["apiVersion"] = "v1"
 			obj["kind"] = "Secret"
+			isSecretObject = true
 		case "PartialObjectMetadataList":
 			obj["apiVersion"] = "v1"
 			obj["kind"] = "SecretList"
 		}
+	}
+
+	if !callerWantsPartial && (isSecretObject || (kind == "" && obj["metadata"] != nil && obj["items"] == nil && obj["rows"] == nil)) && len(dataKeys) > 0 {
+		redactedData := make(map[string]any, len(dataKeys))
+		for _, k := range dataKeys {
+			redactedData[k] = ""
+		}
+		obj["data"] = redactedData
 	}
 
 	if meta, ok := obj["metadata"].(map[string]any); ok {
@@ -133,13 +144,13 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 	if items, ok := obj["items"].([]any); ok {
 		for _, item := range items {
 			if itemMap, ok := item.(map[string]any); ok {
-				scrubSecretObjectMap(itemMap, callerWantsPartial)
 				if !callerWantsPartial {
 					if _, hasKind := itemMap["kind"]; !hasKind {
 						itemMap["apiVersion"] = "v1"
 						itemMap["kind"] = "Secret"
 					}
 				}
+				scrubSecretObjectMap(itemMap, callerWantsPartial)
 			}
 		}
 	}
@@ -157,6 +168,54 @@ func scrubSecretObjectMap(obj map[string]any, callerWantsPartial bool) {
 	if nestedObj, ok := obj["object"].(map[string]any); ok {
 		scrubSecretObjectMap(nestedObj, callerWantsPartial)
 	}
+}
+
+func collectSecretDataKeys(obj map[string]any) []string {
+	seen := make(map[string]struct{})
+	var keys []string
+	addKey := func(k string) {
+		if k == "" {
+			return
+		}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+
+	for _, field := range []string{"data", "stringData"} {
+		if m, ok := obj[field].(map[string]any); ok {
+			for k := range m {
+				addKey(k)
+			}
+		}
+	}
+
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if managedFields, ok := meta["managedFields"].([]any); ok {
+			for _, entry := range managedFields {
+				entryMap, ok := entry.(map[string]any)
+				if !ok {
+					continue
+				}
+				fieldsV1, ok := entryMap["fieldsV1"].(map[string]any)
+				if !ok {
+					continue
+				}
+				for _, fieldKey := range []string{"f:data", "f:stringData"} {
+					if fData, ok := fieldsV1[fieldKey].(map[string]any); ok {
+						for k := range fData {
+							if strings.HasPrefix(k, "f:") {
+								addKey(strings.TrimPrefix(k, "f:"))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return keys
 }
 
 func replaceWithBadGateway(resp *http.Response, message string) {

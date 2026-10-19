@@ -84,8 +84,12 @@ func TestScrubSecretResponse(t *testing.T) {
 		if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
 			t.Fatalf("scrubbed output is not valid JSON: %v", err)
 		}
-		if _, hasData := parsed["data"]; hasData {
-			t.Errorf("expected data field to be removed")
+		dataMap, ok := parsed["data"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected data key map to be preserved with empty values, got %v", parsed["data"])
+		}
+		if dataMap["password"] != "" || dataMap["token"] != "" {
+			t.Errorf("expected data keys to have empty redacted values, got %v", dataMap)
 		}
 		if _, hasStringData := parsed["stringData"]; hasStringData {
 			t.Errorf("expected stringData field to be removed")
@@ -97,13 +101,27 @@ func TestScrubSecretResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("normalizes PartialObjectMetadata to Secret when caller did not request PartialObjectMetadata", func(t *testing.T) {
+	t.Run("normalizes PartialObjectMetadata to Secret and populates data keys from managedFields", func(t *testing.T) {
 		rawPartial := `{
 			"apiVersion": "meta.k8s.io/v1",
 			"kind": "PartialObjectMetadata",
 			"metadata": {
 				"name": "tls-secret",
-				"namespace": "default"
+				"namespace": "default",
+				"managedFields": [
+					{
+						"apiVersion": "v1",
+						"fieldsType": "FieldsV1",
+						"fieldsV1": {
+							"f:data": {
+								".": {},
+								"f:ca.crt": {},
+								"f:tls.crt": {},
+								"f:tls.key": {}
+							}
+						}
+					}
+				]
 			}
 		}`
 		scrubbed, err := ScrubSecretJSONBytes([]byte(rawPartial), false)
@@ -114,6 +132,15 @@ func TestScrubSecretResponse(t *testing.T) {
 		_ = json.Unmarshal(scrubbed, &parsed)
 		if parsed["apiVersion"] != "v1" || parsed["kind"] != "Secret" {
 			t.Errorf("got apiVersion=%v kind=%v, want v1/Secret", parsed["apiVersion"], parsed["kind"])
+		}
+		dataMap, ok := parsed["data"].(map[string]any)
+		if !ok || len(dataMap) != 3 {
+			t.Fatalf("expected 3 data keys from managedFields, got %v", parsed["data"])
+		}
+		for _, k := range []string{"ca.crt", "tls.crt", "tls.key"} {
+			if val, exists := dataMap[k]; !exists || val != "" {
+				t.Errorf("data[%q] = %q (exists=%v), want empty string", k, val, exists)
+			}
 		}
 	})
 

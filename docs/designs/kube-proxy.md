@@ -300,9 +300,9 @@ When `Config.RedactSecrets` is enabled (the default) and `RequestInfo` matches c
    - If the caller requested a table (`as=Table` in `Accept`, used by `kubectl get secrets`), the proxy preserves `as=Table` because `kube-apiserver`'s `Secret` table printer only returns `NAME`, `TYPE`, `DATA` (count), and `AGE`.
    - For all other `Accept` headers (such as `kubectl get secret foo -o yaml` or `-o json` or `--raw /api/v1/secrets`), the proxy rewrites `Accept` to `application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` (or `PartialObjectMetadataList` for `list`), instructing `kube-apiserver` to return only `TypeMeta` and `ObjectMeta`.
 3. **Response body scrubber (Layer 2 — defense in depth)**:
-   - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` inspects the JSON payload and strips:
-     - Top-level and `items[*]` fields: `data` and `stringData` (replaced with `{"REDACTED": "REDACTED_BY_KUBE_PROXY"}` if present).
-     - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`).
+   - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` inspects the JSON payload and scrubs sensitive payloads while preserving `Secret` key names:
+     - Top-level and `items[*]` `.data` and `.stringData` keys are collected (along with any key names recorded in `metadata.managedFields[*].fieldsV1["f:data"]` and `["f:stringData"]`), `.stringData` is removed, and `.data` is populated with empty base64 values (`""`) for each key so `kubectl get secret -o yaml` and `kubectl describe secret` display the key names without exposing secret bytes.
+     - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`) is deleted.
    - If a `secrets` response cannot be parsed as valid JSON, `kube-proxy` fails closed and returns `502 Bad Gateway` rather than forwarding unverified bytes.
 
 ### 8. Header sanitization and streaming (`pkg/k8sapiproxy/headers.go`)

@@ -141,20 +141,6 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	spanCtx, span := startRequestSpan(h.tracerProvider, r, h.mode)
 	r = r.WithContext(spanCtx)
 
-	if HasUpgradeHeader(r) {
-		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
-		WriteStatusError(
-			w,
-			http.StatusForbidden,
-			metav1.StatusReasonForbidden,
-			"kube-proxy policy blocked protocol upgrade request: interactive streaming subresources are not permitted. This is a permission boundary, not an error to work around.",
-		)
-		h.metrics.recordRejection(ReasonProtocolUpgradeBlocked, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedPolicy, http.StatusForbidden, time.Since(start))
-		finishRequestSpan(span, OutcomeRejectedPolicy, ReasonProtocolUpgradeBlocked, http.StatusForbidden)
-		return
-	}
-
 	if _, err := h.authenticator.AuthenticateRequest(r); err != nil {
 		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
 		WriteStatusError(
@@ -182,7 +168,6 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq := r.Clone(r.Context())
 	outReq.URL.Path = cleanPath
 	outReq.URL.RawPath = ""
-	SanitizeRequestHeaders(outReq.Header)
 
 	info, err := h.factory.NewRequestInfo(outReq)
 	if err != nil {
@@ -210,6 +195,8 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		finishRequestSpan(span, OutcomeRejectedPolicy, policyErr.RejectionReason, policyErr.Code)
 		return
 	}
+
+	SanitizeRequestHeaders(outReq.Header)
 
 	var callerWantsPartial bool
 	if secretRedacted {
