@@ -123,7 +123,7 @@ validated: false
 
 domain: reliability
 
-owner: maintainers
+owner: dshnayder
 
 fixtures:
   - no-pdb-workload
