@@ -800,6 +800,17 @@ The App and its key belong to one GitHub host, so a switch needs the App on the 
 
 To switch back to github.com, use `--gitops-host=github.com` with the github.com App and its key (`--github-app-id`, `--github-pem-path` and another new `--kms-key`, or the key that already holds that App's private key). The applied run rewrites `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_CA_SECRET`, `GITOPS_ORG`, `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` in `install.env`, and a switch to github.com removes the first three. Apply the new `charts/kube-agents/crds/` first when you switch an install of an earlier release: the CRD of an earlier release refuses `caBundleRef` on a `github` forge (`install.sh` applies them on a re-run onto an existing cluster). The install then serves only the new host: repositories registered on the other host are skipped. With Terraform alone, you can instead import the new key into the existing key and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values` (see the next section).
 
+After the switch, the `platform-agent-gitops-state` ConfigMap still lists the repositories of the old host: the operator adds the repositories that the new forge declares, and it never removes an entry. The agent and the token minter skip the old entries, but each `submit-suggestion` call prints a `Skipping managed_repos repository '<url>'` line for each of them. Read the two lists, and write them back with only the entries on the new host:
+
+```bash
+kubectl get configmap platform-agent-gitops-state -n kubeagents-system \
+  -o jsonpath='{.data.managed_repos}{"\n"}{.data.context_repos}{"\n"}'
+kubectl patch configmap platform-agent-gitops-state -n kubeagents-system --type merge \
+  -p '{"data":{"managed_repos":"[{\"type\":\"github\",\"url\":\"https://ghe.example.com/acme/infra\"}]","context_repos":"[]"}}'
+```
+
+Keep the GitOps repository first in `managed_repos`, and keep each context repository on the new host in `context_repos`.
+
 #### Terraform + Helm, without `install.sh`
 
 The composition takes the instance through its own variables. In `terraform/examples/full-install/terraform.tfvars` (see [Step 3](#step-3-apply-the-composition)):
