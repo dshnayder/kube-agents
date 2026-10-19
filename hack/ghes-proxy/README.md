@@ -244,16 +244,26 @@ These steps give the proxy a DNS name inside one cluster, with no Cloud DNS zone
    EOF
    ```
 
-3. Send the name's zone to that server with a kube-dns stub domain. First read the ConfigMap: if it already has `stubDomains`, add the entry to the JSON that is there, and do not replace it.
+3. Send the name's zone to that server with a kube-dns stub domain. `stubDomains` is one JSON string, and other zones can already be in it. The commands below read the value, add the entry to it with `jq`, and write the result back, so they keep all the entries that are there. If the cluster has no `kube-dns` ConfigMap in `kube-system`, they make it. They need `jq`.
 
    ```bash
-   kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}'
    DNS_IP=$(kubectl -n "$NAMESPACE" get service ghes-dns -o jsonpath='{.spec.clusterIP}')
-   kubectl -n kube-system patch configmap kube-dns --type merge \
-     -p "{\"data\":{\"stubDomains\":\"{\\\"${GHES_PUBLIC_HOST}\\\": [\\\"${DNS_IP}\\\"]}\"}}"
+   if kubectl -n kube-system get configmap kube-dns >/dev/null 2>&1; then
+     CURRENT=$(kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}')
+     echo "stubDomains before: ${CURRENT:-<none>}"
+     if MERGED=$(jq -nc --arg cur "$CURRENT" --arg host "$GHES_PUBLIC_HOST" --arg ip "$DNS_IP" \
+       '($cur | if . == "" then {} else fromjson end) + {($host): [$ip]}'); then
+       kubectl -n kube-system patch configmap kube-dns --type merge \
+         -p "$(jq -nc --arg v "$MERGED" '{data: {stubDomains: $v}}')"
+     fi
+   else
+     kubectl -n kube-system create configmap kube-dns \
+       --from-literal=stubDomains="$(jq -nc --arg host "$GHES_PUBLIC_HOST" --arg ip "$DNS_IP" '{($host): [$ip]}')"
+   fi
+   kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}'; echo
    ```
 
-   kube-dns and NodeLocal DNSCache read the change in about 30 seconds. See [Setting up custom resolvers for kube-dns](https://cloud.google.com/kubernetes-engine/docs/how-to/kube-dns#stub-domains).
+   If the value that is there is not valid JSON, `jq` fails and the commands change nothing. The last command prints the new value: it has the entries from before and the `${GHES_PUBLIC_HOST}` entry. kube-dns and NodeLocal DNSCache read the change in about 30 seconds. See [Setting up custom resolvers for kube-dns](https://cloud.google.com/kubernetes-engine/docs/how-to/kube-dns#stub-domains).
 
 4. Check from a pod, with the CA, as `INSTALL.md` tells ("The check" in "GitHub Enterprise Server"):
 
@@ -284,4 +294,20 @@ kubectl -n kubeagents-system delete networkpolicy github-token-minter-to-ghes-pr
 rm -rf ~/dev/ghes-proxy-certs
 ```
 
-For the in-cluster DNS steps, delete the namespace, the NetworkPolicy and the certificates as above, and remove the `ghes.eval.internal` entry from `stubDomains` in the `kube-dns` ConfigMap in `kube-system` (if it was the only entry, remove the `stubDomains` key).
+For the in-cluster DNS steps, delete the namespace, the NetworkPolicy and the certificates as above. Then remove the `ghes.eval.internal` entry from `stubDomains` in the `kube-dns` ConfigMap in `kube-system`, and keep the other entries. If it was the only entry, remove the `stubDomains` key:
+
+```bash
+CURRENT=$(kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}')
+if REST=$(jq -nc --arg cur "$CURRENT" --arg host ghes.eval.internal \
+  '($cur | if . == "" then {} else fromjson end) | del(.[$host])'); then
+  if [ "$REST" != "{}" ]; then
+    kubectl -n kube-system patch configmap kube-dns --type merge \
+      -p "$(jq -nc --arg v "$REST" '{data: {stubDomains: $v}}')"
+  elif [ -n "$CURRENT" ]; then
+    kubectl -n kube-system patch configmap kube-dns --type json \
+      -p '[{"op": "remove", "path": "/data/stubDomains"}]'
+  fi
+fi
+```
+
+If step 3 made the `kube-dns` ConfigMap, and it now has no other data, you can delete it.
