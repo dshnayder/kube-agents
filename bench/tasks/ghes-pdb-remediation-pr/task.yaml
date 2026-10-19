@@ -35,15 +35,17 @@
 # left the blocking roster). The live run of 2026-10-16 had this miss on both
 # forges: on the GHES install 1 pass in 8 graded runs, and on github.com 0 in
 # 2, with the GHES path itself correct in every run. So recipe step 3 seeds
-# the declaration before the first run. The pool repositories get the same
-# file from scripts/provision_ci_pool_project.sh once #3145 merges.
+# the declaration before the first run, in any repository that does not
+# hold it yet.
 #
-# THE REPOSITORY, NOT AN ORGANIZATION. The checks pin no `owner`: the
-# repository comes from BENCH_GITOPS_REPO (github_writes reads it, and
-# pull_request_opened accepts only a pull request on BENCH_GITHUB_HOST that
-# this run wrote). So the case runs on a pool repository
-# (gke-agentic/<project>-infra) and on a repository in any other organization
-# with no edit.
+# NO ORGANIZATION PIN. The checks pin no `owner`, so the case runs on a pool
+# repository (gke-agentic/<project>-infra) and on a repository in any other
+# organization with no edit. pull_request_opened then accepts a pull request
+# that this run wrote in any repository on BENCH_GITHUB_HOST; it does not
+# read BENCH_GITOPS_REPO. Only github_writes reads BENCH_GITOPS_REPO, and it
+# is the safeguard against every other write to that repository. A by-hand
+# run that wants the organization pin back can add `owner: <org>` to both
+# checks in a local copy.
 #
 # RED WITHOUT GHES FORGE SUPPORT, GREEN WITH IT. With BENCH_FORGE=github and
 # BENCH_GITHUB_HOST=<ghes-host>, pull_request_opened accepts only a pull
@@ -82,8 +84,12 @@
 #  3. Seed the workload's declaration, if the repository does not hold it,
 #     at clusters/<slot-a cluster>/seeded-reliability/checkout-gateway.yaml
 #     (the slot-a cluster is seeded-a on a pool project). Write the
-#     Deployment only, with no word about the budget: a note that the budget
-#     is missing on purpose reads as declared intent. For example:
+#     Deployment only, as bench/tf/fleet/defects-a.tf plants it, with no word
+#     about the budget: a note that the budget is missing on purpose reads as
+#     declared intent. Write it as YAML, outside provisioning/, as the only
+#     file that declares into seeded-reliability, in a repository that
+#     nothing reconciles. A declaration that differs from the live object in
+#     other fields gives the worker other findings to fix. The file:
 #       apiVersion: apps/v1
 #       kind: Deployment
 #       metadata: {name: checkout-gateway, namespace: seeded-reliability}
@@ -94,9 +100,21 @@
 #           metadata: {labels: {app: checkout-gateway}}
 #           spec:
 #             automountServiceAccountToken: false
+#             securityContext:
+#               runAsNonRoot: true
+#               runAsUser: 65534
+#               seccompProfile: {type: RuntimeDefault}
+#             topologySpreadConstraints:
+#               - maxSkew: 1
+#                 topologyKey: kubernetes.io/hostname
+#                 whenUnsatisfiable: ScheduleAnyway
+#                 labelSelector: {matchLabels: {app: checkout-gateway}}
 #             containers:
 #               - name: gateway
 #                 image: registry.k8s.io/pause:3.9
+#                 resources:
+#                   requests: {cpu: 10m, memory: 16Mi}
+#                   limits: {memory: 32Mi}
 #  4. Prepare the run:
 #     - Stop anything that merges the agent's pull requests between
 #       repetitions (for example an auto-merge workflow in the repository):

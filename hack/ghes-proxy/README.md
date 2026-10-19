@@ -146,7 +146,7 @@ These steps are for GKE and Cloud DNS. They give the proxy an internal address i
 
    The command prints `200`. The check uses `--insecure` because the pod does not have the CA. The clients in the next step get it.
 
-7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as the "GitHub Enterprise Server" section of `INSTALL.md` tells. This needs a build that includes #3032; a build without it refuses the host and `caBundleRef`. `install.sh` writes this forge with `--gitops-host` and `--gitops-ca-file` (#3104), or use the Terraform and Helm steps in that section. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
+7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as the "GitHub Enterprise Server" section of `INSTALL.md` tells. This needs a build that includes #3032; a build without it refuses the host and `caBundleRef`. `install.sh` writes this forge with `--gitops-host` and `--gitops-ca-file`, or use the Terraform and Helm steps in that section. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
 
 8. If the cluster enforces NetworkPolicy, make sure that the credential broker and the token minter can reach the proxy, and that the proxy can reach github.com on TCP 443. The proxy runs in the same cluster as its clients, so a policy does not see the address and port that the client dials. On GKE Dataplane V2, traffic to a Service address, a ClusterIP or the internal load balancer of step 4, goes to the proxy pod. The policy sees a pod in the cluster on the container port `8443`, not an outside address on `443`. Thus the shipped minter policy, which allows TCP 443 to any address for a real instance outside the cluster, does not allow the proxy. Add an egress rule for each client whose policy limits egress (the minter's does; the broker's shipped policy limits ingress only):
 
@@ -181,7 +181,7 @@ These steps are for GKE and Cloud DNS. They give the proxy an internal address i
 
 These steps give the proxy a DNS name inside one cluster, with no Cloud DNS zone and no load balancer. Use them when the cluster is on a VPC that other people share: a private zone is visible on the whole VPC, and these objects go with the cluster. They are for a GKE cluster that uses kube-dns (with or without NodeLocal DNSCache). A cluster that uses Cloud DNS for GKE does not read the kube-dns ConfigMap; use the Cloud DNS steps above for it.
 
-1. Do steps 1 to 3 of the section above, but apply the Service as a ClusterIP Service, with no load balancer:
+1. Do steps 1 and 2 of the section above, and step 3 without its last command, which makes the load balancer. Then apply the Service as a ClusterIP Service:
 
    ```bash
    envsubst < hack/ghes-proxy/manifests/service.yaml.template \
