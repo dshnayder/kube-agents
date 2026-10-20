@@ -470,6 +470,30 @@ the `gitops` project. [Which repository gets the ledger](/kube-agents/concepts/d
 says how to change it, and what happens with several projects and no `role: gitops`, with no
 project, or with a project that the token cannot reach.
 
+To register a second project, for example `infra/terraform` as `managed`, set the full repository
+list in the chart value `platformAgent.integration.repositories`. Helm replaces a list and does not
+merge it, so the list must also hold the `--gitops-repo` project with `role: gitops`. If it does
+not, the install loses that project. Use the forge name `gitlab`, which is the name that the
+installer gives the forge. On an install made with `install.sh`, put the list in the
+`TF_VAR_extra_helm_values` line in `install.env`, as
+[Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows, and run
+`install.sh` again:
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={repositories=[{forge="gitlab",repository="platform/gitops",role="gitops"},{forge="gitlab",repository="infra/terraform",role="managed"}]}}}'
+```
+
+The broker then also serves the group of the second project. The token must reach that project
+with the Developer role: a project access token reaches one project only, and a group access token
+reaches only its own group. For two projects in different groups, use the token of a dedicated
+account that is a Developer member of both. Run the access-level check in
+[Check the token](#check-the-token) once for each project. Then make sure that the install has both
+projects:
+
+```bash
+kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.integration.repositories}'
+```
+
 ## Limits
 
 - The skills read GitLab entries in `managed_repos`, but only GitHub entries in `context_repos`.
