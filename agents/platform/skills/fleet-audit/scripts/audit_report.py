@@ -860,6 +860,13 @@ SILENT_FLOOR_KEY = "silent_floor"
 # The rendered report's last line. `slack_audit_report.ledger_ref` finds the
 # ledger only behind a "ledger:" label, a dash or a markdown link.
 CHAT_REPORT_LEDGER_LINE = "Ledger: {url}"
+# The chat report's line for `SINCE_SCHEDULED_KEY`, and the line when no
+# record shows the last scheduled run.
+CHAT_REPORT_SINCE_SCHEDULED_LINE = "Changed since the last scheduled run: {new}, {resolved}."
+CHAT_REPORT_SINCE_SCHEDULED_UNKNOWN_LINE = (
+    "The change since the last scheduled run is not known: no stored record shows "
+    "what the last scheduled run reported."
+)
 # The store's modes, whatever the writer's umask, for the reason the in-flight
 # lock clears its umask: a hand-run `finish` over `kubectl exec` lands as root,
 # the tick and every session as uid 1000, and a mode is only a request the
@@ -1306,6 +1313,17 @@ SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
 # scheduled run reported. A scheduled run does not report these again; an id
 # that only an on-demand run reported is still news to the channel.
 SCHEDULED_REPORTED_UNDER_GAP_KEY = "scheduled_reported_under_gap"
+# On the JSON line of a scheduled run only: the change since the last
+# scheduled run, when `new` and `resolved` do not say it. `new` and
+# `resolved` count against the last stored run, so after an on-demand run
+# they can be 0 while the channel has not heard of the change. The value is
+# `{"new": [ids], "resolved": [ids]}`: the ids published now and not by the
+# last scheduled run, and the ids the last scheduled run published that are
+# gone now (not an id dropped under a coverage gap). It is None when no
+# record shows what the last scheduled run published. The key is absent when
+# the published ids did not move, or when the last stored run was a
+# scheduled run. See `since_last_scheduled`.
+SINCE_SCHEDULED_KEY = "since_last_scheduled"
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -3295,6 +3313,31 @@ def append_chat_report(
         log(f"WARNING: chat report for {audit_id} not written: {exc}")
 
 
+def since_scheduled_line(payload: dict, delta_known: bool = True) -> str | None:
+    """The report line for `SINCE_SCHEDULED_KEY` on `payload`, or None.
+
+    A scheduled run that an on-demand run came before can count 0 new and 0
+    resolved and still speak. This line says what changed since the last
+    scheduled run, so the channel sees it. With no stored record of the last
+    scheduled run, the line says that the change is not known; it is left
+    out when the headline already says that the change since the last run is
+    not known (`delta_known` false).
+    """
+    if SINCE_SCHEDULED_KEY not in payload:
+        return None
+    since = payload[SINCE_SCHEDULED_KEY]
+    if since is None:
+        return CHAT_REPORT_SINCE_SCHEDULED_UNKNOWN_LINE if delta_known else None
+
+    def counted(ids: list[str], word: str) -> str:
+        return f"{len(ids)} {word} ({', '.join(ids)})" if ids else f"0 {word}"
+
+    return CHAT_REPORT_SINCE_SCHEDULED_LINE.format(
+        new=counted(list(since.get("new") or []), "new"),
+        resolved=counted(list(since.get("resolved") or []), "resolved"),
+    )
+
+
 def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bool = True) -> str:
     """The report the chat relay posts for a run that published to a ledger.
 
@@ -3339,6 +3382,9 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
             f"across {clusters} cluster(s)."
         )
     lines = [head]
+    since = since_scheduled_line(payload, delta_known)
+    if since:
+        lines.append(f"- {since}")
     for label, key in (
         ("Pull requests opened", "prs_opened"),
         ("Pull requests waiting for review", "prs_still_open"),
@@ -8015,6 +8061,39 @@ def next_scheduled_value(scheduled: bool, own: Iterable[str], stored: list[str] 
     if scheduled:
         return sorted(set(own))
     return stored
+
+
+def since_last_scheduled(
+    ids_moved: bool,
+    record: dict | None,
+    baseline: list[str] | None,
+    published: Iterable[str],
+    not_resolved: Iterable[str] = (),
+) -> dict:
+    """The `SINCE_SCHEDULED_KEY` entry for the JSON line, or `{}` for none.
+
+    `ids_moved` says the scheduled run speaks because its published ids are
+    not the last scheduled run's. `record` is the stored record that
+    `baseline` (`scheduled_published_baseline`) was read from, and
+    `published` is what this run published. `not_resolved` holds ids that
+    left under a coverage gap: they are not resolved, and the report lists
+    them on a line of their own. With no baseline the value is None. When
+    the stored record is a scheduled run's, `new` and `resolved` already
+    count against the last scheduled run, so the entry is left out.
+    """
+    if not ids_moved:
+        return {}
+    if baseline is None:
+        return {SINCE_SCHEDULED_KEY: None}
+    if (record or {}).get(RUN_SCHEDULED_KEY) is not False:
+        return {}
+    published = set(published)
+    return {
+        SINCE_SCHEDULED_KEY: {
+            "new": sorted(published - set(baseline)),
+            "resolved": sorted(set(baseline) - published - set(not_resolved)),
+        }
+    }
 
 
 def coverage_changed(
@@ -17394,10 +17473,13 @@ def render_no_forge_summary(
     held: list[str],
     note: str,
     dropped: int = 0,
+    since_scheduled: str | None = None,
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
-    The headline counts, the most severe findings up to
+    The headline counts, the change since the last scheduled run when the
+    counts do not say it (`since_scheduled`, from `since_scheduled_line`),
+    the most severe findings up to
     `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
     collector still flags that the document left out, how many of this run's
     collector candidates the document does not carry (`dropped`), the
@@ -17416,6 +17498,8 @@ def render_no_forge_summary(
         f"{audit_name(audit_id)}: {findings_phrase(len(findings))} "
         f"({counts['critical']} critical) across {clusters} cluster(s){delta}."
     ]
+    if since_scheduled:
+        lines.append(since_scheduled)
     ordered = sort_findings(findings)
     for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
         where = "/".join(
@@ -17508,6 +17592,14 @@ def _finish_without_forge(
     ids_moved = scheduled and (
         scheduled_ids is None or set(stored_ids) != set(scheduled_ids)
     )
+    # Over a coverage gap an absence is not a fix, so nothing is resolved.
+    since_scheduled = since_last_scheduled(
+        ids_moved,
+        record,
+        scheduled_ids,
+        stored_ids,
+        not_resolved=(scheduled_ids or []) if gaps else (),
+    )
     payload = {
         "status": NO_FORGE_STATUS,
         "issue_url": None,
@@ -17544,6 +17636,7 @@ def _finish_without_forge(
         ),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
+        **since_scheduled,
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
@@ -17575,7 +17668,16 @@ def _finish_without_forge(
     # For the same reason, a run the store does not hold is never quiet.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored
     payload["summary"] = render_no_forge_summary(
-        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
+        audit_id,
+        data,
+        gaps,
+        new_ids,
+        resolved_ids,
+        delta_known,
+        held,
+        note,
+        len(unpublished),
+        since_scheduled=since_scheduled_line(payload, delta_known),
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -18165,6 +18267,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         else sorted(scheduled_reported)
     )
     next_scheduled_ids = next_scheduled_value(scheduled, published_ids, scheduled_ids)
+    # The change since the last scheduled run, for the JSON line and the chat
+    # report, when `new` and `resolved` do not say it. An id that left under
+    # a gap is not resolved; the `unreported_under_gap` line names it.
+    since_scheduled = since_last_scheduled(
+        ids_moved,
+        scheduled_memory,
+        scheduled_ids,
+        published_ids,
+        not_resolved=reported_under_gap if gaps else (),
+    )
     for entry in held_entries:
         if carried_without_manifest:
             log(
@@ -18680,6 +18792,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # Only when not empty, so a run without it prints the line it
             # printed before.
             **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
+            # Only on a scheduled run that speaks because its ids moved
+            # (`SINCE_SCHEDULED_KEY`).
+            **since_scheduled,
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -19222,6 +19337,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         UNACCOUNTED_KEY: [],
         # Same key as the CLEAN branch; see the note there.
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
+        **since_scheduled,
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }

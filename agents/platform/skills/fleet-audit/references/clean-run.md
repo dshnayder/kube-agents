@@ -94,11 +94,15 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   stored record, every gap counts as new. A scheduled run compares its gaps with the last
   scheduled run, so a gap first seen on an on-demand run is still reported by the next scheduled run.
 - **A scheduled run whose findings are not those of the last scheduled run** — an on-demand run saw
-  a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it:
-  report the issue URL and say that the ledger changed since the last scheduled run. This includes
-  the first scheduled run after an on-demand run closed the ledger (say that the stream is clean),
-  and a run whose stored record does not show the last scheduled run's findings, for example the
-  first run after an upgrade.
+  a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it.
+  The JSON line then has `since_last_scheduled`: `{"new": [ids], "resolved": [ids]}`, the change
+  since the last scheduled run. Report the issue URL and those counts, for example "changed since
+  the last scheduled run: 1 new, 0 resolved". This includes the first scheduled run after an
+  on-demand run closed the ledger (say that the stream is clean). When no stored record shows the
+  last scheduled run's findings, `since_last_scheduled` is `null`: say that the change since the
+  last scheduled run is not known. This occurs on the first run after an upgrade, or after the
+  report store is rebuilt from the ledger. The key is absent when the last stored run was a
+  scheduled run, because `new` and `resolved` then say the change.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. On a scheduled run, the list also has the
   findings of the last scheduled run that an on-demand run dropped under a gap; a finding that an
