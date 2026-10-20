@@ -2262,10 +2262,6 @@ class TestManagedReposRegistered(unittest.TestCase):
                 self.assertTrue(self.registered(text))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestGetGitopsRepo(WorkspaceTestCase):
     """`get_gitops_repo`: the operator's `gitops_repo` key, named as `get_managed_repos` names it."""
 
@@ -2348,3 +2344,7 @@ class TestGetGitopsRepo(WorkspaceTestCase):
             {"type": "gitlab", "url": "https://gitlab.com/acme/gitops"},
         )
         self.assertIsNone(self.read())
+
+
+if __name__ == "__main__":
+    unittest.main()

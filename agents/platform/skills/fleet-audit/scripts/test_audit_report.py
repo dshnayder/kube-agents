@@ -26351,7 +26351,9 @@ class TestNoForge(BaseTestCase):
         holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
         holder.mkdir(parents=True)
         gitops_workspace.write_lease(holder, AUDIT, "acme/gitops", owner=f"fleet-audit:{AUDIT}")
-        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+        # No run is in flight, so the lease is an earlier run's and is not used.
+        with self.assertRaises(RuntimeError):
+            audit_report.resolve_repo(audit_id=AUDIT)
 
         self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
         self.assertEqual(self.recorder.calls, [])
@@ -27131,10 +27133,6 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertNotEqual(self.chat_record()["run"], run)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _repo_entries(*urls, kind="github"):
     """A `managed_repos` value: one `{type, url}` entry per URL."""
     return json.dumps([{"type": kind, "url": url} for url in urls])
@@ -27207,7 +27205,8 @@ class TestLedgerRepositoryChoice(BaseTestCase):
         self.register(_repo_entries(self.GITOPS, self.TERRAFORM), stale)
         with self.assertRaises(RuntimeError) as caught:
             audit_report.resolve_repo(audit_id=AUDIT)
-        self.assertIn("role: gitops", str(caught.exception))
+        self.assertIn("names no repository in that list", str(caught.exception))
+        self.assertNotIn("none has role gitops", str(caught.exception))
         self.assertNotIn("acme/removed", str(caught.exception))
         # One registered repository: the one-repository rule, not the key.
         self.register(_repo_entries(self.TERRAFORM), stale)
@@ -27232,12 +27231,61 @@ class TestLedgerRepositoryChoice(BaseTestCase):
                 audit_report.resolve_repo(audit_id=AUDIT, workspace=workspace), "acme/terraform"
             )
 
-    def test_the_lease_record_comes_before_the_gitops_role(self):
-        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+    def test_an_unreadable_key_is_not_called_a_missing_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM))
+        unreadable = RuntimeError("Failed to read ConfigMap platform-agent-gitops-state")
+        with patch("gitops_workspace.gitops_repo_key_text", side_effect=unreadable):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.resolve_repo(audit_id=AUDIT)
+        self.assertIn("gitops_repo key could not be read", str(caught.exception))
+        self.assertIn("Failed to read ConfigMap", str(caught.exception))
+        self.assertNotIn("none has role gitops", str(caught.exception))
+
+    def lease(self, repo, refreshed_at=None):
         holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
-        holder.mkdir(parents=True)
-        gitops_workspace.write_lease(holder, AUDIT, "acme/terraform", owner=f"fleet-audit:{AUDIT}")
+        holder.mkdir(parents=True, exist_ok=True)
+        record = gitops_workspace.write_lease(holder, AUDIT, repo, owner=f"fleet-audit:{AUDIT}")
+        if refreshed_at is not None:
+            record["refreshed_at"] = refreshed_at
+            (holder / gitops_workspace.LEASE_FILENAME).write_text(json.dumps(record), encoding="utf-8")
+
+    def claim(self):
+        """Take this stream's in-flight note, as `start` does first."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.real_claim_in_flight(AUDIT)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def test_a_lease_from_an_earlier_run_does_not_override_the_gitops_key(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        # An earlier `--repo` run left its lease, and no run is in flight.
+        self.lease("acme/terraform")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+        # A run is in flight, but the lease is older than its note.
+        self.claim()
+        self.lease("acme/terraform", refreshed_at="2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+
+    def test_this_runs_lease_comes_before_the_gitops_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        self.claim()
+        self.lease("acme/terraform")
         self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
+
+    def test_within_one_run_finish_follows_starts_repo(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        recorder = Recorder()
+        self.patch_attr("run_cmd", recorder)
+        # `start --repo acme/terraform`: the note, then the lease and the record.
+        self.claim()
+        self.lease("acme/terraform")
+        audit_report.write_run_record(AUDIT, "acme/terraform", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/terraform", None))
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/terraform"), ("acme/terraform", None))
+        # It follows the decision; it does not probe again.
+        self.assertEqual(recorder.calls, [])
+        # A record from an earlier run is not this run's.
+        audit_report.release_in_flight(AUDIT)
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
 
     def test_one_repository_needs_no_gitops_role(self):
         self.register(_repo_entries(self.TERRAFORM))
@@ -27307,7 +27355,9 @@ class TestUnreachableRepository(BaseTestCase):
         self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
         self.assertIn("acme/gitops could not be reached", out["no_forge"])
         self.assertTrue((self.store() / "latest.json").exists())
-        # One probe for each command, to the gitops repository, and nothing else.
+        # No in-flight note here (claim_in_flight is stubbed), so `finish` has
+        # no record of this run and probes on its own: one probe for each
+        # command, to the gitops repository, and nothing else.
         self.assertEqual(
             [(call, payload.get("repository")) for call, payload in zip(self.recorder.calls, self.recorder.payloads)],
             [(["forge", "issue-list"], "acme/gitops")] * 2,
@@ -27319,7 +27369,11 @@ class TestUnreachableRepository(BaseTestCase):
         self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
 
     def test_each_repository_code_diverts(self):
-        for code in sorted(audit_report.UNREACHABLE_REPO_CODES):
+        self.assertEqual(
+            audit_report.unreachable_repo_codes(),
+            {"FORGE_NOT_FOUND", "FORGE_FORBIDDEN", "FORGE_UNAUTHENTICATED", "REPOSITORY_NOT_MANAGED"},
+        )
+        for code in sorted(audit_report.unreachable_repo_codes()):
             with self.subTest(code=code):
                 self.patch_attr("run_cmd", _UnreachableRecorder(code))
                 repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
@@ -27342,3 +27396,69 @@ class TestUnreachableRepository(BaseTestCase):
     def test_a_reachable_repository_keeps_the_forge_path(self):
         self.patch_attr("run_cmd", Recorder())
         self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
+
+    def claim_for_real(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def run_once(self, findings=THREE_SEVERITIES):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=findings)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        return self.stdout_json()
+
+    def test_an_unreachable_repository_is_never_silent(self):
+        self.claim_for_real()
+        first = self.run_once()
+        second = self.run_once()
+        for out in (first, second):
+            self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+            self.assertFalse(out["silent_ok"])
+            self.assertIn("FORGE_NOT_FOUND", out[audit_report.UNREACHABLE_REPO_KEY]["reason"])
+            self.assertIn("acme/gitops could not be reached", out["summary"])
+        # The second run is not compared with the first: its delta is unknown.
+        self.assertEqual((second["new"], second["resolved"]), (0, 0))
+
+    def test_finish_follows_starts_unreachable_decision(self):
+        self.claim_for_real()
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        # The repository answers by the time of `finish`; the run stays on
+        # the decision `start` made.
+        reachable = Recorder()
+        self.patch_attr("run_cmd", reachable)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertEqual(out[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+        self.assertEqual(reachable.calls, [])
+
+    def test_finish_follows_starts_reachable_decision(self):
+        # `start` reached the repository; a probe at `finish` would fail, and
+        # `finish` does not make one.
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.real_claim_in_flight(AUDIT)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+        audit_report.write_run_record(AUDIT, "acme/gitops", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_a_repository_the_broker_does_not_manage_says_to_register_it(self):
+        self.patch_attr("run_cmd", _UnreachableRecorder("REPOSITORY_NOT_MANAGED"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        note = audit_report.unreachable_note(unreachable)
+        self.assertIn("Register the repository", note)
+        self.assertNotIn("Make sure that the repository exists", note)
+        self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_NOT_FOUND"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertIn("Make sure that the repository exists", audit_report.unreachable_note(unreachable))
+
+
+if __name__ == "__main__":
+    unittest.main()

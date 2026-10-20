@@ -1670,13 +1670,23 @@ def get_context_github_repo_entries() -> list[dict]:
 GITOPS_REPO_KEY = "gitops_repo"
 
 
-def get_gitops_repo() -> str | None:
+def gitops_repo_key_text() -> str:
+    """The raw value of the `gitops_repo` key, stripped; "" when the key is absent.
+
+    Raises `RuntimeError` when the value cannot be read, as `get_managed_repos`
+    does, so that a caller can tell "no key" from "could not read the key".
+    """
+    return _read_state_text(GITOPS_REPO_KEY).strip()
+
+
+def get_gitops_repo(managed: list[str] | None = None) -> str | None:
     """The repository with role gitops, with the name that `get_managed_repos` gives it.
 
     That is the bare `owner/name` on github.com, and `<host>/<path>` on GitLab
     and on a GitHub Enterprise Server host. The value is read from the
     operator's `gitops_repo` key and matched against `managed_repos`, so the
-    name is always a name that the verbs accept.
+    name is always a name that the verbs accept. `managed` is the result of
+    `get_managed_repos` when the caller has read it already.
 
     None when the key is absent, empty, cannot be read or parsed, or names a
     repository that is not in `managed_repos`. The ConfigMap is
@@ -1685,7 +1695,7 @@ def get_gitops_repo() -> str | None:
     that the install does not manage.
     """
     try:
-        text = _read_state_text(GITOPS_REPO_KEY).strip()
+        text = gitops_repo_key_text()
     except Exception:  # noqa: BLE001 - None is the documented answer
         return None
     if not text:
@@ -1704,7 +1714,8 @@ def get_gitops_repo() -> str | None:
         return None
     try:
         entries = get_managed_repo_entries()
-        managed = get_managed_repos()
+        if managed is None:
+            managed = get_managed_repos()
     except Exception:  # noqa: BLE001 - the resolver's own read reports it
         return None
     # The entry as the list spells it: the same URL first, then the same
@@ -1714,13 +1725,19 @@ def get_gitops_repo() -> str | None:
         entry for entry in entries
         if _repository_keys([entry], MANAGED_REPOS_KEY) == wanted_keys
     ]
-    if same:
-        context = mounted_repo_entries(CONTEXT_REPOS_KEY)
-        for name in _forge_repo_names(same[:1], MANAGED_REPOS_KEY, list(entries) + list(context)):
-            if name in managed:
-                return name
+    if not same:
+        LOGGER.warning(
+            "Ignoring %s %r: it names a repository that is not in %s.",
+            GITOPS_REPO_KEY, wanted[0].get("url"), MANAGED_REPOS_KEY,
+        )
+        return None
+    context = mounted_repo_entries(CONTEXT_REPOS_KEY)
+    for name in _forge_repo_names(same[:1], MANAGED_REPOS_KEY, list(entries) + list(context)):
+        if name in managed:
+            return name
     LOGGER.warning(
-        "Ignoring %s %r: it names a repository that is not in %s.",
+        "Ignoring %s %r: its %s entry is one that this image skips (the warning "
+        "above for that entry says why), so it names no repository the verbs accept.",
         GITOPS_REPO_KEY, wanted[0].get("url"), MANAGED_REPOS_KEY,
     )
     return None
