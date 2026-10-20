@@ -1158,8 +1158,9 @@ flag then reports, and does not go silent.
 
 The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
 the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
-last scheduled run published (`scheduled_published_ids`: its findings, the postures it withheld,
-and the held ids) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
+it withheld, and the held ids; with no forge, its findings and the held ids, which are the ids it
+stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
@@ -1175,10 +1176,11 @@ left under a gap (the on-demand run then put it in `reported_under_gap`). An id 
 run resolved with full coverage is not.
 
 When no record shows the ids of the last scheduled run, the scheduled run speaks. This is the case
-for a record written before `finish` stored the key, and for a record that an on-demand run wrote
-with no value to copy. The delta against the last run cannot replace the baseline, because the last
+for a record written before `finish` stored the key, for a record that an on-demand run wrote
+with no value to copy, and for the record that `finish` seeds from the ledger's hidden block when
+the store holds none ([report store](fleet-audit-report-store.md) §4). The delta against the last run cannot replace the baseline, because the last
 run can be the on-demand run that saw the change first. So every stream speaks once after the
-upgrade that adds the key. A store that holds no run of the stream is not "unknown": no scheduled
+upgrade that adds the key, or after the report store is rebuilt from the ledger. A store that holds no run of the stream is not "unknown": no scheduled
 run published anything, so the baseline is empty.
 
 The stored memory belongs to the open ledger. With no open ledger, a scheduled run reads the

@@ -1303,7 +1303,9 @@ RUN_SCHEDULED_KEY = "scheduled"
 # when no record shows the gaps of a scheduled run.
 SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
 # On the stored envelope only: the finding ids that the last scheduled run
-# published (its findings, the postures it withheld, and the held ids). Kept
+# published. With a ledger, these are its findings, the postures it withheld,
+# and the held ids. With no forge, they are its findings and the held ids,
+# which are the ids it stores as `current_ids`. Kept
 # and copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
 # published ids are not these speaks, so a finding that an on-demand run saw
 # first, new or resolved, still reaches the channel. None when no record
@@ -7992,7 +7994,8 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     scheduled gaps. The delta against the last run cannot replace the
     baseline: when an on-demand run was the last run, its delta hides what it
     saw first. So every stream speaks once after the upgrade that adds this
-    key.
+    key, and once after the store is rebuilt from the ledger
+    (`seed_memory_from_ledger` writes no baseline).
     """
     if memory == {}:
         return []
