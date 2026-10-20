@@ -1300,7 +1300,7 @@ SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
 # and copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
 # published ids are not these speaks, so a finding that an on-demand run saw
 # first, new or resolved, still reaches the channel. None when no record
-# shows them; the run then uses only the delta against the last run.
+# shows them; a scheduled run then speaks (`scheduled_published_baseline`).
 SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
 # On the stored envelope only: the ids under `REPORTED_UNDER_GAP_KEY` that a
 # scheduled run reported. A scheduled run does not report these again; an id
@@ -7938,12 +7938,55 @@ def next_scheduled_gaps(
 def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     """The ids the last scheduled run published, as `memory` shows them, or None.
 
-    None for no record and for a record written before `finish` stored this
-    key: a scheduled run then uses only its delta against the last run, which
-    is the rule that applied before.
+    `{}` is a store that holds no run of this stream: no scheduled run
+    published anything, so the answer is the empty list. None is "not known":
+    no trusted record, a record written before `finish` stored this key, or
+    a record that an on-demand run wrote with no value to copy. A scheduled
+    run speaks on None, as `coverage_changed` does when it knows no
+    scheduled gaps. The delta against the last run cannot replace the
+    baseline: when an on-demand run was the last run, its delta hides what it
+    saw first. So every stream speaks once after the upgrade that adds this
+    key.
     """
+    if memory == {}:
+        return []
     stored = (memory or {}).get(SCHEDULED_PUBLISHED_IDS_KEY)
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def newest_stored_record(audit_id: str, repo: str) -> dict | None:
+    """The newest envelope this stream stored for `repo`, for a run with no open ledger.
+
+    `{}` when the store holds no envelope for `repo`: no run was stored. None
+    when it holds envelopes and none can be read. `latest.json` first, then
+    the `runs/` ring from newest to oldest, as `previous_run_document` reads
+    them. Only the scheduled baseline is read from it. The checks of
+    `read_report_memory` are not necessary here: with no open ledger, the
+    newest record is the record of the ledger that a run closed, or of a
+    clean run that had no ledger, and the channel last heard of the stream
+    from the scheduled baseline in it.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
+        return None
+    candidates = [directory / REPORT_LATEST_NAME]
+    try:
+        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+    except OSError:
+        pass
+    present = [path for path in candidates if path.exists()]
+    if not present:
+        return {}
+    key = _ledger_key(repo)
+    for path in present:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(envelope, dict) and _ledger_key(envelope.get("repo")) == key:
+            return envelope
+    return None
 
 
 def scheduled_reported_baseline(memory: dict | None) -> set[str]:
@@ -17459,10 +17502,11 @@ def _finish_without_forge(
     if not delta_known:
         new_ids, resolved_ids = [], []
     # A scheduled run speaks when its ids are not the last scheduled run's,
-    # so a change that an on-demand run saw first still reaches the channel.
+    # or when no record shows them, so a change that an on-demand run saw
+    # first still reaches the channel.
     scheduled_ids = scheduled_published_baseline(record)
-    ids_moved = (
-        scheduled and scheduled_ids is not None and set(stored_ids) != set(scheduled_ids)
+    ids_moved = scheduled and (
+        scheduled_ids is None or set(stored_ids) != set(scheduled_ids)
     )
     payload = {
         "status": NO_FORGE_STATUS,
@@ -18081,13 +18125,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # the ids the last scheduled run published, and subtracts only what a
     # scheduled run reported. A finding that an on-demand run saw first, new,
     # resolved or dropped under a gap, is then still news to the channel.
-    scheduled_ids = scheduled_published_baseline(memory)
+    # With no open ledger, `memory` is None, and the ids are in the stream's
+    # newest stored record: the record of the ledger that a run closed. When
+    # no record shows the ids, the run speaks.
+    scheduled_memory = memory if existing_issue else newest_stored_record(audit_id, repo)
+    scheduled_ids = scheduled_published_baseline(scheduled_memory)
     scheduled_reported = scheduled_reported_baseline(memory) - published_ids
-    ids_moved = (
-        scheduled
-        and not stale_scheme
-        and scheduled_ids is not None
-        and published_ids != set(scheduled_ids)
+    ids_moved = scheduled and (
+        scheduled_ids is None
+        or (not stale_scheme and published_ids != set(scheduled_ids))
     )
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []

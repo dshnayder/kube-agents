@@ -1161,8 +1161,19 @@ values there, and an on-demand run copies them from the record before it. A sche
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
 the channel. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
-that a scheduled run reported (`scheduled_reported_under_gap`). A record written before `finish`
-stored these keys gives no published-id baseline, and the run uses only its delta, as before.
+that a scheduled run reported (`scheduled_reported_under_gap`).
+
+When no record shows the ids of the last scheduled run, the scheduled run speaks. This is the case
+for a record written before `finish` stored the key, and for a record that an on-demand run wrote
+with no value to copy. The delta against the last run cannot replace the baseline, because the last
+run can be the on-demand run that saw the change first. So every stream speaks once after the
+upgrade that adds the key. A store that holds no run of the stream is not "unknown": no scheduled
+run published anything, so the baseline is empty.
+
+The stored memory belongs to the open ledger. With no open ledger, a scheduled run reads the
+baseline from the newest record that the stream stored for the repository, which is the record of
+the ledger that a run closed. So a scheduled run after an on-demand run that closed the ledger
+speaks once, and the channel hears that the stream is clean.
 
 The Platform Agent's `AGENTS.md` adds one more case: "run the `<x>` cron job now" is answered with
 `hermes cron run <job-id>`, which marks the job due for the next `profile-cron-tick` instead of

@@ -95,7 +95,10 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   scheduled run, so a gap first seen on an on-demand run is still reported by the next scheduled run.
 - **A scheduled run whose findings are not those of the last scheduled run** — an on-demand run saw
   a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it:
-  report the issue URL and say that the ledger changed since the last scheduled run.
+  report the issue URL and say that the ledger changed since the last scheduled run. This includes
+  the first scheduled run after an on-demand run closed the ledger (say that the stream is clean),
+  and a run whose stored record does not show the last scheduled run's findings, for example the
+  first run after an upgrade.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
