@@ -164,15 +164,55 @@ var allowedDiscoveryPaths = map[string]struct{}{
 	"/readyz":     {},
 }
 
-var blockedSubresources = map[string]struct{}{
-	"exec":                {},
-	"attach":              {},
-	"portforward":         {},
-	"proxy":               {},
+var upgradeSubresources = map[string]struct{}{
+	"exec":        {},
+	"attach":      {},
+	"portforward": {},
+	"proxy":       {},
+}
+
+var alwaysBlockedSubresources = map[string]struct{}{
 	"ephemeralcontainers": {},
 	"binding":             {},
 	"token":               {},
 	"approval":            {},
+}
+
+func permissionBoundaryVerb(info *request.RequestInfo) string {
+	if info == nil {
+		return ""
+	}
+	switch strings.ToLower(info.Subresource) {
+	case "scale":
+		return "scale"
+	case "approval":
+		return "certificate approve"
+	case "eviction":
+		return "evict"
+	}
+	switch info.Verb {
+	case "update":
+		return "replace"
+	case "deletecollection":
+		return "delete"
+	default:
+		return info.Verb
+	}
+}
+
+func formatReadOnlyRefusalMessage(base string, mode Mode, info *request.RequestInfo) string {
+	if mode != "" && mode != ModeReadOnly && mode != ModeReadOnlyWithDryRun {
+		return base + " This is a permission boundary, not an error to work around."
+	}
+	verb := permissionBoundaryVerb(info)
+	if verb == "" {
+		return base + " This is a permission boundary, not an error to work around: the change is refused however it is attempted.\npolicy rule: kubernetes.read-only"
+	}
+	return fmt.Sprintf(
+		"%s This is a permission boundary, not an error to work around: the change is refused however it is attempted.\npolicy rule: kubernetes.read-only\npolicy verb: %s",
+		base,
+		verb,
+	)
 }
 
 // IsCoreV1Secret returns true when info targets core/v1 Secret resources.
@@ -182,6 +222,12 @@ func IsCoreV1Secret(info *request.RequestInfo) bool {
 
 // EvaluatePolicy enforces the L7 Kubernetes API policy on r and info.
 func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *request.RequestInfo) *PolicyError {
+	return EvaluatePolicyWithOptions(mode, redactSecrets, false, r, info)
+}
+
+// EvaluatePolicyWithOptions enforces the L7 Kubernetes API policy on r and info,
+// with optional opt-in for interactive stream-upgrade subresources in ModeReadWrite.
+func EvaluatePolicyWithOptions(mode Mode, redactSecrets bool, allowUpgradeSubresources bool, r *http.Request, info *request.RequestInfo) *PolicyError {
 	if !info.IsResourceRequest {
 		if HasUpgradeHeader(r) {
 			return &PolicyError{
@@ -231,21 +277,41 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 		}
 	}
 
+	sub := strings.ToLower(info.Subresource)
+	_, isUpgradeSub := upgradeSubresources[sub]
+	upgradePermitted := mode == ModeReadWrite && allowUpgradeSubresources && isUpgradeSub
+
 	if info.Subresource != "" {
-		if _, blocked := blockedSubresources[info.Subresource]; blocked {
+		if _, blocked := alwaysBlockedSubresources[sub]; blocked {
+			base := fmt.Sprintf("kube-proxy policy blocked subresource %q on resource %q: this subresource is not permitted.", info.Subresource, info.Resource)
+			msg := base + " This is a permission boundary, not an error to work around."
+			if sub == "approval" {
+				msg = formatReadOnlyRefusalMessage(base, mode, info)
+			}
 			return &PolicyError{
 				Code:            http.StatusForbidden,
 				Reason:          metav1.StatusReasonForbidden,
 				RejectionReason: ReasonSubresourceBlocked,
-				Message:         fmt.Sprintf("kube-proxy policy blocked subresource %q on resource %q: this subresource is not permitted. This is a permission boundary, not an error to work around.", info.Subresource, info.Resource),
+				Message:         msg,
 			}
+		}
+		if isUpgradeSub {
+			if !upgradePermitted {
+				return &PolicyError{
+					Code:            http.StatusForbidden,
+					Reason:          metav1.StatusReasonForbidden,
+					RejectionReason: ReasonSubresourceBlocked,
+					Message:         fmt.Sprintf("kube-proxy policy blocked subresource %q on resource %q: this subresource is not permitted. This is a permission boundary, not an error to work around.", info.Subresource, info.Resource),
+				}
+			}
+			return nil
 		}
 		if err := evaluateSubresourceByMode(mode, r, info); err != nil {
 			return err
 		}
 	}
 
-	if HasUpgradeHeader(r) {
+	if HasUpgradeHeader(r) && !upgradePermitted {
 		return &PolicyError{
 			Code:            http.StatusForbidden,
 			Reason:          metav1.StatusReasonForbidden,
@@ -263,7 +329,7 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 			Code:            http.StatusForbidden,
 			Reason:          metav1.StatusReasonForbidden,
 			RejectionReason: ReasonVerbBlocked,
-			Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+			Message:         formatReadOnlyRefusalMessage(fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access.", info.Verb, info.Resource), mode, info),
 		}
 
 	case "", ModeReadOnlyWithDryRun:
@@ -279,14 +345,14 @@ func EvaluatePolicy(mode Mode, redactSecrets bool, r *http.Request, info *reques
 				Code:            http.StatusForbidden,
 				Reason:          metav1.StatusReasonForbidden,
 				RejectionReason: ReasonDryRunRequired,
-				Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access (pass --dry-run=server for non-persisted validation). This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+				Message:         formatReadOnlyRefusalMessage(fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access (pass --dry-run=server for non-persisted validation).", info.Verb, info.Resource), mode, info),
 			}
 		}
 		return &PolicyError{
 			Code:            http.StatusForbidden,
 			Reason:          metav1.StatusReasonForbidden,
 			RejectionReason: ReasonVerbBlocked,
-			Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.", info.Verb, info.Resource),
+			Message:         formatReadOnlyRefusalMessage(fmt.Sprintf("kube-proxy policy blocked verb %q on resource %q: this proxy enforces read-only cluster access.", info.Verb, info.Resource), mode, info),
 		}
 
 	case ModeReadWrite:
@@ -323,9 +389,9 @@ func isBlockedAuthResource(info *request.RequestInfo) bool {
 }
 
 func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.RequestInfo) *PolicyError {
-	switch info.Subresource {
+	switch strings.ToLower(info.Subresource) {
 	case "status", "scale":
-		if info.Verb == "get" {
+		if info.Verb == "get" || info.Verb == "list" || info.Verb == "watch" {
 			return nil
 		}
 		if (mode == "" || mode == ModeReadOnlyWithDryRun) && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") && HasStrictDryRunAll(r) {
@@ -335,11 +401,18 @@ func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.Request
 			return nil
 		}
 	case "log":
-		if info.Verb == "get" {
+		if info.Verb == "get" || info.Verb == "list" || info.Verb == "watch" {
 			return nil
 		}
 	case "eviction":
 		if mode == ModeReadWrite && info.Verb == "create" {
+			return nil
+		}
+	default:
+		if info.Verb == "get" || info.Verb == "list" || info.Verb == "watch" {
+			return nil
+		}
+		if mode == ModeReadWrite && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch" || info.Verb == "delete" || info.Verb == "deletecollection") {
 			return nil
 		}
 	}
@@ -347,7 +420,7 @@ func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.Request
 		Code:            http.StatusForbidden,
 		Reason:          metav1.StatusReasonForbidden,
 		RejectionReason: ReasonSubresourceBlocked,
-		Message:         fmt.Sprintf("kube-proxy policy blocked verb %q on subresource \"%s/%s\": this subresource operation is not permitted. This is a permission boundary, not an error to work around.", info.Verb, info.Resource, info.Subresource),
+		Message:         formatReadOnlyRefusalMessage(fmt.Sprintf("kube-proxy policy blocked verb %q on subresource \"%s/%s\": this subresource operation is not permitted.", info.Verb, info.Resource, info.Subresource), mode, info),
 	}
 }
 

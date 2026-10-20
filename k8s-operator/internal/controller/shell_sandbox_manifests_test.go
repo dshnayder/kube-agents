@@ -1572,9 +1572,9 @@ func TestSandboxEgressReachesNothingButDNSAndTheBroker(t *testing.T) {
 		}
 		for _, p := range rule.Ports {
 			switch p.Port.IntValue() {
-			case 53, credentialProxyPort:
+			case 53, credentialProxyPort, int(kubeProxyPort):
 			default:
-				t.Errorf("unexpected egress port %v — the sandbox needs cluster DNS and the broker, nothing else", p.Port)
+				t.Errorf("unexpected egress port %v — the sandbox needs cluster DNS, the broker, and kube-proxy, nothing else", p.Port)
 			}
 		}
 	}

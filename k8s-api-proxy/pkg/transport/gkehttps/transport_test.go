@@ -79,6 +79,7 @@ func TestTransportGKEAndInCluster(t *testing.T) {
 		InClusterServerURL:  clusterServer.URL,
 		InClusterCAFile:     caFile,
 		InClusterTokenFile:  tokenFile,
+		HostClusterID:       "gke_proj-host_us-central1_host-clu",
 		ContainerAPIBaseURL: containerAPI.URL,
 		TokenProvider:       staticTokenProvider{token: "gcp-oauth-token"},
 		DiscoveryClient:     containerAPI.Client(),
@@ -92,6 +93,20 @@ func TestTransportGKEAndInCluster(t *testing.T) {
 		resp, err := tr.RoundTripCluster(context.Background(), "in-cluster", req)
 		if err != nil {
 			t.Fatalf("RoundTripCluster(in-cluster) failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var got map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&got)
+		if got["auth"] != "Bearer ksa-in-cluster-token" {
+			t.Errorf("auth = %q, want Bearer ksa-in-cluster-token", got["auth"])
+		}
+	})
+
+	t.Run("host GKE cluster ID routes via in-cluster transport without hitting container.googleapis.com", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "https://placeholder/api/v1/pods", nil)
+		resp, err := tr.RoundTripCluster(context.Background(), "gke_proj-host_us-central1_host-clu", req)
+		if err != nil {
+			t.Fatalf("RoundTripCluster(hostClusterID) failed: %v", err)
 		}
 		defer resp.Body.Close()
 		var got map[string]string

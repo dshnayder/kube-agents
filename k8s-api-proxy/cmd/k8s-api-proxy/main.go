@@ -81,9 +81,10 @@ func main() {
 		tlsCertFile     = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
 		tlsKeyFile      = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
 		modeRaw         = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
-		defaultClusterF = flag.String("default-cluster", defaultCluster, "Default cluster ID when /clusters/{id} prefix is omitted")
-		redactSecrets   = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
-		kubeAPIServer   = flag.String("kube-api-server", envOrDefault("CREDENTIAL_PROXY_KUBE_API_SERVER", "https://kubernetes.default.svc"), "Host cluster Kubernetes API server URL")
+		defaultClusterF          = flag.String("default-cluster", defaultCluster, "Default cluster ID when /clusters/{id} prefix is omitted")
+		redactSecrets            = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
+		allowUpgradeSubresources = flag.Bool("allow-upgrade-subresources", envBoolOrDefault("KUBE_PROXY_ALLOW_UPGRADE_SUBRESOURCES", false), "Allow exec, attach, portforward, and proxy subresources when mode is read-write")
+		kubeAPIServer            = flag.String("kube-api-server", envOrDefault("CREDENTIAL_PROXY_KUBE_API_SERVER", "https://kubernetes.default.svc"), "Host cluster Kubernetes API server URL")
 		kubeCAFile      = flag.String("kube-ca-file", envOrDefault("CREDENTIAL_PROXY_KUBE_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"), "Host cluster CA bundle PEM file")
 		kubeTokenFile   = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience        = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
@@ -135,6 +136,7 @@ func main() {
 	})
 
 	upstream, err := gkehttpstransport.NewTransport(gkehttpstransport.Config{
+		HostClusterID:      *defaultClusterF,
 		InClusterServerURL: *kubeAPIServer,
 		InClusterCAFile:    *kubeCAFile,
 		InClusterTokenFile: *kubeTokenFile,
@@ -149,14 +151,15 @@ func main() {
 	auditSink := k8sapiproxy.NewJSONAuditSink(os.Stdout)
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
-		Authenticator:    authn,
-		Upstream:         upstream,
-		DefaultClusterID: *defaultClusterF,
-		Mode:             mode,
-		RedactSecrets:    *redactSecrets,
-		Metrics:          metrics,
-		TracerProvider:   tp,
-		AuditSink:        auditSink,
+		Authenticator:            authn,
+		Upstream:                 upstream,
+		DefaultClusterID:         *defaultClusterF,
+		Mode:                     mode,
+		RedactSecrets:            *redactSecrets,
+		AllowUpgradeSubresources: *allowUpgradeSubresources,
+		Metrics:                  metrics,
+		TracerProvider:           tp,
+		AuditSink:                auditSink,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)

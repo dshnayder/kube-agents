@@ -15,6 +15,7 @@ import (
 
 // Config configures the GKE HTTPS UpstreamTransport.
 type Config struct {
+	HostClusterID       string
 	InClusterServerURL  string
 	InClusterCAFile     string
 	InClusterTokenFile  string
@@ -32,6 +33,7 @@ type cachedClusterTransport struct {
 
 // Transport implements k8sapiproxy.UpstreamTransport over HTTPS for in-cluster and GKE control planes.
 type Transport struct {
+	hostClusterID      string
 	inClusterURL       *url.URL
 	inClusterTokenFile string
 	inClusterRT        http.RoundTripper
@@ -98,6 +100,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 	}
 
 	return &Transport{
+		hostClusterID:       strings.TrimSpace(cfg.HostClusterID),
 		inClusterURL:        parsedInCluster,
 		inClusterTokenFile:  tokenFile,
 		inClusterRT:         inClusterRT,
@@ -111,7 +114,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 
 // RoundTripCluster forwards req to the control plane identified by clusterID.
 func (t *Transport) RoundTripCluster(ctx context.Context, clusterID string, req *http.Request) (*http.Response, error) {
-	if clusterID == "" || clusterID == "in-cluster" || strings.HasPrefix(clusterID, "kind-") {
+	if clusterID == "" || clusterID == "in-cluster" || strings.HasPrefix(clusterID, "kind-") || (t.hostClusterID != "" && clusterID == t.hostClusterID) {
 		return t.roundTripInCluster(ctx, req)
 	}
 	if strings.HasPrefix(clusterID, "gke_") {
@@ -133,7 +136,15 @@ func (t *Transport) roundTripInCluster(ctx context.Context, req *http.Request) (
 	outReq := req.Clone(ctx)
 	rewriteRequestTarget(outReq, t.inClusterURL)
 	outReq.Header.Set("Authorization", "Bearer "+token)
-	return t.inClusterRT.RoundTrip(outReq)
+	resp, err := t.inClusterRT.RoundTrip(outReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("upstream control plane returned redirect HTTP %d, which is not permitted", resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func (t *Transport) roundTripGKECluster(ctx context.Context, clusterID string, req *http.Request) (*http.Response, error) {
@@ -162,6 +173,10 @@ func (t *Transport) roundTripGKECluster(ctx context.Context, clusterID string, r
 		delete(t.clusters, clusterID)
 		t.mu.Unlock()
 		return nil, err
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("upstream control plane returned redirect HTTP %d, which is not permitted", resp.StatusCode)
 	}
 	return resp, nil
 }

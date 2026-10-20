@@ -110,10 +110,13 @@ func TestHandlerEndToEnd(t *testing.T) {
 		if upstream.lastReq.URL.Path != "/api/v1/namespaces/kube-system/pods" {
 			t.Errorf("upstream path = %q, want /api/v1/namespaces/kube-system/pods", upstream.lastReq.URL.Path)
 		}
-		for _, hdr := range []string{"Authorization", "Impersonate-User", "Impersonate-Group", "X-Remote-User"} {
+		for _, hdr := range []string{"Authorization", "Impersonate-User", "Impersonate-Group", "X-Remote-User", "Proxy-Authorization", "Cookie"} {
 			if got := upstream.lastReq.Header.Get(hdr); got != "" {
 				t.Errorf("expected header %s to be stripped, got %q", hdr, got)
 			}
+		}
+		if gotUA := upstream.lastReq.Header.Get("User-Agent"); !strings.Contains(gotUA, "kproxy/system:serviceaccount:ns:shell") {
+			t.Errorf("expected User-Agent to include kproxy/<caller>, got %q", gotUA)
 		}
 	})
 

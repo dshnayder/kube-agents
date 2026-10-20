@@ -14,16 +14,16 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 
 `credential-proxy` remains in place for Git forge operations (`/v1/vcs/*`), read-only Cloud REST calls (`/v1/gcp/*`), and `gcloud` execution (`/v1/exec`). All Kubernetes operations move to `kube-proxy`.
 
-| Layer                                    | Where it lives                                                                                                                       |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Go module                                | [`k8s-api-proxy/go.mod`](../../k8s-api-proxy/go.mod) (`github.com/gke-labs/kube-agents/k8s-api-proxy`)                               |
-| Core HTTP handler and L7 policy          | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
-| Pluggable upstream transport interface   | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
+| Layer                                      | Where it lives                                                                                                                       |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Go module                                  | [`k8s-api-proxy/go.mod`](../../k8s-api-proxy/go.mod) (`github.com/gke-labs/kube-agents/k8s-api-proxy`)                               |
+| Core HTTP handler and L7 policy            | [`k8s-api-proxy/pkg/k8sapiproxy/`](../../k8s-api-proxy/pkg/k8sapiproxy/)                                                             |
+| Pluggable upstream transport interface     | [`k8s-api-proxy/pkg/k8sapiproxy/transport.go`](../../k8s-api-proxy/pkg/k8sapiproxy/transport.go)                                     |
 | GKE HTTPS upstream transport (`gke-https`) | [`k8s-api-proxy/pkg/transport/gkehttps/`](../../k8s-api-proxy/pkg/transport/gkehttps/)                                               |
-| Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
-| Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
-| Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
-| Operator manifests                       | [`k8s-operator/internal/controller/kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)         |
+| Standalone proxy binary                    | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
+| Container image                            | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
+| Sandbox `kubectl` and `kubeconfig` setup   | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
+| Operator manifests                         | [`k8s-operator/internal/controller/kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)         |
 
 ## How to read this document
 
@@ -115,6 +115,8 @@ k8s-api-proxy/
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
     │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   ├── audit.go              # AuditSink interface, AuditEvent struct, and JSON/slog audit sinks
+    │   ├── metrics.go            # Closed-vocabulary Prometheus metrics collector
+    │   ├── telemetry.go          # OpenTelemetry OTLP HTTP tracer setup
     │   └── transport.go          # UpstreamTransport interface
     └── transport/
         └── gkehttps/
@@ -174,12 +176,15 @@ const (
 
 // Config configures the k8sapiproxy HTTP handler.
 type Config struct {
-	Authenticator    CallerAuthenticator
-	Upstream         UpstreamTransport
-	DefaultClusterID string
-	Mode             Mode
-	RedactSecrets    bool
-	AuditSink        AuditSink
+	Authenticator            CallerAuthenticator
+	Upstream                 UpstreamTransport
+	DefaultClusterID         string
+	Mode                     Mode
+	RedactSecrets            bool
+	AllowUpgradeSubresources bool
+	Metrics                  *Metrics
+	AuditSink                AuditSink
+	Tracer                   trace.Tracer
 }
 ```
 
@@ -239,7 +244,7 @@ clusters:
 users:
   - name: sandbox-caller
     user:
-      tokenFile: /var/run/secrets/kubeagents/credential-proxy/token
+      tokenFile: /var/run/secrets/kubeagents/kube-proxy-token/token
 contexts:
   - name: gke_my-project_us-central1_host-cluster
     context:
@@ -251,17 +256,17 @@ contexts:
 
 How multi-cluster context switching works:
 
-1. **`sandbox-entrypoint`**: On startup, writes the default `kubeconfig` at `/opt/data/.kubeconfig` (and sets `KUBECONFIG=/opt/data/.kubeconfig`) seeded with `KUBE_CONTEXT_NAME`, `certificate-authority: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and `tokenFile: /var/run/secrets/kubeagents/credential-proxy/token`.
-2. **`gcloud container clusters get-credentials`**: When the agent runs `gcloud container clusters get-credentials <cluster> --location=<loc> --project=<proj>`, `credential_proxy_client.py` writes a `kubeconfig` entry whose `server:` points to `${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>`, whose `certificate-authority:` points to `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and whose `user:` references `tokenFile: /var/run/secrets/kubeagents/credential-proxy/token`. No cluster credentials or GCP tokens ever enter the sandbox.
+1. **`sandbox-entrypoint`**: On startup, writes the default `kubeconfig` at `/opt/data/.kubeconfig` (and sets `KUBECONFIG=/opt/data/.kubeconfig`) seeded with `KUBE_CONTEXT_NAME`, `certificate-authority: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and `tokenFile: /var/run/secrets/kubeagents/kube-proxy-token/token`.
+2. **`gcloud container clusters get-credentials`**: When the agent runs `gcloud container clusters get-credentials <cluster> --location=<loc> --project=<proj>`, `credential_proxy_client.py` writes a `kubeconfig` entry whose `server:` points to `${KUBE_PROXY_URL}/clusters/gke_<project>_<location>_<cluster>`, whose `certificate-authority:` points to `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and whose `user:` references `tokenFile: /var/run/secrets/kubeagents/kube-proxy-token/token`. No cluster credentials or GCP tokens ever enter the sandbox.
 
 ### 5. Caller authentication (`pkg/k8sapiproxy/auth.go`)
 
 `kube-proxy` authenticates every request from the sandbox before inspecting the Kubernetes API path:
 
 1. Reads `Authorization: Bearer <caller-token>` from the incoming request and immediately deletes the `Authorization` header so the caller's token can never travel upstream.
-2. Verifies the token against the host cluster's `authentication.k8s.io/v1` `TokenReview` API with `spec.audiences: ["credential-proxy"]` (the same projected token volume mounted into `<agent>-shell` and `<agent>-gateway`).
-3. Checks that `status.user.username` is in the allowlist of permitted caller `ServiceAccounts` (`CREDENTIAL_PROXY_ALLOWED_CALLERS`).
-4. Caches verified token hashes (`sha256(token)`) in memory for `min(60s, tokenExpiry)` so repeated `kubectl` calls do not block on `TokenReview` round trips.
+2. Verifies the token against the host cluster's `authentication.k8s.io/v1` `TokenReview` API with `spec.audiences: ["kube-proxy"]` (matching the dedicated projected `ServiceAccount` token volume mounted into `<agent>-shell` at `/var/run/secrets/kubeagents/kube-proxy-token/token`).
+3. Checks that `status.user.username` matches the configured sandbox caller `ServiceAccount` (`KUBE_PROXY_ALLOWED_CALLER_SA`).
+4. Caches verified token hashes (`sha256(token)`) in memory for `min(60s, tokenExpiry)` (parsing the JWT `exp` claim to bound the cache lifetime) and evicts expired entries on write so repeated `kubectl` calls do not block on `TokenReview` round trips.
 
 ### 6. Request parsing and L7 verb policy (`pkg/k8sapiproxy/policy.go`)
 
@@ -269,11 +274,11 @@ How multi-cluster context switching works:
 
 Every request is classified as either a **resource request** (`info.IsResourceRequest == true`) or a **non-resource request** (`info.IsResourceRequest == false`). `pkg/k8sapiproxy` supports three modes (`read-only`, `read-only-dry-run`, and `read-write`) so external agent platforms can select their posture. In `kube-agents`, the operator always configures `kube-proxy` with `read-only-dry-run` (`ModeReadOnlyWithDryRun`) so agents can validate manifests with `kubectl apply --dry-run=server` without mutating cluster state:
 
-| Request class          | Allowed in `read-only`                                                                                                         | Allowed in `read-only-dry-run` (`kube-agents` default)                                                         | Allowed in `read-write`                                                           | Refused in all modes (`403 Forbidden`)                                                                                                   |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| **Non-resource paths** | `GET` or `HEAD` on `/api`, `/apis`, `/version`, `/openapi/v2`, `/openapi/v3`, `/openapi/v3/*`, `/healthz`, `/livez`, `/readyz` | Same as `read-only`                                                                                            | Same as `read-only`                                                               | Any other non-resource path (`/metrics`, `/debug/*`, `/logs/*`) or any non-`GET`/`HEAD` method                                           |
-| **Resource verbs**     | `get`, `list`, `watch`                                                                                                         | `get`, `list`, `watch`, plus `create`, `update`, `patch` **only when** query parameter `dryRun=All` is present | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection` | `proxy`, `connect` (and mutations without `dryRun=All` in `read-only` / `read-only-dry-run`)                                             |
-| **Subresources**       | Safe read subresources (`status`, `scale`, `log` via `get`)                                                                    | `status` and `scale` with `dryRun=All`                                                                         | `status`, `scale`, `log` (`get`), `eviction` (`create`)                           | `exec`, `attach`, `portforward`, `proxy`, `ephemeralcontainers`, `binding`, `token` (`serviceaccounts/token`), `approval` (CSR approval) |
+| Request class          | Allowed in `read-only`                                                                                                         | Allowed in `read-only-dry-run` (`kube-agents` default)                                                         | Allowed in `read-write`                                                                                                                                                                 | Refused in all modes (`403 Forbidden`)                                                                                                                                                            |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Non-resource paths** | `GET` or `HEAD` on `/api`, `/apis`, `/version`, `/openapi/v2`, `/openapi/v3`, `/openapi/v3/*`, `/healthz`, `/livez`, `/readyz` | Same as `read-only`                                                                                            | Same as `read-only`                                                                                                                                                                     | Any other non-resource path (`/metrics`, `/debug/*`, `/logs/*`) or any non-`GET`/`HEAD` method                                                                                                    |
+| **Resource verbs**     | `get`, `list`, `watch`                                                                                                         | `get`, `list`, `watch`, plus `create`, `update`, `patch` **only when** query parameter `dryRun=All` is present | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection`                                                                                                       | `proxy`, `connect` (and mutations without `dryRun=All` in `read-only` / `read-only-dry-run`)                                                                                                      |
+| **Subresources**       | Safe read subresources (`status`, `scale`, `log` via `get`, `list`, `watch`)                                                   | `status` and `scale` with `dryRun=All`                                                                         | `status`, `scale`, `log` (`get`, `list`, `watch`), `eviction` (`create`), plus `exec`/`attach`/`portforward` when `AllowUpgradeSubresources` (`-allow-upgrade-subresources`) is enabled | `exec`, `attach`, `portforward` (unless `ModeReadWrite` with `AllowUpgradeSubresources`), `proxy`, `ephemeralcontainers`, `binding`, `token` (`serviceaccounts/token`), `approval`, `certificate` |
 
 **Dry-run query enforcement**:
 When `Mode == ModeReadOnlyWithDryRun` and `info.Verb` is `create`, `update`, or `patch`:
@@ -290,7 +295,7 @@ When the policy blocks a request, `kube-proxy` returns HTTP `403 Forbidden` with
   "apiVersion": "v1",
   "metadata": {},
   "status": "Failure",
-  "message": "kube-proxy policy blocked verb \"delete\" on resource \"pods\": this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around.",
+  "message": "kube-proxy policy blocked verb \"delete\" on resource \"pods\": this proxy enforces read-only cluster access. This is a permission boundary, not an error to work around: the change is refused however it is attempted.\npolicy rule: kubernetes.read-only\npolicy verb: delete",
   "reason": "Forbidden",
   "code": 403
 }
@@ -304,11 +309,11 @@ When `Config.RedactSecrets` is enabled (the default) and `RequestInfo` matches c
 
 1. **Subresource refusal**: Any subresource on a `Secret` is refused with `403 Forbidden`.
 2. **Request header rewrite (Layer 1 — server-side stripping)**:
-   - Forces `Accept-Encoding: identity` so the upstream response is uncompressed and inspectable.
+   - Deletes `Accept-Encoding` so `net/http.Transport` manages transparent gzip decompression and the upstream response arrives uncompressed for JSON inspection.
    - If the caller requested a table (`as=Table` in `Accept`, used by `kubectl get secrets`), the proxy preserves `as=Table` because `kube-apiserver`'s `Secret` table printer only returns `NAME`, `TYPE`, `DATA` (count), and `AGE`.
-   - For all other `Accept` headers (such as `kubectl get secret foo -o yaml` or `-o json` or `--raw /api/v1/secrets`), the proxy rewrites `Accept` to `application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` (or `PartialObjectMetadataList` for `list`), instructing `kube-apiserver` to return only `TypeMeta` and `ObjectMeta`.
+   - For all other `Accept` headers on `get`, `list`, `create`, `update`, and `patch` (such as `kubectl get secret foo -o yaml` or `-o json`, `kubectl apply --dry-run=server`, or `--raw /api/v1/secrets`), the proxy rewrites `Accept` to `application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` (or `PartialObjectMetadataList` for `list`), instructing `kube-apiserver` to return only `TypeMeta` and `ObjectMeta`.
 3. **Response body scrubber (Layer 2 — defense in depth)**:
-   - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` inspects the JSON payload and scrubs sensitive payloads while preserving `Secret` key names:
+   - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` decompresses any residual `Content-Encoding: gzip` stream, inspects the JSON payload, and scrubs sensitive payloads while preserving `Secret` key names:
      - Top-level and `items[*]` `.data` and `.stringData` keys are collected (along with any key names recorded in `metadata.managedFields[*].fieldsV1["f:data"]` and `["f:stringData"]`), `.stringData` is removed, and `.data` is populated with `"REDACTED"` values for each key so `kubectl get secret -o yaml` and `kubectl describe secret` display the key names without exposing secret bytes.
      - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`) is deleted, and `kubeagents.x-k8s.io/redacted: "true (secret data values are redacted by kube-proxy)"` is added so `kubectl describe secret` explicitly indicates redaction.
    - If a `secrets` response cannot be parsed as valid JSON, `kube-proxy` fails closed and returns `502 Bad Gateway` rather than forwarding unverified bytes.
@@ -317,10 +322,12 @@ When `Config.RedactSecrets` is enabled (the default) and `RequestInfo` matches c
 
 On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy` strips:
 
-- `Authorization` (consumed by `CallerAuthenticator` and never forwarded)
+- `Authorization`, `Proxy-Authorization`, and `Cookie` (consumed or dropped at ingress and never forwarded)
 - `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid`, and any header matching `^Impersonate-Extra-` (case-insensitive)
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
-- `Upgrade` and `Connection: upgrade` (since `exec`, `attach`, and `portforward` are refused in read-only modes, blocking protocol upgrades prevents SPDY or WebSocket tunneling)
+- `Upgrade` and `Connection: upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled)
+
+It also appends `kproxy/<caller-username>` to the outbound `User-Agent` header so `kube-apiserver` audit logs record the originating sandbox identity alongside `kubectl`'s own `User-Agent`.
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
 
@@ -328,16 +335,14 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 
 `pkg/transport/gkehttps` (`gke-https`) implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
 
-1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME` when `KUBERNETES_SERVICE_HOST` is used)**:
-   - Uses `https://kubernetes.default.svc` with `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` and the proxy pod's GCP OAuth token (or mounted Kubernetes `ServiceAccount` token).
+1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME`)**:
+   - Uses `https://kubernetes.default.svc` with `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` and the proxy pod's mounted Kubernetes `ServiceAccount` token (`/var/run/secrets/kubernetes.io/serviceaccount/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
 2. **Fleet GKE clusters (`gke_<project>_<location>_<cluster>`)**:
    - Validates `<project>`, `<location>`, and `<cluster>` against `^[a-z0-9][a-z0-9-]*\z`.
    - Calls `GET https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}` using the proxy pod's Google Cloud `oauth2.TokenSource` (Workload Identity metadata server or Workload Identity Federation credential file `GOOGLE_APPLICATION_CREDENTIALS`).
-   - Selects the cluster's control-plane endpoint:
-     - Uses `https://<dnsEndpoint>` when `controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint` is present and reachable (matching `gke_endpoint.py`), or
-     - Uses `https://<endpoint>` with the cluster's `masterAuth.clusterCaCertificate` root CA.
+   - Dials `https://<endpoint>` verified against the cluster's `masterAuth.clusterCaCertificate` root CA.
    - Caches the per-cluster `*http.Transport` and resolved endpoint URL in memory with a 5-minute TTL and automatic invalidation on connection failure.
-   - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request.
+   - Injects `Authorization: Bearer <gcp-access-token>` on every upstream request and refuses `3xx` upstream redirects (`502 Bad Gateway`) so the bearer token is never followed to a redirect target.
 
 ### 10. Observability: Prometheus metrics, OpenTelemetry tracing, and audit logging (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`, `pkg/k8sapiproxy/audit.go`)
 

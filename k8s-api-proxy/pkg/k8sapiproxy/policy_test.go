@@ -3,6 +3,7 @@ package k8sapiproxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -263,4 +264,34 @@ func TestEvaluatePolicyDifferentialCorpus(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("permission-boundary refusal message matches permission_refusal_stop.py markers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/my-pod", nil)
+		info, _ := factory.NewRequestInfo(req)
+		policyErr := EvaluatePolicy(ModeReadOnlyWithDryRun, true, req, info)
+		if policyErr == nil {
+			t.Fatalf("expected delete to be refused")
+		}
+		for _, wantSubstr := range []string{"refused however it is attempted", "\npolicy rule: kubernetes.read-only", "\npolicy verb: delete"} {
+			if !strings.Contains(policyErr.Message, wantSubstr) {
+				t.Errorf("refusal message %q missing required marker %q", policyErr.Message, wantSubstr)
+			}
+		}
+	})
+
+	t.Run("AllowUpgradeSubresources permits pod exec in ModeReadWrite with protocol upgrade", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods/my-pod/exec?command=sh", nil)
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "SPDY/3.1")
+		info, _ := factory.NewRequestInfo(req)
+		if err := EvaluatePolicyWithOptions(ModeReadWrite, true, false, req, info); err == nil {
+			t.Errorf("expected pod exec to be blocked when allowUpgradeSubresources=false")
+		}
+		if err := EvaluatePolicyWithOptions(ModeReadWrite, true, true, req, info); err != nil {
+			t.Errorf("expected pod exec to be allowed when allowUpgradeSubresources=true in ModeReadWrite, got: %v", err)
+		}
+		if err := EvaluatePolicyWithOptions(ModeReadOnlyWithDryRun, true, true, req, info); err == nil {
+			t.Errorf("expected pod exec to remain blocked in ModeReadOnlyWithDryRun even when allowUpgradeSubresources=true")
+		}
+	})
 }

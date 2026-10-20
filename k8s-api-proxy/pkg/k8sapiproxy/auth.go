@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,8 +23,11 @@ type StaticAuthenticator struct {
 	Identity CallerIdentity
 }
 
-// AuthenticateRequest returns the configured CallerIdentity.
-func (s *StaticAuthenticator) AuthenticateRequest(_ *http.Request) (*CallerIdentity, error) {
+// AuthenticateRequest returns the configured CallerIdentity and strips any caller Authorization header.
+func (s *StaticAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity, error) {
+	if r != nil && r.Header != nil {
+		r.Header.Del("Authorization")
+	}
 	id := s.Identity
 	return &id, nil
 }
@@ -150,9 +154,10 @@ type tokenReviewResponse struct {
 	} `json:"status"`
 }
 
-// AuthenticateRequest extracts the Bearer token from r and validates it via TokenReview.
+// AuthenticateRequest extracts the Bearer token from r, strips the Authorization header, and validates it via TokenReview.
 func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity, error) {
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	r.Header.Del("Authorization")
 	if authHeader == "" {
 		return nil, errors.New("missing Authorization header")
 	}
@@ -165,10 +170,15 @@ func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 		return nil, errors.New("empty Bearer token")
 	}
 
+	now := time.Now()
+	jwtExpiry, hasJWTExpiry := parseJWTExpiry(callerToken)
+	if hasJWTExpiry && !now.Before(jwtExpiry) {
+		return nil, errors.New("caller token has expired")
+	}
+
 	sum := sha256.Sum256([]byte(callerToken))
 	cacheKey := hex.EncodeToString(sum[:])
 
-	now := time.Now()
 	a.mu.RLock()
 	if entry, ok := a.cache[cacheKey]; ok && now.Before(entry.expiresAt) {
 		id := entry.identity
@@ -253,12 +263,40 @@ func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 		Groups:   parsed.Status.User.Groups,
 	}
 
+	expiresAt := now.Add(a.cacheTTL)
+	if hasJWTExpiry && jwtExpiry.Before(expiresAt) {
+		expiresAt = jwtExpiry
+	}
+
 	a.mu.Lock()
+	for k, v := range a.cache {
+		if !now.Before(v.expiresAt) {
+			delete(a.cache, k)
+		}
+	}
 	a.cache[cacheKey] = cachedIdentity{
 		identity:  identity,
-		expiresAt: now.Add(a.cacheTTL),
+		expiresAt: expiresAt,
 	}
 	a.mu.Unlock()
 
 	return &identity, nil
+}
+
+func parseJWTExpiry(token string) (time.Time, bool) {
+	segments := strings.Split(token, ".")
+	if len(segments) != 3 {
+		return time.Time{}, false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(segments[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp *int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil || claims.Exp == nil || *claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(*claims.Exp, 0), true
 }

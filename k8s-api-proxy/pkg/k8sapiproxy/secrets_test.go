@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,29 +14,49 @@ import (
 func TestRewriteSecretRequestHeaders(t *testing.T) {
 	factory := NewRequestInfoFactory()
 
-	t.Run("get secret rewrites Accept to PartialObjectMetadata", func(t *testing.T) {
+	t.Run("get secret rewrites Accept to PartialObjectMetadata and deletes Accept-Encoding", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/my-secret", nil)
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Accept-Encoding", "gzip")
 		info, _ := factory.NewRequestInfo(req)
-		callerPartial := RewriteSecretRequestHeaders(req, info)
+		callerPartial, acceptRewritten := RewriteSecretRequestHeadersWithStatus(req, info)
 		if callerPartial {
 			t.Errorf("expected callerPartial=false")
+		}
+		if !acceptRewritten {
+			t.Errorf("expected acceptRewritten=true")
 		}
 		if got := req.Header.Get("Accept"); got != partialObjectMetadataAccept {
 			t.Errorf("Accept = %q, want %q", got, partialObjectMetadataAccept)
 		}
-		if got := req.Header.Get("Accept-Encoding"); got != "identity" {
-			t.Errorf("Accept-Encoding = %q, want identity", got)
+		if got := req.Header.Get("Accept-Encoding"); got != "" {
+			t.Errorf("Accept-Encoding = %q, want empty (deleted)", got)
 		}
 	})
 
-	t.Run("list secrets with as=Table preserves Table Accept", func(t *testing.T) {
+	t.Run("list secrets with as=Table preserves Table Accept and reports acceptRewritten=false", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets", nil)
 		req.Header.Set("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io,application/json")
 		info, _ := factory.NewRequestInfo(req)
-		RewriteSecretRequestHeaders(req, info)
+		_, acceptRewritten := RewriteSecretRequestHeadersWithStatus(req, info)
+		if acceptRewritten {
+			t.Errorf("expected acceptRewritten=false when Table Accept is preserved")
+		}
 		if got := req.Header.Get("Accept"); got != tableAccept {
 			t.Errorf("Accept = %q, want %q", got, tableAccept)
+		}
+	})
+
+	t.Run("create secret rewrites Accept to PartialObjectMetadata", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/secrets?dryRun=All", nil)
+		req.Header.Set("Accept", "application/json")
+		info, _ := factory.NewRequestInfo(req)
+		_, acceptRewritten := RewriteSecretRequestHeadersWithStatus(req, info)
+		if !acceptRewritten {
+			t.Errorf("expected acceptRewritten=true for create")
+		}
+		if got := req.Header.Get("Accept"); got != partialObjectMetadataAccept {
+			t.Errorf("Accept = %q, want %q", got, partialObjectMetadataAccept)
 		}
 	})
 }
@@ -177,6 +198,33 @@ func TestScrubSecretResponse(t *testing.T) {
 		}
 		if strings.Contains(string(out), "dmFs") {
 			t.Fatalf("watch event leaked secret data: %s", string(out))
+		}
+	})
+
+	t.Run("decompresses gzip-encoded Secret response before scrubbing", func(t *testing.T) {
+		rawSecret := `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"gz-sec"},"data":{"pw":"c2VjcmV0"}}`
+		var gzBuf bytes.Buffer
+		gz := gzip.NewWriter(&gzBuf)
+		_, _ = gz.Write([]byte(rawSecret))
+		_ = gz.Close()
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/gz-sec", nil)
+		info, _ := factory.NewRequestInfo(req)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Encoding": []string{"gzip"}},
+			Body:       io.NopCloser(&gzBuf),
+		}
+		ScrubSecretResponse(resp, info, false)
+		if got := resp.Header.Get("Content-Encoding"); got != "" {
+			t.Errorf("expected Content-Encoding header to be removed after gunzip, got %q", got)
+		}
+		out, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read scrubbed body failed: %v", err)
+		}
+		if strings.Contains(string(out), "c2VjcmV0") {
+			t.Fatalf("gzip secret response leaked secret value: %s", string(out))
 		}
 	})
 }

@@ -60,12 +60,13 @@ func ParseMode(raw string) (Mode, error) {
 
 // Config configures the k8sapiproxy HTTP handler.
 type Config struct {
-	Authenticator    CallerAuthenticator
-	Upstream         UpstreamTransport
-	DefaultClusterID string
-	Mode             Mode
-	RedactSecrets    bool
-	Metrics          *Metrics
-	TracerProvider   trace.TracerProvider
-	AuditSink        AuditSink
+	Authenticator            CallerAuthenticator
+	Upstream                 UpstreamTransport
+	DefaultClusterID         string
+	Mode                     Mode
+	RedactSecrets            bool
+	AllowUpgradeSubresources bool
+	Metrics                  *Metrics
+	TracerProvider           trace.TracerProvider
+	AuditSink                AuditSink
 }

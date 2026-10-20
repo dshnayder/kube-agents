@@ -705,14 +705,15 @@ def _caller_default_kubeconfig_path() -> Path:
     return Path("/opt/data/.kubeconfig")
 
 
-def merge_context_into_default_kubeconfig(context: str) -> None:
-    """Register `context` in the default kubeconfig while preserving `current-context`."""
+def _merge_context_into_kubeconfig_file(
+    path: Path,
+    context: str,
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
     import yaml
 
-    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
-    if not proxy_url:
-        return
-    path = _caller_default_kubeconfig_path()
     try:
         if not path.is_file() or path.stat().st_uid != os.geteuid():
             return
@@ -721,13 +722,6 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         return
     if not isinstance(doc, dict):
         return
-    ca_file = (
-        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
-    ).strip()
-    token_file = (
-        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
-        or DEFAULT_KUBE_PROXY_TOKEN_FILE
-    ).strip()
     clusters = list(doc.get("clusters") or [])
     clusters = [c for c in clusters if isinstance(c, dict) and c.get("name") != context]
     clusters.append(
@@ -767,6 +761,29 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
     except OSError:
         pass
+
+
+def merge_context_into_default_kubeconfig(context: str) -> None:
+    """Register `context` in the default kubeconfig while preserving `current-context`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    ca_file = (
+        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    token_file = (
+        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    candidates = [_caller_default_kubeconfig_path(), Path("/opt/data/.kubeconfig")]
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        _merge_context_into_kubeconfig_file(
+            path, context, proxy_url, ca_file, token_file
+        )
 
 
 def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
@@ -809,7 +826,9 @@ def land_implicit_kubeconfig(generated: str) -> None:
     except OSError as exc:
         written = False
         print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
-    pinned = record_shell_context(target.context_name)
+    pinned = False
+    if not os.environ.get("KUBE_PROXY_URL", "").strip():
+        pinned = record_shell_context(target.context_name)
     lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
     if written:
         lines.append(f"  Credentials for {target.context_name} are in {path}.")

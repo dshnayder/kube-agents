@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,28 +24,37 @@ const (
 )
 
 // RewriteSecretRequestHeaders rewrites Accept and Accept-Encoding headers on core/v1 Secret requests
-// so the upstream API server returns uncompressed JSON metadata instead of Secret payload bytes.
+// so the upstream API server returns metadata instead of Secret payload bytes.
 // It returns true if the caller originally requested PartialObjectMetadata directly.
 func RewriteSecretRequestHeaders(r *http.Request, info *request.RequestInfo) bool {
-	r.Header.Set("Accept-Encoding", "identity")
+	callerWantsPartial, _ := RewriteSecretRequestHeadersWithStatus(r, info)
+	return callerWantsPartial
+}
+
+// RewriteSecretRequestHeadersWithStatus rewrites Accept and Accept-Encoding headers on core/v1 Secret
+// requests and returns (callerWantsPartial, acceptRewritten).
+func RewriteSecretRequestHeadersWithStatus(r *http.Request, info *request.RequestInfo) (bool, bool) {
+	r.Header.Del("Accept-Encoding")
 
 	origAccept := r.Header.Get("Accept")
 	callerWantsPartial := strings.Contains(origAccept, "as=PartialObjectMetadata")
 
 	if strings.Contains(origAccept, "as=Table") {
 		r.Header.Set("Accept", tableAccept)
-		return callerWantsPartial
+		return callerWantsPartial, false
 	}
 
-	switch info.Verb {
+	verb := ""
+	if info != nil {
+		verb = info.Verb
+	}
+	switch verb {
 	case "list":
 		r.Header.Set("Accept", partialObjectListAccept)
-	case "get", "watch":
-		r.Header.Set("Accept", partialObjectMetadataAccept)
 	default:
-		r.Header.Set("Accept", "application/json")
+		r.Header.Set("Accept", partialObjectMetadataAccept)
 	}
-	return callerWantsPartial
+	return callerWantsPartial, true
 }
 
 // ScrubSecretResponse redacts Secret payload fields (.data, .stringData, and last-applied-configuration)
@@ -55,14 +65,26 @@ func ScrubSecretResponse(resp *http.Response, info *request.RequestInfo, callerW
 		return
 	}
 
+	bodyReader := io.ReadCloser(resp.Body)
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			_ = resp.Body.Close()
+			replaceWithBadGateway(resp, "kube-proxy failed to decompress gzip Secret response from upstream")
+			return
+		}
+		resp.Header.Del("Content-Encoding")
+		bodyReader = &gzipReadCloser{gz: gzReader, raw: resp.Body}
+	}
+
 	if info != nil && info.Verb == "watch" && resp.StatusCode == http.StatusOK {
 		resp.Header.Del("Content-Length")
-		resp.Body = newSecretWatchScrubber(resp.Body, callerWantsPartial)
+		resp.Body = newSecretWatchScrubber(bodyReader, callerWantsPartial)
 		return
 	}
 
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	defer bodyReader.Close()
+	raw, err := io.ReadAll(io.LimitReader(bodyReader, 64<<20))
 	if err != nil {
 		replaceWithBadGateway(resp, "kube-proxy failed to read Secret response body from upstream")
 		return
@@ -78,6 +100,20 @@ func ScrubSecretResponse(resp *http.Response, info *request.RequestInfo, callerW
 	resp.Header.Set("Content-Length", strconv.Itoa(len(scrubbed)))
 	resp.ContentLength = int64(len(scrubbed))
 	resp.Body = io.NopCloser(bytes.NewReader(scrubbed))
+}
+
+type gzipReadCloser struct {
+	gz  *gzip.Reader
+	raw io.ReadCloser
+}
+
+func (g *gzipReadCloser) Read(p []byte) (int, error) {
+	return g.gz.Read(p)
+}
+
+func (g *gzipReadCloser) Close() error {
+	_ = g.gz.Close()
+	return g.raw.Close()
 }
 
 // ScrubSecretJSONBytes parses a JSON payload and strips .data, .stringData, and last-applied-configuration

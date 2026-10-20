@@ -74,6 +74,9 @@ func resolveKubeProxyImage() string {
 	if operatorImage := os.Getenv(operatorImageEnvVar); operatorImage != "" {
 		return deriveImageFromOperator(operatorImage, kubeProxyRepositoryName)
 	}
+	if agentImage := os.Getenv(platformAgentImageEnvVar); agentImage != "" {
+		return deriveImageFromOperator(agentImage, kubeProxyRepositoryName)
+	}
 	return "ghcr.io/gke-labs/kube-agents/" + kubeProxyRepositoryName + ":" + DefaultPlatformAgentVersion
 }
 
@@ -83,12 +86,20 @@ func buildKubeProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
 		Spec: corev1.ServiceSpec{
 			Selector: kubeProxySelector(agent),
-			Ports: []corev1.ServicePort{{
-				Name:       "https",
-				Port:       kubeProxyPort,
-				TargetPort: intstr.FromString("https"),
-				Protocol:   corev1.ProtocolTCP,
-			}},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "https",
+					Port:       kubeProxyPort,
+					TargetPort: intstr.FromString("https"),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       kubeProxyMetricsPortName,
+					Port:       kubeProxyMetricsPort,
+					TargetPort: intstr.FromString(kubeProxyMetricsPortName),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
 		},
 	}
 	withCommonLabels(svc, agent)

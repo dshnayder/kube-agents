@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -54,15 +55,16 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	factory := NewRequestInfoFactory()
 
 	h := &proxyHandler{
-		authenticator:    cfg.Authenticator,
-		upstream:         cfg.Upstream,
-		defaultClusterID: defaultCluster,
-		mode:             mode,
-		redactSecrets:    cfg.RedactSecrets,
-		metrics:          metrics,
-		tracerProvider:   cfg.TracerProvider,
-		auditSink:        auditSink,
-		factory:          factory,
+		authenticator:            cfg.Authenticator,
+		upstream:                 cfg.Upstream,
+		defaultClusterID:         defaultCluster,
+		mode:                     mode,
+		redactSecrets:            cfg.RedactSecrets,
+		allowUpgradeSubresources: cfg.AllowUpgradeSubresources,
+		metrics:                  metrics,
+		tracerProvider:           cfg.TracerProvider,
+		auditSink:                auditSink,
+		factory:                  factory,
 	}
 
 	h.reverseProxy = &httputil.ReverseProxy{
@@ -120,16 +122,17 @@ func NewHandler(cfg Config) (http.Handler, error) {
 }
 
 type proxyHandler struct {
-	authenticator    CallerAuthenticator
-	upstream         UpstreamTransport
-	defaultClusterID string
-	mode             Mode
-	redactSecrets    bool
-	metrics          *Metrics
-	tracerProvider   trace.TracerProvider
-	auditSink        AuditSink
-	factory          *request.RequestInfoFactory
-	reverseProxy     *httputil.ReverseProxy
+	authenticator            CallerAuthenticator
+	upstream                 UpstreamTransport
+	defaultClusterID         string
+	mode                     Mode
+	redactSecrets            bool
+	allowUpgradeSubresources bool
+	metrics                  *Metrics
+	tracerProvider           trace.TracerProvider
+	auditSink                AuditSink
+	factory                  *request.RequestInfoFactory
+	reverseProxy             *httputil.ReverseProxy
 }
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +243,7 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	secretRedacted := h.redactSecrets && IsCoreV1Secret(info)
 	annotateRequestSpanInfo(span, clusterID, info, dryRun, secretRedacted)
 
-	if policyErr := EvaluatePolicy(h.mode, h.redactSecrets, outReq, info); policyErr != nil {
+	if policyErr := EvaluatePolicyWithOptions(h.mode, h.redactSecrets, h.allowUpgradeSubresources, outReq, info); policyErr != nil {
 		WriteStatusError(w, policyErr.Code, policyErr.Reason, policyErr.Message)
 		duration := time.Since(start)
 		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
@@ -265,12 +268,18 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	SanitizeRequestHeaders(outReq.Header)
+	_, isUpgradeSub := upgradeSubresources[strings.ToLower(info.Subresource)]
+	preserveUpgrade := h.mode == ModeReadWrite && h.allowUpgradeSubresources && info.IsResourceRequest && isUpgradeSub
+	SanitizeRequestHeadersWithOptions(outReq.Header, preserveUpgrade)
+	AppendCallerUserAgent(outReq.Header, caller)
 
 	var callerWantsPartial bool
 	if secretRedacted {
-		callerWantsPartial = RewriteSecretRequestHeaders(outReq, info)
-		h.metrics.recordSecretRedaction(SecretActionAcceptHeaderRewritten)
+		var acceptRewritten bool
+		callerWantsPartial, acceptRewritten = RewriteSecretRequestHeadersWithStatus(outReq, info)
+		if acceptRewritten {
+			h.metrics.recordSecretRedaction(SecretActionAcceptHeaderRewritten)
+		}
 	}
 
 	ctx := context.WithValue(outReq.Context(), clusterIDContextKey, clusterID)

@@ -19,6 +19,9 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 SANDBOX_IMAGE_VARS := PYTHON_IMAGE
 SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
+KUBE_PROXY_IMAGE_VARS := GOLANG_IMAGE DISTROLESS_IMAGE
+KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
 # What the image reports as its own version. Hermes interpolates it into the
 # `User-Agent` of every remote-MCP call, so an image built without it is
 # indistinguishable on the wire from any other. Both cloudbuild files, the
@@ -64,7 +67,7 @@ docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 docker-build-kube-proxy: ## Build the kube-proxy image.
-	docker build --platform linux/amd64 -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
+	docker build --platform linux/amd64 $(KUBE_PROXY_IMAGE_ARGS) -t $(REPO)/kube-proxy:latest -f deploy/kube-proxy/Dockerfile .
 
 # Context is the repository root, not deploy/sandbox: the image ships the same
 # credential-proxy client and PATH script the agent image does, and copying
@@ -425,6 +428,9 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go build (a2a)"; cd a2a && go build ./...
 	@echo "==> go vet (a2a)";   cd a2a && go vet ./...
 	@echo "==> go test (a2a)";  cd a2a && go test ./...
+	@echo "==> go build (k8s-api-proxy)"; cd k8s-api-proxy && go build ./...
+	@echo "==> go vet (k8s-api-proxy)";   cd k8s-api-proxy && go vet ./...
+	@echo "==> go test (k8s-api-proxy)";  cd k8s-api-proxy && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
