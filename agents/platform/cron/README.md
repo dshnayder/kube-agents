@@ -706,7 +706,8 @@ the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
 that passed the flag would let every on-demand run of its stream go silent.
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
-prompt has the sentence and that no SOP passes the flag. A prompt without it
+prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
+flag. A prompt without it
 only makes its job noisier. The rule is in
 [ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 
