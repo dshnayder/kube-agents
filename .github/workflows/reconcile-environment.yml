@@ -36,6 +36,11 @@ on:
         required: false
         default: "defer"
         type: string
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
       # For an environment that may not be provisioned yet: when the GitHub
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
@@ -89,6 +94,11 @@ on:
           - "fail"
           - "defer"
           - "ignore"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   # Asks whether the GitHub environment exists before any job binds it, because
@@ -275,6 +285,7 @@ jobs:
           GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
           IMAGE_TAG: ${{ inputs.image_tag }}
           LEASE_POLICY: ${{ inputs.lease_policy }}
+          ALLOW_BREAKING_DOWNGRADE: ${{ inputs.allow_breaking_downgrade }}
           GH_TOKEN: ${{ github.token }}
           # Every install setting, under the names render_install_env.sh maps.
           # An environment missing one of the required ones fails there, naming
@@ -322,9 +333,9 @@ jobs:
           # The PlatformAgent's spec.mode. Unset or `today` renders no key, so
           # an environment that does not set it renders the file it always
           # did; anything but today or next is refused by the renderer. The
-          # installer on main does not read the key yet: until the install's
-          # --mode flag (#2524) lands, `next` reaches a cluster only through
-          # deploy-environment.yml's mode input, which patches the CR itself.
+          # installer reads the key, so a full upgrade renders the mode into
+          # the chart: this is how a long-lived environment's declared mode
+          # reaches its cluster, and how one a rebuild left on today returns.
           PLATFORM_AGENT_MODE: ${{ vars.PLATFORM_AGENT_MODE }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
@@ -355,7 +366,7 @@ jobs:
       # always(), because a failed plan is the artifact worth having.
       - name: Upload the plan
         if: always() && steps.reconcile.outputs.plan_log != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reconcile-${{ inputs.github_environment }}-${{ inputs.mode }}
           path: ${{ steps.reconcile.outputs.plan_log }}
