@@ -648,10 +648,6 @@ reads. `create_job`'s signature is fixed keywords, so `deliver` is also the only
 field such a job _can_ set — which is what makes it the right place for the
 switch rather than merely a convenient one.
 
-The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
-That sentence controls silence, not delivery: a prompt without it only makes the job noisier
-([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
-
 Making it a mode is free because the scheduler has already done the work by the
 time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
@@ -665,6 +661,10 @@ carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
 scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
 sender and carries no such guard; no roster job uses `"all"`.
+
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+That sentence controls silence, not delivery: a prompt without it only makes the job noisier
+([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 
 ## How the switch is wired: `chat` is a platform
 
