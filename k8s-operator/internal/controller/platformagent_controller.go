@@ -90,7 +90,8 @@ const (
 	gitopsStateGitHubHostKey = "github_host"
 	// gitopsStateGitOpsRepoKey is the repository with role gitops, as one
 	// managed_repos entry ({"type", "url"}). The operator writes it only when
-	// exactly one repository has that role, and removes it when none has. The
+	// exactly one repository has that role, and removes it when none has or
+	// when two have it. The
 	// fleet audit reads it (gitops_workspace.get_gitops_repo) to choose the
 	// repository for its ledger issue when several repositories are managed.
 	gitopsStateGitOpsRepoKey = "gitops_repo"
@@ -1519,6 +1520,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
 }
 
+// twoGitOpsLogged holds the PlatformAgents, as namespace/name, for which
+// declaredGitOpsRepo has logged two gitops repositories. An entry goes when
+// the declaration has one gitops repository or none again.
+var twoGitOpsLogged sync.Map
+
 // declaredGitOpsRepo is the value of the gitops_repo key: the managed_repos
 // entry of the one repository with role gitops, as JSON, or "" when no
 // repository has that role. resolved is false when the key must stay as it
@@ -1529,11 +1535,6 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 // the key is removed and not written: the agent must not use either one as
 // the GitOps repository until the declaration is corrected. Problems reports
 // the second one in the status conditions.
-// twoGitOpsLogged holds the PlatformAgents, as namespace/name, for which
-// declaredGitOpsRepo has logged two gitops repositories. An entry goes when
-// the declaration has one gitops repository or none again.
-var twoGitOpsLogged sync.Map
-
 func declaredGitOpsRepo(agent *agentv1alpha1.PlatformAgent) (value string, resolved bool) {
 	if agent.Spec.Integration == nil {
 		return "", true
