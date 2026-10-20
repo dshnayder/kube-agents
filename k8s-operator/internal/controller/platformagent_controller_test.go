@@ -7529,3 +7529,103 @@ func TestBuildGitopsStateConfigMapGitOpsRepo(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcileGitopsStateGitOpsRepoHeldOrRemoved covers the gitops_repo key
+// on an existing ConfigMap: a declaration that does not resolve, or a gitops
+// repository that validation refuses, keeps the key as it is; two gitops
+// repositories remove it.
+func TestReconcileGitopsStateGitOpsRepoHeldOrRemoved(t *testing.T) {
+	const want = `{"type":"github","url":"https://github.com/acme/infra"}`
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "held-agent", Namespace: "test-ns"}}
+	declare := func(spec agentv1alpha1.IntegrationSpec) {
+		agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: spec}
+	}
+	read := func() (string, bool) {
+		var cm corev1.ConfigMap
+		if err := cl.Get(ctx, client.ObjectKey{Name: "held-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+		return value, ok
+	}
+	reconcile := func(step string) {
+		if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+	}
+
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("create")
+	if got, _ := read(); got != want {
+		t.Fatalf("gitops_repo = %q, expected %q", got, want)
+	}
+
+	// Both spellings at once: the declaration does not resolve.
+	declare(agentv1alpha1.IntegrationSpec{
+		Forges:       gh,
+		Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+		GitHub:       &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "other"},
+	})
+	reconcile("unresolved")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a declaration that does not resolve, expected it kept at %q", got, want)
+	}
+
+	// A gitops repository that validation refuses.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "acme/in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("refused")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a refused gitops repository, expected it kept at %q", got, want)
+	}
+
+	// Two gitops repositories: neither one is the GitOps repository.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleGitOps},
+	}})
+	reconcile("two gitops")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q with two gitops repositories, expected no key", got)
+	}
+	reconcile("two gitops again")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q on the second reconcile with two gitops repositories, expected no key", got)
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias covers a
+// github.com install that install.sh renders through the deprecated github
+// alias: its gitRepo is the gitops repository.
+func TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias(t *testing.T) {
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "alias-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			IntegrationSpec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "infra"}},
+		}},
+	}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := cl.Get(ctx, client.ObjectKey{Name: "alias-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cm.Data[gitopsStateGitOpsRepoKey], `{"type":"github","url":"https://github.com/acme/infra"}`; got != want {
+		t.Errorf("gitops_repo = %q, expected %q", got, want)
+	}
+}

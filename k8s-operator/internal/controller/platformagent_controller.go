@@ -1529,6 +1529,11 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 // the key is removed and not written: the agent must not use either one as
 // the GitOps repository until the declaration is corrected. Problems reports
 // the second one in the status conditions.
+// twoGitOpsLogged holds the PlatformAgents, as namespace/name, for which
+// declaredGitOpsRepo has logged two gitops repositories. An entry goes when
+// the declaration has one gitops repository or none again.
+var twoGitOpsLogged sync.Map
+
 func declaredGitOpsRepo(agent *agentv1alpha1.PlatformAgent) (value string, resolved bool) {
 	if agent.Spec.Integration == nil {
 		return "", true
@@ -1538,12 +1543,20 @@ func declaredGitOpsRepo(agent *agentv1alpha1.PlatformAgent) (value string, resol
 		return "", false
 	}
 	declared := ri.WithRole(agentv1alpha1.RepositoryRoleGitOps)
+	if len(declared) <= 1 {
+		twoGitOpsLogged.Delete(agent.Namespace + "/" + agent.Name)
+	}
 	switch {
 	case len(declared) == 0:
 		return "", true
 	case len(declared) > 1:
-		manifestsLog.Info("not writing the GitOps repository key: more than one repository has role gitops",
-			"key", gitopsStateGitOpsRepoKey, "count", len(declared))
+		// Once for each PlatformAgent, not on every reconcile: Problems
+		// already reports the second one in the status conditions.
+		if _, logged := twoGitOpsLogged.LoadOrStore(agent.Namespace+"/"+agent.Name, true); !logged {
+			manifestsLog.Info("not writing the GitOps repository key: more than one repository has role gitops",
+				"key", gitopsStateGitOpsRepoKey, "count", len(declared),
+				"namespace", agent.Namespace, "name", agent.Name)
+		}
 		return "", true
 	}
 	accepted := ri.Accepted(agentv1alpha1.RepositoryRoleGitOps)
