@@ -1496,9 +1496,10 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
 # The notes `disclose_manual_remediation_routes` adds to a `manual` remediation
-# from the collector's candidate fields. Each note starts with its lede and
-# ends with `ROUTE_NOTE_END`, so the pass can find and remove the note that an
-# earlier copy of the text carries before it writes the note again.
+# from the collector's candidate fields. Each value in a note is a path or a
+# name that `ROUTE_PATH_PATTERN` or `RECONCILER_PATTERN` accepts, so the pass
+# can find and remove the whole note that an earlier copy of the text carries
+# (`ROUTE_NOTE_PATTERN`) before it writes the note again.
 DECLARED_NOTE_LEDE = "_(Declared in this repository at "
 DECLARED_NOTE = (
     DECLARED_NOTE_LEDE + "`{path}`. Make the change in the repository, not on the live object.)_"
@@ -1515,20 +1516,31 @@ RECONCILED_NOTE = (
     RECONCILED_NOTE_LEDE + "{reconciler}. The next sync or upgrade can revert a change made "
     "by hand to the live object; make the change where that reconciler gets its configuration.)_"
 )
-ROUTE_NOTE_END = ".)_"
-ROUTE_NOTE_LEDES = (
-    DECLARED_NOTE_LEDE,
-    RELEASE_NOTE_LEDE,
-    NAMESPACE_DIRECTORY_NOTE_LEDE,
-    RECONCILED_NOTE_LEDE,
+# The characters a route note shows from a path or a name. The values come
+# from file names in the repository and from annotations on the live object,
+# which anyone who can edit the object can set. A value of these characters
+# cannot close its code span, start a link or an HTML tag, or mention a
+# user, so it shows as plain text. A path with another character gets no
+# location note.
+ROUTE_PATH_TEXT = r"[A-Za-z0-9_./-]+"
+ROUTE_PATH_PATTERN = re.compile(ROUTE_PATH_TEXT)
+# A name in a reconciler: a Helm release, an Argo CD Application, or an
+# `app.kubernetes.io/managed-by` label value.
+ROUTE_NAME_TEXT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+# A namespace is a DNS label, which has no character that Markdown reads,
+# so it shows outside a code span, as `collect.reconciler_of` writes it.
+ROUTE_NAMESPACE_TEXT = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+# The three phrases `collect.reconciler_of` writes, copied because this script
+# does not import the collector. A reconciler that is not exactly one of
+# them is shown as `RECONCILER_UNNAMED`: the note then still says that a
+# change by hand can be reverted, and it shows nothing from the annotation.
+RECONCILER_TEXT = (
+    rf"the Helm release `{ROUTE_NAME_TEXT}`(?: in {ROUTE_NAMESPACE_TEXT})?"
+    rf"|the Argo CD Application `{ROUTE_NAME_TEXT}`"
+    rf"|`{ROUTE_NAME_TEXT}`"
 )
-# One earlier route note, from its lede to the first `ROUTE_NOTE_END`.
-ROUTE_NOTE_PATTERN = re.compile(
-    "(?:" + "|".join(re.escape(lede) for lede in ROUTE_NOTE_LEDES) + r").*?"
-    + re.escape(ROUTE_NOTE_END)
-)
-# The same, with the spaces before it, so that a removal keeps the newlines.
-ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
+RECONCILER_PATTERN = re.compile(RECONCILER_TEXT)
+RECONCILER_UNNAMED = "a controller whose name the audit does not show"
 # The `renderer` values `collect.release_declarations` writes, copied because
 # this script does not import the collector, and the noun the release note
 # uses for each. A Kustomize overlay has no values file, so "the chart
@@ -1538,6 +1550,25 @@ RELEASE_RENDERER_NOUNS = {
     "kustomize": "the Kustomize overlay",
 }
 RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+# One earlier route note, exactly as a template above writes it. A value can
+# hold no character of the text around it, so a match is always one whole
+# note, and a removal never leaves part of a note behind.
+ROUTE_NOUN_TEXT = "|".join(
+    re.escape(noun) for noun in (*RELEASE_RENDERER_NOUNS.values(), RELEASE_RENDERER_FALLBACK_NOUN)
+)
+ROUTE_NOTE_PATTERN = re.compile(
+    "|".join(
+        "(?:"
+        + re.escape(template)
+        .replace(re.escape("{path}"), ROUTE_PATH_TEXT)
+        .replace(re.escape("{noun}"), f"(?:{ROUTE_NOUN_TEXT})")
+        .replace(re.escape("{reconciler}"), f"(?:{RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
+        + ")"
+        for template in (DECLARED_NOTE, RELEASE_NOTE, NAMESPACE_DIRECTORY_NOTE, RECONCILED_NOTE)
+    )
+)
+# The same, with the spaces before it, so that a removal keeps the newlines.
+ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
 # What a worker note is cut with when the route notes need its space.
 ROUTE_NOTE_TRUNCATED = " …(truncated)"
 # What joins two route notes, and what puts the route notes on their own
@@ -15137,6 +15168,9 @@ class RouteEvidence(NamedTuple):
     is no claim: the collector attaches a field only where it resolved one,
     and a missing `declaration` can mean that the index was empty, that two
     files declare the object, or that content mode could not copy the YAML.
+    A path that `ROUTE_PATH_PATTERN` does not accept is also `""`, and a
+    reconciler that `RECONCILER_PATTERN` does not accept is
+    `RECONCILER_UNNAMED`, so every field is safe to show in Markdown.
     """
 
     declaration: str
@@ -15147,9 +15181,28 @@ class RouteEvidence(NamedTuple):
 
 
 def _field_path(candidate: dict, field: str) -> str:
-    """The `path` inside one of the candidate's location fields, or `""`."""
+    """The `path` inside one of the candidate's location fields, or `""`.
+
+    `""` also when the path has a character that `ROUTE_PATH_PATTERN` does not
+    accept: no location note is better than a note that a file name can
+    change into a link or a mention.
+    """
     value = candidate.get(field)
-    return str(value.get("path") or "").strip() if isinstance(value, dict) else ""
+    path = str(value.get("path") or "").strip() if isinstance(value, dict) else ""
+    return path if ROUTE_PATH_PATTERN.fullmatch(path) else ""
+
+
+def _shown_reconciler(candidate: dict) -> str:
+    """The candidate's `reconciler` as a route note shows it, or `""`.
+
+    The phrase comes from annotations on the live object. When it is not
+    exactly one of the phrases `collect.reconciler_of` writes, with safe
+    names, the note shows `RECONCILER_UNNAMED` in its place.
+    """
+    reconciler = str(candidate.get("reconciler") or "").strip()
+    if not reconciler or RECONCILER_PATTERN.fullmatch(reconciler):
+        return reconciler
+    return RECONCILER_UNNAMED
 
 
 def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
@@ -15167,7 +15220,7 @@ def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
             release=_field_path(candidate, "release_declaration"),
             renderer=str((release or {}).get("renderer") or "") if isinstance(release, dict) else "",
             namespace_directory=_field_path(candidate, "namespace_directory"),
-            reconciler=str(candidate.get("reconciler") or "").strip(),
+            reconciler=_shown_reconciler(candidate),
         )
         if found.declaration or found.release or found.namespace_directory or found.reconciler:
             evidence[_candidate_identity(entry, candidate)] = found

@@ -667,6 +667,11 @@ else the `namespace_directory` where a new object belongs. A `reconciler` adds a
 next sync or upgrade can revert a change made by hand. A plain `helm install` release reverts a
 field that the chart sets only at the next `helm upgrade`, so the notes say "can revert", not "is
 reverted".
+The paths come from file names in the repository and the reconciler from annotations on the live
+object, so a note shows only letters, digits and `_./-` from them. A path with another character
+gets no location note. A reconciler that is not exactly one of the phrases the collector writes is
+shown as "a controller whose name the audit does not show". So a value cannot add a link or a
+mention to the ledger, and the next pass can find and remove each whole note.
 The notes go in a paragraph of their own after the worker's note, and a code fence that the
 worker's note leaves open is closed first. A note whose path the worker's note already names as a
 whole path is not written. A candidate without these fields gets no note, because a missing

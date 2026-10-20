@@ -20311,6 +20311,38 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.disclose(copied, self.manifest(declaration={"path": "apps/new/a.yaml"}))
         self.assertTrue(self.note(copied).startswith("Line one.\nLine two.\n\n_(Declared"), self.note(copied))
 
+    def test_a_hostile_reconciler_is_not_published_and_the_note_does_not_grow(self):
+        """The reconciler comes from annotations on the live object, which
+        anyone who can edit the object can set. A value that leaves its code
+        span must not publish a mention or a link, and the next pass must
+        remove the whole note it wrote."""
+        hostile = "the Helm release `r` in ns @octo-org/sec [docs](https://example.invalid/x).)_ tail"
+        for reconciler in (
+            hostile,
+            "the Argo CD Application `a`b`",
+            "`flux\n@octo-org/sec`",
+            "the Helm release `r` in Ns_X",
+        ):
+            with self.subTest(reconciler=reconciler):
+                manifest = self.manifest(reconciler=reconciler)
+                finding = self.manual()
+                self.assertEqual(self.disclose(finding, manifest), ["a"])
+                once = self.note(finding)
+                for leaked in ("@octo-org", "](https://", "tail", "a`b", "Ns_X"):
+                    self.assertNotIn(leaked, once)
+                self.assertIn(
+                    audit_report.RECONCILED_NOTE.format(reconciler=audit_report.RECONCILER_UNNAMED), once
+                )
+                self.assertEqual(self.disclose(finding, manifest), [])
+                self.assertEqual(self.note(finding), once)
+
+    def test_a_path_that_is_not_safe_in_markdown_gets_no_location_note(self):
+        for path in ("apps/`x`/a.yaml", "apps/a.yaml\n@octo-org/sec", "apps/[x](https://e.invalid).yaml"):
+            with self.subTest(path=path):
+                finding = self.manual()
+                self.assertEqual(self.disclose(finding, self.manifest(declaration={"path": path})), [])
+                self.assertEqual(self.note(finding), self.WORKER_NOTE)
+
 
 class TestManualRemediationRoutesInFinish(HarnessTestCase):
     """The wiring: what reaches the ledger body, in the real run and in the
