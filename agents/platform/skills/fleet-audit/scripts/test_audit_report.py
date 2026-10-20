@@ -16721,6 +16721,15 @@ class TestScheduledBaselineUnknownOrClosed(HarnessTestCase):
         self.assertTrue(self.finish([], scheduled=False)["status"] == "CLEAN")
         self.assertTrue(self.finish([], scheduled=True)["silent_ok"])
 
+    def test_an_id_resolved_on_demand_is_not_reported_under_a_later_gap(self):
+        self.seed_scheduled([self.a, self.c])
+        on_demand = self.finish([self.a], scheduled=False)
+        self.assertEqual(on_demand["resolved"], 1)
+        first = self.finish([self.a], scheduled=True, skipped=self.PARTIAL)
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, first)
+        # The published ids moved since the last scheduled run, so it speaks.
+        self.assertFalse(first["silent_ok"])
+
 
 class TestStandingCoverageGap(HarnessTestCase):
     """A coverage gap that did not change since the stored run is not news.

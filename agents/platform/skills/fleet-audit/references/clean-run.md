@@ -100,7 +100,9 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   and a run whose stored record does not show the last scheduled run's findings, for example the
   first run after an upgrade.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
-  this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
+  this run published, and a gap holds `resolved` at 0. On a scheduled run, the list also has the
+  findings of the last scheduled run that an on-demand run dropped under a gap; a finding that an
+  on-demand run resolved with full coverage is not in it. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
   coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
   run with the same gap does not list it again.
