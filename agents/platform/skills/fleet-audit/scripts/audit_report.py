@@ -18289,14 +18289,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
-    # this run's findings, the postures it withheld, and the held ids. An id
+    # this run's findings, the postures it withheld, the collector-held ids,
+    # and the ids kept under _Not re-checked this run_. An id
     # that an earlier run already reported this way, and that is still not
     # published, is not reported again (`REPORTED_UNDER_GAP_KEY` on the stored
     # record). The exception keys on what a run reported, not on the ledger
     # being held open: a run can hold the ledger open and report no id.
     # Withheld over a scheme bump, as `resolved` is: the ids on the two sides
     # are spelled differently, so every stored id would look missing.
-    published_ids = held_exclude | held_ids
+    published_ids = held_exclude | held_ids | unread_ids
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
     } - published_ids

@@ -14538,6 +14538,31 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
         self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
         self.assertIn("Stage namespace has no NetworkPolicy", body)
 
+    def test_a_held_row_is_not_reported_as_no_longer_reported(self):
+        """The body shows the finding as not re-checked, so the run must not say it left the ledger."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, self.stdout_json())
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn(audit_report.REPORTED_UNDER_GAP_KEY, stored)
+
+    def test_a_clean_run_over_the_gap_does_not_report_a_held_row_as_dropped(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        # The prod finding was checked and not reported; the stage one was not checked.
+        self.assertEqual(
+            self.stdout_json()[audit_report.UNREPORTED_UNDER_GAP_KEY],
+            [derived_id()],
+        )
+
     def test_a_remediate_on_a_held_row_is_deferred_on_a_clean_run_over_the_same_gap(self):
         """The row says "not re-checked", so the answer must not say "no longer reproduces"."""
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
