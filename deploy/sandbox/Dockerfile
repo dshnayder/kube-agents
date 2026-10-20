@@ -459,7 +459,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
-#   fleet_scope_args.py    the two flags (`--scope-projects`, `--scope-unread`) the
+#   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
+#                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
 #                          by. The scope's snapshot sits on the agent pod's data
 #                          volume, which this container does not share, so the agent
@@ -489,6 +490,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          skill trees are not staged in this image (see
 #                          deploy/sandbox/entrypoint.sh: everything agents/cluster
 #                          names is under /opt/data/scripts)
+#   audit_cluster.sh       the Cluster Agent's gke-workload-security audit; its
+#                          gcloud read goes through the same wrapper. Here for the
+#                          reason stall_report.py is, and copied from the Platform
+#                          Agent's synced skill so both agents run one file
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -530,6 +535,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
+     agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      /opt/defaults/scripts/

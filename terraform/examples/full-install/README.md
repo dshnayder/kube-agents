@@ -61,6 +61,14 @@ install without the interview.
   development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
   `install.env`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
+  `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
+  A key that is not set keeps the default in the agent image. Each apply that
+  changes the env list that the chart renders replaces the `PlatformAgent`'s
+  `spec.deployment.env`, and entries added to the CR by hand are lost. Set
+  those through `platformAgent.deployment.env` in `extra_helm_values`. The
+  [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+  gives the buckets, the defaults and a sizing method.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -85,6 +93,26 @@ install without the interview.
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
+- Optionally (`model_provider = "openai_compatible"`) a server speaking the OpenAI
+  chat-completions API (vLLM, TGI, an internal gateway), reached through the
+  gateway. No GCP resource: the composition passes the chart
+  `litellm.openaiCompatible` from `openai_compatible_api_base` (the base URL
+  including `/v1`), `openai_compatible_target_port` (the server pod's port, for
+  an in-cluster Service), `openai_compatible_egress_cidrs` (the private ranges
+  any other host is reached at; none for a public endpoint on 443) and
+  `openai_compatible_ca_secret_name` (a Secret you create holding the CA under
+  `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
+  Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
+  it; the plan fails without it or the base URL.
+- Optionally (`litellm_env_secret_name`) a Secret you create in the agent's
+  namespace that the gateway reads whole as environment variables. No GCP
+  resource and nothing in state: the composition passes the name as the chart's
+  `litellm.envFromSecret`. It is how `model_provider = "sap"` (SAP AI Core,
+  `AICORE_SERVICE_KEY` and `AICORE_RESOURCE_GROUP`), any other LiteLLM provider
+  slug (its driver's variables; `model_default_name` is then required and the
+  plan fails without it) and an `openai_compatible` gateway behind OAuth2
+  client credentials (`OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`, `_CLIENT_ID`,
+  `_CLIENT_SECRET`) get their credentials.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
