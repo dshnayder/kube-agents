@@ -477,16 +477,19 @@ not, the install loses that project. Use the forge name `gitlab`, which is the n
 installer gives the forge. On an install made with `install.sh`, put the list in the
 `TF_VAR_extra_helm_values` line in `install.env`, as
 [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows, and run
-`install.sh` again:
+`install.sh` again. If `install.env` already has that line, add the key to the same object,
+because a second line replaces the first. Replace `platform/infra/gitops` with your
+`--gitops-repo` project:
 
 ```bash
-TF_VAR_extra_helm_values='{platformAgent={integration={repositories=[{forge="gitlab",repository="platform/gitops",role="gitops"},{forge="gitlab",repository="infra/terraform",role="managed"}]}}}'
+TF_VAR_extra_helm_values='{platformAgent={integration={repositories=[{forge="gitlab",repository="platform/infra/gitops",role="gitops"},{forge="gitlab",repository="infra/terraform",role="managed"}]}}}'
 ```
 
 The broker then also serves the group of the second project. The token must reach that project
 with the Developer role: a project access token reaches one project only, and a group access token
-reaches only its own group. For two projects in different groups, use the token of a dedicated
-account that is a Developer member of both. Run the access-level check in
+reaches its group and the subgroups of that group. For two
+projects with no common parent group, use the token of a dedicated account that is a Developer
+member of both. Run the access-level check in
 [Check the token](#check-the-token) once for each project. Then make sure that the install has both
 projects:
 
