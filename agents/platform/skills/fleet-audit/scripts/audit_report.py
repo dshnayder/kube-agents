@@ -17579,10 +17579,10 @@ def handle_remediate(args: argparse.Namespace) -> None:
     )
 
 
-def previous_no_forge_ids(audit_id: str) -> list[str] | None:
-    """The finding ids the previous run with no forge stored; None when unknowable.
+def previous_no_forge_record(audit_id: str) -> dict | None:
+    """The envelope the previous run with no forge stored; None when unknowable.
 
-    `[]` when the store holds no envelope for this key at all: the run is
+    `{}` when the store holds no envelope for this key at all: the run is
     first, and everything it finds is new. There is no public ledger to hold
     the record against, so an envelope is trusted on its own when a run with
     no forge wrote it for this key under this id scheme. `latest.json` first;
@@ -17599,7 +17599,7 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
         pass
     present = [path for path in candidates if path.exists()]
     if not present:
-        return []
+        return {}
     for path in present:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -17612,7 +17612,7 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
             and _ledger_key(envelope.get("repo")) == _ledger_key(NO_FORGE_REPO)
             and envelope.get("id_scheme") == ID_SCHEME
         ):
-            return [str(fid) for fid in ids]
+            return envelope
     log(
         f"WARNING: no report store record for {audit_id} was written by a run with no "
         f"forge under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
@@ -17629,12 +17629,14 @@ def render_no_forge_summary(
     held: list[str],
     note: str,
     dropped: int = 0,
+    unread: list[str] | None = None,
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
     The headline counts, the most severe findings up to
     `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
-    collector still flags that the document left out, how many of this run's
+    collector still flags that the document left out, the ids kept because
+    this run did not check their target (`unread`), how many of this run's
     collector candidates the document does not carry (`dropped`), the
     coverage gaps, and `note`. Redacted like the ledger body, because it is delivered to a
     channel the same way.
@@ -17676,6 +17678,15 @@ def render_no_forge_summary(
             + shown
             + (f", and {more} more in the report store" if more > 0 else "")
         )
+    if unread:
+        shown = ", ".join(unread[:NO_FORGE_SUMMARY_FINDINGS])
+        more = len(unread) - NO_FORGE_SUMMARY_FINDINGS
+        lines.append(
+            "Not re-checked this run, because the run did not check their target, and "
+            "kept in the report store: "
+            + shown
+            + (f", and {more} more" if more > 0 else "")
+        )
     if dropped:
         lines.append(
             f"The collector flagged {dropped} candidate(s) this run's document does not carry; "
@@ -17703,7 +17714,10 @@ def _finish_without_forge(
     The checks still ran, so the delta is taken against the previous no-forge
     envelope and the JSON line carries a `summary` for the run to deliver to
     chat. A previous finding the collector still flags is held, as the ledger
-    holds it: the document leaving it out is not the condition clearing. A
+    holds it: the document leaving it out is not the condition clearing. So
+    is a previous finding on a target this run did not read or did not check
+    (`unread_held_entries`), with its place stored under `NOT_RECHECKED_KEY`,
+    until a run checks the target again. A
     document `finish` would refuse is refused the same way, since validation
     runs before this.
     """
@@ -17716,7 +17730,10 @@ def _finish_without_forge(
     unpublished = unpublished_candidates(accounted, manifest)
     wholly_dropped = wholly_unpublished_checks(accounted, manifest)
     current_ids = finding_ids(findings)
-    previous_ids = previous_no_forge_ids(audit_id)
+    record = previous_no_forge_record(audit_id)
+    previous_ids = (
+        None if record is None else [str(fid) for fid in record.get("current_ids") or []]
+    )
     delta_known = previous_ids is not None
     earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
@@ -17726,7 +17743,29 @@ def _finish_without_forge(
         - set(current_ids)
         - set(finding_ids(postures_withheld(data)))
     )
-    stored_ids = sorted(set(current_ids) | set(held))
+    # The previous findings on a target this run did not check, as the
+    # ledger branch keeps them; only over a gap and with a trusted record.
+    unread_entries = (
+        unread_held_entries(
+            "",
+            record,
+            data,
+            exclude=set(current_ids)
+            | set(held)
+            | set(finding_ids(postures_withheld(data)))
+            | _declared_ids(data),
+            previous_ids=previous_ids,
+        )
+        if gaps and record
+        else []
+    )
+    unread = [entry["id"] for entry in unread_entries]
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is in the report store and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays as not re-checked rather than resolved."
+        )
+    stored_ids = sorted(set(current_ids) | set(held) | set(unread))
     new_ids = sorted(set(current_ids) - set(previous_ids or []))
     # Over a coverage gap an absence means "not checked", not fixed.
     resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(stored_ids))
@@ -17779,6 +17818,7 @@ def _finish_without_forge(
             resolved_ids=resolved_ids,
             rendered_ids=stored_ids,
             delta_known=delta_known,
+            not_rechecked=unread_entries,
         ),
         now,
     )
@@ -17789,7 +17829,16 @@ def _finish_without_forge(
     # For the same reason, a run the store does not hold is never quiet.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored
     payload["summary"] = render_no_forge_summary(
-        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
+        audit_id,
+        data,
+        gaps,
+        new_ids,
+        resolved_ids,
+        delta_known,
+        held,
+        note,
+        len(unpublished),
+        unread=unread,
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))

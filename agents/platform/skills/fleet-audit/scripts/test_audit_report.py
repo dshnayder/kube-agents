@@ -27405,6 +27405,27 @@ class TestNoForge(BaseTestCase):
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
         self.assertIn(left_out, latest["current_ids"])
 
+    def test_a_finding_on_a_skipped_cluster_stays_in_the_store_over_a_gap(self):
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        self.finish(make_doc(findings=[make_finding(), stage]))
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        skipped = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+        gap = make_doc(findings=[make_finding()], clusters=[prod], skipped=skipped)
+
+        for _ in range(2):
+            out = self.finish(gap)
+            self.assertEqual((out["new"], out["resolved"]), (0, 0))
+            latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+            self.assertIn(stage_id, latest["current_ids"])
+            self.assertIn(stage_id, out["summary"])
+
+        # The next complete run does not call it new, and announces a fix.
+        self.assertEqual(self.finish(make_doc(findings=[make_finding(), stage]))["new"], 0)
+        self.finish(gap)
+        fixed = self.finish(make_doc(findings=[make_finding()]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
     def test_a_failed_store_write_says_the_message_is_the_only_record(self):
         self.reports_dir.mkdir(parents=True)
         (self.reports_dir / AUDIT).write_text("not a directory", encoding="utf-8")
