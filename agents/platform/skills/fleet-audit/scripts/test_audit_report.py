@@ -19966,6 +19966,44 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 )
         self.assertIn("a", self.unwritten([self.manual(check=check)], self.manifest(check=check)))
 
+    def test_each_fix_the_refusal_path_answered_gets_no_route_note(self):
+        """A planned fix, a declined one, one a pull request answers, and one a
+        pull request carries are each skipped on their own; an unwritten fix
+        with none of these, and a decline of no unwritten fix, are not."""
+        fix = audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)
+        unwritten = {fid: fix for fid in ("planned", "declined", "answered", "open")}
+        skip = audit_report.route_note_skip(
+            unwritten,
+            {"declined": "why", "stray": "why"},
+            {"planned": ("apps/a/pdb.yaml", "# text\n")},
+            {"answered"},
+            {"carried"},
+        )
+        self.assertEqual(skip, {"planned", "declined", "answered", "carried"})
+        for name in ("planned", "declined", "answered", "carried"):
+            with self.subTest(name):
+                left = audit_report.route_note_skip(
+                    unwritten,
+                    {"declined": "why"} if name != "declined" else {},
+                    {"planned": ("p", "t")} if name != "planned" else {},
+                    {"answered"} if name != "answered" else set(),
+                    {"carried"} if name != "carried" else set(),
+                )
+                self.assertNotIn(name, left)
+
+    def test_a_fix_carried_by_a_pull_request_is_found_by_either_join(self):
+        """The delta block of any pull request the harness did not close, and
+        for a degraded fix the branch its promised path names."""
+        on_branch = self.pr_on("apps/a/pdb.yaml", state="OPEN")
+        naming = {"state": "OPEN", "headRefName": "x", "body": audit_report.delta_block(["b"])}
+        self.assertEqual(
+            audit_report.pr_carried_fixes({"a": "apps/a/pdb.yaml"}, ["a"], AUDIT, [on_branch, naming]), {"a", "b"}
+        )
+        # A path that is promised but not degraded is joined on nothing.
+        self.assertEqual(audit_report.pr_carried_fixes({"a": "apps/a/pdb.yaml"}, [], AUDIT, [on_branch]), set())
+        stale = {**naming, "state": "CLOSED", "labels": [{"name": audit_report.STALE_CLOSED_LABEL}]}
+        self.assertEqual(audit_report.pr_carried_fixes({}, [], AUDIT, [stale]), set())
+
     def test_prs_still_open_names_a_pull_request_that_answers_a_manual_finding(self):
         finding = {"id": "a"}
         carrying = {"state": "OPEN", "url": "https://x/pull/9", "body": audit_report.delta_block(["a"])}
