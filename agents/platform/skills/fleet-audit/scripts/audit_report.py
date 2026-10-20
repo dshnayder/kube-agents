@@ -1746,9 +1746,9 @@ MAX_HELD_DETAIL_ROWS = 50
 # then the ids held because a run did not check their target. The ids are a
 # monotone term in the hidden marker that no SOP-side edit can shrink, so
 # unbounded they could push a body past GitHub's limit on every run; kept in
-# sorted order so which ones survive the cap is deterministic. The
-# collector-held overflow is logged and stated in the body; the other overflow
-# is logged.
+# sorted order so which ones survive the cap is deterministic. Each overflow
+# is logged, and the body states it in every tier of the held span except the
+# id-only one, which has no text.
 MAX_HELD_IDS = 200
 # The coverage gaps a clean run files when the report store holds no memory of
 # the open ledger. The first when the collector still flags something the
