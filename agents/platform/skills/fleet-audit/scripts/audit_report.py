@@ -18230,8 +18230,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # gap. They render as held rows (`_render_unread_held`), so their ids stay
     # in the hidden block, out of `resolved` and out of the stale-close pass.
     # Only over a gap: a run with no gap checked every target. The clean
-    # branch keeps the previous body as it is over a gap, so it needs none.
-    # They share `MAX_HELD_IDS` with the collector-held entries, which come
+    # branch keeps the previous body as it is over a gap, so it renders no
+    # rows, but it uses the ids to defer `/remediate` and to keep the pull
+    # requests of these findings open in the shield's close. They share `MAX_HELD_IDS` with the collector-held entries, which come
     # first.
     unread_entries: list[dict] = []
     unread_overflow = 0
@@ -18473,7 +18474,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
-                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
+                # Nor is a previous finding on a target this run did not
+                # check (`unread_ids`): absence there is not evidence of a fix.
+                repo, audit_id, remediation_prs, still_flagged | unread_ids, previous_titles, {}, now,
                 # Over a gap or an unaccounted finding the close acts on the
                 # namespaces `start`'s file declares and on nothing the
                 # worker wrote; a complete run keeps the shield's ids too.
