@@ -95,11 +95,35 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
+    from eval_dashboard.health import (
+        POOL_BREACH,
+        POOL_STALE,
+        POOL_UNMEASURED,
+        PROW_JOB_TIMEOUT,
+        SECONDS_PER_MINUTE,
+        minutes_text,
+        near_deadline_headroom_text,
+        near_deadline_margin,
+        pool_drift_split,
+        pool_span,
+        wait_text,
+    )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly, periodics
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
+    from eval_dashboard.health import (
+        POOL_BREACH,
+        POOL_STALE,
+        POOL_UNMEASURED,
+        PROW_JOB_TIMEOUT,
+        SECONDS_PER_MINUTE,
+        minutes_text,
+        near_deadline_headroom_text,
+        near_deadline_margin,
+        pool_drift_split,
+        pool_span,
+        wait_text,
+    )
 
 STATE_SCHEMA_VERSION = 1
 
@@ -123,7 +147,7 @@ CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 CONDITION_DEADLINE_KILL = "deadline_kill"
 # The presubmit job's timeout in minutes, as health.py owns it.
-DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // 60)
+DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
@@ -157,6 +181,7 @@ KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
+KIND_NEAR_DEADLINE = "near_deadline"  # qualifying runs approach the Prow job timeout; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
@@ -376,13 +401,18 @@ def pool_advisable(pool: dict, drained: bool = False) -> bool:
     reads later as already said, and the next live queue under the same cause
     would go unannounced.
 
-    A breach needs a live backlog, because the verdict lasts a week while the
-    remedy is read fresh each hour. Unknown is not a refusal -- an unreadable
+    A breach needs a live backlog, or a refused acquire in the periodic's
+    recent window, because the verdict lasts a week while the remedy is read
+    fresh each hour. Unknown is not a refusal -- an unreadable
     queue withholds nothing, and `pool_cause_text` drops the diagnosis instead
     -- except after the queue was last seen drained, when a Deck that fails
     every other hour would announce a jam nothing has measured since.
     """
     if pool.get("verdict") != POOL_BREACH:
+        return True
+    # A refused acquire is a backlog that has already cost a run: nothing is
+    # queued because the runs that would be waiting died at the lease.
+    if pool.get("lease_failures"):
         return True
     live = pool.get("waiting_now")
     return live is True or (live is None and not drained)
@@ -459,12 +489,18 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     if health.get("slow") and not (prev or {}).get("slow"):
         kinds.append(KIND_SLOW)
 
+    # The near_deadline note goes out when the note appears, not when it clears: the
+    # digest carries it while it lasts, and "back to normal" is not news.
+    if health.get("near_deadline") and not (prev or {}).get("near_deadline"):
+        kinds.append(KIND_NEAR_DEADLINE)
+
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
-    # not yet named this episode. A breach message also needs a live queue: the
-    # verdict spans seven days while the remedy is read live, so one bad day
-    # keeps the verdict for a week and the remedy tracks a pool that has since
-    # drained. `over_threshold` shares the cause's instant. The two monitoring
-    # verdicts are exempt -- neither advises anything.
+    # not yet named this episode. A breach message also needs a live queue or
+    # a refusal in the periodic's recent window: the verdict spans seven days
+    # while the remedy is read live, so one bad day keeps the verdict for a
+    # week and the remedy tracks a pool that has since drained.
+    # `over_threshold` shares the cause's instant. The two monitoring verdicts
+    # are exempt -- neither advises anything.
     pool = health.get("pool") or {}
     told = prev or {}
     if (
@@ -819,12 +855,40 @@ def render_slow(health: dict) -> str:
     )
 
 
+def near_deadline_text(nd: dict) -> str:
+    max_min = minutes_text(nd.get("max_s"))
+    return f"slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}"
+
+
+def render_near_deadline(health: dict) -> str:
+    nd = health.get("near_deadline") or {}
+    tail = (
+        " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
+        if nd.get("kills", 0) > 0
+        else (
+            " Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
+        )
+    )
+    return "\n".join(
+        [
+            f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}.{tail}",
+            dashboard_link(DASHBOARD_VIEW_AGENT),
+        ]
+    )
+
+
+def near_deadline_digest_line(nd: dict) -> str:
+    max_min = minutes_text(nd.get("max_s"))
+    return f"slowest run {max_min} min, {near_deadline_headroom_text(nd)}"
+
+
 def pool_numbers(pool: dict) -> list[str]:
     """What tripped the verdict, with each figure beside its own limit.
     "against 15/45" makes the reader pair four numbers positionally, and gets
     it wrong. The periodic breaches on a day's row, on runs queued past p95
-    right now, or on both, so the message quotes whichever it was -- the
-    seven-day window it is not judged on can sit well inside its own limit.
+    right now, or on runs refused a project in its recent window, so the
+    message quotes whichever it was, under every header -- the seven-day
+    window it is not judged on can sit well inside its own limit.
 
     The recent stretch leads when the periodic could judge it, and the worst
     breached day stands in when it could not; `pool_note` picks between them
@@ -843,7 +907,17 @@ def pool_numbers(pool: dict) -> list[str]:
             f"{waiting} {plural(waiting, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
+    if pool.get("lease_failures"):
+        lines.append(f"{pool_refusals(pool).capitalize()}.")
     return lines
+
+
+def pool_refusals(pool: dict) -> str:
+    """`2 runs refused a project in the last 3h`, the periodic's third trigger."""
+    refused = pool.get("lease_failures") or 0
+    hours = pool.get("lease_failures_hours")
+    stretch = f" in the last {hours}h" if hours else ""
+    return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
 def pool_cause_text(pool: dict) -> str:
@@ -852,14 +926,23 @@ def pool_cause_text(pool: dict) -> str:
     nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
-        # The full pool is this hour's Boskos reading and carries the remedy on
-        # its own. The clause needs a backlog Deck actually saw: unread, it would
-        # assert one from a verdict up to a week old, and under the limit there
-        # may be no run queued at all.
+        # The counts are this hour's Boskos reading and carry the remedy on
+        # their own. The clause needs a backlog Deck actually saw: unread, it
+        # would assert one from a verdict up to a week old, and under the limit
+        # there may be no run queued at all. A refusal in the recent window
+        # keeps the cause once the pool has drained, so the header says "was"
+        # over a reading with projects free rather than calling them leased.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
+        held = f", {pool['no_build_id']} with no build ID in the owner" if pool.get("no_build_id") else ""
+        free = pool.get("free")
+        if isinstance(free, int) and free > 0:
+            return (
+                f"*Smoke gate: pool was full* — {free} of {figure(pool.get('total'))} projects"
+                f" are free now{held}{queuing}. Consider onboarding a project."
+            )
         return (
             f"*Smoke gate: pool full* — all {figure(pool.get('total'))} projects are leased"
-            f"{queuing}. Consider onboarding a project."
+            f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
         return (
@@ -935,13 +1018,20 @@ def render_pool(health: dict) -> str:
                 POOL_JOB_HISTORY_URL,
             ]
         )
+    # The agent view, not a scoped one: rule 8 rides beside the state and can
+    # start mid-incident, so there is no window to scope to.
+    # A queued run starts late and passes; a refused run died at the acquire,
+    # so the closing line says which.
+    tail = (
+        "A refused run did not start; retest once the pool has room."
+        if pool.get("lease_failures")
+        else "Runs still pass; /retest makes the queue longer."
+    )
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
             *pool_numbers(pool),
-            "Runs still pass; /retest makes the queue longer.",
-            # The agent view, not a scoped one: rule 8 rides beside the state
-            # and can start mid-incident, so there is no window to scope to.
+            tail,
             dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
@@ -1166,7 +1256,7 @@ def _is_dated(finished: datetime, now: datetime | None) -> bool:
 
 def dated_clock(finished: datetime | None, now: datetime | None) -> str:
     """A finish time for the digest: the clock alone within a day, the
-    weekday and date before it past that, so last month's on-merge run does
+    weekday and date before it past that, so last month's postsubmit run does
     not read as this morning's."""
     if finished is None:
         return "?"
@@ -1366,11 +1456,18 @@ def pool_digest_line(pool: dict) -> str:
     cleared = "" if live is not False else " No backlog right now."
     span = pool_span(pool)
     if not span:
+        # Both counts when both are set: the queue is the live fact, the
+        # refusal the reason there may be no queue to see.
         waiting = pool.get("over_threshold") or 0
-        return (
-            f"{headline} — {waiting} {plural(waiting, 'run')} waiting"
-            f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.{cleared}"
-        )
+        parts = []
+        if waiting or not pool.get("lease_failures"):
+            parts.append(
+                f"{waiting} {plural(waiting, 'run')} waiting"
+                f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit"
+            )
+        if pool.get("lease_failures"):
+            parts.append(pool_refusals(pool))
+        return f"{headline} — {'; '.join(parts)}.{cleared}"
     # Both figures, as pool_numbers does: the stretch breaches on p50 or p95, so
     # the median on its own can be a passing number standing in as the reason.
     return (
@@ -1384,7 +1481,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- one line on last night's nightly run with a link
     to its report: the counts, what is newly failing against the night
-    before and the wall clock, or that the night was truncated or missing."""
+    before, the opening chat turn's p50 and p95 when the reps carried it,
+    and the wall clock, or that the night was truncated or missing."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1405,6 +1503,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     if health.get("slow"):
         lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
+    if health.get("near_deadline"):
+        lines.append(f"⏱ Close to the deadline since {clock(parse_iso(health['near_deadline'].get('since')))}: {near_deadline_digest_line(health['near_deadline'])}.")
     ceiling = metrics.get("ceiling_reps") or 0
     if ceiling:
         # Apart from the headline's infra count on purpose: these repetitions
@@ -1443,6 +1543,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_pool_scan(health)
     if kind == KIND_SLOW:
         return render_slow(health)
+    if kind == KIND_NEAR_DEADLINE:
+        return render_near_deadline(health)
     if kind == KIND_POOL:
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
@@ -1611,6 +1713,7 @@ def run(
     told_fixture = KIND_FIXTURE_SCAN in sent
     told_pool_scan = KIND_POOL_SCAN in sent
     told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
+    told_near_deadline = KIND_NEAR_DEADLINE in sent or KIND_NEAR_DEADLINE not in kinds
     # The pool note records its verdict rather than a bit, because a verdict
     # change inside one episode is its own message (see decide). The clear is
     # held to the same bar: dropping the verdict on a send that failed would
@@ -1703,6 +1806,7 @@ def run(
             pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))
         ),
         "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
+        "near_deadline": bool(health.get("near_deadline")) if told_near_deadline else bool(before.get("near_deadline")),
         # No artifact is not a reading: clearing the verdict on a blind tick
         # re-posts the same breach once the fetch recovers.
         "pool_verdict": (

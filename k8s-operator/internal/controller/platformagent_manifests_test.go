@@ -477,8 +477,11 @@ func TestBuildDeployment(t *testing.T) {
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
-	if dep.Spec.Template.Spec.ServiceAccountName != "custom-sa" {
-		t.Errorf("expected shared pod service account custom-sa, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	// The gateway runs as its own operator-minted ServiceAccount whatever
+	// spec.security.serviceAccountName says: that name, and its cloud binding,
+	// are the broker's.
+	if dep.Spec.Template.Spec.ServiceAccountName != gatewayServiceAccountName(agent) {
+		t.Errorf("expected the gateway's own service account %s, got %s", gatewayServiceAccountName(agent), dep.Spec.Template.Spec.ServiceAccountName)
 	}
 	if dep.Spec.Template.Spec.AutomountServiceAccountToken == nil || *dep.Spec.Template.Spec.AutomountServiceAccountToken {
 		t.Errorf("expected sandbox service account token automount to be disabled")
@@ -1297,8 +1300,8 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	}
 	// Drift bills a bucket of its own rather than the Warning one it displays
 	// as, so its ceiling is a fourth variable and has to be overridable by the
-	// same route. Off the allowlist, one multi-object `kubectl apply` spends
-	// the default of 5 and every later drift record that day is lost for good
+	// same route. Off the allowlist, one large `kubectl apply` can spend
+	// the default and every later drift record that day is lost for good
 	// — the detector cannot re-offer one — with no way to raise the cap short
 	// of a new image.
 	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
@@ -1499,13 +1502,14 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. 500m is what lets a mint finish inside its
 	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
-	// rendered request is the admitted one on both cluster modes.
+	// 1Gi is the memory the child memory budget needs when Autopilot without
+	// bursting makes the request the limit: above the 512Mi the CPU:memory
+	// band would admit a 500m pod at, and above the budget's 672Mi floor.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
-		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
+		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Limits.Cpu().String(); got != "1" {
 		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
@@ -3087,8 +3091,8 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 8 {
-		t.Fatalf("expected 8 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 12 {
+		t.Fatalf("expected 12 PolicyRules, got %d", len(role.Rules))
 	}
 
 	// Core group rule
@@ -3119,6 +3123,68 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	expectedMetricsVerbs := []string{"get", "list"}
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+// The agent reads the GitOps reconcilers' sync objects to learn which repository
+// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
+// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
+// sync lookup does not need stay out, so the readable inline values are bounded
+// to what Applications and Kustomizations carry.
+func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
+	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	want := map[string][]string{
+		"argoproj.io":                 {"applications"},
+		"kustomize.toolkit.fluxcd.io": {"kustomizations"},
+		"source.toolkit.fluxcd.io":    {"gitrepositories", "ocirepositories"},
+		"configsync.gke.io":           {"rootsyncs", "reposyncs"},
+	}
+	excluded := map[string]string{
+		"helmreleases":     "helm.toolkit.fluxcd.io",
+		"applicationsets":  "argoproj.io",
+		"appprojects":      "argoproj.io",
+		"helmrepositories": "source.toolkit.fluxcd.io",
+	}
+	readOnly := []string{"get", "list", "watch"}
+	seen := map[string]bool{}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.Resources, "secrets") {
+			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		}
+		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
+			t.Errorf("minimal role carries a wildcard: %+v", rule)
+		}
+		for _, resource := range rule.Resources {
+			if group, ok := excluded[resource]; ok && slices.Contains(rule.APIGroups, group) {
+				t.Errorf("minimal role grants %s.%s, which carries inline values or templates", resource, group)
+			}
+		}
+		for _, group := range rule.APIGroups {
+			resources, ok := want[group]
+			if !ok {
+				continue
+			}
+			// Every rule on a pinned group is checked, not only the first: a
+			// second rule on the same group must not widen it unseen.
+			if seen[group] {
+				t.Errorf("%s: more than one rule; the grant must be exactly %v", group, resources)
+				continue
+			}
+			seen[group] = true
+			if !slices.Equal(rule.Resources, resources) {
+				t.Errorf("%s: resources %v, want %v", group, rule.Resources, resources)
+			}
+			if !slices.Equal(rule.Verbs, readOnly) {
+				t.Errorf("%s: verbs %v, want %v", group, rule.Verbs, readOnly)
+			}
+		}
+	}
+	for group := range want {
+		if !seen[group] {
+			t.Errorf("minimal role has no rule for %s", group)
+		}
 	}
 }
 
@@ -4437,6 +4503,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4464,6 +4531,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is
@@ -6461,6 +6535,23 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 	}
 }
 
+// TestPlatformFrontDoorOverlayEnablesBackfillPlugins: an existing front-door volume never
+// gains a list entry from the image's config.yaml, so the overlay is what turns these on.
+func TestPlatformFrontDoorOverlayEnablesBackfillPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-backfill", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "pr_opened") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
 // TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
 // clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
 //
@@ -6576,7 +6667,7 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.

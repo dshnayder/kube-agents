@@ -78,12 +78,12 @@ _INTERPOLATIONS = {
     "local.run_wait": "900",
     "local.poll": "15",
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
-    "local.gate_script": "bootstrap_scan_gate.py",
+    "local.gate_script": "oobe.py bootstrap_scan_gate.py",
     "local.gate_wait": "300",
     "local.list_tries": "3",
     "local.list_wait": "5",
     "local.pod_wait": "5",
-    "local.scan_job": "bootstrap-inventory-scan",
+    "local.scan_job": "oobe",
     "local.prioritize_key": "bootstrap-inventory-prioritize",
     "local.handoff_wait": "1800",
     "local.settle_hold": "120",
@@ -594,10 +594,10 @@ class Step1StateQueryTest(unittest.TestCase):
         return completed.stdout.strip()
 
     def test_an_enabled_scan_job_reads_clear(self):
-        self.assertEqual(self._state([{"id": "other", "enabled": False}, {"id": "bootstrap-inventory-scan", "enabled": True}]), "clear")
+        self.assertEqual(self._state([{"id": "other", "enabled": False}, {"id": "oobe", "enabled": True}]), "clear")
 
     def test_a_paused_scan_job_reads_paused(self):
-        self.assertEqual(self._state([{"id": "bootstrap-inventory-scan", "enabled": False}]), "paused")
+        self.assertEqual(self._state([{"id": "oobe", "enabled": False}]), "paused")
 
     def test_a_missing_scan_job_reads_nojob(self):
         self.assertEqual(self._state([{"id": "other", "enabled": True}]), "nojob")
@@ -607,6 +607,12 @@ class Step1StateQueryTest(unittest.TestCase):
     def test_the_markers_are_read_before_the_job(self):
         self.assertEqual(self._state([], markers=[".bootstrap_completed"]), "completed")
         self.assertEqual(self._state(markers=[".user_aligned"]), "aligned")
+
+    def test_a_conversation_marker_reads_as_aligned(self):
+        self.assertEqual(self._state(markers=[".user_aligned_conversation"]), "aligned")
+
+    def test_a_conversation_binding_reads_as_aligned(self):
+        self.assertEqual(self._state(markers=["onboarding_conversation.json"]), "aligned")
 
 
 class SweepIdReadTest(unittest.TestCase):
