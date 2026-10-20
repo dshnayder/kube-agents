@@ -15292,31 +15292,41 @@ def _names_path(text: str, path: str) -> bool:
     return bool(re.search(r"(?<![\w./-])" + re.escape(path) + r"(?!\.?[\w/-])", text))
 
 
-def _route_notes(found: RouteEvidence, worker_note: str) -> list[str]:
-    """The route notes for one `manual` finding, in the order they are written.
+def _location_note(found: RouteEvidence) -> tuple[str, str]:
+    """The path and the location note for one `manual` finding, or `("", "")`.
 
     One location note at most, the most specific that the collector found:
     the object's own file, then the release that renders it, then the
-    directory for a new object. A note whose path the worker's note already
-    names is not written, because it would only repeat the worker. The
-    reconciler note is independent of the location note.
+    directory for a new object.
     """
-    notes: list[str] = []
     if found.declaration:
-        location, note = found.declaration, DECLARED_NOTE.format(path=found.declaration)
-    elif found.release:
+        return found.declaration, DECLARED_NOTE.format(path=found.declaration)
+    if found.release:
         noun = RELEASE_RENDERER_NOUNS.get(found.renderer, RELEASE_RENDERER_FALLBACK_NOUN)
-        location, note = found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
-    elif found.namespace_directory:
-        location = found.namespace_directory
-        note = NAMESPACE_DIRECTORY_NOTE.format(path=found.namespace_directory)
-    else:
-        location, note = "", ""
-    if note and not _names_path(worker_note, location):
-        notes.append(note)
-    if found.reconciler:
-        notes.append(RECONCILED_NOTE.format(reconciler=found.reconciler))
-    return notes
+        return found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
+    if found.namespace_directory:
+        return found.namespace_directory, NAMESPACE_DIRECTORY_NOTE.format(path=found.namespace_directory)
+    return "", ""
+
+
+def _routed_note(found: RouteEvidence, worker_note: str) -> tuple[str, str]:
+    """The worker's note and the route notes for one `manual` finding, made to
+    fit `MAX_NOTE_CHARS` (`_fit_route_notes`).
+
+    The location note is not written when the worker's note names its path,
+    because it would only repeat the worker. That is decided on the worker's
+    note after the cut: when the cut removes the only mention of the path, the
+    location note is written. The reconciler note is independent of the
+    location note.
+    """
+    location, location_note = _location_note(found)
+    reconciled = [RECONCILED_NOTE.format(reconciler=found.reconciler)] if found.reconciler else []
+    if location_note and _names_path(worker_note, location):
+        fitted, added = _fit_route_notes(worker_note, NOTE_SEPARATOR.join(reconciled))
+        if _names_path(fitted, location):
+            return fitted, added
+    notes = [location_note, *reconciled] if location_note else reconciled
+    return _fit_route_notes(worker_note, NOTE_SEPARATOR.join(notes))
 
 
 def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
@@ -15425,8 +15435,7 @@ def disclose_manual_remediation_routes(
         if ROUTE_NOTE_PATTERN.search(worker_note):
             worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
         found = evidence.get(derive_finding_id(finding))
-        added = NOTE_SEPARATOR.join(_route_notes(found, worker_note)) if found else ""
-        fitted, added = _fit_route_notes(worker_note, added)
+        fitted, added = _routed_note(found, worker_note) if found else (worker_note, "")
         if fitted != worker_note:
             remediation[ROUTE_UNCUT_NOTE_FIELD] = worker_note
         note = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)

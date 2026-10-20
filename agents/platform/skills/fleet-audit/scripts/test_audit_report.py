@@ -20343,6 +20343,25 @@ class TestManualRemediationRoutes(unittest.TestCase):
                 self.disclose(finding, manifest)
                 self.assertEqual("Declared in this repository" not in self.note(finding), named)
 
+    def test_a_path_the_cut_removes_from_the_worker_note_is_named_by_the_note(self):
+        """The worker's mention of the path counts only when it stays after the
+        cut that gives the route notes room."""
+        tail = " Edit apps/web/a.yaml by hand."
+        worker = "x" * (1972 - len(tail)) + tail
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"}, reconciler="`flux`")
+        finding = self.manual(note=worker)
+        self.disclose(finding, manifest)
+        note = self.note(finding)
+        self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+        self.assertIn("…(truncated)", note)
+        self.assertIn(audit_report.DECLARED_NOTE.format(path="apps/web/a.yaml"), note)
+        self.assertIn("Reconciled by `flux`", note)
+        # A mention that stays after the cut still counts.
+        finding = self.manual(note="Edit apps/web/a.yaml by hand. " + "x" * 1972)
+        self.disclose(finding, manifest)
+        self.assertNotIn(audit_report.DECLARED_NOTE_LEDE, self.note(finding))
+        self.assertTrue(self.note(finding).startswith("Edit apps/web/a.yaml by hand."))
+
     def test_the_newlines_of_a_manual_note_are_kept(self):
         stale = audit_report.DECLARED_NOTE.format(path="apps/old/a.yaml")
         copied = self.manual(note=f"Line one.\nLine two. {stale}")
