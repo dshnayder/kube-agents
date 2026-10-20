@@ -16,10 +16,10 @@
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit [--repo "<owner>/<repo>"]
 ```
 
-If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+The audit targets the repository with `role: gitops`. `start` and `finish` resolve it without `--repo`, also when more than one repository is registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`):
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
-- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
+- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` stops because it cannot find the `role: gitops` repository, report its message and stop.
+- **Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run,** and pass the same `--repo` to `finish`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/obtainability-audit/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…], "context_repos":["org/terraform-live"], "declared_intent_repos":["org/repo","org/terraform-live"], "declared_intent_searched":["org/repo@<sha>","org/terraform-live@<sha>"], "declared_intent_sources":[{"repo":"org/repo","ref":null,"paths":["knowledge"]},…], "declared_intent_unsearched":[{"repo":"org/terraform-live","ref":"release-2026"},…], "declarations_path":"/opt/data/scratch/declarations_obtainability-audit.json"}`. Keep `findings_path`, `workspace`, `context_repos`, `declared_intent_repos`, `declared_intent_searched` and `declared_intent_unsearched` from this call; you write into the first two and read the rest in §4a.
 
