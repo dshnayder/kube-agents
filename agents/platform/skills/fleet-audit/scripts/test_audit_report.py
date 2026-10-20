@@ -14563,6 +14563,76 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
             [derived_id()],
         )
 
+    def run_tiers_across_two_gap_runs(self, *tiers):
+        """A gap run, a second gap run and a complete run, with the held span forced to a lower tier.
+
+        `tiers` names the renderers that are made too long for the body, so
+        `render_issue_body` falls to the tier below them.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        for name in tiers:
+            real = getattr(audit_report, name)
+            self.patch_attr(
+                name,
+                lambda *a, _real=real, **k: _real(*a, **k) + ["x" * audit_report.BODY_BUDGET],
+            )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        for _ in range(2):
+            self.assertEqual(self.run_finish(gap), 0, self.err)
+            body = self.written_body()
+            self.assertNotIn("Stage namespace has no NetworkPolicy", body)
+            self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+            # The second run reads the store the first run wrote.
+            self.harness.replies.pop("issue-view !comments", None)
+        both = make_doc(findings=[make_finding(), self.stage_finding()])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+
+    def test_a_held_id_in_the_note_tier_survives_the_next_gap_run(self):
+        self.run_tiers_across_two_gap_runs("_render_collector_held")
+
+    def test_a_held_id_in_the_ids_only_tier_survives_the_next_gap_run(self):
+        self.run_tiers_across_two_gap_runs("_render_collector_held", "_render_held_note")
+
+    def test_a_clean_run_that_keeps_the_body_keeps_the_stored_places(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        real = audit_report._render_collector_held
+        self.patch_attr(
+            "_render_collector_held",
+            lambda *a, **k: real(*a, **k) + ["x" * audit_report.BODY_BUDGET],
+        )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [e["id"] for e in stored[audit_report.NOT_RECHECKED_KEY]], [self.stage_id()]
+        )
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+
+    def test_an_id_with_no_place_is_logged_when_it_is_dropped(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        previous = published_body(make_doc(findings=[make_finding()]), generated_at=NOW)
+        orphan = "netpol-missing.stage-eu.payments.orphan"
+        previous = previous.replace(
+            audit_report.delta_block(audit_report.parse_delta_block(previous)),
+            audit_report.delta_block(audit_report.parse_delta_block(previous) + [orphan]),
+        )
+        self.assertIn(orphan, audit_report.parse_delta_block(previous))
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+        }
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(orphan, self.err)
+        self.assertIn("no recorded place", self.err)
+
     def test_a_remediate_on_a_held_row_is_deferred_on_a_clean_run_over_the_same_gap(self):
         """The row says "not re-checked", so the answer must not say "no longer reproduces"."""
         self.touch("clusters/prod-us-east/payments-netpol.yaml")

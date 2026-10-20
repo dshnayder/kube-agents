@@ -1295,6 +1295,14 @@ UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
 # `unreported_under_gap` and that are still not published. The next run does
 # not report them again. A record without the key subtracts nothing.
 REPORTED_UNDER_GAP_KEY = "reported_under_gap"
+# On the stored envelope only: the title and place of each previous finding
+# that the run kept under _Not re-checked this run_ (`unread_held_entries`).
+# The note and id-only tiers of the held span write no row for them, and the
+# run's own document does not carry them, so without this key the next gap
+# run cannot tell where each one is and drops it. Only when not empty.
+NOT_RECHECKED_KEY = "not_rechecked"
+# The fields of one entry under `NOT_RECHECKED_KEY`.
+NOT_RECHECKED_FIELDS = ("id", "title", "check", "cluster", "namespace", "object")
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -2915,6 +2923,7 @@ def report_envelope(
     ledger_held_open: bool = False,
     delta_known: bool = True,
     reported_under_gap: list[str] | None = None,
+    not_rechecked: list[dict] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -2939,6 +2948,8 @@ def report_envelope(
     open ledger: `new_ids` and `resolved_ids` are then empty because the delta
     was withheld, not because nothing changed, and a reader must say so
     rather than print a zero.
+    `not_rechecked` is the entries the run kept under _Not re-checked this
+    run_; each is stored with its title and place (`NOT_RECHECKED_KEY`).
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
     The phase timers (`PHASE_TIMER_KEYS`) are copied from `payload`, and a
@@ -2988,6 +2999,17 @@ def report_envelope(
         **(
             {REPORTED_UNDER_GAP_KEY: sorted(set(reported_under_gap))}
             if reported_under_gap
+            else {}
+        ),
+        # Only when not empty, as above.
+        **(
+            {
+                NOT_RECHECKED_KEY: [
+                    {field: str(entry.get(field) or "") for field in NOT_RECHECKED_FIELDS}
+                    for entry in sorted(not_rechecked, key=lambda e: str(e.get("id", "")))
+                ]
+            }
+            if not_rechecked
             else {}
         ),
     }
@@ -8496,6 +8518,10 @@ def _stored_finding_places(memory: dict | None) -> dict[str, dict[str, str]]:
     row in the previous body. `report_finding_titles` and
     `report_finding_places` keep no object, and a held row needs one for its
     `Where:` line, so they are not used here.
+
+    Then the entries under `NOT_RECHECKED_KEY`: the findings that the
+    stored run kept as not re-checked. That run's document does not carry
+    them, and its body has no row for them in the note and id-only tiers.
     """
     envelope = memory or {}
     document = envelope.get("ledger_document")
@@ -8516,6 +8542,18 @@ def _stored_finding_places(memory: dict | None) -> dict[str, dict[str, str]]:
                 "object": str(finding.get("object") or "").strip(),
             },
         )
+    kept = envelope.get(NOT_RECHECKED_KEY)
+    for entry in kept if isinstance(kept, list) else []:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        places.setdefault(
+            str(entry["id"]),
+            {
+                field: str(entry.get(field) or "").strip()
+                for field in NOT_RECHECKED_FIELDS
+                if field != "id"
+            },
+        )
     return places
 
 
@@ -8525,6 +8563,7 @@ def unread_held_entries(
     data: dict,
     *,
     exclude: set[str],
+    previous_ids: list[str] | None = None,
 ) -> list[dict]:
     """The previous findings that sit on a target this run did not check, as held entries.
 
@@ -8543,7 +8582,10 @@ def unread_held_entries(
     `report_finding_titles` reads them). Less `exclude` (the document's ids,
     the withheld postures, the declared entries and the collector-held ids).
     The place of each comes from its row on the previous body, or else from
-    that same stored document. An id with no known place is not kept: a row
+    that same stored document, or else from the stored entries the previous
+    run kept as not re-checked (`NOT_RECHECKED_KEY`), which is where the
+    place of a held id with no row is. An id with no known place is not
+    kept, and the log names it: a row
     held by id alone never gets a place back, so it would stay for as long
     as any gap stands, and a collector-held id-only row that the collector
     stopped flagging would come back as not re-checked. The
@@ -8552,16 +8594,22 @@ def unread_held_entries(
     another identity scheme the rows are spelled again (`_respelled_rows`)
     and an id without a row is lost, as for every hold over a scheme change.
 
+    `previous_ids` replaces the hidden block on a run with no ledger body
+    (`_finish_without_forge`): the ids of the stored record, which is
+    trusted only under this `ID_SCHEME`.
+
     Each entry has the shape of `collector_held_entries`, plus
     `UNREAD_REASON_KEY` with the reason the row shows. Sorted by id.
     """
-    previous_ids = parse_delta_block(previous_body)
+    from_body = previous_ids is None
+    if previous_ids is None:
+        previous_ids = parse_delta_block(previous_body)
     if not previous_ids:
         return []
     places = _stored_finding_places(memory)
     in_block = set(previous_ids)
-    previous_ids = previous_ids + [fid for fid in places if fid not in in_block]
-    stale = parse_id_scheme(previous_body) != ID_SCHEME
+    previous_ids = list(previous_ids) + [fid for fid in places if fid not in in_block]
+    stale = from_body and parse_id_scheme(previous_body) != ID_SCHEME
     respelled = _respelled_rows(previous_body) if stale else {}
     for raw, where in parse_finding_locations(previous_body).items():
         places[raw] = {**where, "check": raw.split(".", 1)[0]}
@@ -8574,6 +8622,10 @@ def unread_held_entries(
             continue
         place = places.get(raw)
         if place is None:
+            log(
+                f"NOTE: {fid} is on the previous ledger with no recorded place, so this "
+                "run cannot tell if it checked its target; it is not kept as not re-checked."
+            )
             continue
         check = place.get("check") or raw.split(".", 1)[0]
         reason = unread_target_reason(data, check, place.get("cluster", ""))
@@ -10921,14 +10973,17 @@ def _render_held_note(
     unread = [entry for entry in held if entry.get(UNREAD_REASON_KEY)]
     held = [entry for entry in held if not entry.get(UNREAD_REASON_KEY)]
     # The rows of `_render_unread_held` in one sentence. Their ids are in the
-    # hidden block and not in the held-id list (see `UNREAD_HELD_HEADING`).
+    # hidden block and not in the held-id list (see `UNREAD_HELD_HEADING`),
+    # and the report store keeps where each one is (`NOT_RECHECKED_KEY`), so
+    # the next gap run keeps them without a row.
     unread_lines = (
         [
             "",
             UNREAD_HELD_SUBHEADING if held else UNREAD_HELD_HEADING,
             "",
             _held_rows_intro(len(unread)) + " The body had no room for their rows; "
-            "their ids are in the hidden block below.",
+            "their ids are in the hidden block below, and the report store keeps "
+            "where each one is.",
         ]
         if unread
         else []
@@ -10991,7 +11046,9 @@ def _render_held_ids_only(held: list[dict]) -> list[str]:
 
     Charged to the budget ahead of the findings, so it always fits; the hold
     survives a body with no room for even the note, because the next run
-    reads the list and not the rows.
+    reads the list and not the rows. An entry held because this run did not
+    check its target is not in the list: the next run reads its id from the
+    hidden block and its place from the report store (`NOT_RECHECKED_KEY`).
     """
     if not held:
         return []
@@ -18853,9 +18910,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # document the untouched body renders rides alongside as
         # `ledger_document`, for the next run's titles.
         ledger_document = None
+        # The places of the findings the untouched body keeps as not
+        # re-checked, as the stored run recorded them (`NOT_RECHECKED_KEY`).
+        not_rechecked: list[dict] = []
         if body_untouched:
             stored_issue = existing_issue if memory else None
             stored_body, stored_ids = previous_body, previous_ids
+            kept = (memory or {}).get(NOT_RECHECKED_KEY)
+            not_rechecked = [e for e in kept if isinstance(e, dict)] if isinstance(kept, list) else []
             carried = (memory or {}).get("ledger_document")
             # A held-open run's own `document` is its empty set, not what the
             # body renders, and a seed has none: only a run that wrote the
@@ -18898,6 +18960,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 ledger_held_open=body_untouched,
                 delta_known=delta_known,
                 reported_under_gap=reported_under_gap,
+                not_rechecked=not_rechecked,
             ),
             now,
             ledger_unchanged=body_untouched,
@@ -19398,6 +19461,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             rendered_ids=parse_delta_block(ledger_body),
             delta_known=delta_known,
             reported_under_gap=reported_under_gap,
+            # Their places, which the note and id-only tiers do not render.
+            not_rechecked=unread_entries,
         ),
         now,
     )
