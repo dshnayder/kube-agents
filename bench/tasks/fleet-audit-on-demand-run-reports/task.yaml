@@ -26,13 +26,16 @@
 # github.com issue URL". The clean close does not rewrite the footer, so
 # `max_clock_skew_sec` is the sibling's (its header says why).
 #
-# DETERMINISM: THE RED IS NOT CERTAIN. On main the SOP still tells the worker
-# that an on-demand run is never silent, and the worker often obeys it and
-# reports the URL. #1929 saw `[SILENT]` on two reruns of 2026-09-23, but no
-# run measured how often. So a run on main can pass, and only a run that
-# answers `[SILENT]` is red. The green is deterministic in the harness: with
-# the change, `silent_ok` is false on this run (test_audit_report.py,
-# TestOnDemandRunIsNeverSilent).
+# THE RED, OBSERVED ON MAIN. On a dev install on main d05869ae (2026-10-20),
+# the check `the-report-cites-the-closed-ledger` failed: "the run's report
+# names no github.com issue URL, but says the ledger was retired as clean
+# ('ledger issue #81 was closed')". The run closed the ledger and its report
+# gave no URL. The red depends on the worker: on main the SOP still tells the
+# worker that an on-demand run is never silent, and a worker that obeys that
+# rule over `silent_ok: true` reports the URL. So a run on main can pass, and
+# no run measured how often it does. The green is deterministic in the
+# harness: with the change, `silent_ok` is false on this run
+# (test_audit_report.py, TestOnDemandRunIsNeverSilent).
 #
 # Two ways the case breaks without the change being wrong, both reported as
 # failures of the stack or the run rather than as a red:
