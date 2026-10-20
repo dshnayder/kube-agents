@@ -67,12 +67,13 @@ What it publishes to the GitOps repository has two tiers: a durable report that 
 
 ### Which repository gets the ledger
 
-The ledger issue and every remediation pull request (a merge request on GitLab) go to one repository: the one with `role: gitops` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration). The installer's `--gitops-repo` and the chart's `github.gitRepo` give a repository that role. A `context` repository is never the target, because the agent only reads it, and a `managed` repository does not get the ledger either.
+The ledger issue and every remediation pull request (a merge request on GitLab) go to one repository: the one with `role: gitops` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration). The installer's `--gitops-repo` and the chart's `platformAgent.integration.github.gitRepo` give a repository that role. A `context` repository is never the target, because the agent only reads it. A `managed` repository gets the ledger only when it is the one managed repository and no repository has `role: gitops`.
 
-- **To change the repository**, give `role: gitops` to another repository. At most one repository can have that role. The next run writes its ledger in the new repository. The open ledger issue in the old repository stays as it is.
-- **Several repositories and no `role: gitops`.** The audit does not choose one. The run stops with a message that tells you to give one repository `role: gitops`. To use another repository for one on-demand run, ask the agent to run the audit with `--repo <repository>`.
+- **To change the repository**, give `role: gitops` to another repository. At most one repository can have that role. The next run writes its ledger in the new repository, because a run does not keep the repository of an earlier run. The open ledger issue in the old repository stays as it is.
+- **One run in another repository.** Ask the agent to run the audit with `--repo <repository>`. That repository must be managed. The repository applies to that run only: the next run goes back to the `role: gitops` repository.
+- **Several repositories and no `role: gitops`.** The audit does not choose one. The run stops with a message that tells you to give one repository `role: gitops`.
 - **No repository.** The run keeps its findings in the report store and reports them in chat, as the paragraph above says.
-- **A repository the agent cannot reach.** Before it publishes, the run reads one issue from the repository through the credential broker. If the forge says that the repository does not exist, or that the install's credential cannot read it, the run does not try another repository. It keeps its findings in the report store and reports them in chat, and the report names the repository and the reason.
+- **A repository the agent cannot reach.** Before it publishes, the run reads one issue from the repository through the credential broker. If the forge says that the repository does not exist, or that the install's credential cannot read it, the run does not try another repository. It keeps its findings in the report store and reports them in chat on every run, and the report names the repository and the reason.
 
 ### Tier 1 — the ledger issue
 

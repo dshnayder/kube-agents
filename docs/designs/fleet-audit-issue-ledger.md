@@ -512,8 +512,10 @@ with workspace lease markers and the git remote kept as fallbacks. This resolves
 `github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
 by construction rather than by coincidence.
 
-The order is `--repo`, the workspace, the lease record, the repository with `role: gitops`, and then
-the one managed repository. The operator writes the repository with `role: gitops` to the
+The order is `--repo`, the lease record, the repository with `role: gitops`, and then the one managed
+repository. The lease record lasts on the shared volume across runs, so it counts only for the run
+that wrote it: while the stream's in-flight note exists and the lease is not older than that note.
+A `--repo` run, or a role that moved since, therefore does not hold later runs on the old repository. The operator writes the repository with `role: gitops` to the
 `gitops_repo` key of the same ConfigMap, as one `managed_repos` entry, and removes the key when no
 repository has that role. The key is read only when more than one repository is managed, and a key
 that names a repository not in `managed_repos` is ignored. So an install that manages a second
@@ -522,12 +524,14 @@ repository, and a context repository is never the target. With several managed r
 `role: gitops`, `start` refuses and names the fix (give one repository that role, or pass `--repo`
 for one run): the harness never chooses among them, and neither may the agent.
 
-Before it publishes, `start` and `finish` each list one open issue in the resolved repository
-through the broker. When the forge answers that the repository is missing or that the credential
+Before it publishes, `start` lists one open issue in the resolved repository through the broker and
+records the result in the run record. `finish` follows that record, and lists one only when there is
+no record of this run. When the forge answers that the repository is missing or that the credential
 cannot see it (`FORGE_NOT_FOUND`, `FORGE_FORBIDDEN`, `FORGE_UNAUTHENTICATED`), or the broker does not
 manage it (`REPOSITORY_NOT_MANAGED`), the run takes the no-forge path of a run with no repository:
 the findings go to the report store and to chat, and the note names the repository and the reason.
-It does not try another repository. A broker that does not answer is `BrokerUnavailable`, as on every
+It does not try another repository. Such a run is never silent, on every run, and it is not compared
+with the no-forge history of the store, so its new and resolved counts are unknown. A broker that does not answer is `BrokerUnavailable`, as on every
 other forge call, and any other refusal leaves the run on its forge path.
 
 `start` is also the **only** subcommand that scrubs the working tree — see the note under

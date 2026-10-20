@@ -36,10 +36,14 @@ The ledger issue and every remediation pull request or merge request go to one r
 and `finish` resolve it in this order:
 
 1. `--repo`, when you pass it. It must be in the managed list.
-2. The stream's workspace and its lease record, from an earlier `start` of this run.
+2. The workspace lease record, only when the `start` of this run wrote it. A lease from an earlier
+   run is ignored, so a `--repo` run does not change the repository of later runs.
 3. The repository with `role: gitops`, when more than one repository is managed. The operator
    writes it to the `gitops_repo` key of `$GITOPS_STATE_CONFIGMAP`.
 4. The one managed repository, when there is only one.
+
+`finish` follows the repository that the `start` of this run chose. Pass `--repo` to `finish` only
+when you passed it to `start`, with the same value.
 
 A context repository is never the target: it is only read. With several managed repositories and
 none with `role: gitops`, `start` stops with a message that says to give one repository
@@ -47,11 +51,12 @@ none with `role: gitops`, `start` stops with a message that says to give one rep
 message to the user. With no managed repository, the run has no forge; see
 [No forge configured](finish.md#no-forge-configured).
 
-Before it publishes, `start` and `finish` each list one open issue in the resolved repository
-through the broker. If the forge says that the repository does not exist, or that the install's
-credential cannot read it, the run does not choose another repository. It takes the no-forge path,
-and its `no_forge` note names the repository and the reason; see
-[No forge configured](finish.md#no-forge-configured).
+Before it publishes, `start` lists one open issue in the resolved repository through the broker.
+`finish` follows the result that `start` recorded, and lists one only when this run has no record.
+If the forge says that the repository does not exist, or that the install's credential cannot read
+it, or the broker does not manage it, the run does not choose another repository. It takes the
+no-forge path, and its `no_forge` note names the repository and the reason; see
+[No forge configured](finish.md#no-forge-configured). Such a run is never silent.
 
 ### Step 1 — `start`
 

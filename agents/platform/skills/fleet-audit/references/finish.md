@@ -164,7 +164,9 @@ An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (an
 no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
 does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
 repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
-run does not choose another repository. The audit runs anyway:
+check is one issue listing that `start` makes through the broker, and `finish` follows its result.
+The run does not choose another repository, and it is never silent (`silent_ok: false`). The audit
+runs anyway:
 
 - `start` skips the credential, the labels and the ledger lookup, and prints `"mode": "none"`,
   `"repo": null`, `"issue": null`, a `no_forge` note, and a `workspace` path to an empty directory. Pass that `workspace` to the collector as the SOP says. There is no repository, so

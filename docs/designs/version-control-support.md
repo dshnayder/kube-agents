@@ -2145,7 +2145,7 @@ the entry the token refresh mints for when nothing names a repository — and a 
 the list does not yet hold is added at the front rather than the end. The skills' own resolvers
 refuse to guess among several entries, so once a `managed` repository sits beside the GitOps one,
 a caller names its target with `--repo`. The one exception is the fleet audit: the operator also
-writes the GitOps repository, as one `managed_repos` entry, to a third key, `gitops_repo`, and
+writes the GitOps repository, as one `managed_repos` entry, to the key `gitops_repo`, and
 removes it when no repository has that role, and the audit sends its ledger issue and fixes there
 when several repositories are managed ([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) §6).
 
