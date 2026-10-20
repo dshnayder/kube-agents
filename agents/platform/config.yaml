@@ -186,13 +186,17 @@ mcp_servers:
 # each, and 99% of 6,059 worker calls sent their first chunk within 60s. The
 # slow ones were stalls, not thinks: most returned fewer than 120 tokens, three
 # in four missed the prompt cache, and each 600s stale kill matched a Vertex
-# 504. A 120s bound retries such a call 480s sooner, and a persistent stall
-# trips the breaker after 10 minutes instead of 50. agents/cluster/config.yaml
-# sets the same value for the Cluster Agents.
+# 504. A 120s bound retries such a call up to 480s sooner. Hermes raises the
+# bound for a large prompt (to at least 240s above 50k context tokens and 300s
+# above 100k), so the gain is smaller there. agents/cluster/config.yaml sets the
+# same value for the Cluster Agents.
 #
-# Under the unsupported `experimental.platformFrontDoor`, chat reaches this
-# profile directly, and a long front-door think can pass 120s. Hermes then
-# retries the call. Set the 600s bound again in that case.
+# A person can also chat with this profile directly (`hermes -p platform`), and
+# under the unsupported `experimental.platformFrontDoor` chat reaches it as the
+# front door. A hard question there can think in silence for more than 120s,
+# and Hermes then retries the call. Under platformFrontDoor the entrypoint only
+# fills keys this profile lacks, so an install that upgrades keeps the bound it
+# already has, and only a new install gets 120s.
 providers:
   custom:
     stale_timeout_seconds: 120

@@ -40,8 +40,10 @@ model:
 # calls sent their first chunk within 60s. The slow ones were stalls, not
 # thinks: most returned fewer than 120 tokens, three in four missed the prompt
 # cache, and each 600s stale kill matched a Vertex 504. A 120s bound retries
-# such a call 480s sooner, and a persistent stall trips the breaker after 10
-# minutes instead of 50.
+# such a call up to 480s sooner. Hermes raises the bound for a large prompt
+# (to at least 240s above 50k context tokens and 300s above 100k), so the gain
+# is smaller there. The cluster loop in deploy/shared/docker-entrypoint.sh moves
+# a profile that still holds the old 600s to this value.
 providers:
   custom:
     stale_timeout_seconds: 120

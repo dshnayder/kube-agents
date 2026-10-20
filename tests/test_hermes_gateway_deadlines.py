@@ -69,8 +69,12 @@ class TestGatewayDeadlines(unittest.TestCase):
                 self.assertEqual(deadlines["request_timeout_seconds"], REQUEST_TIMEOUT_SECONDS)
 
     def test_workers_fail_faster_than_the_front_door(self) -> None:
-        self.assertLess(WORKER_STALE_SECONDS, FRONT_DOOR_STALE_SECONDS)
-        self.assertLess(WORKER_STALE_SECONDS, REQUEST_TIMEOUT_SECONDS)
+        front_door = _deadlines(_load(_CHAT))["stale_timeout_seconds"]
+        for name, config in (("cluster", _load(_CLUSTER)), ("platform", _merged_platform_config())):
+            with self.subTest(profile=name):
+                worker = _deadlines(config)
+                self.assertLess(worker["stale_timeout_seconds"], front_door)
+                self.assertLess(worker["stale_timeout_seconds"], worker["request_timeout_seconds"])
 
 
 if __name__ == "__main__":
