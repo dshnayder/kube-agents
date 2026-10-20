@@ -521,8 +521,9 @@ repository has that role. The key is read only when more than one repository is 
 that names a repository not in `managed_repos` is ignored. So an install that manages a second
 repository (Terraform, applications) still sends the ledger issue and every fix to its GitOps
 repository, and a context repository is never the target. With several managed repositories and no
-`role: gitops`, `start` refuses and names the fix (give one repository that role, or pass `--repo`
-for one run): the harness never chooses among them, and neither may the agent.
+`role: gitops`, the run takes the no-forge path with the reason and the fix (give one repository
+that role, or pass `--repo` for one run): the findings go to chat and the report store, and the
+harness never chooses among the repositories, nor may the agent.
 
 Before it publishes, `start` lists one open issue in the resolved repository through the broker and
 records the result in the run record. `finish` follows that record, and lists one only when there is
@@ -531,7 +532,10 @@ cannot see it (`FORGE_NOT_FOUND`, `FORGE_FORBIDDEN`, `FORGE_UNAUTHENTICATED`), o
 manage it (`REPOSITORY_NOT_MANAGED`), the run takes the no-forge path of a run with no repository:
 the findings go to the report store and to chat, and the note names the repository and the reason.
 It does not try another repository. Such a run is never silent, on every run, and it is not compared
-with the no-forge history of the store, so its new and resolved counts are unknown. A broker that does not answer is `BrokerUnavailable`, as on every
+with the no-forge history of the store, so its new and resolved counts are unknown. Its envelope is
+stored under that repository's own store directory, marked unreachable, so the store keeps one
+directory for the stream; a run with no repository never uses a marked envelope as its baseline, and
+the forge path reads its memory from the newest envelope that is not marked. A broker that does not answer is `BrokerUnavailable`, as on every
 other forge call, and any other refusal leaves the run on its forge path.
 
 `start` is also the **only** subcommand that scrubs the working tree — see the note under

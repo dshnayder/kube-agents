@@ -18,7 +18,7 @@ python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py s
 
 The audit targets the repository with `role: gitops`. `start` and `finish` resolve it without `--repo`, also when more than one repository is registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`):
 
-- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` stops because it cannot find the `role: gitops` repository, report its message and stop.
+- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` cannot find the `role: gitops` repository, it says so in its `no_forge` note and the run goes on with no forge; never choose a repository yourself.
 - **Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run,** and pass the same `--repo` to `finish`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/stockout-prevention/org__repo", "findings_path":"/opt/data/scratch/findings_stockout-prevention.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.

@@ -16,7 +16,7 @@
 
 The audit targets the repository with `role: gitops`. `start` and `finish` resolve it without `--repo`, also when more than one repository is registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`):
 
-- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` stops because it cannot find the `role: gitops` repository, report its message and stop.
+- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` cannot find the `role: gitops` repository, it says so in its `no_forge` note and the run goes on with no forge; never choose a repository yourself.
 - **Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run,** and pass the same `--repo` to `finish`.
 
 Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consistency-drift/<owner>__<name>", "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `workspace` is the GitOps clone `start` made — the pod has no checkout of its own — and any `remediation.path` you emit in §5 is resolved against it. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or make any forge call (`vcs.py` or otherwise) yourself — the helper owns every git and forge operation and renders the ledger issue body. You never hand-write it.

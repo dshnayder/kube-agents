@@ -46,9 +46,10 @@ and `finish` resolve it in this order:
 when you passed it to `start`, with the same value.
 
 A context repository is never the target: it is only read. With several managed repositories and
-none with `role: gitops`, `start` stops with a message that says to give one repository
-`role: gitops` (or to pass `--repo` for one run). Do not choose a repository yourself: report the
-message to the user. With no managed repository, the run has no forge; see
+none with `role: gitops`, the run takes the no-forge path: its `no_forge` note says to give one
+repository `role: gitops`, or to pass `--repo` for one run, and `finish` sends the findings to chat
+and the report store. Do not choose a repository yourself. A `--repo` that is not in the managed list
+is an error. With no managed repository, the run has no forge; see
 [No forge configured](finish.md#no-forge-configured).
 
 Before it publishes, `start` lists one open issue in the resolved repository through the broker.
