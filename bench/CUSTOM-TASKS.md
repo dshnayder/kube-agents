@@ -454,12 +454,14 @@ body's Scope table enumerates every audited cluster on every run, so requiring `
 body would pass a run that swept the fleet and faulted nobody. The hidden
 `<!-- audit-findings: [...] -->` block carries the ids `audit_report.py` derived as
 `<check>.<cluster>.<namespace>.<object>`, so a name appears there only when a finding was actually
-filed against it. The same argument applies to any planted _object_ name that a clean inventory
+filed against it, by this run or a previous one: the block also lists the collector-held ids and,
+over a coverage gap, the ids of previous findings on a target the run did not check. The same argument applies to any planted _object_ name that a clean inventory
 table would also mention. On a body truncated for size the delta block lists only the rendered findings, and the scope
 reads the `<!-- audit-findings-all: [...] -->` block the script adds there instead, so a filed
 finding that sorted last still counts. The script leaves that block out when it would exceed
 `ALL_FINDINGS_BLOCK_CAP` in `audit_report.py` (12,000 characters, roughly 160 ids of 70
-characters); past that only the rendered findings and the collector-held ids count, so a case
+characters); past that only the rendered findings, the collector-held ids and the not-re-checked
+ids count, so a case
 graded this way needs a fleet whose findings stay under it.
 
 **Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`
