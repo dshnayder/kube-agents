@@ -1666,7 +1666,8 @@ def get_context_github_repo_entries() -> list[dict]:
 #: The gitops-state ConfigMap key that names the repository with role gitops,
 #: as one `managed_repos` entry (`{"type", "url"}`). The operator writes it
 #: only when exactly one repository has that role, and removes it when none
-#: has (`gitopsStateGitOpsRepoKey` in `platformagent_controller.go`).
+#: has or when two have it (`gitopsStateGitOpsRepoKey` in
+#: `platformagent_controller.go`).
 GITOPS_REPO_KEY = "gitops_repo"
 
 

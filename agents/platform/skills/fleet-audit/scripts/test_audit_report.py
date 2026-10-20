@@ -16508,15 +16508,17 @@ class TestDispatchAndHandover(unittest.TestCase):
         # (2026-09-24), and the operator's release lives in the cron README,
         # which the worker does not read. The guard paragraph promises what
         # the TTL delivers (a dead run costs at most the ticks inside two
-        # hours), not "never", and says what the lease spans: one pair, so a
-        # multi-repo loop reclaims per repository and a mid-loop refusal is
-        # a partial run, not "already running".
+        # hours), not "never", and says what the lease spans: one pair, and a
+        # run publishes to one repository, so there is no loop over the managed
+        # repositories; a refusal between two repositories a person asked for
+        # leaves the rest not audited.
         self.assertNotIn("takeover", text.lower())
         self.assertNotIn("never blocks", section)
         self.assertIn("at most the ticks", section)
         self.assertIn("operator's action", section)
         self.assertIn("one `start`-`finish` pair", section)
-        self.assertIn("taken between repositories", section)
+        self.assertIn("do not loop over the managed", section)
+        self.assertIn("another run took the stream", section)
         # The exit-code paragraph tells a `START REFUSED` and a
         # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
         # file to fix.
@@ -26358,12 +26360,16 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
         self.assertEqual(self.recorder.calls, [])
 
-    def test_several_repositories_keep_the_resolvers_error(self):
+    def test_several_repositories_with_none_chosen_report_the_reason(self):
         self.managed_text = '[{"type": "github", "url": "https://github.com/acme/a"}, {"type": "github", "url": "https://github.com/acme/b"}]'
         with patch("gitops_workspace.get_managed_repos", return_value=["acme/a", "acme/b"]):
-            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
-        self.assertIn("Multiple repositories configured", self.err)
+            out = self.start()
+        self.assertEqual(out["mode"], audit_report.NO_FORGE_MODE)
+        self.assertIsNone(out["repo"])
+        self.assertIn("Multiple repositories configured", out["no_forge"])
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, out)
         self.assertNotIn("cannot use", self.err)
+        self.assertEqual(self.recorder.calls, [])
 
     def test_an_empty_list_is_nothing_registered(self):
         self.managed_text = "[]"
@@ -27354,7 +27360,13 @@ class TestUnreachableRepository(BaseTestCase):
         self.assertIn("FORGE_NOT_FOUND", out[audit_report.UNREACHABLE_REPO_KEY]["reason"])
         self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
         self.assertIn("acme/gitops could not be reached", out["no_forge"])
-        self.assertTrue((self.store() / "latest.json").exists())
+        # Stored under the repository's own directory, marked; not under no_forge/local.
+        latest = json.loads(
+            (audit_report.reports_dir_for(AUDIT, "acme/gitops") / "latest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(latest["repo"], "acme/gitops")
+        self.assertEqual(latest[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+        self.assertFalse(self.store().exists())
         # No in-flight note here (claim_in_flight is stubbed), so `finish` has
         # no record of this run and probes on its own: one probe for each
         # command, to the gitops repository, and nothing else.
@@ -27458,6 +27470,109 @@ class TestUnreachableRepository(BaseTestCase):
         self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_NOT_FOUND"))
         _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
         self.assertIn("Make sure that the repository exists", audit_report.unreachable_note(unreachable))
+
+
+    def test_report_query_reads_the_one_repository_after_an_unreachable_run(self):
+        self.claim_for_real()
+        self.run_once()
+        reports_scripts = Path(__file__).resolve().parents[2] / "fleet-audit-reports" / "scripts"
+        sys.path.insert(0, str(reports_scripts))
+        self.addCleanup(sys.path.remove, str(reports_scripts))
+        import report_query
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = report_query.main(["show", AUDIT, "--root", str(self.reports_dir)])
+        self.assertEqual(code, 0, out.getvalue())
+        answer = json.loads(out.getvalue())
+        self.assertIsNone(answer.get("error"))
+        self.assertEqual(answer["repo"], "acme/gitops")
+        self.assertEqual(answer["envelope"][audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+
+    def test_a_true_no_forge_run_does_not_use_a_marked_envelope_as_its_baseline(self):
+        directory = audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO)
+        directory.mkdir(parents=True)
+        (directory / "latest.json").write_text(
+            json.dumps({
+                "status": audit_report.NO_FORGE_STATUS,
+                "repo": audit_report.NO_FORGE_REPO,
+                "id_scheme": audit_report.ID_SCHEME,
+                "current_ids": ["a.b.c"],
+                audit_report.NO_REPOSITORY_CHOSEN_KEY: {"reason": "several"},
+            }),
+            encoding="utf-8",
+        )
+        self.assertIsNone(audit_report.previous_no_forge_ids(AUDIT))
+
+    def test_the_forge_memory_skips_an_unreachable_envelope(self):
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        runs = directory / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True)
+        published = {"repo": "acme/gitops", "issue_number": 7, "ledger_body": "body", "current_ids": ["x"]}
+        diverted = {"repo": "acme/gitops", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+                    audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/gitops", "reason": "r"}}
+        (runs / "20260101T000000Z.json").write_text(json.dumps(published), encoding="utf-8")
+        (runs / "20260102T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
+        (directory / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
+        memory = audit_report.read_report_memory(AUDIT, 7, "acme/gitops")
+        self.assertEqual(memory["current_ids"], ["x"])
+
+    def test_a_refused_listing_says_issues_must_be_enabled(self):
+        self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_FORBIDDEN"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertIn("issues enabled", audit_report.unreachable_note(unreachable))
+
+
+class TestNoRepositoryChosen(BaseTestCase):
+    """Several managed repositories and none chosen: the chat path, never a pick (#3536)."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.tmp_path / "state"
+        self.state.mkdir()
+        (self.state / "managed_repos").write_text(
+            _repo_entries("https://github.com/acme/terraform", "https://github.com/acme/gitops"),
+            encoding="utf-8",
+        )
+        env = patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state / "managed_repos")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def test_the_run_reports_to_chat_and_the_store_with_the_remedy(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        started = self.stdout_json()
+        self.assertEqual(started["mode"], audit_report.NO_FORGE_MODE)
+        self.assertIn("role: gitops", started["no_forge"])
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertFalse(out["silent_ok"])
+        reason = out[audit_report.NO_REPOSITORY_CHOSEN_KEY]["reason"]
+        self.assertIn("role: gitops", reason)
+        self.assertIn("--repo", reason)
+        self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
+        # The chat relay has the summary, and no repository was used.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual([part["text"] for part in record["parts"]], [out["summary"]])
+        self.assertEqual(self.recorder.calls, [])
+        latest = json.loads(
+            (audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO) / "latest.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, latest)
+
+    def test_an_unregistered_repo_is_still_a_hard_error(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--repo", "acme/other"]), 1)
+        self.assertIn("not in the managed repositories list", self.err)
+        self.assertEqual(self.out, "")
 
 
 if __name__ == "__main__":
