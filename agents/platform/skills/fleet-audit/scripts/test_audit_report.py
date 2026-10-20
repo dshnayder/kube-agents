@@ -20344,6 +20344,22 @@ class TestManualRemediationRoutes(unittest.TestCase):
                 self.assertEqual(self.note(finding), self.WORKER_NOTE)
 
 
+    def test_the_route_note_survives_a_note_that_grows_when_it_is_published(self):
+        """The renderer measures the note after `publishable_text`, which
+        escapes a comment opener and puts a longer placeholder over a
+        secret."""
+        manifest = self.manifest(reconciler="`flux`")
+        added = audit_report.RECONCILED_NOTE.format(reconciler="`flux`")
+        room = audit_report.MAX_NOTE_CHARS - len(added) - len(audit_report.ROUTE_PARAGRAPH_BREAK)
+        for name, grows in {"comment opener": "<!-- ", "secret": "password: x\n"}.items():
+            with self.subTest(name):
+                worker = (grows * room)[:room].rstrip()
+                finding = self.manual(note=worker)
+                self.disclose(finding, manifest)
+                rendered = "\n".join(audit_report.render_finding(finding))
+                self.assertIn(added, rendered)
+                self.assertNotIn(added + " …(truncated)", rendered)
+
 class TestManualRemediationRoutesInFinish(HarnessTestCase):
     """The wiring: what reaches the ledger body, in the real run and in the
     preview, and the fix the refusal path handled."""

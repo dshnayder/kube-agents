@@ -15266,23 +15266,44 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
     route notes after it are prose. A cut never goes inside a code block: a
     worker note with a fence is cut only before its first fence, and when
     that does not give enough space the route notes are left out.
+
+    The length is measured after `publishable_text`, as the renderer measures
+    it: an escaped comment opener and a redaction placeholder make the text
+    longer, and a route note that the renderer cuts loses its end.
     """
     if not added:
         return worker_note, added
     if worker_note.count(CODE_FENCE) % 2:
         worker_note += CODE_FENCE_CLOSE
-    budget = MAX_NOTE_CHARS - len(added) - len(ROUTE_PARAGRAPH_BREAK)
-    if len(worker_note) <= budget:
+
+    def fits(head: str) -> bool:
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (head, added) if part)
+        return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
+
+    def cut(room: int) -> str:
+        return worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED
+
+    if fits(worker_note):
         return worker_note, added
-    room = budget - len(ROUTE_NOTE_TRUNCATED)
+    if not fits(""):
+        return worker_note, ""
     if CODE_FENCE in worker_note:
         head = worker_note[: worker_note.index(CODE_FENCE)].rstrip()
-        if head and len(head) <= room:
+        if head and fits(head + ROUTE_NOTE_TRUNCATED):
             return head + ROUTE_NOTE_TRUNCATED, added
         return worker_note, ""
-    if room <= 0:
-        return "", added
-    return worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED, added
+    # The longest cut that fits. Redaction can depend on the text after a
+    # match, so the result is checked again.
+    low, high = 0, len(worker_note) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(cut(middle)):
+            low = middle
+        else:
+            high = middle - 1
+    if low and fits(cut(low)):
+        return cut(low), added
+    return "", added
 
 
 def disclose_manual_remediation_routes(
