@@ -1571,6 +1571,12 @@ ROUTE_NOTE_PATTERN = re.compile(
 ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
 # What a worker note is cut with when the route notes need its space.
 ROUTE_NOTE_TRUNCATED = " …(truncated)"
+# The remediation field that keeps the worker's note before that cut. The
+# stored document keeps it, and `carry_unchanged_findings` puts it back as
+# the note, so a cut that the route notes needed on one run does not stay on
+# the note of a later run that has room. Only `finish` writes it:
+# `validate_findings` removes it from the worker's document.
+ROUTE_UNCUT_NOTE_FIELD = "uncut_note"
 # What joins two route notes, and what puts the route notes on their own
 # paragraph after the worker's note. A paragraph of its own is outside any
 # code block the worker's note ends with.
@@ -4800,6 +4806,9 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+        # Only `finish` writes this field, and the carry puts it back as the
+        # note; a worker's copy would replace a later run's note with its own.
+        remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
         # Write the corrected spelling back, for the same reason the manifest
         # path above is normalised here: these strings are what get published,
         # and every reader downstream sees whatever they say.
@@ -6389,12 +6398,17 @@ def _strip_route_notes(remediation: object) -> None:
     `disclose_manual_remediation_routes` writes them again from this run's
     manifest after the carry. It leaves a finding in its `skip` set alone, so
     a route note copied from the previous run would stay there unchecked.
+    When the previous run cut the worker's note to give the route notes room,
+    the note before the cut (`ROUTE_UNCUT_NOTE_FIELD`) comes back in its place.
     """
     if not isinstance(remediation, dict):
         return
-    note = str(remediation.get("note") or "")
+    uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+    note = uncut if isinstance(uncut, str) else str(remediation.get("note") or "")
     if ROUTE_NOTE_PATTERN.search(note):
-        remediation["note"] = ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+        note = ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+    if isinstance(uncut, str) or note != remediation.get("note"):
+        remediation["note"] = note
 
 
 def collector_flagged_ids(manifest: dict | None) -> set[str]:
@@ -15359,13 +15373,17 @@ def disclose_manual_remediation_routes(
         if fid in skip or not isinstance(remediation, dict) or remediation.get("kind") != "manual":
             continue
         original = str(remediation.get("note") or "")
-        worker_note = original.strip()
+        # The note before an earlier pass of this run cut it, when there was one.
+        uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+        worker_note = uncut if isinstance(uncut, str) else original.strip()
         if ROUTE_NOTE_PATTERN.search(worker_note):
             worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
         found = evidence.get(derive_finding_id(finding))
         added = NOTE_SEPARATOR.join(_route_notes(found, worker_note)) if found else ""
-        worker_note, added = _fit_route_notes(worker_note, added)
-        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (worker_note, added) if part)
+        fitted, added = _fit_route_notes(worker_note, added)
+        if fitted != worker_note:
+            remediation[ROUTE_UNCUT_NOTE_FIELD] = worker_note
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)
         if note != original.strip():
             remediation["note"] = note
             disclosed.append(fid)

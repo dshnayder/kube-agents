@@ -20360,6 +20360,27 @@ class TestManualRemediationRoutes(unittest.TestCase):
                 self.assertIn(added, rendered)
                 self.assertNotIn(added + " …(truncated)", rendered)
 
+    def test_a_carried_cut_note_is_whole_again_when_there_is_room(self):
+        """The carry copies the stored note. A cut made only to give the route
+        notes room must not stay on the note after the route notes are gone."""
+        whole = "Set the probe. " + "y" * audit_report.MAX_NOTE_CHARS
+        finding = self.manual(note=whole)
+        self.disclose(finding, self.manifest(declaration={"path": "apps/web/a.yaml"}))
+        self.assertIn("…(truncated)", self.note(finding))
+        stored = json.loads(json.dumps(audit_report._redact_document(finding)))
+        now = self.manual(note="Other words.")
+        self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [stored]}), ["a"])
+        self.disclose(now, self.manifest())
+        self.assertEqual(self.note(now), whole)
+
+    def test_a_worker_cannot_set_the_uncut_note(self):
+        """Only `finish` writes the field, so the carry restores only `finish`'s copy."""
+        finding = make_finding(
+            remediation={"kind": "manual", "note": "n", audit_report.ROUTE_UNCUT_NOTE_FIELD: "Other words."}
+        )
+        data = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertNotIn(audit_report.ROUTE_UNCUT_NOTE_FIELD, data["findings"][0]["remediation"])
+
 class TestManualRemediationRoutesInFinish(HarnessTestCase):
     """The wiring: what reaches the ledger body, in the real run and in the
     preview, and the fix the refusal path handled."""
