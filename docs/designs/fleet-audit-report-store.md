@@ -64,8 +64,8 @@ Both writes are atomic (`os.replace` from a temp file in the same directory). Th
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
-run (`scheduled_coverage_gaps`), the ids it published (`scheduled_published_ids`) and the ids it
-reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)), the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)), the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
 the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
 and `document`, this run's validated findings document, whole rather than clipped to the body's

@@ -69,7 +69,8 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   the open-ledger search lists open issues only.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, and no
+  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, on a
+  scheduled run the same published ids as the last scheduled run (§7.5), and no
   collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
@@ -1126,7 +1127,9 @@ collector candidate the document dropped ([collector design §3.5](fleet-audit-c
 — and it is computed from the numbers `finish` is
 about to _report_,
 not the ones it privately knows. A partial run reports `resolved: 0`; a report store with no record of
-the open ledger makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
+the open ledger makes the delta unknowable and reports `new: 0`. On a scheduled run, one more
+term applies: the published ids are the ids the last scheduled run published (below).
+`silent_ok` follows what was published, so the flag
 and the report can never disagree. The PR counters are in the conjunction because opening a fix is
 news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
 while a pull request now exists that did not before.
