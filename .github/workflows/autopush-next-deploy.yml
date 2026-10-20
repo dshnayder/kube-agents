@@ -7,9 +7,8 @@ name: "Autopush-Next: Deploy"
 # one, and a slow or leased autopush-next never holds up autopush.
 #
 # autopush-next has its own GitHub environment and GCP project, whose
-# PLATFORM_AGENT_MODE is next. It holds next only once the chart and installer
-# render spec.mode (#2740, product item 1); until then the reconcile installs
-# today there, as on autopush. Until the environment is provisioned its deploy
+# PLATFORM_AGENT_MODE is next; the reconcile renders that into the chart, so
+# the environment runs next. Until the environment is provisioned its deploy
 # reports `skipped` with a notice (skip_unconfigured).
 
 on:
@@ -43,6 +42,11 @@ on:
           - "fail"
           - "ignore"
           - "defer"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -117,6 +121,8 @@ jobs:
       mode: "apply"
       image_tag: ${{ needs.resolve-candidate.outputs.commit_sha }}
       lease_policy: ${{ needs.resolve-candidate.outputs.lease_policy }}
+      # Null on the automatic triggers, which only ever move forward.
+      allow_breaking_downgrade: ${{ inputs.allow_breaking_downgrade == true }}
       # Until the environment exists with a GCP_PROJECT_ID. Drop it once it
       # does, so an environment that loses its configuration reds this run.
       skip_unconfigured: true

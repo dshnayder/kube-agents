@@ -16,6 +16,7 @@ package controller
 
 import (
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -47,14 +48,50 @@ const (
 	// add. A document past it is treated as absent.
 	usageTotalCeiling int64 = math.MaxInt64 / 2
 	// usageDocumentVersion is the document's layout. A later layout changes
-	// it, so that an older document is re-seeded rather than read wrong.
-	usageDocumentVersion = 1
+	// it, so that an older document is migrated where the layout allows
+	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
+	// Version 2 keys the pod entries by pod UID and counter, since the broker
+	// pod feeds several counters from one body; version 1 keyed them by pod UID.
+	usageDocumentVersion         = 2
+	usageDocumentVersionPodKeyed = 1
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
-	usageCounterToolExecutions = "toolExecutionsTotal"
-	usageCounterEventsIngested = "eventsIngestedTotal"
+	usageCounterToolExecutions       = "toolExecutionsTotal"
+	usageCounterEventsIngested       = "eventsIngestedTotal"
+	usageCounterRemediationsProposed = "remediationsProposedTotal"
+	usageCounterRemediationsMerged   = "remediationsMergedTotal"
+	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
+	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
+	// key; a UID carries no slash.
+	usagePodEntryKeySeparator = "/"
 )
+
+var (
+	// usageGatewayCounters, usageChatCounters and usageBrokerCounters are the
+	// counters each pod group's body feeds, in the order the stub source hands
+	// samples out.
+	usageGatewayCounters = []string{usageCounterEventsIngested}
+	usageChatCounters    = []string{usageCounterChatMessagesInbound}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
+	// usageCounters is every counter the document keeps and the status seeds.
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound}
+)
+
+// usagePodEntryKey is the document key of one pod's entry for one counter.
+func usagePodEntryKey(uid, counter string) string {
+	return uid + usagePodEntryKeySeparator + counter
+}
+
+// usageZeroTotals is every counter at zero, the totals a fresh document starts
+// from before the seed is laid over them.
+func usageZeroTotals() map[string]int64 {
+	totals := make(map[string]int64, len(usageCounters))
+	for _, counter := range usageCounters {
+		totals[counter] = 0
+	}
+	return totals
+}
 
 // usageAggregation says how the deltas of the pods feeding one counter combine
 // in a poll.
@@ -89,22 +126,105 @@ type usageDocument struct {
 	// and a name is not ownership.
 	AgentUID string `json:"agentUID"`
 	// FirstRecorded is the poll at which every pod was last re-baselined: the
-	// first poll, and each re-seed after a mismatch or a failed bound. Only a
-	// pod created after it starts from zero with none of its count seen,
-	// which is the one case in which a whole sample is added.
+	// first poll, and each re-seed after a mismatch or a failed bound. A pod
+	// created after it, or a never-read pod whose Sum-counter process started
+	// after it, starts from zero with none of its count seen, the cases in
+	// which a whole sample is added.
 	FirstRecorded metav1.Time      `json:"firstRecorded"`
 	Totals        map[string]int64 `json:"totals"`
 	// LastMoved is the poll in which a total last advanced, projected to
 	// status.usage.lastActiveTime; nil until one has.
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
-	// Pods is the baseline, keyed by pod UID.
+	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
+	// migrated is set by migrateUsageDocument on a document it changed on read,
+	// so the poll writes it back even when the fold changed nothing; rekeyed
+	// says the change was the layout, not only a counter the document predated.
+	// Not serialised.
+	migrated bool
+	// Unfolded names the counters migrateUsageDocument added to Totals at
+	// zero and no pod has been recorded for since: the status carried nothing
+	// for them and no pod's sample has been folded into them through this
+	// document, so nothing of any pod's sample has been seen, and a pod older
+	// than the document adds its whole sample the way a pod created after
+	// FirstRecorded does. Serialised, since the migrating poll may not read
+	// the pod that feeds the counter: the document is written at the current
+	// layout regardless, and a set that lived only in memory would be gone by
+	// the poll that does read it, which would baseline the pod and lose what
+	// it counted before the upgrade. A counter leaves the set in the poll
+	// that first records a pod for it.
+	Unfolded []string `json:"unfolded,omitempty"`
+	rekeyed  bool
 }
 
-// usagePodEntry is one pod's baseline.
+// usageUnfolded reports whether counter is in doc's unfolded set.
+func usageUnfolded(doc *usageDocument, counter string) bool {
+	return slices.Contains(doc.Unfolded, counter)
+}
+
+// migrateUsageDocument brings a document an earlier release wrote to the
+// current layout in place. A version-1 document, entries keyed by pod UID with
+// no PodUID, has its keys gain their counter and its entries their pod; a
+// document of either version that predates a counter gains that counter's
+// total, since a release that adds a counter does not change the layout.
+// Nothing is lost, which a re-seed cannot say: a re-seed starts from the
+// status, which a pruning CRD leaves empty, and re-baselines every pod at its
+// current sample, so whatever the listeners counted since the last poll is
+// never added. A total the document lacked starts at its floor, the status
+// value the read-back holds every total to, rather than at zero: an operator
+// that wrote the newer field, was rolled back to one that kept a document
+// without it, and came back again finds the status still carrying what it
+// wrote, and a zero under that floor would have usageDocumentInvalid refuse
+// the document and re-seed it, losing the interval's counts on every counter.
+// What the listeners counted during the rollback is not recovered: the pods
+// are baselined at their samples, and only a counter whose floor is zero, so
+// that none of any sample can be in the total, is recorded in Unfolded for
+// foldUsage to add whole, on this poll or on the first that reads the pod.
+// Any other version is left for usageDocumentInvalid to refuse.
+func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
+	if doc.Pods == nil || doc.Totals == nil {
+		return
+	}
+	switch doc.Version {
+	case usageDocumentVersionPodKeyed:
+		rekeyed := make(map[string]*usagePodEntry, len(doc.Pods))
+		for key, entry := range doc.Pods {
+			if entry == nil {
+				continue
+			}
+			if entry.PodUID == "" {
+				entry.PodUID = key
+			}
+			rekeyed[usagePodEntryKey(entry.PodUID, entry.Counter)] = entry
+		}
+		doc.Pods = rekeyed
+		doc.Version = usageDocumentVersion
+		doc.migrated = true
+		doc.rekeyed = true
+	case usageDocumentVersion:
+	default:
+		return
+	}
+	for _, counter := range usageCounters {
+		if _, ok := doc.Totals[counter]; ok {
+			continue
+		}
+		doc.Totals[counter] = floors[counter]
+		doc.migrated = true
+		if floors[counter] == 0 && !usageUnfolded(doc, counter) {
+			doc.Unfolded = append(doc.Unfolded, counter)
+		}
+	}
+	slices.Sort(doc.Unfolded)
+}
+
+// usagePodEntry is one pod's baseline for one counter, keyed by
+// usagePodEntryKey.
 type usagePodEntry struct {
-	// Name is for a reader of the ConfigMap; the key is the UID.
+	// Name is for a reader of the ConfigMap; PodUID is the pod the entry
+	// belongs to, the half of the key the live set is matched on.
 	Name    string `json:"name"`
+	PodUID  string `json:"podUID"`
 	Counter string `json:"counter"`
 	// Sample is the last sample taken from the pod's listener.
 	Sample int64 `json:"sample"`
@@ -180,7 +300,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			Version:       usageDocumentVersion,
 			AgentUID:      agentUID,
 			FirstRecorded: stamp,
-			Totals:        map[string]int64{usageCounterToolExecutions: 0, usageCounterEventsIngested: 0},
+			Totals:        usageZeroTotals(),
 			LastMoved:     seed.LastMoved,
 			Pods:          map[string]*usagePodEntry{},
 		}
@@ -204,15 +324,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		// bounded re-seed over-count the design records, in return for never
 		// guessing from samples that cannot say.
 		for _, s := range ordered {
-			next.Pods[s.UID] = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
+			next.Pods[usagePodEntryKey(s.UID, s.Counter)] = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 		}
 		return usageFoldResult{Document: next, Changed: true}
 	}
 
 	changed := false
-	for uid := range doc.Pods {
-		if !live[uid] {
-			delete(doc.Pods, uid)
+	for key, entry := range doc.Pods {
+		if !live[entry.PodUID] {
+			delete(doc.Pods, key)
 			changed = true
 		}
 	}
@@ -221,21 +341,36 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// set is the live pods the document already knew, so an entry recorded
 	// this poll, whose marker is this poll, resets no sibling.
 	markers := make(map[string]metav1.Time, len(doc.Pods))
-	for uid, entry := range doc.Pods {
-		markers[uid] = entry.Marker
+	for key, entry := range doc.Pods {
+		markers[key] = entry.Marker
 	}
 
 	candidates := map[string][]usageCandidate{}
+	// The unfolded counters a pod was recorded for this poll, cleared from the
+	// set after the loop so that every pod first read in the same poll adds
+	// whole. A pod first read on a later poll is baselined: the counter has a
+	// recorded baseline by then, and the rule for a pod older than the document
+	// applies to it as to any other counter. A second pod of a Sum counter
+	// first read later is the under-count that rule already accepts, taken
+	// over a set kept per pod.
+	folded := map[string]bool{}
 	for _, s := range ordered {
-		entry, known := doc.Pods[s.UID]
+		key := usagePodEntryKey(s.UID, s.Counter)
+		entry, known := doc.Pods[key]
 		if !known {
 			// Recorded whatever its sample. Created after the document was
 			// first recorded, it started from zero and none of it was seen, so
-			// the whole sample adds, under the ceiling; older, or past the
+			// the whole sample adds, under the ceiling; so does a sample for a
+			// counter the migration added unfolded, which no document and no
+			// status has seen any of; older on any other counter, or past the
 			// ceiling, it is recorded and adds nothing.
-			entry = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
-			doc.Pods[s.UID] = entry
+			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
+			doc.Pods[key] = entry
 			changed = true
+			unfolded := usageUnfolded(doc, s.Counter)
+			if unfolded {
+				folded[s.Counter] = true
+			}
 			// A new replica feeding a Max counter beside a live sibling is
 			// recorded with the sibling's as-read marker, not this poll's
 			// stamp. A sibling counted after this replica started supplied the
@@ -263,13 +398,23 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 					entry.Marker = doc.FirstRecorded
 				}
 			}
-			if s.Created.After(doc.FirstRecorded.Time) && s.Sample <= usageDeltaCeiling {
+			// A pod older than the document whose body carries a process
+			// start later than the document was first recorded has, for a
+			// Sum counter, counted nothing any document has seen either: a
+			// pod keeps its entry once read, so only a never-read pod is
+			// here, and its process began after the baseline did. The
+			// standby that takes the lease is that pod, and its first
+			// interval of messages counts. Max counters are read on every
+			// replica from the first poll, so none reaches here that way.
+			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
+			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
 		}
-		if entry.Name != s.Name || entry.Counter != s.Counter {
-			entry.Name, entry.Counter = s.Name, s.Counter
+		// The counter is half the key, so only the name can drift.
+		if entry.Name != s.Name {
+			entry.Name = s.Name
 			changed = true
 		}
 
@@ -306,6 +451,13 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			continue
 		}
 		candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: delta, sample: s.Sample, startTime: s.StartTime})
+	}
+
+	if len(folded) > 0 {
+		doc.Unfolded = slices.DeleteFunc(doc.Unfolded, func(counter string) bool { return folded[counter] })
+		if len(doc.Unfolded) == 0 {
+			doc.Unfolded = nil
+		}
 	}
 
 	moved := false
@@ -444,14 +596,14 @@ func addUsageTotal(doc *usageDocument, counter string, delta int64) bool {
 	return true
 }
 
-// latestSiblingMarker is the latest marker among the other pods feeding
-// counter, as the document read them (markers holds the live entries only),
-// and whether there is one.
+// latestSiblingMarker is the latest marker among the other pods' entries for
+// counter, as the document read them (markers holds the live entries only,
+// by entry key), and whether there is one.
 func latestSiblingMarker(doc *usageDocument, markers map[string]metav1.Time, uid, counter string) (metav1.Time, bool) {
 	var latest metav1.Time
 	found := false
 	for other, marker := range markers {
-		if other == uid || doc.Pods[other].Counter != counter {
+		if entry := doc.Pods[other]; entry.PodUID == uid || entry.Counter != counter {
 			continue
 		}
 		if !found || marker.After(latest.Time) {

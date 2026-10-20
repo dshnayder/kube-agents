@@ -94,11 +94,11 @@ FILES_READ = "__ONBOARDING_FILES_READ__"
 FILE_PRESENT = "present"
 FILE_ABSENT = "absent"
 
-# The scheduler's record of each run of the delivery job (bootstrap_delivery.py:
-# DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
+# The scheduler's record of each run of the job whose delivery stage posts the report
+# (bootstrap_delivery.py: OOBE_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
 # the agent's own interpreter, falling back to python3 as the other reads do:
 # the agent image ships no sqlite3 binary.
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+DELIVERY_JOB_ID = "oobe"
 EXECUTIONS_DB = f"{DATA_ROOT}/cron/executions.db"
 RUNS_READ = "__ONBOARDING_RUNS_READ__"
 # The job ticks every minute, so this reaches back several hours from the
@@ -301,9 +301,10 @@ def writer():
 
 try:
     with open(os.path.join(root, marker)) as fh:
-        ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in fh) if m]
+        lines = fh.readlines()
 except OSError as exc:
     done("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in lines) if m]
 if not ids or not ids[0]:
     done("%s names no task_id" % marker)
 try:

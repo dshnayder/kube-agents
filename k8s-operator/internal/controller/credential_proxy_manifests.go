@@ -44,10 +44,10 @@ import (
 //
 // spec.security.workloadIdentityFederation is optional hardening on top. It
 // moves this pod's cloud identity off the metadata server and onto a projected
-// token file: the pod's ServiceAccount carries no iam.gke.io/gcp-service-account
-// annotation, so the metadata server answers with an unbound
-// <project>.svc.id.goog principal that IAM grants nothing, and the provider's
-// attribute conditions bound what the exchange can mint. It narrows what this
+// token file the provider's attribute conditions bound. Without it this pod
+// takes its Google identity from the Workload Identity annotation on its
+// ServiceAccount (agentServiceAccountName), which the gateway Pod no longer
+// shares. It narrows what this
 // pod may mint; it does not decide where the pod runs.
 //
 // The split is by role rather than by copy: the same image runs here and in the
@@ -115,14 +115,27 @@ const (
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
-	// 512Mi whatever this line says. The request is declared at that floor
-	// rather than left below it so the manifest the operator writes is the pod
-	// the cluster admits on both Standard and Autopilot: the chart's footprint
-	// file and its quota preflight sum this line, and a namespace quota sized
-	// to a 256Mi footprint would pass the preflight and then refuse the pod on
-	// Autopilot for the 256Mi the admission added.
+	// 512Mi at least whatever this line says; the request is declared on or
+	// above that floor rather than left below it so the manifest the operator
+	// writes is the pod the cluster admits on both Standard and Autopilot: the
+	// chart's footprint file and its quota preflight sum this line, and a
+	// namespace quota sized to a 256Mi footprint would pass the preflight and
+	// then refuse the pod on Autopilot for the 256Mi the admission added.
+	//
+	// Autopilot clamps memory as it clamps CPU: without bursting it sets the
+	// container's limits equal to its requests, so there the broker's limit
+	// is this request, not credentialProxyMemoryLimit, and the budget it
+	// derives from the limit is sized by this line. 1Gi rather than the 512Mi
+	// the band alone would give because 512Mi is under the budget's 672Mi
+	// floor (credentialProxyMinimumMemoryLimitBytes), at which the broker
+	// turns the budget off and admits by slot alone, which is the OOM
+	// exposure the budget exists to remove, on the cluster type a new install
+	// runs on. At 1Gi the budget admits four requests at once there
+	// (TestCredentialProxyBudgetArithmeticAtTheDefaults holds the request to
+	// the floor); 500m/1Gi is 2 GiB per vCPU, inside the band. On Standard
+	// the request is scheduling weight only and the 2Gi limit stands.
 	credentialProxyCPURequest    = "500m"
-	credentialProxyMemoryRequest = "512Mi"
+	credentialProxyMemoryRequest = "1Gi"
 	// The limits. CPU is the ceiling a mint or a listing may burst to on
 	// Standard; memory is what the comment above sizes; ephemeral storage
 	// bounds the content workspace (the broker's own clone of a repository
@@ -698,6 +711,11 @@ var (
 		"credential-proxy-policy":    true,
 		"credential-proxy-runtime":   true,
 		"credential-proxy-ksa-token": true,
+		// The watcher-audience token confers the broker's `watcher` role: every
+		// fleet cluster's events and named objects, and the drift subscription.
+		// It is projected into agent-api-auth alone, and that geometry is the
+		// whole of what keeps it from the model's container.
+		watcherTokenVolume: true,
 	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,
@@ -805,9 +823,10 @@ func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
 	}
 	return fmt.Sprintf(
 		"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
-			"Those hold the broker's home directory, its generated kubeconfigs and its git "+
-			"workspaces, and mounting them into the agent container defeats the credential "+
-			"isolation the proxy provides. Remove them, or use a volume of your own.",
+			"Those hold the broker's home directory, its generated kubeconfigs, its git "+
+			"workspaces and the watchers' broker token, and mounting them into the agent "+
+			"container defeats the credential isolation the proxy provides. Remove them, or "+
+			"use a volume of your own.",
 		strings.Join(forbidden, ", "),
 	)
 }

@@ -4564,6 +4564,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// another principal's reply subject is interception, because
 		// anyone who may subscribe may join a queue group.
 		"a2a.cap.reply." + a2aBridgeAddressee + ".>",
+		// The Home tab's board request, which the bridge answers.
+		"chat.board",
 		"_INBOX." + a2aBridgeUser + ".>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("bridge subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -4580,7 +4582,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// let this principal name itself anything; one subject is what makes
 	// the subject-as-identity check sound. No read on the cap bucket
 	// appears anywhere in this list, and that is the point of asking.
-	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee)
+	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee, "chat.board.reply.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bridge publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
@@ -4740,7 +4742,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "chat.notify.gchat", "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
@@ -4870,7 +4872,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack",
+		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -4886,6 +4889,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// under `cap.hop.>` -- the gateway mints each successor's root
 		// itself, so a hop grant here would be authority with no caller.
 		"$KV.cap.root.*",
+		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
@@ -5867,7 +5871,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 
 // The console chat door, in the one spelling every check here shares. Two
 // exact subjects, not a namespace: the render's other chat.* grants are the
-// notify route's, held by their own check below, so admitting the "chat"
+// notify and board routes', held by their own checks, so admitting the "chat"
 // namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
@@ -5877,17 +5881,25 @@ const (
 // The chat.notify route's two subjects, spelled here independently of the
 // render's constants so a renamed constant cannot carry the check with it.
 const (
-	notifyRequest = "chat.notify.gchat"
-	notifyReply   = "chat.notify.reply.agent.>"
+	notifyRequest      = "chat.notify.gchat"
+	notifyRequestSlack = "chat.notify.slack"
+	notifyReply        = "chat.notify.reply.agent.>"
+)
+
+// The board route's two subjects, spelled independently for the same reason.
+const (
+	boardRequest = "chat.board"
+	boardReply   = "chat.board.reply.gateway.>"
 )
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyReply}
+var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// chat door subjects: the console's two and the notify route's two.
+// chat door subjects: the console's two, the notify route's three and the
+// board route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
 // refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
@@ -5917,6 +5929,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{consoleInbound, true},
 		{consoleOutbound, true},
 		{notifyRequest, true},
+		{notifyRequestSlack, true},
 		{notifyReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
@@ -5931,10 +5944,11 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
 		{"chat.console.>", false},
-		// The notify route admits its two subjects and nothing around them:
-		// a sibling backend not yet routed, the namespace wildcard, the reply
-		// namespace widened to every principal, and one literal inside it.
-		{"chat.notify.slack", false},
+		// The notify route admits its subjects (one per routed backend, and
+		// the reply namespace) and nothing around them: a sibling backend not
+		// yet routed, the namespace wildcard, the reply namespace widened to
+		// every principal, and one literal inside it.
+		{"chat.notify.discord", false},
 		{"chat.notify.>", false},
 		{"chat.notify.reply.>", false},
 		{"chat.notify.reply.agent.x", false},
@@ -6336,10 +6350,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 
 // TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
 // off the door's port, so a leaked token alone reaches nothing; it has to
-// select the gateway pod and admit nobody to the door. Its one rule admits the
-// managed-Prometheus collector's namespace to the metrics port alone; any
-// other ingress rule appearing here later is a decision someone has to make
-// deliberately.
+// select the gateway pod and admit nobody to the door. The builder's one rule
+// admits the managed-Prometheus collector's namespace to the metrics port
+// alone, and the applied copy adds the operator's (a2aFenceWithOperatorPeer);
+// any other ingress rule appearing here later is a decision someone has to
+// make deliberately.
 func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	cl, agent, _, _ := a2aInjectAgentState(t)
@@ -7609,6 +7624,36 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 	}
 }
 
+// TestChatBoardSubjectsHaveExactlyOneWriterAndOneReader is the board
+// route's authorization: the gateway alone asks and reads the answers, the
+// bridge alone reads the asks and answers. The gateway draws the Slack Home
+// tab from the answer, so a second writer on the reply namespace could put
+// words on it.
+func TestChatBoardSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	rules := []struct{ verb, pattern, owner string }{
+		{"publish", boardRequest, "gateway"},
+		{"subscribe", boardReply, "gateway"},
+		{"subscribe", boardRequest, a2aBridgeUser},
+		{"publish", boardReply, a2aBridgeUser},
+	}
+	for _, r := range rules {
+		var holders []string
+		for _, id := range ids {
+			list := id.publish
+			if r.verb == "subscribe" {
+				list = id.subscribe
+			}
+			if slices.ContainsFunc(list, func(g string) bool { return subjectPatternsOverlap(g, r.pattern) }) {
+				holders = append(holders, id.user)
+			}
+		}
+		if !slices.Equal(holders, []string{r.owner}) {
+			t.Errorf("%s %s is held by %v; want %s alone", r.verb, r.pattern, holders, r.owner)
+		}
+	}
+}
+
 // notifyDoorViolations is the chat.notify route's half of the door check:
 // the agent alone may publish a notify and read the answers, and the gateway
 // alone may read a notify and publish the answers. Matched by overlap, so a
@@ -7619,8 +7664,10 @@ func notifyDoorViolations(ids []a2aIdentity) []string {
 		grants               func(a2aIdentity) []string
 	}{
 		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
 	}
 	var out []string
@@ -7667,8 +7714,10 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	}
 	for _, want := range []struct{ user, verb, pattern string }{
 		{a2aAgentBusUser, "publish", notifyRequest},
+		{a2aAgentBusUser, "publish", notifyRequestSlack},
 		{a2aAgentBusUser, "subscribe", notifyReply},
 		{"gateway", "subscribe", notifyRequest},
+		{"gateway", "subscribe", notifyRequestSlack},
 		{"gateway", "publish", notifyReply},
 	} {
 		if !holds(want.user, want.verb, want.pattern) {
@@ -7687,6 +7736,7 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 		user, verb, grant string
 	}{
 		{a2aBridgeUser, "publish", "chat.notify.gchat"},
+		{a2aBridgeUser, "publish", "chat.notify.slack"},
 		{"web", "subscribe", "chat.notify.reply.>"},
 	} {
 		mutated := slices.Clone(ids)
