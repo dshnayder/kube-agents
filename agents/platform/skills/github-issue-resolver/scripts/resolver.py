@@ -302,6 +302,33 @@ def forge(verb: str, payload: dict, repo: str) -> dict:
     return vcs_client.forge(verb, dict(payload), repository=repo)
 
 
+# The refusals a forge with no issue tracker, or no labels, gives this script's
+# first call, and what `capabilities` then says about it.
+UNTRACKED_REFUSALS = frozenset({"FORGE_UNSUPPORTED", "LABELS_UNSUPPORTED"})
+TRACKER_VERBS = ("issue-list", "issue-view", "issue-comment", "issue-update")
+
+
+def has_no_tracker(repo: str) -> bool:
+    """True when the forge of `repo` says it has no issue tracker or no labels.
+
+    Asked only after a refusal, so a repository whose forge has both costs
+    no extra call. An answer that cannot be read is False, and the refusal is
+    then reported as before.
+    """
+    try:
+        answer = forge("capabilities", {}, repo)
+    except vcs_client.VcsError:
+        return False
+    if not answer.get("forge") or answer.get("missing"):
+        # A host no forge serves, or one this install has not configured,
+        # also answers with no verbs: that stays a refusal.
+        return False
+    verbs = answer.get("verbs")
+    if isinstance(verbs, list) and not all(verb in verbs for verb in TRACKER_VERBS):
+        return True
+    return answer.get("labels") is False
+
+
 def ensure_labels_exist(repo: str):
     """Make sure this skill's status and governance labels exist.
 
@@ -641,6 +668,9 @@ def handle_poll(args):
     # forge has stopped accepting from an install pointed at a repository that
     # does not exist, and those two faults belong to different people.
     refusals: dict = {}
+    # Repositories whose forge has no issue tracker, or no labels to claim an
+    # issue with (Bitbucket). Not refusals: there is nothing to poll there.
+    untracked: list = []
     # Repository -> the refusal's own words. The code is what the rules branch
     # on; the message is what names the broker and the errno when there is no
     # code, and throwing it away left "every managed repository refused the
@@ -675,6 +705,9 @@ def handle_poll(args):
             # -- the broker unreachable, its token missing, an answer that was
             # not JSON -- and it gets a code of this side's rather than the
             # broker's word for a forge fault.
+            if refusal.code in UNTRACKED_REFUSALS and has_no_tracker(repo):
+                untracked.append(repo)
+                continue
             refusals[repo] = refusal.code or BROKER_UNREACHABLE
             errors[repo] = str(refusal)
             print(f"resolver: {repo}: {refusals[repo]}: {refusal}", file=sys.stderr)
@@ -686,8 +719,12 @@ def handle_poll(args):
 
     unreachable_repos = [repo for repo in repos if repo in refusals]
 
+    # Only when there are some, so the answer for a forge with a tracker is
+    # exactly what it was.
+    extra = {"untracked_repos": untracked} if untracked else {}
+
     if not all_issues:
-        if len(refusals) == len(repos):
+        if refusals and len(refusals) + len(untracked) == len(repos):
             # Every managed repository refused, so this is not a quiet fleet.
             # When they all refused for the same reason that reason is the
             # answer -- a credential the forge has stopped accepting is one
@@ -716,6 +753,7 @@ def handle_poll(args):
                     "status": "NO_ISSUES",
                     "managed_repos": repos,
                     "unreachable_repos": unreachable_repos,
+                    **extra,
                 }
             )
         )
@@ -772,6 +810,7 @@ def handle_poll(args):
                 # rather than conclude from a partial one.
                 "comments_truncated": comments_truncated,
                 "unreachable_repos": unreachable_repos,
+                **extra,
             },
             indent=2,
         )
