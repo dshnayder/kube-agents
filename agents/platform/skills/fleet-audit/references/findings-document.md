@@ -245,11 +245,16 @@ field, and publishes nothing:
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
   can revert a patch to the live object), or else the `namespace_directory` for a new object. It
-  also names the `reconciler`, whose next sync or upgrade can revert a change made by hand. The notes go in a paragraph of their own after
-  your note. It writes no note for a candidate without these fields, and none for a fix that "Write
-  every `manifest` remediation file" in the skill's red lines wrote, declined, or found in a pull
-  request. It does not change your words. A `--dry-run` can leave out a note the real run adds. Do
-  not copy these notes into your `note`.
+  skips that location note when your note already names the same path. It also names the
+  `reconciler`, whose next sync or upgrade can revert a change made by hand. The notes go in a
+  paragraph of their own after your note. It writes no note for a candidate without these fields,
+  and none for a fix that `finish` wrote itself, that you declined with `--decline-fix`, or that a
+  pull request already carries. It removes route notes that your note copied from an earlier
+  ledger. It closes a code fence that your note leaves open. When your note and the route notes
+  together are longer than the note cap, it cuts your note and ends it with ` …(truncated)`, so
+  that the route notes fit. A note with a code fence is cut only before its first fence; when that
+  does not give room, the route notes are left out. A `--dry-run` can leave out a note the real
+  run adds. Do not copy these notes into your `note`.
 
 ### Scope, skipped, and limitations
 
