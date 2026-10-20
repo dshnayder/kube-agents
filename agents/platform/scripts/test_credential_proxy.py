@@ -14161,27 +14161,37 @@ class KubeProxyClientTest(unittest.TestCase):
         )
         self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(rewritten))
 
-    def test_ensure_kubeconfig_uses_kube_proxy_upgrades_legacy_file(self):
+    def test_merge_context_into_default_kubeconfig_preserves_current_context(self):
         with tempfile.TemporaryDirectory() as tmp:
-            kc = Path(tmp) / "kubeconfig.yaml"
+            kc = Path(tmp) / ".kubeconfig"
             kc.write_text(
-                f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
-                "clusters:\n- name: old\n  cluster:\n    server: https://10.0.0.1\n",
+                "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+                "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
+                "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/broker-token/token\n",
                 encoding="utf-8",
             )
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
-                },
-                clear=False,
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_caller_default_kubeconfig_path",
+                    return_value=kc,
+                ),
             ):
-                credential_proxy_client.ensure_kubeconfig_uses_kube_proxy(kc)
+                credential_proxy_client.merge_context_into_default_kubeconfig(self.CONTEXT)
             updated = kc.read_text(encoding="utf-8")
             self.assertIn(
                 f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
                 updated,
             )
+            self.assertEqual("in-cluster", credential_proxy_client.read_current_context(updated))
 
 
 if __name__ == "__main__":

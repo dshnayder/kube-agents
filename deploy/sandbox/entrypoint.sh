@@ -582,7 +582,7 @@ SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 # /opt/vcs/bin holds the only `git` in the sandbox, the credential-free wrapper
 # (deploy/sandbox/vcs-git.sh); /opt/credential-proxy/bin holds gcloud and
-# kubectl and nothing named git or gh, so the order between the two decides
+# nothing named kubectl, git or gh, so the order between the two decides
 # nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
 # because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""

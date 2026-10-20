@@ -668,10 +668,9 @@ RUN set -e; \
 # which is not on the build PATH either, so a hit below still means a native
 # binary arrived by some other route.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl; do \
-        ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
-    done && \
+    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
     test -x /usr/local/bin/kubectl && \
+    test ! -e /opt/credential-proxy/bin/kubectl && \
     for binary in gcloud gh git; do \
         if command -v "${binary}" >/dev/null 2>&1; then \
             echo "unexpected credential-aware CLI in the sandbox image: ${binary}" >&2; \
