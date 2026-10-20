@@ -676,8 +676,11 @@ The notes go in a paragraph of their own after the worker's note, and a code fen
 worker's note leaves open is closed first. A note whose path the worker's note already names as a
 whole path is not written. A candidate without these fields gets no note, because a missing
 `declaration` is not a claim that no file declares the object. A route note copied from an earlier
-ledger is removed before the notes are written again. A fix that the refusal path wrote, declined,
-or found in a pull request keeps the text that path gave it. The notes give the location; a worker
+ledger is removed before the notes are written again. A fix that `finish` wrote, that the worker
+declined, or that a pull request already carries gets no route note, because the row already gives
+the answer. A pull request carries the fix when its delta block names the finding, or, for a
+degraded fix, when it is on the branch that the promised path names; a pull request that the
+harness closed as stale does not count. The notes give the location; a worker
 clause that contradicts them stays, and the note beside it is the correction. The worker's note is
 cut first when the total is longer than the note cap, measured after redaction and the escape of a
 comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut

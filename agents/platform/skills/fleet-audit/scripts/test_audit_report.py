@@ -20466,6 +20466,44 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
         self.assertIn(DECLINE_REASON, body)
         self.assertNotIn(audit_report.DECLARED_NOTE_LEDE, body)
 
+    def test_a_declared_manual_fix_a_pull_request_carries_gets_no_route_note(self):
+        """The pull request is the answer the row shows; a note that sends the
+        reader to the repository would ask for the same change again."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        check, obj = "unbound-sa-automount", "Deployment/api"
+        finding = make_finding(
+            check=check, obj=obj, remediation={"kind": "manual", "note": "Set the field on the pod template."}
+        )
+        doc = make_doc(findings=[finding])
+        fid = audit_report.derive_finding_id(dict(finding))
+        manifest = _full_manifest(
+            candidates=[
+                self.candidate(
+                    check=check, object=obj, declaration={"path": "clusters/payments/api.yaml"}, reconciler="`flux`"
+                )
+            ]
+        )
+        carrying = pr(5, "platform-agent/fix-elsewhere", body=audit_report.delta_block([fid]))
+        self.harness.replies["proposal-list"] = proposals_view([carrying])
+        self.assertEqual(self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)]), 0, self.err)
+        body = "".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("Set the field on the pod template.", body)
+        self.assertFalse(audit_report.DECLARED_NOTE_LEDE in body)
+        self.assertFalse(audit_report.RECONCILED_NOTE_LEDE in body)
+
+    def test_a_degraded_fix_whose_branch_has_a_pull_request_gets_no_route_note(self):
+        """The file was never written, but the pull request on the branch its
+        path names carries the fix, as the sweep reads it."""
+        doc = make_doc()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["proposal-list"] = proposals_view([pr(5, branch)])
+        manifest = _full_manifest(candidates=[self.candidate(reconciler="`flux`")])
+        self.assertEqual(self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)]), 0, self.err)
+        body = "".join(self.harness.bodies_for("issue-*"))
+        self.assertIn("did not write it", body)
+        self.assertFalse(audit_report.RECONCILED_NOTE_LEDE in body)
+
 
 class TestTriageMarkedFindings(BaseTestCase):
     """A finding the collector stands behind whose *fix* it cannot vouch for.

@@ -15147,7 +15147,7 @@ def unwritten_sweep_fixes(
     # carries -- open, merged, or closed by a person -- is answered; the
     # generated check is left to `plan_generated_fixes`, which tells its own
     # pull request from another.
-    carried = {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
+    carried = _delta_carried_fixes(prs)
     unwritten: dict[str, UnwrittenFix] = {}
     for finding in findings:
         fid = str(finding.get("id", ""))
@@ -15161,9 +15161,7 @@ def unwritten_sweep_fixes(
             log(f"{log_prefix}{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
             continue
         if fid in degraded_set and promised.get(fid):
-            as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
-            pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
-            if pr is None or pr_closed_by_harness(pr):
+            if not _promised_fix_carried(prs, audit_id, fid, promised[fid]):
                 unwritten[fid] = UnwrittenFix(promised[fid], declared=False)
             continue
         remediation = finding.get("remediation") or {}
@@ -15173,6 +15171,54 @@ def unwritten_sweep_fixes(
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
+
+
+def _delta_carried_fixes(prs: list[dict]) -> set[str]:
+    """Every finding id that the delta block of a pull request names, when the
+    harness did not close that pull request: open, merged, or closed by a person."""
+    return {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
+
+
+def _promised_fix_carried(prs: list[dict], audit_id: str, fid: str, path: str) -> bool:
+    """Whether a pull request that the harness did not close is on the branch
+    that the promised `path` names, as the sweep joins a fix to its branch."""
+    as_written = {"id": fid, "remediation": {"kind": "manifest", "path": path}}
+    pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+    return pr is not None and not pr_closed_by_harness(pr)
+
+
+def pr_carried_fixes(
+    promised: dict[str, str], degraded: list[str], audit_id: str, prs: list[dict]
+) -> set[str]:
+    """The finding ids whose fix a pull request already carries.
+
+    By the joins `unwritten_sweep_fixes` uses: a finding that the delta block
+    of a pull request names, and a degraded fix whose promised path names the
+    branch of a pull request. In both, a pull request that the harness closed
+    as stale does not count.
+    """
+    carried = _delta_carried_fixes(prs)
+    carried.update(
+        fid for fid in degraded if promised.get(fid) and _promised_fix_carried(prs, audit_id, fid, promised[fid])
+    )
+    return carried
+
+
+def route_note_skip(
+    unwritten: dict[str, UnwrittenFix],
+    declines: dict[str, str],
+    planned: dict[str, tuple[str, str]],
+    answered: set[str],
+    carried: set[str],
+) -> set[str]:
+    """The findings that `disclose_manual_remediation_routes` gives no route note.
+
+    A fix that `finish` wrote (`planned`), a fix that the worker declined, and
+    a fix that a pull request already carries (`answered`, `carried`). The row
+    already gives the answer for each, and a note that sends the reader to the
+    repository asks for the same change again.
+    """
+    return {fid for fid in unwritten if fid in declines} | set(planned) | set(answered) | set(carried)
 
 
 class RouteEvidence(NamedTuple):
@@ -15350,9 +15396,9 @@ def disclose_manual_remediation_routes(
     `declaration` is not a claim that no file declares the object, so a note
     that says "not declared" would publish a claim that nobody measured.
 
-    A finding in `skip` is left alone: those are the fixes the refusal path
-    in `finish` already handled, which wrote the fix, declined it with a
-    published reason, or found a pull request that carries it.
+    A finding in `skip` is left alone (`route_note_skip`): a fix that `finish`
+    wrote, that the worker declined with a published reason, or that a pull
+    request already carries.
 
     The pass first removes the route notes that the text already carries,
     which a worker that copies the previous ledger brings back, and then
@@ -18392,12 +18438,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     finally:
         probe.close()
     # After every pass that changes a remediation, so the notes describe the
-    # remediation that is published. A fix the refusal path handled (written,
-    # declined, or carried by a pull request) is left as that path wrote it.
+    # remediation that is published. A fix that `finish` wrote, that the
+    # worker declined, or that a pull request already carries gets no route
+    # note (`route_note_skip`).
     disclose_manual_routes_and_log(
         findings,
         manifest,
-        {fid for fid in unwritten if fid in declines or fid in planned or fid in answered},
+        route_note_skip(
+            unwritten, declines, planned, answered, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)
+        ),
     )
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
