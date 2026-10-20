@@ -2983,7 +2983,7 @@ def report_envelope(
 
     `scheduled` records whether the run was a scheduled run (`finish
     --scheduled`). `scheduled_coverage_gaps` is the gap list of the last
-    scheduled run (`next_scheduled_gaps`), or None when no record shows it.
+    scheduled run (`next_scheduled_value`), or None when no record shows it.
     `scheduled_published_ids` is the id set the last scheduled run published
     (`next_scheduled_value`), or None. `scheduled_reported_under_gap` is the
     part of `reported_under_gap` that a scheduled run reported.
@@ -3579,20 +3579,10 @@ def previous_run_document(audit_id: str, repo: str | None) -> dict | None:
     except ValueError:
         return None
     key = _ledger_key(repo)
-    candidates = [directory / REPORT_LATEST_NAME]
-    try:
-        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
-    except OSError:
-        pass
-    for path in candidates:
-        try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        document = _envelope_document(envelope, key)
-        if document is not None:
-            return document
-    return None
+    envelope = first_stored_record(
+        directory, lambda envelope: _envelope_document(envelope, key) is not None
+    )
+    return _envelope_document(envelope, key) if envelope else None
 
 
 def invalidate_report_memory(audit_id: str, repo: str) -> None:
@@ -7969,20 +7959,6 @@ def scheduled_gaps_baseline(memory: dict | None) -> list[str] | None:
     return None
 
 
-def next_scheduled_gaps(
-    scheduled: bool, gaps: list[str], memory: dict | None
-) -> list[str] | None:
-    """The value this run stores under `SCHEDULED_COVERAGE_GAPS_KEY`.
-
-    A scheduled run stores its own gaps. An on-demand run stores the value it
-    read from `memory`, so it does not change what the next scheduled run
-    compares with.
-    """
-    if scheduled:
-        return list(gaps)
-    return scheduled_gaps_baseline(memory)
-
-
 def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     """The ids the last scheduled run published, as `memory` shows them, or None.
 
@@ -8003,6 +7979,32 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
 
 
+def first_stored_record(directory: Path, trusted: Callable[[dict], bool]) -> dict | None:
+    """The newest stored envelope in `directory` that `trusted` accepts.
+
+    `latest.json` first, then the `runs/` ring from newest to oldest: a
+    failed write drops `latest.json` and leaves the ring. `{}` when the
+    directory holds no envelope at all. None when it holds envelopes and
+    none can be read or `trusted` accepts none.
+    """
+    candidates = [directory / REPORT_LATEST_NAME]
+    try:
+        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
+    except OSError:
+        pass
+    present = [path for path in candidates if path.exists()]
+    if not present:
+        return {}
+    for path in present:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(envelope, dict) and trusted(envelope):
+            return envelope
+    return None
+
+
 def newest_stored_record(audit_id: str, repo: str) -> dict | None:
     """The newest envelope this stream stored for `repo`, for a run with no open ledger.
 
@@ -8019,23 +8021,8 @@ def newest_stored_record(audit_id: str, repo: str) -> dict | None:
         directory = reports_dir_for(audit_id, repo)
     except ValueError:
         return None
-    candidates = [directory / REPORT_LATEST_NAME]
-    try:
-        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
-    except OSError:
-        pass
-    present = [path for path in candidates if path.exists()]
-    if not present:
-        return {}
     key = _ledger_key(repo)
-    for path in present:
-        try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(envelope, dict) and _ledger_key(envelope.get("repo")) == key:
-            return envelope
-    return None
+    return first_stored_record(directory, lambda envelope: _ledger_key(envelope.get("repo")) == key)
 
 
 def scheduled_reported_baseline(memory: dict | None) -> set[str]:
@@ -8058,8 +8045,9 @@ def scheduled_reported_baseline(memory: dict | None) -> set[str]:
 def next_scheduled_value(scheduled: bool, own: Iterable[str], stored: list[str] | None):
     """What this run stores for a "last scheduled run" key.
 
-    A scheduled run stores its own value. An on-demand run stores the value
-    it read, so it does not change what the next scheduled run compares with.
+    A scheduled run stores its own value, sorted and without duplicates: the
+    readers compare it as a set. An on-demand run stores the value it read,
+    so it does not change what the next scheduled run compares with.
     """
     if scheduled:
         return sorted(set(own))
@@ -17438,28 +17426,17 @@ def previous_no_forge_record(audit_id: str) -> dict | None:
     leaves the ring, and on this install nothing else remembers the run. A
     store with envelopes and none trusted is unknowable rather than empty.
     """
-    directory = reports_dir_for(audit_id, NO_FORGE_REPO)
-    candidates = [directory / REPORT_LATEST_NAME]
-    try:
-        candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
-    except OSError:
-        pass
-    present = [path for path in candidates if path.exists()]
-    if not present:
-        return {}
-    for path in present:
-        try:
-            envelope = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        ids = envelope.get("current_ids") if isinstance(envelope, dict) else None
-        if (
-            isinstance(ids, list)
+    record = first_stored_record(
+        reports_dir_for(audit_id, NO_FORGE_REPO),
+        lambda envelope: (
+            isinstance(envelope.get("current_ids"), list)
             and envelope.get("status") == NO_FORGE_STATUS
             and _ledger_key(envelope.get("repo")) == _ledger_key(NO_FORGE_REPO)
             and envelope.get("id_scheme") == ID_SCHEME
-        ):
-            return envelope
+        ),
+    )
+    if record is not None:
+        return record
     log(
         f"WARNING: no report store record for {audit_id} was written by a run with no "
         f"forge under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
@@ -17659,7 +17636,7 @@ def _finish_without_forge(
             rendered_ids=stored_ids,
             delta_known=delta_known,
             scheduled=scheduled,
-            scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, record),
+            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(record)),
             scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),
         ),
         now,
@@ -18865,7 +18842,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 delta_known=delta_known,
                 reported_under_gap=reported_under_gap,
                 scheduled=scheduled,
-                scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, memory),
+                scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
                 scheduled_published_ids=next_scheduled_ids,
                 scheduled_reported_under_gap=next_scheduled_reported,
             ),
@@ -19364,7 +19341,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             delta_known=delta_known,
             reported_under_gap=reported_under_gap,
             scheduled=scheduled,
-            scheduled_coverage_gaps=next_scheduled_gaps(scheduled, gaps, memory),
+            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
             scheduled_published_ids=next_scheduled_ids,
             scheduled_reported_under_gap=next_scheduled_reported,
         ),
