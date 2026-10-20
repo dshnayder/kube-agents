@@ -7395,3 +7395,137 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
 	}
 }
+
+// TestReconcileGitopsStateGitOpsRepo covers the gitops_repo key: the fleet
+// audit reads it to choose the repository for its ledger issue when several
+// repositories are managed. Each forge gets the key, in the form of its
+// managed_repos entry, and the key goes away when no repository has role
+// gitops.
+func TestReconcileGitopsStateGitOpsRepo(t *testing.T) {
+	gitlabToken := &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}
+	cases := []struct {
+		name   string
+		forges []agentv1alpha1.ForgeSpec
+		want   string
+	}{
+		{
+			name:   "github.com",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name:   "GitLab",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme", CredentialsRef: gitlabToken}},
+			want:   `{"type":"gitlab","url":"https://gitlab.example.com/acme/infra"}`,
+		},
+		{
+			name:   "GitHub Enterprise Server",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Host: "ghe.example.com", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://ghe.example.com/acme/infra"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+			ctx := context.Background()
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"}}
+			declare := func(gitopsRole string) {
+				agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: tc.forges,
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "vcs", Repository: "infra", Role: gitopsRole},
+						{Forge: "vcs", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				}}
+			}
+			read := func() (string, bool) {
+				var cm corev1.ConfigMap
+				if err := cl.Get(ctx, client.ObjectKey{Name: "repo-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+					t.Fatalf("get: %v", err)
+				}
+				value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+				return value, ok
+			}
+
+			// Created with the key.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on create = %q, expected %q", got, tc.want)
+			}
+
+			// Removed when the role goes away.
+			declare(agentv1alpha1.RepositoryRoleManaged)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := read(); ok {
+				t.Errorf("gitops_repo = %q stayed after no repository has role gitops", got)
+			}
+
+			// Written again on an update, and not only on create.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on update = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildGitopsStateConfigMapGitOpsRepo(t *testing.T) {
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	cases := []struct {
+		name string
+		list []agentv1alpha1.RepositorySpec
+		want string
+	}{
+		{
+			name: "one gitops repository among managed and context ones",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "docs", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+			want: `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name: "no gitops repository",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+		{
+			// The CRD refuses this; past it, neither one is the GitOps repository.
+			name: "two gitops repositories",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: tc.list},
+				}},
+			}
+			got, ok := buildGitopsStateConfigMap(agent).Data[gitopsStateGitOpsRepoKey]
+			if tc.want == "" && ok {
+				t.Errorf("gitops_repo = %q, expected no key", got)
+			}
+			if tc.want != "" && got != tc.want {
+				t.Errorf("gitops_repo = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}

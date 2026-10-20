@@ -65,6 +65,15 @@ The agent's only output is a validated `findings.json` — one entry per deviati
 
 What it publishes to the GitOps repository has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff. An install with no GitOps repository gets neither tier: the run keeps its findings in the report store and reports them in chat.
 
+### Which repository gets the ledger
+
+The ledger issue and every remediation pull request (a merge request on GitLab) go to one repository: the one with `role: gitops` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration). The installer's `--gitops-repo` and the chart's `github.gitRepo` give a repository that role. A `context` repository is never the target, because the agent only reads it, and a `managed` repository does not get the ledger either.
+
+- **To change the repository**, give `role: gitops` to another repository. At most one repository can have that role. The next run writes its ledger in the new repository. The open ledger issue in the old repository stays as it is.
+- **Several repositories and no `role: gitops`.** The audit does not choose one. The run stops with a message that tells you to give one repository `role: gitops`. To use another repository for one on-demand run, ask the agent to run the audit with `--repo <repository>`.
+- **No repository.** The run keeps its findings in the report store and reports them in chat, as the paragraph above says.
+- **A repository the agent cannot reach.** Before it publishes, the run reads one issue from the repository through the credential broker. If the forge says that the repository does not exist, or that the install's credential cannot read it, the run does not try another repository. It keeps its findings in the report store and reports them in chat, and the report names the repository and the reason.
+
 ### Tier 1 — the ledger issue
 
 Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`), and its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail: evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.

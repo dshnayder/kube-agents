@@ -512,6 +512,24 @@ with workspace lease markers and the git remote kept as fallbacks. This resolves
 `github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
 by construction rather than by coincidence.
 
+The order is `--repo`, the workspace, the lease record, the repository with `role: gitops`, and then
+the one managed repository. The operator writes the repository with `role: gitops` to the
+`gitops_repo` key of the same ConfigMap, as one `managed_repos` entry, and removes the key when no
+repository has that role. The key is read only when more than one repository is managed, and a key
+that names a repository not in `managed_repos` is ignored. So an install that manages a second
+repository (Terraform, applications) still sends the ledger issue and every fix to its GitOps
+repository, and a context repository is never the target. With several managed repositories and no
+`role: gitops`, `start` refuses and names the fix (give one repository that role, or pass `--repo`
+for one run): the harness never chooses among them, and neither may the agent.
+
+Before it publishes, `start` and `finish` each list one open issue in the resolved repository
+through the broker. When the forge answers that the repository is missing or that the credential
+cannot see it (`FORGE_NOT_FOUND`, `FORGE_FORBIDDEN`, `FORGE_UNAUTHENTICATED`), or the broker does not
+manage it (`REPOSITORY_NOT_MANAGED`), the run takes the no-forge path of a run with no repository:
+the findings go to the report store and to chat, and the note names the repository and the reason.
+It does not try another repository. A broker that does not answer is `BrokerUnavailable`, as on every
+other forge call, and any other refusal leaves the run on its forge path.
+
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
@@ -1445,7 +1463,9 @@ directory's `origin`, which is the GitOps repo — correct for the PRs, but a pl
 audit issues in an ops/tracking repo instead. If they must differ, `start` needs an explicit
 issue-repo argument and the App token needs scope on both.
 
-_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
+_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look. On an
+install with several managed repositories, the GitOps repo is the one with `role: gitops` (§6,
+`start`).
 
 The divergence this question surfaced — `audit_report.py` deriving the repo from the working
 directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from

@@ -461,6 +461,15 @@ Notes:
   Secret names and the namespace from `install.env`.
 - After an uninstall, revoke the token in GitLab.
 
+## Where the audits report
+
+The fleet audits put their ledger issue and their fix merge requests in the `--gitops-repo`
+project, which the install declares with `role: gitops`. They never use a context repository. If
+you register a second project, for example a Terraform project as `managed`, the audits still use
+the `gitops` project. [Which repository gets the ledger](/kube-agents/concepts/declarative-workflow/#which-repository-gets-the-ledger)
+says how to change it, and what happens with several projects and no `role: gitops`, with no
+project, or with a project that the token cannot reach.
+
 ## Limits
 
 - The skills read GitLab entries in `managed_repos`, but only GitHub entries in `context_repos`.

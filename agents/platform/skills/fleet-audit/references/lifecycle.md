@@ -30,6 +30,29 @@ Between `content` and `directory` everything else is identical, including where 
 and what `finish` publishes. Where the two differ, this file says which mode it is talking about.
 `none` differs throughout, and its own section says how.
 
+### Which repository
+
+The ledger issue and every remediation pull request or merge request go to one repository. `start`
+and `finish` resolve it in this order:
+
+1. `--repo`, when you pass it. It must be in the managed list.
+2. The stream's workspace and its lease record, from an earlier `start` of this run.
+3. The repository with `role: gitops`, when more than one repository is managed. The operator
+   writes it to the `gitops_repo` key of `$GITOPS_STATE_CONFIGMAP`.
+4. The one managed repository, when there is only one.
+
+A context repository is never the target: it is only read. With several managed repositories and
+none with `role: gitops`, `start` stops with a message that says to give one repository
+`role: gitops` (or to pass `--repo` for one run). Do not choose a repository yourself: report the
+message to the user. With no managed repository, the run has no forge; see
+[No forge configured](finish.md#no-forge-configured).
+
+Before it publishes, `start` and `finish` each list one open issue in the resolved repository
+through the broker. If the forge says that the repository does not exist, or that the install's
+credential cannot read it, the run does not choose another repository. It takes the no-forge path,
+and its `no_forge` note names the repository and the reason; see
+[No forge configured](finish.md#no-forge-configured).
+
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
@@ -40,9 +63,7 @@ Before inspecting anything, claim the workspace:
   [--repo "<owner>/<repo>"]
 ```
 
-This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, failing if ambiguous across multiple repos, and
-running with no forge when none is registered — see [No forge configured](finish.md#no-forge-configured)), makes
+This resolves the target repository (see [Which repository](#which-repository) below), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster

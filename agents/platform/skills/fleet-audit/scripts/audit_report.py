@@ -874,6 +874,46 @@ NO_FORGE_UNSTORED_NOTE = (
     "remediation pull request was opened. The report store write failed, so "
     "the store may not hold this run: keep this message."
 )
+# A run whose repository resolved but cannot be reached through the broker:
+# the forge says that the repository is missing or that the install's
+# credential cannot see it, or the broker does not manage it. The run does not
+# choose another repository. It takes the no-forge path, and its note says
+# why. These are the codes that `gitops_preflight.py` reads as
+# REPO_UNREACHABLE and NOT_MANAGED; every other refusal (an outage, a rate
+# limit) is not about the repository, and the run continues as before.
+UNREACHABLE_REPO_CODES = frozenset(
+    {"FORGE_NOT_FOUND", "FORGE_FORBIDDEN", "FORGE_UNAUTHENTICATED", "REPOSITORY_NOT_MANAGED"}
+)
+# The read that proves the repository can be reached: one open issue, the
+# listing the ledger lookup itself uses.
+REACHABILITY_PROBE_VERB = "issue-list"
+REACHABILITY_PROBE_LIMIT = 1
+UNREACHABLE_NOTE = (
+    "The repository {repo} could not be reached through the broker ({reason}), so "
+    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "not choose another repository. Make sure that the repository exists and that "
+    "the install's forge credential can read and write it. The findings are in the "
+    "report store."
+)
+UNREACHABLE_UNSTORED_NOTE = (
+    "The repository {repo} could not be reached through the broker ({reason}), so "
+    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "not choose another repository. Make sure that the repository exists and that "
+    "the install's forge credential can read and write it. The report store write "
+    "failed, so the store may not hold this run: keep this message."
+)
+# The JSON line's key for the repository that could not be reached, and why.
+UNREACHABLE_REPO_KEY = "unreachable_repo"
+# The refusal when several repositories are managed and none has role gitops.
+# The audit never chooses one of them itself (gke-labs/kube-agents#2989).
+NO_GITOPS_ROLE_MESSAGE = (
+    "Multiple repositories configured in ConfigMap ({repos}) and none has role "
+    "gitops, so the audit cannot choose the repository for its ledger issue and "
+    "its fixes. To fix it, give one repository role: gitops in the PlatformAgent's "
+    "spec.integration.repositories (the installer's --gitops-repo does this). For "
+    "one run, pass --repo <owner/name>. Do not choose a repository yourself: "
+    "report this to the user."
+)
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
 # How many findings the chat summary names, most severe first; the store keeps
@@ -12189,7 +12229,13 @@ def resolve_repo(
     repo: str | None = None,
     workspace: str | Path | None = None,
 ) -> str:
-    """Resolve the GitOps repository as `owner/name`, checking explicit repo, workspace, lease record, then ConfigMap."""
+    """Resolve the GitOps repository as `owner/name`.
+
+    The order is: the explicit repository, the workspace, the lease record,
+    the repository with role gitops (`gitops_workspace.get_gitops_repo`), and
+    then the one repository in the ConfigMap. Several repositories with none
+    in role gitops is a refusal that says how to fix it.
+    """
     import gitops_workspace
 
     if repo and str(repo).strip():
@@ -12225,6 +12271,17 @@ def resolve_repo(
         except Exception:
             pass
 
+    # With several managed repositories, the one with role gitops, when the
+    # operator names one and it is registered. This comes before the
+    # one-repository rule, so that an install that manages a second
+    # repository (Terraform, apps) still has one answer. With one or no
+    # repository the key cannot change the answer, so it is not read.
+    managed = gitops_workspace.get_managed_repos()
+    if len(managed) > 1:
+        gitops = gitops_workspace.get_gitops_repo()
+        if gitops:
+            return gitops
+        raise RuntimeError(NO_GITOPS_ROLE_MESSAGE.format(repos=", ".join(managed)))
     return gitops_workspace.resolve_repo()
 
 
@@ -12234,7 +12291,7 @@ def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     Only a raw `managed_repos` value that is blank or an empty list means no
     forge. A value that does not parse, or whose entries this image cannot
     serve, fails with that said; a list that parses to repositories keeps the
-    resolver's own errors (several repositories ask for `--repo`); a list that
+    resolver's own errors (several repositories and no gitops role refuse); a list that
     cannot be read raises.
 
     The resolver's lease step can answer with the repository an earlier
@@ -12267,6 +12324,58 @@ def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
         except RuntimeError:
             pass
     return resolved
+
+
+def unreachable_reason(repo: str) -> str | None:
+    """Why the broker cannot reach `repo`, or None when it can, or when it cannot tell.
+
+    One cheap read (`REACHABILITY_PROBE_VERB`). A reason is returned only for
+    a refusal with a code in `UNREACHABLE_REPO_CODES`, which is about the
+    repository and the credential. A lost broker raises `BrokerUnavailable`
+    from `forge`, as every other forge call does. Any other refusal returns
+    None: it is not about the repository, and the run continues as before.
+    """
+    try:
+        forge(REACHABILITY_PROBE_VERB, repo, {"state": "open", "limit": REACHABILITY_PROBE_LIMIT})
+    except ForgeError as exc:
+        code = getattr(exc.__cause__, "code", None)
+        if code in UNREACHABLE_REPO_CODES:
+            return redact_secrets(str(exc))
+    return None
+
+
+def resolve_reachable_repo(
+    audit_id: str, repo: str | None = None
+) -> tuple[str, tuple[str, str] | None]:
+    """`resolve_repo_or_no_forge`, then a check that the broker can reach the repository.
+
+    Returns the repository and None, or `NO_FORGE_REPO` and the pair
+    (repository, reason) when the resolved repository cannot be reached. The
+    run then does not choose another repository: it keeps its findings in the
+    report store and sends them to chat, as a run with no repository does,
+    and `unreachable_note` says why.
+    """
+    resolved = resolve_repo_or_no_forge(audit_id, repo)
+    if resolved == NO_FORGE_REPO:
+        return resolved, None
+    reason = unreachable_reason(resolved)
+    if reason is None:
+        return resolved, None
+    log(f"UNREACHABLE: {resolved}: {reason}; the run keeps its findings in the report store")
+    return NO_FORGE_REPO, (resolved, reason)
+
+
+def unreachable_note(unreachable: tuple[str, str] | None, *, stored: bool = True) -> str:
+    """The no-forge note: why the run has no repository to publish to.
+
+    `unreachable` is the pair `resolve_reachable_repo` returns, or None for an
+    install that registers no repository.
+    """
+    if unreachable is None:
+        return NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
+    repo, reason = unreachable
+    template = UNREACHABLE_NOTE if stored else UNREACHABLE_UNSTORED_NOTE
+    return template.format(repo=repo, reason=reason, noun=_proposal_noun(repo))
 
 
 def no_forge_workspace(audit_id: str) -> Path:
@@ -15780,7 +15889,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
             stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
-    repo = resolve_repo_or_no_forge(audit_id, opt_repo)
+    repo, unreachable = resolve_reachable_repo(audit_id, opt_repo)
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
@@ -15788,7 +15897,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
-        log(f"NO FORGE: {NO_FORGE_NOTE}")
+        log(f"NO FORGE: {unreachable_note(unreachable)}")
         root = no_forge_workspace(audit_id)
         existing_issue, pending, carried = None, [], []
     else:
@@ -15839,7 +15948,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                 # a mode switch. `none` is an install with no forge: nothing
                 # publishes the fixes, and the workspace is empty.
                 "mode": NO_FORGE_MODE if no_forge else ("content" if content_mode() else "directory"),
-                **({"no_forge": NO_FORGE_NOTE} if no_forge else {}),
+                **({"no_forge": unreachable_note(unreachable)} if no_forge else {}),
                 # Where this stream's workspace actually is. The agent does not
                 # start in one and cannot guess this — the path carries a lease
                 # segment, and it is private to this audit, so a manifest
@@ -17064,8 +17173,13 @@ def _finish_without_forge(
     manifest: dict | None,
     waiver: str,
     timers: Callable[[], dict],
+    unreachable: tuple[str, str] | None = None,
 ) -> None:
     """Keep a run on an install with no forge in the report store, and print its line.
+
+    `unreachable` is the repository and the reason when a repository resolved
+    but the broker cannot reach it (`resolve_reachable_repo`); the note then
+    names both, and the JSON line carries them under `unreachable_repo`.
 
     Everything `finish` does with a ledger is skipped: the issue, its delta
     comment, the remediation sweep and the stale closes all need a repository.
@@ -17153,8 +17267,10 @@ def _finish_without_forge(
     )
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
-    note = NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
+    note = unreachable_note(unreachable, stored=stored)
     payload["no_forge"] = note
+    if unreachable is not None:
+        payload[UNREACHABLE_REPO_KEY] = {"repo": unreachable[0], "reason": unreachable[1]}
     # For the same reason, a run the store does not hold is never quiet.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored
     payload["summary"] = render_no_forge_summary(
@@ -17312,7 +17428,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # called from. The real run knows which repository it is finishing and
     # holds the record to it; a dry run resolves nothing and compares only
     # when `--repo` was given.
-    repo_hint = opt_repo if args.dry_run else resolve_repo_or_no_forge(audit_id, opt_repo)
+    unreachable: tuple[str, str] | None = None
+    if args.dry_run:
+        repo_hint = opt_repo
+    else:
+        repo_hint, unreachable = resolve_reachable_repo(audit_id, opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
     # Before the dry-run split, so that the preview and the real run publish
     # the same words. After `adopt_collector_evidence`, which makes the
@@ -17385,7 +17505,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     repo = repo_hint
     if repo == NO_FORGE_REPO:
         _finish_without_forge(
-            audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload
+            audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload,
+            unreachable=unreachable,
         )
         return
     earlier = earlier_finish(audit_id, repo, now)
