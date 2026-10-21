@@ -27338,6 +27338,7 @@ class TestNoForge(BaseTestCase):
                     "repo": audit_report.NO_FORGE_REPO,
                     "text": out["summary"],
                     audit_report.CHAT_REPORT_SILENT_OK_KEY: False,
+                    audit_report.CHAT_REPORT_NEWS_KEY: True,
                     audit_report.CHAT_REPORT_NEW_IDS_KEY: [],
                 }
             ],
@@ -27915,10 +27916,10 @@ class TestSecondFinishInOneRun(HarnessTestCase):
     def start(self):
         audit_report.open_chat_report(AUDIT, "acme/fleet", datetime.now(timezone.utc))
 
-    def finish_again(self, doc):
+    def finish_again(self, doc, scheduled=True):
         """The second call, which finds the ledger the first one opened."""
         self.harness.replies["issue-list"] = self.issue_list(7, "https://github.com/acme/fleet/issues/7")
-        return self.run_finish(doc)
+        return self.run_finish(doc, scheduled=scheduled)
 
     def chat_record(self):
         return json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
@@ -27994,6 +27995,63 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertIn("/remediate", body)
         self.assertIn("an earlier finish in this run already ran the automatic sweep", body)
         self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+    def manifest_findings(self, count):
+        findings = []
+        for i in range(count):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    title=f"Crit {i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        return findings
+
+    def test_a_second_on_demand_finish_opens_no_more_pull_requests(self):
+        self.start()
+        findings = self.manifest_findings(audit_report.AUTO_PROMOTION_CAP + 2)
+        doc = make_doc(findings=findings)
+        self.assertEqual(self.run_finish(doc, scheduled=False), 0)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, audit_report.AUTO_PROMOTION_CAP)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                pr(100 + i, audit_report.group_branch_for(AUDIT, [finding]))
+                for i, finding in enumerate(findings[: audit_report.AUTO_PROMOTION_CAP])
+            ]
+        )
+
+        self.assertEqual(self.finish_again(doc, scheduled=False), 0)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+        self.assertTrue(self.stdout_json()[audit_report.SILENT_FLOOR_KEY])
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn("an earlier finish in this run already ran the automatic sweep", body)
+
+    def test_a_second_on_demand_finish_after_one_with_no_news_opens_its_pull_request(self):
+        """An on-demand `finish` is never silent, but it is not news either.
+
+        Only news or an opened pull request is a floor for the next `finish`.
+        """
+        quiet = make_doc(findings=[make_finding(fid="m", severity="major")])
+        self.assertEqual(self.run_finish(quiet), 0)
+        Path(audit_report.chat_report_path_for(AUDIT)).unlink()
+        self.start()
+        self.assertEqual(self.finish_again(quiet, scheduled=False), 0)
+        first = self.stdout_json()
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(first["new"], 0)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+        fixed = make_doc(findings=[*quiet["findings"], *self.manifest_findings(1)])
+        self.assertEqual(self.finish_again(fixed, scheduled=False), 0, self.err)
+        second = self.stdout_json()
+        self.assertNotIn(audit_report.SILENT_FLOOR_KEY, second)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertNotIn("an earlier finish in this run already ran the automatic sweep", body)
 
     def test_a_finish_that_dies_after_the_store_write_still_leaves_its_verdict(self):
         self.start()

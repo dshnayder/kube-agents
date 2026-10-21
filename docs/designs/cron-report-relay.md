@@ -228,8 +228,10 @@ two hours, is the same run. It adds its report under the earlier one's, below a 
 and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
 report, the later one fills the entry in its place. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
-it writes the report store. When that was `false` the later one is not silent either and its automatic
-sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
+it writes the report store. With it, it saves `news`: true when it reported news or opened a pull
+request. When `news` was true the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`, `silent_floor`). The floor does not read `silent_ok`,
+because an on-demand `finish` always gets `silent_ok: false`, also when it reported nothing new. A `finish` with no `start` fills no entry,
 but while a current record holds this repository's entry with a saved verdict it is taken for a
 later `finish` of that run, and the
 relay posts that run's report again with its own under it. The relay

@@ -845,6 +845,11 @@ CHAT_REPORT_TEXT_KEY = "text"
 # the same run must not turn silent, and the ids its ledger body marked new.
 CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
 CHAT_REPORT_NEW_IDS_KEY = "new_ids"
+# Saved with the verdict: True when that `finish` reported news or opened a
+# pull request, which is the silent floor of a later `finish`. It is not read
+# from `silent_ok`, because an on-demand `finish` is never silent, also when
+# it reported nothing new. A part without the key reads `silent_ok` False.
+CHAT_REPORT_NEWS_KEY = "news"
 # Above a later `finish`'s report in the same entry: its counts are measured
 # against the report above it, or against what an earlier `finish` that died
 # before its report published, not against the previous run.
@@ -3239,7 +3244,11 @@ def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
 
 def silent_floor(earlier: dict | None) -> bool:
     """Whether an earlier `finish` in this run reported news or opened a pull request."""
-    return earlier is not None and earlier.get(CHAT_REPORT_SILENT_OK_KEY) is False
+    if earlier is None:
+        return False
+    if CHAT_REPORT_NEWS_KEY in earlier:
+        return bool(earlier[CHAT_REPORT_NEWS_KEY])
+    return earlier.get(CHAT_REPORT_SILENT_OK_KEY) is False
 
 
 def apply_earlier_finish(payload: dict, earlier: dict | None) -> None:
@@ -3257,12 +3266,20 @@ def apply_earlier_finish(payload: dict, earlier: dict | None) -> None:
 
 
 def save_chat_verdict(
-    audit_id: str, repo: str, silent_ok: bool, new_ids: Iterable[str], now: datetime
+    audit_id: str,
+    repo: str,
+    silent_ok: bool,
+    new_ids: Iterable[str],
+    now: datetime,
+    *,
+    news: bool,
 ) -> None:
     """Save this `finish`'s verdict on `repo`'s entry. Best-effort: never fails the run.
 
     Called as each sweep pull request opens and before the store write, so a
     `finish` that dies after either still leaves the verdict for its re-run.
+    `news` says that this `finish` reported news or opened a pull request
+    (`silent_floor`). Once saved True in a run, it stays True.
     """
     record = _live_chat_record(audit_id, now)
     if record is None:
@@ -3271,6 +3288,7 @@ def save_chat_verdict(
     if part is None:
         return
     part[CHAT_REPORT_SILENT_OK_KEY] = bool(silent_ok)
+    part[CHAT_REPORT_NEWS_KEY] = bool(part.get(CHAT_REPORT_NEWS_KEY)) or bool(news)
     part[CHAT_REPORT_NEW_IDS_KEY] = sorted(set(part.get(CHAT_REPORT_NEW_IDS_KEY) or []) | set(new_ids))
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
@@ -17595,6 +17613,18 @@ def _finish_without_forge(
         stored_ids,
         not_resolved=(scheduled_ids or []) if gaps else (),
     )
+    # The findings branch's rule: quiet only when nothing changed and the run
+    # could vouch for what it saw. Only a scheduled run can be quiet, but an
+    # on-demand run that would have been quiet is no news (`silent_floor`).
+    quiet = not (
+        not delta_known
+        or new_ids
+        or resolved_ids
+        or ids_moved
+        or gaps
+        or unpublished
+        or wholly_dropped
+    )
     payload = {
         "status": NO_FORGE_STATUS,
         "issue_url": None,
@@ -17603,18 +17633,7 @@ def _finish_without_forge(
         "prs_opened": [],
         "prs_still_open": [],
         "prs_closed": [],
-        # The findings branch's rule: quiet only when nothing changed and the
-        # run could vouch for what it saw. Only a scheduled run can be quiet.
-        "silent_ok": scheduled
-        and not (
-            not delta_known
-            or new_ids
-            or resolved_ids
-            or ids_moved
-            or gaps
-            or unpublished
-            or wholly_dropped
-        ),
+        "silent_ok": scheduled and quiet,
         "partial": bool(gaps),
         "coverage_gaps": gaps,
         "declared": len(declared),
@@ -17635,7 +17654,14 @@ def _finish_without_forge(
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
-    save_chat_verdict(audit_id, NO_FORGE_REPO, payload["silent_ok"], [], now)
+    save_chat_verdict(
+        audit_id,
+        NO_FORGE_REPO,
+        payload["silent_ok"],
+        [],
+        now,
+        news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
+    )
     stored = write_report(
         audit_id,
         report_envelope(
@@ -18739,6 +18765,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
         clean_resolved = 0 if (gaps or unaccounted or held_unread) else len(previous_ids)
+        # Whether a scheduled run would be quiet. An on-demand run is never
+        # silent, but when this is True it is no news (`silent_floor`).
+        clean_quiet = not (
+            clean_resolved
+            or ids_moved
+            or coverage_moved
+            or unreported_under_gap
+            or prs_closed
+            or unaccounted
+            or held_unread
+            or collector_speaks
+        )
         payload = {
             # HELD is CLEAN refused its close: the same zero findings,
             # with the ledger left open over findings the run did not
@@ -18758,18 +18796,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # a new or changed gap means it could not look rather than
             # found nothing. A gap that did not change since the stored
             # run was said on the run that got it (`coverage_changed`).
-            # Only a scheduled run can be quiet.
-            "silent_ok": scheduled
-            and not (
-                clean_resolved
-                or ids_moved
-                or coverage_moved
-                or unreported_under_gap
-                or prs_closed
-                or unaccounted
-                or held_unread
-                or collector_speaks
-            ),
+            # Only a scheduled run can be quiet (`clean_quiet`).
+            "silent_ok": scheduled and clean_quiet,
             "partial": bool(gaps),
             "coverage_gaps": gaps,
             # How many postures a declaration kept off the ledger.
@@ -18840,7 +18868,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             stored_issue = opened_issue
             stored_body, stored_ids = opened_body, []
         apply_earlier_finish(payload, earlier)
-        save_chat_verdict(audit_id, repo, payload["silent_ok"], [], now)
+        save_chat_verdict(
+            audit_id,
+            repo,
+            payload["silent_ok"],
+            [],
+            now,
+            news=not clean_quiet or bool(payload.get(SILENT_FLOOR_KEY)),
+        )
         write_report(
             audit_id,
             report_envelope(
@@ -19144,7 +19179,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         noun=noun,
         # As each opens, and not only before the store write: a `finish` that
         # dies after one is re-run, and the re-run must not sweep again.
-        on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now),
+        on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now, news=True),
     )
 
     # What the live ledger renders once this branch is done, for the store.
@@ -19246,6 +19281,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     reported_resolved = (
         0 if (gaps or stale_scheme or not delta_known) else len(resolved_ids)
     )
+    # Whether a scheduled run would be quiet; the note at `silent_ok` below
+    # gives each term. An on-demand run is never silent, but when this is
+    # True it is no news (`silent_floor`).
+    quiet = not (
+        not delta_known
+        or ids_moved
+        or reported_new
+        or reported_resolved
+        or coverage_moved
+        or unreported_under_gap
+        or prs_opened
+        or prs_closed
+        or collector_speaks
+    )
     payload = {
         "status": status,
         "issue_url": issue_url,
@@ -19294,18 +19343,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # A coverage gap is news only when it is new or changed since the
         # stored run (`coverage_changed`). A gap that stays the same is said
         # on the run that gets it, and stays in the ledger and on this line.
-        "silent_ok": scheduled
-        and not (
-            not delta_known
-            or ids_moved
-            or reported_new
-            or reported_resolved
-            or coverage_moved
-            or unreported_under_gap
-            or prs_opened
-            or prs_closed
-            or collector_speaks
-        ),
+        "silent_ok": scheduled and quiet,
         # Coverage, and only coverage: `partial` is true iff
         # `coverage_gaps` is non-empty, on this branch and on the CLEAN
         # one alike. It used to also be set by `rendered.partial` —
@@ -19339,7 +19377,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         **timer_payload(),
     }
     apply_earlier_finish(payload, earlier)
-    save_chat_verdict(audit_id, repo, payload["silent_ok"], new_marked or [], now)
+    save_chat_verdict(
+        audit_id,
+        repo,
+        payload["silent_ok"],
+        new_marked or [],
+        now,
+        news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
+    )
     write_report(
         audit_id,
         report_envelope(
