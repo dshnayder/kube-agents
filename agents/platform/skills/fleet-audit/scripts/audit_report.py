@@ -1574,6 +1574,11 @@ ROUTE_NOTE_PATTERN = re.compile(
         for template in (DECLARED_NOTE, RELEASE_NOTE, NAMESPACE_DIRECTORY_NOTE, RECONCILED_NOTE)
     )
 )
+# What must not touch a path in a worker's note for the note to name that
+# path as a whole path: no path character before it, and no path character
+# after it, also after a full stop that ends a sentence.
+WHOLE_PATH_BEFORE = r"(?<![\w./-])"
+WHOLE_PATH_AFTER = r"(?!\.?[\w/-])"
 # The same, with the spaces before it, so that a removal keeps the newlines.
 ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
 # What a worker note is cut with when the route notes need its space.
@@ -15299,7 +15304,7 @@ def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
 
 def _names_path(text: str, path: str) -> bool:
     """Whether `text` names `path` as a whole path, not as part of a longer one."""
-    return bool(re.search(r"(?<![\w./-])" + re.escape(path) + r"(?!\.?[\w/-])", text))
+    return bool(re.search(WHOLE_PATH_BEFORE + re.escape(path) + WHOLE_PATH_AFTER, text))
 
 
 def _location_note(found: RouteEvidence) -> tuple[str, str]:
