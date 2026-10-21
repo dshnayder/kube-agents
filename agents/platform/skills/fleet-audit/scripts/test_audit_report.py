@@ -27980,6 +27980,7 @@ class TestNoRepositoryChosen(BaseTestCase):
     def test_the_run_reports_to_chat_and_the_store_with_the_remedy(self):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
         started = self.stdout_json()
+        start_err = self.err
         self.assertEqual(started["mode"], audit_report.NO_FORGE_MODE)
         self.assertIn("role: gitops", started["no_forge"])
         path = audit_report.findings_path_for(AUDIT)
@@ -27994,6 +27995,13 @@ class TestNoRepositoryChosen(BaseTestCase):
         self.assertIn("role: gitops", reason)
         self.assertIn("--repo", reason)
         self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
+        # The operator reads the summary, so the instruction to the agent is
+        # only on the agent's own stderr line.
+        agent_note = "Do not choose a repository yourself"
+        for text in (started["no_forge"], reason, out["summary"]):
+            self.assertNotIn(agent_note, text)
+        self.assertIn("NO REPOSITORY CHOSEN: ", start_err)
+        self.assertIn(agent_note, start_err)
         # The chat relay has the summary, and no repository was used.
         record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
         self.assertEqual([part["text"] for part in record["parts"]], [out["summary"]])

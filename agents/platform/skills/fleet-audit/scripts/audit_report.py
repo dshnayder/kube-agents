@@ -958,9 +958,11 @@ UNREACHABLE_REPO_KEY = "unreachable_repo"
 NO_GITOPS_ROLE_MESSAGE = (
     "Multiple repositories configured in ConfigMap ({repos}) and {why}, so the "
     "audit cannot choose the repository for its ledger issue and its fixes. "
-    "{remedy} For one run, pass --repo <owner/name>. Do not choose a repository "
-    "yourself: report this to the user."
+    "{remedy} For one run, pass --repo <owner/name>."
 )
+# What `NoGitOpsRepo` adds for the agent, on stderr only. The note that goes
+# to chat and to the report store is for the operator and does not hold it.
+NO_REPOSITORY_CHOSEN_AGENT_NOTE = "Do not choose a repository yourself: report this to the user."
 # The `why` and `remedy` of NO_GITOPS_ROLE_MESSAGE, by the state of the
 # operator's `gitops_repo` key.
 NO_GITOPS_ROLE_WHY = "none has role gitops"
@@ -1938,7 +1940,14 @@ class NoGitOpsRepo(RuntimeError):
     No repository has role gitops, or the operator's `gitops_repo` key cannot
     be read or names no registered repository. `start` and `finish` take the
     no-forge path with this message; the audit never chooses a repository.
+
+    `message` is the operator's text, for the no-forge note. The string of
+    the error, which stderr shows, also tells the agent not to choose.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{message} {NO_REPOSITORY_CHOSEN_AGENT_NOTE}")
+        self.message = message
 
 
 class BrokerUnavailable(ValidationError):
@@ -12728,7 +12737,7 @@ def resolve_reachable_repo(
         # The same chat path as a run with no repository, with the reason and
         # the remedy, and no repository chosen. "" is that pair's repository.
         log(f"NO REPOSITORY CHOSEN: {exc}")
-        return NO_FORGE_REPO, ("", str(exc))
+        return NO_FORGE_REPO, ("", exc.message)
     if resolved == NO_FORGE_REPO:
         return resolved, None
     reason = unreachable_reason(resolved)
