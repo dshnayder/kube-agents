@@ -18940,9 +18940,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 scheduled=scheduled,
                 scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
                 # A body left untouched still publishes the previous ids, so
-                # a scheduled run stores those as the scheduled baseline.
+                # a scheduled run stores those as the scheduled baseline,
+                # with what the run published: the postures it withheld are
+                # in no body block.
                 scheduled_published_ids=(
-                    stored_ids if scheduled and body_untouched else next_scheduled_ids
+                    sorted(set(stored_ids) | published_ids)
+                    if scheduled and body_untouched
+                    else next_scheduled_ids
                 ),
                 scheduled_reported_under_gap=next_scheduled_reported,
             ),

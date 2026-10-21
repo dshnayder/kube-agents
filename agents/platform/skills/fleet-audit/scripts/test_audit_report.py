@@ -16761,6 +16761,23 @@ class TestScheduledBaselineUnknownOrClosed(HarnessTestCase):
         self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, back)
         self.assertTrue(back["silent_ok"])
 
+    def test_a_held_open_clean_run_keeps_the_postures_it_withheld_in_the_baseline(self):
+        # The declared-intent search was skipped, so `finish` withholds the
+        # posture p and the run is clean over a gap. The body still lists a
+        # and c. The run publishes p as well, so the baseline has p, and the
+        # next run with the same gap and the same posture is quiet.
+        self.seed_scheduled([self.a, self.c])
+        p = make_finding(fid="p", severity="major", obj="Namespace/p")
+        doc = make_doc(findings=[p])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        for expected_silent in (False, True):
+            with self.subTest(silent=expected_silent):
+                self.assertEqual(self.run_finish(doc, scheduled=True), 0, self.err)
+                out = self.stdout_json()
+                self.assertEqual(out["status"], "CLEAN")
+                self.assertTrue(out["postures_withheld"])
+                self.assertEqual(out["silent_ok"], expected_silent)
+
     def test_an_on_demand_run_after_a_held_open_clean_run_does_not_make_the_ids_new(self):
         self.seed_scheduled([self.a, self.c])
         self.finish([], scheduled=True, skipped=self.PARTIAL)
