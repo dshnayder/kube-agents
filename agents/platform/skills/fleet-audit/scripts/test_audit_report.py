@@ -26590,6 +26590,35 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
         self.assert_fence_survives_the_clip(note)
 
+    def test_the_route_notes_keep_the_copied_file(self):
+        """The copied file fills the note up to the cap, and the route-note
+        cut removed the first code block and all text after it: the only
+        published copy of the fix. Now the location note goes first, and the
+        block is made shorter by its own sizing for the reconciler note."""
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB, "".join(f"    key-{i:02d}: {'v' * 40}\n" for i in range(40)))
+        finding = kustomize_fix(self.PDB)
+        self.degrade(root, [finding])
+        self.assertIn("```yaml\n", finding["remediation"]["note"])
+        candidate = {
+            **_cand(finding["check"], finding["cluster"], finding["object"], finding["namespace"]),
+            "declaration": {"path": f"{self.OVERLAY}/deployment.yaml"},
+            "reconciler": "the Argo CD Application `checkout-gateway`",
+        }
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.disclose_manual_remediation_routes([finding], _manifest(("c1", [candidate])))
+        note = finding["remediation"]["note"]
+        self.assertLessEqual(len(audit_report.publishable_text(note)), audit_report.MAX_NOTE_CHARS)
+        self.assertTrue(note.startswith("_(The audit did not open"), note[:80])
+        self.assertIn("```yaml\n    key-00: ", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+        self.assertEqual(note.count("```") % 2, 0, note)
+        self.assertTrue(
+            note.endswith(audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `checkout-gateway`")),
+            note[-300:],
+        )
+        self.assert_fence_survives_the_clip(note)
+
     def test_a_long_broker_error_drops_the_block(self):
         """No room is left after the note's own text, so the block goes."""
         target = self.tmp_path / self.PDB

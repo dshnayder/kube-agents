@@ -1647,6 +1647,20 @@ DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run t
 KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
 # The sentence every note of `degrade_unlisted_kustomize_additions` holds.
 KUSTOMIZE_NOTE_MARK = "A new file in a Kustomize root renders only if its kustomization lists it."
+# The start of a note of `degrade_unlisted_kustomize_additions`: its own text
+# on one line, then the worker's file as a fenced YAML block, or, when no
+# line of the file fits, its own text with no block. The route-note pass
+# does not cut this text, because the block is the only published copy of
+# the fix.
+# Its own text ends at the end of its line when the block follows, and at
+# the first end of a note after the mark when the worker's note follows.
+KUSTOMIZE_NOTE_LINE_TEXT = re.escape(DEGRADED_REMEDIATION_LEDE) + r"[^\n]*" + re.escape(KUSTOMIZE_NOTE_MARK)
+KUSTOMIZE_NOTE_BLOCK_PATTERN = re.compile(
+    r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*\.\)_)"
+    r"\n\n(?P<fence>`{3,})yaml\n(?P<body>.*?)\n(?P=fence)(?:\n|\Z)",
+    re.DOTALL,
+)
+KUSTOMIZE_NOTE_PREFIX_PATTERN = re.compile(r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*?\.\)_)(?= |\Z)")
 # Text that `finish` itself writes into a remediation note. A note that holds
 # one of these is not the worker's wording, and `carry_unchanged_findings`
 # does not copy it: the pass that wrote it runs again on each run and writes
@@ -14974,22 +14988,32 @@ def _manifest_note_block(root: Path, path: str, prefix: str) -> str:
     except (OSError, ValidationError):
         return ""
     lines = text.rstrip("\n").splitlines()
+    return _sized_manifest_block(
+        lines, True, lambda block: len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+    )
 
-    def render(kept: list[str]) -> str:
-        return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
-    def fits(block: str) -> bool:
-        return len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+def _manifest_block_text(kept: list[str]) -> str:
+    """The lines `kept` as the fenced YAML block of a Kustomize note."""
+    return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
+
+def _sized_manifest_block(lines: list[str], whole_file: bool, fits: Callable[[str], bool]) -> str:
+    """The longest block of `lines` that `fits` accepts, or "".
+
+    The block keeps at most MANUAL_NOTE_MANIFEST_LINES lines, and ends in
+    MANUAL_NOTE_TRUNCATED when it keeps less than the whole file. `lines` is
+    the whole file only when `whole_file` is true. The fences are always
+    closed, because the block is cut by lines and not by characters."""
     whole = lines[:MANUAL_NOTE_MANIFEST_LINES]
-    if len(whole) == len(lines) and fits(render(whole)):
-        return render(whole)
+    if whole_file and len(whole) == len(lines) and fits(_manifest_block_text(whole)):
+        return _manifest_block_text(whole)
     kept: list[str] = []
     for line in whole:
-        if not fits(render(kept + [line, MANUAL_NOTE_TRUNCATED])):
+        if not fits(_manifest_block_text(kept + [line, MANUAL_NOTE_TRUNCATED])):
             break
         kept.append(line)
-    block = render(kept + [MANUAL_NOTE_TRUNCATED])
+    block = _manifest_block_text(kept + [MANUAL_NOTE_TRUNCATED])
     return block if fits(block) else ""
 
 
@@ -15429,6 +15453,36 @@ def _split_harness_tail(note: str) -> tuple[str, str]:
     return note[:start].rstrip(), note[start:]
 
 
+class KustomizeNoteHead(NamedTuple):
+    """The start of a note of `degrade_unlisted_kustomize_additions`.
+
+    `prefix` is its own text, `lines` the lines of the copied file without
+    the truncation line (None when the note has no block), `whole` whether
+    the block holds the whole file, and `rest` the worker's note after it.
+    """
+
+    prefix: str
+    lines: list[str] | None
+    whole: bool
+    rest: str
+
+
+def _split_kustomize_head(note: str) -> KustomizeNoteHead:
+    """`note` split after the text of `degrade_unlisted_kustomize_additions`,
+    or with an empty `prefix` when the note does not start with that text."""
+    found = KUSTOMIZE_NOTE_BLOCK_PATTERN.match(note)
+    if found:
+        lines = found.group("body").split("\n")
+        whole = lines[-1] != MANUAL_NOTE_TRUNCATED
+        return KustomizeNoteHead(
+            found.group("prefix"), lines if whole else lines[:-1], whole, note[found.end() :].strip()
+        )
+    found = KUSTOMIZE_NOTE_PREFIX_PATTERN.match(note)
+    if found:
+        return KustomizeNoteHead(found.group("prefix"), None, True, note[found.end() :].strip())
+    return KustomizeNoteHead("", None, True, note)
+
+
 def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
 
@@ -15442,6 +15496,13 @@ def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     the stored note has no `HARNESS_NOTE_MARKS` entry. The cut goes into it
     only when the reconciler note, or the last route note, leaves no room
     for it.
+
+    The text of `degrade_unlisted_kustomize_additions` at the start of the
+    note, with the copied file, is not cut either: the block is the only
+    published copy of the fix. When the route notes do not fit with it, the
+    location note goes first. Then the block is made shorter by lines
+    (`_sized_manifest_block`) to make room for the reconciler note, and its
+    fences stay closed.
 
     A worker note that leaves a code fence open gets the fence closed, so the
     text after it is prose. A cut never goes inside a code block: a worker
@@ -15457,33 +15518,53 @@ def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     notes = [note for note in notes if note]
     if not notes:
         return worker_note, ""
-    body, tail = _split_harness_tail(worker_note)
-    for kept, harness in ((body, tail), (worker_note, "")) if tail else ((worker_note, ""),):
+    head = _split_kustomize_head(worker_note)
+    block = ""
+    if head.lines is not None:
+        block = _manifest_block_text(head.lines if head.whole else [*head.lines, MANUAL_NOTE_TRUNCATED])
+    harness_head = head.prefix + block
+    body, tail = _split_harness_tail(head.rest)
+    for kept, harness in ((body, tail), (head.rest, "")) if tail else ((head.rest, ""),):
         for first in range(len(notes)):
             added = NOTE_SEPARATOR.join(notes[first:])
-            fitted = _cut_worker_note(kept, harness, added)
+            fitted = _cut_worker_note(kept, harness, added, harness_head)
             if fitted is not None:
                 return fitted, added
-    return worker_note, ""
+    if head.lines is None or not notes[-1].startswith(RECONCILED_NOTE_LEDE):
+        return worker_note, ""
+    # Only the reconciler note, and a shorter copy of the file.
+    added = notes[-1]
+    block = _sized_manifest_block(
+        head.lines,
+        head.whole,
+        lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None,
+    )
+    fitted = _cut_worker_note(head.rest, "", added, head.prefix + block)
+    return (fitted, added) if fitted is not None else (worker_note, "")
 
 
-def _cut_worker_note(body: str, tail: str, added: str) -> str | None:
+def _cut_worker_note(body: str, tail: str, added: str, head: str = "") -> str | None:
     """`body` cut so that it, `tail` and the route notes `added` fit
-    `MAX_NOTE_CHARS`, with `tail` after it, or None when no cut fits."""
+    `MAX_NOTE_CHARS`, with `head` before it and `tail` after it, or None when
+    no cut fits. `head` and `tail` are text that `finish` wrote."""
     if body.count(CODE_FENCE) % 2:
         body += CODE_FENCE_CLOSE
 
-    def joined(head: str) -> str:
+    def joined(cut: str) -> str:
         # A fence line with text after it does not close the fence.
-        separator = ROUTE_PARAGRAPH_BREAK if head.endswith(CODE_FENCE) else NOTE_SEPARATOR
-        return separator.join(part for part in (head, tail) if part)
+        separator = ROUTE_PARAGRAPH_BREAK if cut.endswith(CODE_FENCE) else NOTE_SEPARATOR
+        worker = separator.join(part for part in (cut, tail) if part)
+        return (head + NOTE_SEPARATOR + worker if worker else head).strip()
 
-    def fits(head: str) -> bool:
-        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(head), added) if part)
+    def fits(cut: str) -> bool:
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(cut), added) if part)
         return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
 
     if fits(body):
         return joined(body)
+    if head and not body:
+        # No worker text to cut, so no truncation mark.
+        return None
     prose = body[: body.index(CODE_FENCE)] if CODE_FENCE in body else body
 
     def cut(room: int) -> str:

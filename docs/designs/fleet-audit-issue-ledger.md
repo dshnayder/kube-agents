@@ -685,7 +685,10 @@ it, and the text before the block is cut. When the route notes still do not fit 
 mark, the location note is left out; the reconciler note always fits, because of the caps above, so
 a reconciled object is never published without it. The cut is in the worker's part of the note:
 the text that the degrade of an unwritten file adds at the end stays whole, unless the reconciler
-note leaves no room for it. The stored document keeps the note from before the cut in the
+note leaves no room for it. The text that the Kustomize degrade writes at the start, with its copy
+of the worker's file, is never cut, because that copy is the only published copy of the fix. When
+the route notes do not fit with it, the location note is left out first, and then the copy is made
+shorter by whole lines, with its fences closed, to make room for the reconciler note. The stored document keeps the note from before the cut in the
 remediation's `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut
 does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
