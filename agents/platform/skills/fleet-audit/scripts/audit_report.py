@@ -1511,6 +1511,26 @@ RELEASE_NOTE = (
 )
 NAMESPACE_DIRECTORY_NOTE_LEDE = "_(A new object for this namespace belongs under "
 NAMESPACE_DIRECTORY_NOTE = NAMESPACE_DIRECTORY_NOTE_LEDE + "`{path}`.)_"
+# The namespace-directory note for the two `namespace_directory.source`
+# values that oblige the worker to do more than add a file. A Kustomize root
+# renders only the files that its `resources:` names. A directory for the
+# whole cluster supplies no namespace, and a cluster-scoped finding can get it.
+NAMESPACE_OVERLAY_NOTE = (
+    NAMESPACE_DIRECTORY_NOTE_LEDE + "the Kustomize root `{path}`. "
+    "List its file in the `resources:` of that root, or it does not render.)_"
+)
+NAMESPACE_CLUSTER_NOTE = (
+    "_(A new object for this cluster belongs under `{path}`. That directory serves the whole "
+    "cluster, so a namespaced object there must set `metadata.namespace`.)_"
+)
+# The `namespace_directory.source` values `collect.namespace_directories`
+# writes, copied because this script does not import the collector, and the
+# note for each. Another value gets `NAMESPACE_DIRECTORY_NOTE`, as `sibling`.
+NAMESPACE_DIRECTORY_NOTES = {
+    "sibling": NAMESPACE_DIRECTORY_NOTE,
+    "overlay": NAMESPACE_OVERLAY_NOTE,
+    "cluster": NAMESPACE_CLUSTER_NOTE,
+}
 RECONCILED_NOTE_LEDE = "_(Reconciled by "
 RECONCILED_NOTE = (
     RECONCILED_NOTE_LEDE + "{reconciler}. The next sync or upgrade can revert a change made "
@@ -1571,7 +1591,14 @@ ROUTE_NOTE_PATTERN = re.compile(
         .replace(re.escape("{noun}"), f"(?:{ROUTE_NOUN_TEXT})")
         .replace(re.escape("{reconciler}"), f"(?:{RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
         + ")"
-        for template in (DECLARED_NOTE, RELEASE_NOTE, NAMESPACE_DIRECTORY_NOTE, RECONCILED_NOTE)
+        for template in (
+            DECLARED_NOTE,
+            RELEASE_NOTE,
+            NAMESPACE_DIRECTORY_NOTE,
+            NAMESPACE_OVERLAY_NOTE,
+            NAMESPACE_CLUSTER_NOTE,
+            RECONCILED_NOTE,
+        )
     )
 )
 # What must not touch a path in a worker's note for the note to name that
@@ -15248,6 +15275,7 @@ class RouteEvidence(NamedTuple):
     release: str
     renderer: str
     namespace_directory: str
+    namespace_source: str
     reconciler: str
 
 
@@ -15290,11 +15318,13 @@ def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
     evidence: dict[str, RouteEvidence] = {}
     for entry, candidate in _candidates(manifest):
         release = candidate.get("release_declaration")
+        directory = candidate.get("namespace_directory")
         found = RouteEvidence(
             declaration=_field_path(candidate, "declaration"),
             release=_field_path(candidate, "release_declaration"),
             renderer=str((release or {}).get("renderer") or "") if isinstance(release, dict) else "",
             namespace_directory=_field_path(candidate, "namespace_directory"),
+            namespace_source=str((directory or {}).get("source") or "") if isinstance(directory, dict) else "",
             reconciler=_shown_reconciler(candidate),
         )
         if found.declaration or found.release or found.namespace_directory or found.reconciler:
@@ -15312,7 +15342,8 @@ def _location_note(found: RouteEvidence) -> tuple[str, str]:
 
     One location note at most, the most specific that the collector found:
     the object's own file, then the release that renders it, then the
-    directory for a new object.
+    directory for a new object, with what its `source` obliges the reader to
+    do (`NAMESPACE_DIRECTORY_NOTES`).
     """
     if found.declaration:
         return found.declaration, DECLARED_NOTE.format(path=found.declaration)
@@ -15320,7 +15351,8 @@ def _location_note(found: RouteEvidence) -> tuple[str, str]:
         noun = RELEASE_RENDERER_NOUNS.get(found.renderer, RELEASE_RENDERER_FALLBACK_NOUN)
         return found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
     if found.namespace_directory:
-        return found.namespace_directory, NAMESPACE_DIRECTORY_NOTE.format(path=found.namespace_directory)
+        template = NAMESPACE_DIRECTORY_NOTES.get(found.namespace_source, NAMESPACE_DIRECTORY_NOTE)
+        return found.namespace_directory, template.format(path=found.namespace_directory)
     return "", ""
 
 

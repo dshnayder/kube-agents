@@ -97,7 +97,7 @@ _(Reconciled by the Helm release `vllm` in serving. The next sync or upgrade can
 _(Reconciled by the Argo CD Application `web`. The next sync or upgrade can revert a change made by hand to the live object; make the change where that reconciler gets its configuration.)_
 ```
 
-For a Kustomize overlay the release note says "the Kustomize overlay" in place of "the chart release". A note shows a path or a name only when it has letters, digits and `_./-` and is not longer than 512 characters: another path gives no location note, and another reconciler, or one that is not one of the forms above, shows as "a controller whose name the audit does not show". The notes go in a paragraph of their own below the finding's remediation text.
+For a Kustomize overlay the release note says "the Kustomize overlay" in place of "the chart release". When the namespace directory is a local Kustomize root (the second source in rule 3), its note also says to list the new file in the `resources:` of that root. When it is the directory for the whole cluster (the third source), the note says "A new object for this cluster" and that a namespaced object there must set `metadata.namespace`. A note shows a path or a name only when it has letters, digits and `_./-` and is not longer than 512 characters: another path gives no location note, and another reconciler, or one that is not one of the forms above, shows as "a controller whose name the audit does not show". The notes go in a paragraph of their own below the finding's remediation text.
 
 ### Tier 2 — remediation pull requests
 

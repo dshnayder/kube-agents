@@ -244,17 +244,18 @@ field, and publishes nothing:
   then returns next run as `pr-merged-persists`, where neither documented explanation fits.
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
-  can revert a patch to the live object), or else the `namespace_directory` for a new object. It
-  skips that location note when your note names the same path and the cut below keeps that
-  mention. It also names the `reconciler`, whose next sync or upgrade can revert a change made by
-  hand. The notes go in a paragraph of their own after your note. It writes no note for a candidate without these fields,
-  and none for a fix that `finish` wrote itself, that you declined with `--decline-fix`, or that a
-  pull request already carries. It removes route notes that your note copied from an earlier
-  ledger. It closes a code fence that your note leaves open. When your note and the route notes
-  together are longer than the note cap, it cuts your note and ends it with ` …(truncated)`, so
-  that the route notes fit. A note with a code fence is cut only before its first fence; when that
-  does not give room, the route notes are left out. A `--dry-run` can leave out a note the real
-  run adds. Do not copy these notes into your `note`.
+  can revert a patch to the live object), or else the `namespace_directory` for a new object (with
+  the `resources:` entry that an `overlay` source needs, or the `metadata.namespace` that a
+  `cluster` source needs). It skips that location note when your note names the same path and the
+  cut below keeps that mention. It also names the `reconciler`, whose next sync or upgrade can
+  revert a change made by hand. The notes go in a paragraph of their own after your note. It writes
+  no note for a candidate without these fields, and none for a fix that `finish` wrote itself, that
+  you declined with `--decline-fix`, or that a pull request already carries. It removes route notes
+  that your note copied from an earlier ledger. It closes a code fence that your note leaves open.
+  When your note and the route notes together are longer than the note cap, it cuts your note and
+  ends it with ` …(truncated)`, so that the route notes fit. A note with a code fence is cut only
+  before its first fence; when that does not give room, the route notes are left out. A `--dry-run`
+  can leave out a note the real run adds. Do not copy these notes into your `note`.
 
 ### Scope, skipped, and limitations
 

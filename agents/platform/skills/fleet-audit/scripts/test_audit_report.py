@@ -20200,6 +20200,26 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertEqual(self.disclose(finding, manifest), ["a"])
         self.assertIn("_(A new object for this namespace belongs under `clusters/c1/web`.)_", self.note(finding))
 
+    def test_the_namespace_directory_note_says_what_its_source_obliges(self):
+        """A Kustomize root renders only the files its `resources:` names, and
+        a directory for the whole cluster supplies no namespace."""
+        for source, phrase in {
+            "overlay": "List its file in the `resources:` of that root",
+            "cluster": "must set `metadata.namespace`",
+        }.items():
+            with self.subTest(source=source):
+                manifest = self.manifest(namespace_directory={"path": "clusters/c1/web", "source": source})
+                finding = self.manual()
+                self.disclose(finding, manifest)
+                once = self.note(finding)
+                self.assertIn("`clusters/c1/web`", once)
+                self.assertIn(phrase, once)
+                # The next pass finds and removes the whole note it wrote.
+                self.assertEqual(self.disclose(finding, manifest), [])
+                self.assertEqual(self.note(finding), once)
+                self.disclose(finding, self.manifest())
+                self.assertEqual(self.note(finding), self.WORKER_NOTE)
+
     def test_a_reconciled_object_says_a_change_by_hand_can_be_reverted(self):
         for reconciler in ("the Argo CD Application `web`", "the Helm release `web` in web", "`flux`"):
             with self.subTest(reconciler=reconciler):
