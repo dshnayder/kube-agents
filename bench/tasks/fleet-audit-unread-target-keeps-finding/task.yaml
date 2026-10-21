@@ -17,16 +17,21 @@
 # with audit_report's own functions. The host cluster carries no environment
 # label (see consistency-no-environment-label), so the drift collector puts it
 # in no cohort and compares it on no facet: only `no-environment-label` runs
-# there, and its `limitations` sentence is a coverage gap. The same check
-# files a finding on the host, so the run takes the findings branch and
-# writes the body again. `label-keys` is a cluster-level facet, so the
-# collector does not declare it not applicable on the host in either mode.
+# there, and its `limitations` sentence is a coverage gap. A run that files
+# a finding takes the findings branch and writes the body again. On a
+# project with the seeded fleet the planted drift outlier is such a finding
+# (the fixture below). `no-environment-label` files the host itself only when
+# two or more labelled peers share the host's mode (`joinable_for_cluster`
+# in fleet_drift.py), so the grade does not ask for that finding.
+# `label-keys` is a cluster-level facet, so the collector does not declare
+# it not applicable on the host in either mode.
 # No collector emits the invented object, so only a held row can keep its id.
 #
 # THE GRADE. `ledger_issue_contains` on `finding_ids` reads the hidden id
 # block of the ledger that the report cites. The body is the one this run's
-# `finish` wrote, so the default clock-skew window holds, and the
-# `no-environment-label` objective shows that this run wrote it.
+# `finish` wrote, so the default clock-skew window holds. The held-row
+# objective shows that this run wrote it: only the held-row renderer writes
+# its line, and the stack's body has no held row.
 #
 # Eval-driven development (.agents/rules/eval_driven_development.md): red on
 # main, where the body is written from the run's document alone and the
@@ -41,6 +46,8 @@
 #      reaches the floor (consistency-no-environment-label's header has the
 #      arithmetic); `label-keys` then runs on the host, the finding is gone,
 #      and the change correctly does not keep it.
+#   -- the run files no finding at all. The clean branch then keeps the
+#      stack's body as it is, and the held-row objective fails.
 #   -- the run writes the seeded finding into its own document. That is a
 #      false green on main, not a red.
 #   -- the drift collector spells the host target other than
@@ -80,9 +87,10 @@ domain: fleet-audits
 owner: dshnayder
 
 # The stack plants everything this case asserts on, and the gap is the host
-# cluster's, which is the install and not a fixture; no seeded-fleet role is
-# read (docs/designs/bench-case-format.md, the `fixtures: []` rule).
-fixtures: []
+# cluster's, which is the install and not a fixture. The run needs one
+# finding to write the body again, and on the seeded fleet the drift outlier
+# gives it; no check reads the fixture itself.
+fixtures: [drift-outlier]
 
 verification_spec:
   # The id is "label-keys.<host target>._.cluster-eval-unread-held". The
@@ -100,7 +108,9 @@ verification_spec:
       scope: finding_ids
       required_phrases: ["eval-unread-held"]
   # The row says why it is held. Only the held-row renderer writes this line,
-  # with the facet and the host target in it.
+  # with the facet and the host target in it. The stack's body has no held
+  # row, so this check also refuses a clean run that left that body as it is,
+  # even when its footer stamp falls inside the default clock-skew window.
   - name: the-held-row-says-the-facet-did-not-run
     role: objective
     mode: assert
@@ -109,18 +119,6 @@ verification_spec:
       audit: fleet-consistency-drift
       scope: body
       required_phrases: ["- **Not re-checked:** `label-keys` did not run on"]
-  # The run took the findings branch, which is the branch that writes the
-  # body again. A clean run over the gap leaves the stack's body as it is,
-  # and that body's footer stamp can fall inside the default clock-skew
-  # window; the stack's body has no such id, so this check refuses it.
-  - name: the-run-filed-the-unlabelled-host
-    role: objective
-    mode: assert
-    check:
-      type: ledger_issue_contains
-      audit: fleet-consistency-drift
-      scope: finding_ids
-      required_phrases: ["no-environment-label"]
   # The audit reads the fleet and changes nothing. Labelling the host would
   # also put it in a cohort, so a run that "fixes" the gap destroys what the
   # case grades on later repetitions.
