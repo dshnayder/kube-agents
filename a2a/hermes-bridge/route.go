@@ -54,8 +54,9 @@ const (
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
 // the agent side spells it with (Hermes's, and lib's NotifyPlatform names).
-// A conversation on any other door (inject, the A2A door, Discord) has no
-// notify route, and no route is recorded for it.
+// A conversation on any other door (inject, console, the A2A door, Discord) has
+// no chat notify route; identityRouteFor records an identity-only route for
+// doors that still carry speaker or audience context.
 var routePlatforms = map[string]string{
 	"gchat:": lib.NotifyPlatformGchat,
 	"slack:": lib.NotifyPlatformSlack,
@@ -89,7 +90,9 @@ type routeAuthority struct {
 		Kind         string `json:"kind"`
 	} `json:"audience"`
 	Requester struct {
-		Principal string `json:"principal"`
+		Principal  string `json:"principal"`
+		Backend    string `json:"backend"`
+		VerifiedBy string `json:"verifiedBy"`
 	} `json:"requester"`
 }
 
@@ -128,8 +131,19 @@ func routeFor(env *lib.Envelope) (conversationRoute, error) {
 	return conversationRoute{}, errNoChatConversation
 }
 
+// hasSharedPrincipal reports whether the gateway conversation or requester
+// uses a shared credential across multiple humans (such as the console door's
+// nats:console principal). Personal memory must stay off for shared principals
+// so one operator's private memories never pool with another's.
+func hasSharedPrincipal(key string, auth routeAuthority) bool {
+	return strings.HasPrefix(key, "console:") ||
+		strings.TrimSpace(auth.Requester.Backend) == "console" ||
+		strings.TrimSpace(auth.Requester.VerifiedBy) == "nats-grant"
+}
+
 // identityRouteFor extracts an identity-only record for doors without a chat
-// notify route (such as inject) when the gateway supplies a requester principal.
+// notify route (such as inject or console) when the gateway supplies a
+// requester principal or a shared-principal door supplies an audience kind.
 func identityRouteFor(env *lib.Envelope) (conversationRoute, bool) {
 	auth, err := parseRouteAuthority(env)
 	if err != nil {
@@ -138,7 +152,12 @@ func identityRouteFor(env *lib.Envelope) (conversationRoute, bool) {
 	key := strings.TrimSpace(auth.Audience.Conversation)
 	userID := strings.TrimSpace(auth.Requester.Principal)
 	chatType := strings.TrimSpace(auth.Audience.Kind)
-	if key == "" || userID == "" || env.ContextID == "" {
+	if hasSharedPrincipal(key, auth) {
+		userID = ""
+		if key == "" || chatType == "" || env.ContextID == "" {
+			return conversationRoute{}, false
+		}
+	} else if key == "" || userID == "" || env.ContextID == "" {
 		return conversationRoute{}, false
 	}
 	return conversationRoute{

@@ -1474,8 +1474,10 @@ DM-only by design.
 
 #### Why a space stays on one session
 
-`thread_sessions_per_user` would restore attribution, and with it personal memory,
-by giving each participant their own session. It is deliberately left off: a space's
+In `spec.mode: today`, `thread_sessions_per_user` would restore attribution, and
+with it personal memory, by giving each participant their own session. It is
+deliberately left off (and in `spec.mode: next`, the A2A gateway always assigns one
+`context_id` per group thread regardless of `thread_sessions_per_user`): a space's
 value is the shared thread, and with per-user sessions Bob's follow-up lands in a
 session that never saw Alice ask the question.
 

@@ -210,6 +210,60 @@ func TestAPI_InjectConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
 	}
 }
 
+// A console conversation uses a shared credential (nats:console, backend:
+// "console", verifiedBy: "nats-grant") across all operators holding the grant.
+// It records an identity-only route with UserID cleared ("") and ChatType kept
+// so the memory provider treats the session as an interactive unattributable
+// DM rather than pooling personal memory across operators.
+func TestAPI_ConsoleConversationClearsSharedPrincipalUserID(t *testing.T) {
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-console", "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": "console:tok-1", "kind": "dm"}
+	auth["requester"] = map[string]any{
+		"principal":  "hmac:fedcba9876543210fedcba9876543210",
+		"backend":    "console",
+		"verifiedBy": "nats-grant",
+	}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, "task-console", "ctx-console", "corr-console",
+		messagePayload(t, "task-console", "ctx-console", "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-console"), env); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, "task-console")
+	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+		t.Fatalf("answer = %q carries the route-lost note for a console door", got)
+	}
+	puts := store.seen()
+	want := routePut{
+		path: "PUT /v1/sessions/a2a-ctx-console/route",
+		auth: "Bearer kv-key",
+		body: conversationRoute{
+			Conversation: "console:tok-1",
+			ContextID:    "ctx-console",
+			UserID:       "",
+			ChatType:     "dm",
+		},
+	}
+	if len(puts) != 1 || puts[0] != want {
+		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
+	}
+}
+
 // A route the store refuses is said in the answer: a turn that ends
 // "completed" and then nothing, while the card's answer goes nowhere, is the
 // failure this exists to end.

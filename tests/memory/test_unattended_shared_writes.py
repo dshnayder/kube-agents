@@ -214,8 +214,30 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         An unqualified write must default to `personal` and be refused rather than
         silently publishing the human's personal fact to `scope:shared`.
         """
-        p, retained = provider(unattended=False)
-        p._personal_disabled_reason = NO_IDENTITY_NOTICE
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+
+        p = KubeAgentsMemoryProvider()
+        retained = {}
+
+        class StubClient:
+            def aretain_batch(self, **kw):
+                retained.update(kw)
+                return SimpleNamespace(id="doc-1")
+
+        stub_hs = SimpleNamespace(
+            _bank_id="kube-agents-memory",
+            _budget="low",
+            _recall_max_tokens=4096,
+            _recall_types=["observation"],
+            _run_hindsight_operation=lambda op: op(StubClient()),
+        )
+        with patch.object(kam_client, "load_hindsight", return_value=stub_hs), \
+             patch.object(kam_client, "apply_scoping"), \
+             patch.object(kam_client, "ensure_bank"):
+            p.initialize("a2a-ctx-unrouted")
+        self.assertFalse(p._unattended)
+        self.assertEqual(p._personal_disabled_reason, NO_IDENTITY_NOTICE)
         r = json.loads(p.handle_tool_call("memory_retain", {
             "content": "My personal GKE cluster is dev-1.",
         }))
