@@ -33,8 +33,9 @@
 # this stack opens.
 #
 # The cluster, project and object names are invented names that only the two
-# cases of this stack use. The destroy closes each open ledger of the stream whose body names the
-# invented cluster. A ledger that the run closed is already closed.
+# cases of this stack use. The destroy closes each open ledger of the stream whose number the
+# seed wrote to the report store, or whose body names the invented cluster. A ledger that the
+# run closed is already closed.
 
 terraform {
   required_version = ">= 1.5.0"

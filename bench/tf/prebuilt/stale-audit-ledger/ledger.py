@@ -33,11 +33,18 @@ stored record does not pass the check that `finish` makes.
 seed-gap: opens one ledger for the stream that a coverage gap opened: no
 finding, the retired cluster checked in full, and a second invented cluster
 under `scope.skipped`. It writes the stored record of that ledger with the gap.
-A clean run with full coverage closes it with nothing new, nothing resolved and
-no gap, which is the run that `finish` calls quiet when it is scheduled.
+The record is the scheduled run that opened the ledger: it carries the gap and
+an empty published set as the scheduled baseline. A clean run with full
+coverage closes it with nothing new, nothing resolved and no gap, which is the
+run that `finish` calls quiet when it is scheduled.
 
-teardown: closes, as not planned, each open ledger of the stream whose body
-names the invented cluster. Only the two cases of this stack write that name.
+Both seed modes write the number of the issue they opened to a file in the
+stream's report store directory, for teardown.
+
+teardown: closes, as not planned, each open ledger of the stream whose number
+the seed wrote or whose body names the invented cluster. Only the two cases of
+this stack write that name. A run with a coverage gap of its own rewrites the
+gap ledger's body, so the number is what finds that ledger.
 """
 
 import json
@@ -70,6 +77,10 @@ TEARDOWN_MODE = "teardown"
 MODES = (SEED_MODE, SEED_GAP_MODE, TEARDOWN_MODE)
 # audit_report's mark on a memory seeded from the ledger, not read from the store.
 SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
+# The file in the stream's report store directory that holds the number of the
+# issue the seed opened. audit_report reads only latest.json and runs/ there.
+SEEDED_ISSUE_FILE = "eval-stale-ledger-issue.json"
+SEEDED_ISSUE_KEY = "issue_number"
 
 
 def stale_document(audit_report, audit_id, gap=False):
@@ -168,6 +179,11 @@ def seed(audit_report, audit_id, repo, now, gap=False):
     url = str(opened.get("url") or "")
     if not isinstance(number, int):
         sys.exit(f"ERROR: the forge opened no issue for {audit_id} in {repo}: {opened}")
+    # Teardown does not create the directory: a store directory that holds
+    # no run is not the same to `finish` as no directory.
+    path = seeded_issue_path(audit_report, audit_id, repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({SEEDED_ISSUE_KEY: number}), encoding="utf-8")
     ids = audit_report.parse_delta_block(rendered.body)
     payload = {
         "status": GAP_SEED_STATUS if gap else SEED_STATUS,
@@ -191,6 +207,11 @@ def seed(audit_report, audit_id, repo, now, gap=False):
             new_ids=ids,
             resolved_ids=[],
             rendered_ids=ids,
+            # The gap ledger stands for the scheduled run that opened it, so
+            # its record is the scheduled baseline: its gap, and no finding.
+            scheduled=gap,
+            scheduled_coverage_gaps=gaps if gap else None,
+            scheduled_published_ids=ids if gap else None,
         ),
         now,
     )
@@ -208,8 +229,24 @@ def seed(audit_report, audit_id, repo, now, gap=False):
     return url
 
 
+def seeded_issue_path(audit_report, audit_id, repo):
+    """The file that holds the number of the issue the seed opened."""
+    return audit_report.reports_dir_for(audit_id, repo) / SEEDED_ISSUE_FILE
+
+
+def seeded_issue(path):
+    """The issue number in `path`, or None when the file is absent or not valid."""
+    try:
+        number = json.loads(path.read_text(encoding="utf-8")).get(SEEDED_ISSUE_KEY)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return number if isinstance(number, int) else None
+
+
 def teardown(audit_report, audit_id, repo):
     """Close each open ledger of the stream that this case opened."""
+    path = seeded_issue_path(audit_report, audit_id, repo)
+    number = seeded_issue(path)
     answer = audit_report.forge(
         "issue-list",
         repo,
@@ -217,11 +254,14 @@ def teardown(audit_report, audit_id, repo):
     )
     closed = []
     for issue in answer.get("issues") or []:
-        if isinstance(issue, dict) and RETIRED_CLUSTER in str(issue.get("body") or ""):
+        if not isinstance(issue, dict):
+            continue
+        if issue.get("number") == number or RETIRED_CLUSTER in str(issue.get("body") or ""):
             audit_report.forge(
                 "issue-close", repo, {"number": issue["number"], "reason": TEARDOWN_REASON}
             )
             closed.append(issue["number"])
+    path.unlink(missing_ok=True)
     return closed
 
 

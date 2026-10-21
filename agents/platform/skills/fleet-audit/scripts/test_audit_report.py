@@ -16426,20 +16426,34 @@ class TestOnDemandRunIsNeverSilent(HarnessTestCase):
         # The shape of the eval case fleet-audit-on-demand-run-reports: a
         # ledger that a coverage gap opened, with no finding, and a run with
         # full coverage that closes it. Nothing is new or resolved, and a gap
-        # that cleared is not news, so on a scheduled run this is silent.
+        # that cleared is not news, so on a scheduled run this is silent. The
+        # stored record is the scheduled run that opened the ledger, as the
+        # bench plant writes it.
         partial = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
         gap_doc = make_doc(findings=[], skipped=partial)
-        self.seed_report(
-            published_body(gap_doc, generated_at=NOW),
-            coverage_gaps=audit_report.coverage_gaps(gap_doc),
-            status="CLEAN",
-        )
-        self.harness.replies = {"issue-list": self.issue_list()}
-        self.assertEqual(self.run_finish(make_doc(findings=[]), scheduled=False), 0, self.err)
-        out = self.stdout_json()
-        self.assertEqual((out["status"], out["resolved"], out["partial"]), ("CLEAN", 0, False))
-        self.assertTrue(self.harness.forge_calls("issue-close"))
-        self.assertFalse(out["silent_ok"])
+        gaps = audit_report.coverage_gaps(gap_doc)
+        for scheduled in (False, True):
+            with self.subTest(scheduled=scheduled):
+                self.seed_report(
+                    published_body(gap_doc, generated_at=NOW),
+                    coverage_gaps=gaps,
+                    status="CLEAN",
+                    **{
+                        audit_report.RUN_SCHEDULED_KEY: True,
+                        audit_report.SCHEDULED_COVERAGE_GAPS_KEY: gaps,
+                        audit_report.SCHEDULED_PUBLISHED_IDS_KEY: [],
+                    },
+                )
+                self.harness.replies = {"issue-list": self.issue_list()}
+                self.assertEqual(
+                    self.run_finish(make_doc(findings=[]), scheduled=scheduled), 0, self.err
+                )
+                out = self.stdout_json()
+                self.assertEqual(
+                    (out["status"], out["resolved"], out["partial"]), ("CLEAN", 0, False)
+                )
+                self.assertTrue(self.harness.forge_calls("issue-close"))
+                self.assertEqual(out["silent_ok"], scheduled)
 
     def test_the_stored_record_says_whether_the_run_was_scheduled(self):
         self.finish_json(make_doc(findings=[make_finding(fid="a", severity="major")]), scheduled=False)

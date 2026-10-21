@@ -185,6 +185,25 @@ def test_teardown_closes_only_the_ledger_this_case_opened(store, monkeypatch):
     assert [p["number"] for p in forge.payloads("issue-close")] == [7]
 
 
+def test_teardown_closes_the_seeded_ledger_after_the_run_rewrote_its_body(store, monkeypatch):
+    # A run with a coverage gap of its own rewrites the gap ledger from its
+    # own document, so the body no longer names the invented cluster.
+    seeded_body(monkeypatch, gap=True)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-list": {
+                "issues": [
+                    {"number": 7, "body": "a body the run wrote for the real fleet"},
+                    {"number": 8, "body": "another stream run's ledger"},
+                ]
+            }
+        },
+    )
+    assert ledger.teardown(audit_report, AUDIT, GITOPS) == [7]
+    assert [p["number"] for p in forge.payloads("issue-close")] == [7]
+
+
 @pytest.mark.parametrize("path", [TASK, GAP_TASK])
 def test_every_task_variable_is_declared_by_the_stack(path):
     task = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -233,3 +252,8 @@ def test_the_gap_that_cleared_is_not_news_to_the_clean_run(store, monkeypatch):
     memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
     assert not audit_report.coverage_changed([], memory)
     assert not audit_report.coverage_changed([], memory, scheduled=True)
+    # The record is the scheduled run that opened the ledger: the channel
+    # heard its gap and no finding, so a clean scheduled run moves no id.
+    assert memory[audit_report.RUN_SCHEDULED_KEY] is True
+    assert audit_report.scheduled_published_baseline(memory) == []
+    assert audit_report.scheduled_gaps_baseline(memory) == memory["coverage_gaps"]
