@@ -1458,16 +1458,27 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
     pr_by_num = {int(p["number"]): p for p in prs}
     issue_by_num = {int(i["number"]): i for i in issues}
 
-    re_reverts = re.compile(r"Reverts\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)", re.I)
+    re_reverts = re.compile(
+        r"Reverts\s+(?:PR|MR|pull request|merge request)?\s*(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)"
+        r"|^Revert\s+PR\s+[#!]\s*(\d+)",
+        re.I | re.M,
+    )
     re_fixes = re.compile(
-        r"(?:fixes|resolves|mitigates|closes)\s+(?:SEV-\d+\s+Incident\s+|Incident\s+|issue\s+)?[#!]\s*(\d+)",
+        r"(?:fixes|resolves|mitigates|closes)\s+(?:SEV-\d+\s+Incident\s+|Incident\s+|issue\s+)?"
+        r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)?[#!]\s*(\d+)",
         re.I,
     )
     re_rejected = re.compile(r"rejection of\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)", re.I)
     re_supersedes = re.compile(
-        r"Supersedes Freeze from Incident\s+[#!]\s*(\d+)\s*/\s*Revert\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)",
+        r"Supersedes Freeze from Incident\s+[#!]\s*(\d+)\s*/\s*Revert\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)"
+        r"|supersedes\b[^\n#!]*(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)",
         re.I,
     )
+    re_high_signal_fix = re.compile(
+        r"^(?:fix|perf)\([^)]+\):|^docs(?:\(conventions\))?:.*(?:conventions|naming|require|policy)",
+        re.I,
+    )
+    re_eval_noise = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
 
     written: List[str] = []
     triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
@@ -1497,14 +1508,17 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
         date_str = str(merged or pr.get("created_at") or _dt.date.today().isoformat())[:10]
         year = int(date_str[:4])
 
-        # Case 1: Superseding PR (e.g. BB-10 PR #33)
+        # Case 1: Superseding PR (e.g. BB-10 PR #33 or PR #254 superseding #253)
         m_sup = re_supersedes.search(body)
         if merged and m_sup:
-            inc_num, old_rev_pr = int(m_sup.group(1)), int(m_sup.group(2))
+            if m_sup.group(1) and m_sup.group(2):
+                inc_num, old_rev_pr = int(m_sup.group(1)), int(m_sup.group(2))
+            else:
+                inc_num, old_rev_pr = 0, int(m_sup.group(3))
             old_rec_id = pr_to_record_id.get(old_rev_pr)
-            inc = issue_by_num.get(inc_num, {})
+            inc = issue_by_num.get(inc_num, {}) if inc_num else {}
             old_pr_obj = pr_by_num.get(old_rev_pr, {})
-            scoped_files = sorted(set(files + (old_pr_obj.get("_files") or [])))
+            scoped_files = sorted(set(files + (old_pr_obj.get("_files") or []))) or ["CONVENTIONS.md"]
             rid = _alloc_id("decision", year)
             synth = _llm_synthesize_record(
                 llm_url, llm_model, llm_key, "decision",
@@ -1514,6 +1528,12 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             if synth:
                 llm_synthesized_count += 1
             rec_title = str((synth or {}).get("title") or title).strip()
+            evidence: Dict[str, Any] = {
+                "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                "breaking_pr": f"#{old_rev_pr}",
+            }
+            if inc_num:
+                evidence["incident"] = _format_issue_ref(inc, inc_num, gh_repo)
             meta: Dict[str, Any] = {
                 "type": "decision",
                 "id": rid,
@@ -1521,11 +1541,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 "status": "active",
                 "date": date_str,
                 "scope": {"paths": scoped_files},
-                "evidence": {
-                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
-                    "incident": _format_issue_ref(inc, inc_num, gh_repo),
-                    "breaking_pr": f"#{old_rev_pr}",
-                },
+                "evidence": evidence,
             }
             if old_rec_id:
                 meta["supersedes"] = [old_rec_id]
@@ -1539,12 +1555,19 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 rec_body_lines.extend(["## Decision", "", str(synth["decision"]).strip(), ""])
             if (synth or {}).get("consequences"):
                 rec_body_lines.extend(["## Consequences", "", str(synth["consequences"]).strip(), ""])
-            rec_body_lines.extend([
-                "## Superseded Incident & Freeze",
-                "",
-                f"Supersedes earlier revert PR #{old_rev_pr} and Incident #{inc_num} ({inc.get('title', '')}).",
-                "The prerequisite upgrade has landed and the temporary freeze is lifted.",
-            ])
+            if inc_num:
+                rec_body_lines.extend([
+                    "## Superseded Incident & Freeze",
+                    "",
+                    f"Supersedes earlier revert PR #{old_rev_pr} and Incident #{inc_num} ({inc.get('title', '')}).",
+                    "The prerequisite upgrade has landed and the temporary freeze is lifted.",
+                ])
+            else:
+                rec_body_lines.extend([
+                    "## Superseded Policy",
+                    "",
+                    f"Supersedes earlier PR #{old_rev_pr} ({old_pr_obj.get('title', '')}).",
+                ])
             rec_body = "\n".join(rec_body_lines)
             rel = f"knowledge/decisions/{rid}-{slug(rec_title)}.md"
             if a.write:
@@ -1640,20 +1663,22 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             triage_counts["decision"] += 1
             continue
 
-        # Case 3: Revert / Fix PR reverting a Breaking PR that caused an Incident (BB-01, 03..10)
-        m_rev = re_reverts.search(body)
-        if merged and m_rev and m_fix:
-            brk_num = int(m_rev.group(1))
-            inc_num = int(m_fix.group(1))
+        # Case 3: Revert / Fix PR reverting a Breaking PR (e.g. BB-01..10 or PR #259 reverting #258)
+        m_rev = re_reverts.search(body + "\n" + title)
+        if merged and m_rev and (m_fix or llm_url):
+            brk_num = int(m_rev.group(1) or m_rev.group(2))
+            inc_num = int(m_fix.group(1)) if m_fix else 0
             brk_pr = pr_by_num.get(brk_num, {})
-            inc = issue_by_num.get(inc_num, {})
-            target_file = files[0] if files else ""
+            inc = issue_by_num.get(inc_num, {}) if inc_num else {}
+            scoped_files = sorted(set(files + (brk_pr.get("_files") or [])))
+            target_file = scoped_files[0] if scoped_files else ""
             commit_sha = pr.get("merge_commit_sha") or ""
             guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
             synth = _llm_synthesize_record(
                 llm_url, llm_model, llm_key, "lesson",
                 {"pr_number": num, "title": title, "body": body, "breaking_pr": brk_num,
-                 "breaking_title": brk_pr.get("title", ""), "incident": inc, "files": files},
+                 "breaking_title": brk_pr.get("title", ""), "breaking_body": brk_pr.get("body", ""),
+                 "incident": inc, "files": scoped_files},
             ) if llm_url else None
             if synth:
                 llm_synthesized_count += 1
@@ -1661,28 +1686,34 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                     guard = synth["guard"]
             rid = _alloc_id("lesson", year)
             rec_title = str((synth or {}).get("title") or inc.get("title") or title).strip()
+            evidence = {
+                "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                "breaking_pr": _format_proposal_ref(brk_pr, brk_num, gh_repo),
+                "commit": commit_sha[:12] if commit_sha else "",
+            }
+            if inc_num:
+                evidence["incident"] = _format_issue_ref(inc, inc_num, gh_repo)
             meta = {
                 "type": "lesson",
                 "id": rid,
                 "title": rec_title,
                 "status": "active",
                 "date": date_str,
-                "scope": {"paths": files},
-                "evidence": {
-                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
-                    "breaking_pr": _format_proposal_ref(brk_pr, brk_num, gh_repo),
-                    "incident": _format_issue_ref(inc, inc_num, gh_repo),
-                    "commit": commit_sha[:12] if commit_sha else "",
-                },
+                "scope": {"paths": scoped_files or ["gcp/**"]},
+                "evidence": evidence,
             }
             if guard:
                 meta["guard"] = guard
+            header_line = (
+                f"Breaking PR #{brk_num} ({brk_pr.get('title', '')}) triggered Incident #{inc_num}:"
+                if inc_num else f"Breaking PR #{brk_num} ({brk_pr.get('title', '')}) required revert in PR #{num}:"
+            )
             rec_body_lines = [
                 "## What happened",
                 "",
-                f"Breaking PR #{brk_num} ({brk_pr.get('title', '')}) triggered Incident #{inc_num}:",
+                header_line,
                 "",
-                str((synth or {}).get("root_cause") or inc.get("body") or "").strip(),
+                str((synth or {}).get("root_cause") or inc.get("body") or body).strip(),
                 "",
                 "## What fixed it",
                 "",
@@ -1701,59 +1732,89 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             triage_counts["revert-lesson"] += 1
             continue
 
-        # Case 4: Natural-language incident fix or rejected governance PR synthesized via LLM
-        if llm_url and files and merged and m_fix:
-            inc_num = int(m_fix.group(1))
-            inc = issue_by_num.get(inc_num, {})
-            target_file = files[0]
+        # Case 4: High-signal incident fix or governance/convention PR synthesized via LiteLLM
+        live_files = [f for f in files if (repo / f).exists() and not f.startswith("knowledge/")]
+        if (
+            llm_url
+            and merged
+            and live_files
+            and not re_eval_noise.search(title + " " + body)
+            and (m_fix or re_high_signal_fix.search(title))
+        ):
+            is_doc_policy = title.lower().startswith("docs") or any(f.endswith("CONVENTIONS.md") for f in live_files)
+            rec_kind = "decision" if is_doc_policy else "lesson"
+            inc_num = int(m_fix.group(1)) if m_fix else 0
+            inc = issue_by_num.get(inc_num, {}) if inc_num else {}
+            target_file = live_files[0]
             commit_sha = pr.get("merge_commit_sha") or ""
             guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            if guard and not _guard_passes_on_head(repo, guard, []):
+                guard = None
             synth = _llm_synthesize_record(
-                llm_url, llm_model, llm_key, "lesson",
-                {"pr_number": num, "title": title, "body": body, "incident": inc, "files": files},
+                llm_url, llm_model, llm_key, rec_kind,
+                {"pr_number": num, "title": title, "body": body, "incident": inc, "files": live_files},
             )
             if synth:
                 llm_synthesized_count += 1
                 if not guard and isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
                     guard = synth["guard"]
-                rid = _alloc_id("lesson", year)
+                rid = _alloc_id(rec_kind, year)
                 rec_title = str(synth.get("title") or inc.get("title") or title).strip()
+                evidence = {
+                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                    "commit": commit_sha[:12] if commit_sha else "",
+                }
+                if inc_num:
+                    evidence["incident"] = _format_issue_ref(inc, inc_num, gh_repo)
                 meta = {
-                    "type": "lesson",
+                    "type": rec_kind,
                     "id": rid,
                     "title": rec_title,
                     "status": "active",
                     "date": date_str,
-                    "scope": {"paths": files},
-                    "evidence": {
-                        "pull_request": _format_proposal_ref(pr, num, gh_repo),
-                        "incident": _format_issue_ref(inc, inc_num, gh_repo),
-                        "commit": commit_sha[:12] if commit_sha else "",
-                    },
+                    "scope": {"paths": live_files},
+                    "evidence": {k: v for k, v in evidence.items() if v},
                 }
                 if guard:
                     meta["guard"] = guard
-                rec_body = "\n".join([
-                    "## What happened",
-                    "",
-                    str(synth.get("root_cause") or inc.get("body") or body).strip(),
-                    "",
-                    "## What fixed it",
-                    "",
-                    f"Fix PR #{num} ({title}):",
-                    str(synth.get("fix") or body).strip(),
-                    "",
-                    "## Prevent it next time",
-                    "",
-                    str(synth.get("prevention") or "").strip(),
-                ])
-                rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                if rec_kind == "decision":
+                    rec_body = "\n".join([
+                        "## Context",
+                        "",
+                        str(synth.get("context") or body).strip(),
+                        "",
+                        "## Decision",
+                        "",
+                        str(synth.get("decision") or body).strip(),
+                        "",
+                        "## Consequences",
+                        "",
+                        str(synth.get("consequences") or "").strip(),
+                    ])
+                    rel = f"knowledge/decisions/{rid}-{slug(rec_title)}.md"
+                    triage_counts["decision"] += 1
+                else:
+                    rec_body = "\n".join([
+                        "## What happened",
+                        "",
+                        str(synth.get("root_cause") or inc.get("body") or body).strip(),
+                        "",
+                        "## What fixed it",
+                        "",
+                        f"Fix PR #{num} ({title}):",
+                        str(synth.get("fix") or body).strip(),
+                        "",
+                        "## Prevent it next time",
+                        "",
+                        str(synth.get("prevention") or "").strip(),
+                    ])
+                    rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                    triage_counts["revert-lesson"] += 1
                 if a.write:
                     (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                     (repo / rel).write_text(render_record(meta, rec_body))
                     written.append(rel)
                 pr_to_record_id[num] = rid
-                triage_counts["revert-lesson"] += 1
                 continue
 
         triage_counts["routine"] += 1
