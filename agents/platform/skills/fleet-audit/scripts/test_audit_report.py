@@ -14758,6 +14758,18 @@ class TestUnreadTargetReason(unittest.TestCase):
             audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "gone/us-east1/b")
         )
 
+    def test_a_skipped_cluster_named_like_a_project_target_is_not_that_project(self):
+        """`project-acme` and `project/acme` segment the same; only the second is a project."""
+        audit = "gcp-networking-fabric-audit"
+        data = self.doc(
+            audit,
+            [{"name": "project/other", "checks_run": []}, {"name": "other/us-east1/a", "checks_run": []}],
+            [{"cluster": "project-acme", "reason": "permission denied"}],
+        )
+        self.assertIsNone(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b")
+        )
+
     def test_a_target_of_a_kind_with_no_entry_was_not_read(self):
         audit = "gcp-networking-fabric-audit"
         checks = [{"check": c, "command": "gcloud x"} for c in audit_report.audit_target_checks(audit, "project/acme")]

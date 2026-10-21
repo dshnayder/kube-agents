@@ -8466,10 +8466,18 @@ def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
     scope = data.get("scope") or {}
     audit_id = str(data.get("audit") or "")
     key = _id_segment(name)
-    skipped = {
-        _id_segment(str(entry.get("cluster", "")))
+    skipped_names = [
+        str(entry.get("cluster", ""))
         for entry in scope.get("skipped") or []
         if isinstance(entry, dict)
+    ]
+    skipped = {_id_segment(skipped_name) for skipped_name in skipped_names}
+    # Only the entries spelled as a project target. `_id_segment` makes a
+    # cluster named `project-acme` the same key as `project/acme`.
+    skipped_projects = {
+        _id_segment(skipped_name)
+        for skipped_name in skipped_names
+        if skipped_name.startswith(PROJECT_TARGET_PREFIX)
     }
     if key in skipped:
         return f"`{_ident(name)}` was not read this run"
@@ -8499,7 +8507,7 @@ def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
         )
     if QUALIFIED_TARGET_SEPARATOR in name and not name.startswith(PROJECT_TARGET_PREFIX):
         project = name.split(QUALIFIED_TARGET_SEPARATOR, 1)[0]
-        if _id_segment(PROJECT_TARGET_PREFIX + project) in skipped:
+        if _id_segment(PROJECT_TARGET_PREFIX + project) in skipped_projects:
             return f"project `{_ident(project)}` was not read this run"
     spec = AUDITS.get(audit_id)
     kind = scoped_target_kind(spec, name) if spec else target_kind(name)
