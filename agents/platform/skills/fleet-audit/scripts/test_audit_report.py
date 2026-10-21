@@ -27926,6 +27926,18 @@ class TestUnreachableRepository(BaseTestCase):
         )
         self.assertIsNone(audit_report.previous_no_forge_ids(AUDIT))
 
+    def test_a_failed_store_write_keeps_the_published_memory(self):
+        """The diverted run wrote nothing to the ledger, so the record of the
+        last published run still describes it exactly."""
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        directory.mkdir(parents=True)
+        published = {"repo": "acme/gitops", "issue_number": 7, "ledger_body": "body", "current_ids": ["x"]}
+        (directory / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.run_once()
+        self.assertIn("report store write", self.err)
+        self.assertEqual(audit_report.read_report_memory(AUDIT, 7, "acme/gitops")["current_ids"], ["x"])
+
     def test_the_forge_memory_skips_an_unreachable_envelope(self):
         directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
         runs = directory / audit_report.REPORT_RUNS_DIR

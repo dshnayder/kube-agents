@@ -3426,7 +3426,7 @@ def write_report(
     Called on the exit-0 publish path only; a dry run, a rejected document and
     `remediate` return before reaching it. `ledger_unchanged` says this run
     left the ledger's body as it found it (a clean run held open, which only
-    comments), so a failed write leaves `latest.json` in place: it still
+    comments, or a run diverted to the no-forge path), so a failed write leaves `latest.json` in place: it still
     describes that body exactly.
     """
     try:
@@ -17771,7 +17771,9 @@ def _finish_without_forge(
         delta_known=delta_known,
     )
     envelope.update(marker)
-    stored = write_report(audit_id, envelope, now)
+    # A diverted run wrote nothing to the ledger, so when its write fails the
+    # stored record of the last published run is still correct.
+    stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
     note = unreachable_note(unreachable, stored=stored)
