@@ -1062,7 +1062,8 @@ coverage, and nothing else:
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
   those ids under `unreported_under_gap`. Each id is reported once: the stored record keeps, under
   `reported_under_gap`, the ids that a run already reported and that are still not published, and
-  the next run does not report them again. A record without that key subtracts nothing, so a run
+  the next run does not report them again. A run with full coverage clears the list: it did not find
+  those ids, so it resolved them. A record without that key subtracts nothing, so a run
   that held the ledger open without reporting an id (an unreadable conversation, an unaccounted
   finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. A
   scheduled run (`--scheduled`, §7.5) compares its gaps with the last stored _scheduled_ run, not
@@ -1174,8 +1175,8 @@ run on the open ledger, because `new` and `resolved` then say the change. An id 
 gap, on this run or an earlier one (`reported_under_gap`), is not counted as resolved, and when
 every id that moved left under a gap the key is absent: "0 new, 0 resolved" is not why the run
 speaks. An id that an on-demand run resolved with full coverage is counted as resolved, also on a
-scheduled run with a gap. With no forge, the record keeps under `reported_under_gap` the ids that
-left under a gap, and a run with full coverage clears them.
+scheduled run with a gap. A run with full coverage clears `reported_under_gap`, with a ledger and
+with no forge, so an id that it resolved is not counted as one that left under a gap.
 `new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
 that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
 published and that an on-demand run dropped since then is in `unreported_under_gap` only when it

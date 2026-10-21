@@ -16730,6 +16730,22 @@ class TestScheduledBaselineUnknownOrClosed(HarnessTestCase):
         # The published ids moved since the last scheduled run, so it speaks.
         self.assertFalse(first["silent_ok"])
 
+    def test_an_id_resolved_on_demand_after_a_gap_is_resolved_under_a_later_gap(self):
+        # c leaves under a gap on demand, then a run with full coverage
+        # resolves it. The next scheduled run with a gap counts c as
+        # resolved since the last scheduled run, not as dropped under a gap.
+        self.seed_scheduled([self.a, self.c])
+        gap = self.finish([self.a], scheduled=False, skipped=self.PARTIAL)
+        gone = derived_id(obj="Namespace/c")
+        self.assertEqual(gap[audit_report.UNREPORTED_UNDER_GAP_KEY], [gone])
+        self.finish([self.a], scheduled=False)
+        with patch.object(audit_report, "append_chat_report") as chat:
+            first = self.finish([self.a], scheduled=True, skipped=self.PARTIAL)
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, first)
+        self.assertEqual(first[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
+        self.assertIn(f"0 new, 1 resolved ({gone}).", chat.call_args.args[2])
+        self.assertFalse(first["silent_ok"])
+
 
 class TestScheduledChangeIsSaid(HarnessTestCase):
     """A scheduled run that speaks because its ids moved says what moved.

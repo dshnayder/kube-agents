@@ -1296,8 +1296,9 @@ UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
 # On the stored envelope only: the ids that some run already reported under
 # `unreported_under_gap` and that are still not published. The next run does
 # not report them again. A record without the key subtracts nothing. With no
-# forge, the ids that left under a gap and are still not stored; a run with
-# full coverage clears them. A scheduled run does not count these as resolved.
+# forge, the ids that left under a gap and are still not stored. A run with
+# full coverage clears them, with a ledger and with no forge: it resolved
+# them. A scheduled run does not count these as resolved.
 REPORTED_UNDER_GAP_KEY = "reported_under_gap"
 # On the stored envelope only: True when the run was a scheduled run, that is,
 # its `finish` got `--scheduled`. A record without the key was written before
@@ -18273,14 +18274,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # no record shows the ids, the run speaks.
     scheduled_memory = memory if existing_issue else newest_stored_record(audit_id, repo)
     scheduled_ids = scheduled_published_baseline(scheduled_memory)
-    scheduled_reported = scheduled_reported_baseline(memory) - published_ids
     ids_moved = scheduled and (
         scheduled_ids is None
         or (not stale_scheme and published_ids != set(scheduled_ids))
     )
-    already_reported = {
-        str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
-    } - published_ids
+    # An id stays under `reported_under_gap` until a run publishes it again
+    # or a run with full coverage does not find it. That run resolved it, so
+    # a later scheduled run with a gap does not report it as dropped under a
+    # gap, and counts it as resolved since the last scheduled run.
+    if gaps or stale_scheme:
+        already_reported = {
+            str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
+        } - published_ids
+        scheduled_reported = scheduled_reported_baseline(memory) - published_ids
+    else:
+        already_reported, scheduled_reported = set(), set()
     if scheduled:
         # An id that the last scheduled run published and that an on-demand
         # run dropped since then is news only when it left under a gap, which
