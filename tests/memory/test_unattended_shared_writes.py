@@ -208,6 +208,21 @@ class TestUnattendedSharedWrites(unittest.TestCase):
 
         self.assertIn("captured automatically", _retain_description(provider(user_tag="user:alice")[0]))
 
+    def test_an_unqualified_write_in_an_unattributable_interactive_dm_is_refused_not_published(self):
+        """When an A2A or interactive DM session loses its route or user_id, a human
+        is still speaking (`_unattended = False`, `_personal_disabled_reason = NO_IDENTITY_NOTICE`).
+        An unqualified write must default to `personal` and be refused rather than
+        silently publishing the human's personal fact to `scope:shared`.
+        """
+        p, retained = provider(unattended=False)
+        p._personal_disabled_reason = NO_IDENTITY_NOTICE
+        r = json.loads(p.handle_tool_call("memory_retain", {
+            "content": "My personal GKE cluster is dev-1.",
+        }))
+        self.assertIn("error", r, r)
+        self.assertEqual(r["error"], NO_IDENTITY_NOTICE, r)
+        self.assertFalse(retained, retained)
+
     def test_a_read_only_profile_is_unaffected_in_every_state(self):
         """Specialists stay barred; none of this reaches them."""
         for has_identity, unattended in ((True, False), (False, True), (False, False)):

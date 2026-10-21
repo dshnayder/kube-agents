@@ -22,10 +22,15 @@ run it.
     HERMES_ROOT=~/git/hermes-agent python3 tests/memory/test_user_tag_isolation.py
 """
 
+from contextlib import closing
 import hashlib
+import json
 import os
+import sqlite3
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _HERMES = os.environ.get("HERMES_ROOT") or "/opt/hermes"
@@ -42,10 +47,12 @@ except (ImportError, ValueError):
 import memory_file_import as mfi  # noqa: E402
 from kube_agents_memory import (  # noqa: E402
     NO_IDENTITY_NOTICE,
+    SHARED_SESSION_NOTICE,
     USER_TAG_PREFIX,
     KubeAgentsMemoryProvider,
     sanitize_user_id,
 )
+from kube_agents_memory import client as kam_client  # noqa: E402
 
 # Pairs that the readable half alone maps onto one string. All are plausible
 # addresses, not adversarial input: the first two differ by one separator, the
@@ -111,6 +118,76 @@ class TestUserTagIsolation(unittest.TestCase):
                 self.assertEqual(mfi.sanitize_user_id(raw), sanitize_user_id(raw), raw)
         for edge in ("", "   ", "@@@", "  alice@corp.example  ", "slackbot"):
             self.assertEqual(mfi.sanitize_user_id(edge), sanitize_user_id(edge), repr(edge))
+
+    def test_a2a_session_resolves_identity_and_chat_type_from_session_kv(self):
+        """Under spec.mode: next, hermes-bridge records user_id and chat_type in session_kv.db."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kv_db = os.path.join(tmp, "session_kv.db")
+            state_db = os.path.join(tmp, "state.db")
+            alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-dm",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM1",
+                                "context_id": "ctx-dm",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-group",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/SPACE1",
+                                "context_id": "ctx-group",
+                                "user_id": alice_hmac,
+                                "chat_type": "group",
+                            }
+                        }),
+                    ),
+                )
+            with closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-dm', NULL, 'compression')")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_cont', 'a2a-ctx-dm', NULL)")
+
+            with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
+                 patch.object(kam_client, "load_hindsight", return_value=None):
+                p_dm = KubeAgentsMemoryProvider()
+                p_dm.initialize("a2a-ctx-dm")
+                self.assertEqual(p_dm._user_tag, f"{USER_TAG_PREFIX}{sanitize_user_id(alice_hmac)}")
+                self.assertEqual(p_dm._personal_disabled_reason, "")
+                self.assertFalse(p_dm._unattended)
+
+                # Compressed continuation resolves the parent a2a-* session.
+                p_cont = KubeAgentsMemoryProvider()
+                p_cont.initialize("20261021_cont", hermes_home=tmp)
+                self.assertEqual(p_cont._user_tag, f"{USER_TAG_PREFIX}{sanitize_user_id(alice_hmac)}")
+
+                # Group conversation on A2A disables personal memory without thread_id.
+                p_group = KubeAgentsMemoryProvider()
+                p_group.initialize("a2a-ctx-group")
+                self.assertEqual(p_group._user_tag, "")
+                self.assertEqual(p_group._personal_disabled_reason, SHARED_SESSION_NOTICE)
+                self.assertFalse(p_group._unattended)
+
+                # Unattributable interactive A2A session (route missing) is NOT unattended.
+                p_missing = KubeAgentsMemoryProvider()
+                p_missing.initialize("a2a-ctx-missing")
+                self.assertEqual(p_missing._user_tag, "")
+                self.assertEqual(p_missing._personal_disabled_reason, NO_IDENTITY_NOTICE)
+                self.assertFalse(p_missing._unattended)
 
 
 if __name__ == "__main__":
