@@ -1222,32 +1222,6 @@ def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], Li
     return normalized_prs, issues
 
 
-def _gh_fetch_all(github_repo: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    prs_raw = subprocess.run(
-        ["gh", "api", "--paginate", f"repos/{github_repo}/pulls?state=all&per_page=100"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    issues_raw = subprocess.run(
-        ["gh", "api", "--paginate", f"repos/{github_repo}/issues?state=all&per_page=100"],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    prs = json.loads(prs_raw) if prs_raw.strip() else []
-    issues = [i for i in (json.loads(issues_raw) if issues_raw.strip() else []) if "pull_request" not in i]
-    for pr in prs:
-        if not pr.get("merged_at") and pr.get("state") == "closed" and pr.get("title") != "[withdrawn-eval-probe]":
-            c_raw = subprocess.run(
-                ["gh", "api", f"repos/{github_repo}/issues/{pr['number']}/comments"],
-                check=True, capture_output=True, text=True,
-            ).stdout
-            pr["_comments"] = json.loads(c_raw) if c_raw.strip() else []
-        f_raw = subprocess.run(
-            ["gh", "api", f"repos/{github_repo}/pulls/{pr['number']}/files"],
-            check=True, capture_output=True, text=True,
-        ).stdout
-        pr["_files"] = [f["filename"] for f in (json.loads(f_raw) if f_raw.strip() else [])]
-    return prs, issues
-
-
 def _format_proposal_ref(pr_obj: Dict[str, Any], num: int, repo_id: str) -> str:
     url = pr_obj.get("html_url") or pr_obj.get("url")
     sigil = "!" if (url and "/-/merge_requests/" in str(url)) else "#"
@@ -1308,12 +1282,8 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
     if a.prs_json and a.issues_json:
         prs = [_normalize_proposal(p, by_pr, by_sha) for p in json.loads(Path(a.prs_json).read_text())]
         issues = [_normalize_issue(i) for i in json.loads(Path(a.issues_json).read_text())]
-    elif os.environ.get("CREDENTIAL_PROXY_URL", "").strip():
-        prs, issues = _vcs_fetch_all(repo, gh_repo)
     else:
-        raw_prs, raw_issues = _gh_fetch_all(gh_repo)
-        prs = [_normalize_proposal(p, by_pr, by_sha) for p in raw_prs]
-        issues = [_normalize_issue(i) for i in raw_issues]
+        prs, issues = _vcs_fetch_all(repo, gh_repo)
 
     prs = [p for p in prs if p.get("title") != "[withdrawn-eval-probe]"]
     if cutoff_date:
