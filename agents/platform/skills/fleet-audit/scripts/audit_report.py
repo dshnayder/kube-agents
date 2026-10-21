@@ -15395,11 +15395,11 @@ def _routed_note(found: RouteEvidence, worker_note: str) -> tuple[str, str]:
     location, location_note = _location_note(found)
     reconciled = [RECONCILED_NOTE.format(reconciler=found.reconciler)] if found.reconciler else []
     if location_note and _names_path(worker_note, location):
-        fitted, added = _fit_route_notes(worker_note, NOTE_SEPARATOR.join(reconciled))
+        fitted, added = _fit_route_notes(worker_note, reconciled)
         if _names_path(fitted, location):
             return fitted, added
     notes = [location_note, *reconciled] if location_note else reconciled
-    return _fit_route_notes(worker_note, NOTE_SEPARATOR.join(notes))
+    return _fit_route_notes(worker_note, notes)
 
 
 def _split_harness_tail(note: str) -> tuple[str, str]:
@@ -15413,32 +15413,41 @@ def _split_harness_tail(note: str) -> tuple[str, str]:
     return note[:start].rstrip(), note[start:]
 
 
-def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
+def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
+
+    `notes` are the route notes in their order in the note. When they do not
+    all fit, the first ones are left out first, so the reconciler note, which
+    is last, is the last to go. With the caps on a path and a reconciler, the
+    reconciler note always fits with the truncation mark.
 
     The cut is in the worker's part of the note only. The note that
     `degrade_missing_remediations` wrote at the end stays whole: without it,
-    the stored note has no `HARNESS_NOTE_MARKS` entry. Only when the route
-    notes leave no room for that note does the cut go into it.
+    the stored note has no `HARNESS_NOTE_MARKS` entry. The cut goes into it
+    only when the reconciler note, or the last route note, leaves no room
+    for it.
 
     A worker note that leaves a code fence open gets the fence closed, so the
     text after it is prose. A cut never goes inside a code block: a worker
-    note with a fence is cut only before its first fence, and when that does
-    not give enough space the route notes are left out. A cut always ends with
+    note with a fence loses its first code block and all the text after it,
+    and the text before the block is cut as needed. A cut always ends with
     `ROUTE_NOTE_TRUNCATED`, and route notes that leave no room for it are left
-    out too.
+    out.
 
     The length is measured after `publishable_text`, as the renderer measures
     it: an escaped comment opener and a redaction placeholder make the text
     longer, and a route note that the renderer cuts loses its end.
     """
-    if not added:
-        return worker_note, added
+    notes = [note for note in notes if note]
+    if not notes:
+        return worker_note, ""
     body, tail = _split_harness_tail(worker_note)
     for kept, harness in ((body, tail), (worker_note, "")) if tail else ((worker_note, ""),):
-        fitted = _cut_worker_note(kept, harness, added)
-        if fitted is not None:
-            return fitted, added
+        for first in range(len(notes)):
+            added = NOTE_SEPARATOR.join(notes[first:])
+            fitted = _cut_worker_note(kept, harness, added)
+            if fitted is not None:
+                return fitted, added
     return worker_note, ""
 
 
@@ -15457,21 +15466,16 @@ def _cut_worker_note(body: str, tail: str, added: str) -> str | None:
         note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(head), added) if part)
         return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
 
-    def cut(room: int) -> str:
-        return (body[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
-
     if fits(body):
         return joined(body)
-    if not fits(""):
-        return None
-    if CODE_FENCE in body:
-        head = body[: body.index(CODE_FENCE)].rstrip()
-        if head and fits(head + ROUTE_NOTE_TRUNCATED):
-            return joined(head + ROUTE_NOTE_TRUNCATED)
-        return None
+    prose = body[: body.index(CODE_FENCE)] if CODE_FENCE in body else body
+
+    def cut(room: int) -> str:
+        return (prose[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
+
     # The longest cut that fits. Redaction can depend on the text after a
     # match, so the result is checked again.
-    low, high = 0, len(body) - 1
+    low, high = 0, len(prose)
     while low < high:
         middle = (low + high + 1) // 2
         if fits(cut(middle)):

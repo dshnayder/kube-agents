@@ -20362,10 +20362,27 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
         self.assertEqual(note.count("```") % 2, 0)
         self.assertTrue(note.startswith("Run this. …(truncated)\n\n_(Reconciled by"), note[:80])
-        # No prose before the fence: no room is made, and the note is left out.
-        bare = self.manual(note=command)
-        self.assertEqual(self.disclose(bare, manifest), [])
-        self.assertEqual(self.note(bare), command)
+
+    def test_the_reconciler_note_is_published_when_a_fenced_note_leaves_little_room(self):
+        """The SOP tells the worker to leave the reconciler to `finish`, so a
+        reconciled object must not publish without the note. The code block
+        goes first, then the prose before it is cut, then the location note."""
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="`flux`")
+        command = "```bash\n" + "x" * audit_report.MAX_NOTE_CHARS + "\n```"
+        long_prose = "Run this. " + "p" * audit_report.MAX_NOTE_CHARS + " "
+        for name, worker in {"no prose": command, "long prose": long_prose + command}.items():
+            with self.subTest(name):
+                finding = self.manual(note=worker)
+                self.assertEqual(self.disclose(finding, self.manifest(reconciler="`flux`")), ["a"])
+                note = self.note(finding)
+                self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+                self.assertNotIn("```", note)
+                self.assertTrue(note.endswith("…(truncated)\n\n" + reconciled), note[-300:])
+        location = "_(" + "l" * audit_report.MAX_NOTE_CHARS + ")_"
+        self.assertEqual(
+            audit_report._fit_route_notes("Set the probe.", [location, reconciled]),
+            ("Set the probe.", reconciled),
+        )
 
     def test_a_copied_note_goes_when_the_candidate_has_no_field(self):
         stale = audit_report.RECONCILED_NOTE.format(reconciler="`flux`")
@@ -20478,7 +20495,7 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertIn(audit_report.RECONCILER_UNNAMED, self.note(finding))
         self.assertNotIn(name, self.note(finding))
         crowded = "y" * (audit_report.MAX_NOTE_CHARS - len(audit_report.ROUTE_PARAGRAPH_BREAK) - 1)
-        self.assertEqual(audit_report._fit_route_notes(worker, crowded), (worker, ""))
+        self.assertEqual(audit_report._fit_route_notes(worker, [crowded]), (worker, ""))
 
     def test_the_longest_route_notes_leave_room_for_the_worker_note(self):
         path = "a" * audit_report.ROUTE_PATH_MAX_CHARS

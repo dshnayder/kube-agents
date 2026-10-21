@@ -253,12 +253,12 @@ field, and publishes nothing:
   you declined with `--decline-fix`, or that an open pull request carries. A fix whose pull request
   merged while the finding still reproduces, or that a person closed, gets the notes. It removes
   route notes that your note copied from an earlier ledger. It closes a code fence that your note
-  leaves open.
-  When your note and the route notes together are longer than the note cap, it cuts your note and
-  ends it with ` …(truncated)`, so that the route notes fit. The cut does not go into the text that
-  `finish` adds after your note when the audit did not write your file. A note with a code fence is
-  cut only before its first fence; when that does not give room, the route notes are left out. A
-  `--dry-run` can leave out a note the real run adds. Do not copy these notes into your `note`.
+  leaves open. When your note and the route notes together are longer than the note cap, it cuts
+  your note and ends it with ` …(truncated)`, so that the route notes fit. The cut does not go into
+  the text that `finish` adds after your note when the audit did not write your file. A cut never
+  goes into a code block: your first code block and all text after it go, and the text before the
+  block is cut. When the route notes still do not fit, the location note goes first; the reconciler
+  note always stays. A `--dry-run` can leave out a note the real run adds. Do not copy these notes into your `note`.
 
 ### Scope, skipped, and limitations
 
