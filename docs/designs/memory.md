@@ -301,7 +301,7 @@ Whenever the speaker cannot be attributed to a single human in a direct message,
 | `unattributable-shared`      | `chat_type == "group"` or (`chat_type != "dm"` and `thread_id` non-empty)     | Disabled                                        | Enabled (read & write)                       | Refused (`SHARED_SESSION_NOTICE`)                     | Instructs the model to refuse personal `"Remember: ..."` requests in group spaces and explain that DMs are required       |
 | `unattributable-interactive` | Interactive / `a2a-*` session with empty `user_id` or missing `session_kv.db` | Disabled                                        | Enabled (read & write)                       | Refused (`NO_IDENTITY_NOTICE`)                        | Instructs the model to refuse personal `"Remember: ..."` requests when caller identity is unavailable; never silent no-op |
 | `unattended`                 | Non-`a2a-*` background cron or event-watcher session with no `user_id`        | Disabled                                        | Enabled (read & write)                       | Writes to `scope:shared`                              | Background operational mode (`UNATTENDED_NOTICE`)                                                                         |
-| `read-only`                  | Kanban-spawned specialist worker (`read_only: true`)                          | Disabled                                        | Read-only (`recall` & `reflect` only)        | Write tool not registered                             | Read-only shared memory guidance                                                                                          |
+| `read-only`                  | Delegated specialist worker (`read_only: true`)                               | Disabled                                        | Read-only (`recall` & `reflect` only)        | Write tool not registered                             | Read-only shared memory guidance                                                                                          |
 
 This state table guarantees three safety properties:
 
@@ -321,13 +321,22 @@ This state table guarantees three safety properties:
   - Every `memory_recall` and `memory_reflect` call returns a structured `status` (`found`, `no_match`, or `unreachable`) plus a `searched` metadata envelope (bank, scope tags, query, and layer).
   - Distinguishing `no_match` (_"the store answered, and this query matched nothing"_) from `unreachable` (_"the memory service did not respond"_) prevents the agent from claiming that a record does not exist when a query simply missed or the database was unreachable.
 
+#### Communication style, verbosity, and scheduled report preferences
+
+Engineers on the same team often want different levels of detail from the agent: some prefer a concise three-bullet summary, while others want full step-by-step explanations with command outputs and citations. Layer 1 supports both per-user and team-wide communication preferences without static installer flags:
+
+| Preference scope                                    | Tag in `kube-agents-memory` | How it is set or updated                                                                                                                                                                           | Where it applies                                                                                                                              |
+| --------------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Per-user response style & verbosity**             | `user:<id>`                 | Direct request in DM (_"Keep replies short and lead with a summary"_), conversational feedback (_"Too verbose"_), or Web UI verbosity/tone controls writing to the user's personal memory profile. | Every direct message turn with that user across chat surfaces and the Web UI.                                                                 |
+| **Team-wide channel & scheduled digest formatting** | `scope:shared`              | Explicit team instruction in chat (`memory_retain(scope="shared")`, e.g., _"Format scheduled audit and cron digests as concise executive summaries, not walls of text"_).                          | Shared group channels and unattended background runs (`unattended` cron jobs and event watchers) that retrieve `scope:shared` before posting. |
+
 #### Read-only shared memory and finding nominations for specialist subagents
 
-Kanban-spawned specialist workers (`agents/platform/config.yaml`) run with no human `user_id` and set `memory.read_only: true` with `recall_budget: low`:
+Delegated specialist workers (`agents/platform/config.yaml`) run with no human `user_id` and set `memory.read_only: true` with `recall_budget: low`:
 
 - **Read access**: Specialists receive per-turn shared memory prefetch and can call `memory_recall` and `memory_reflect` against `scope:shared`. Giving specialists sanctioned read access prevents them from improvising unsanctioned local caches.
 - **Write prohibition**: `memory_retain` is omitted from tool schemas, refused by `handle_tool_call` with `status: read_only`, and disabled on automatic turn hooks.
-- **Finding nomination via Kanban cards**: When a specialist discovers a durable operational fact during a task, it includes a `**Worth remembering**` block in its card `result` and records the sentence in `kanban_complete(metadata={"memory_candidates": [...]})`. The human in chat sees the nomination in the reply and can ask the Chat Agent to save it to `scope:shared`.
+- **Finding nomination**: When a specialist discovers a durable operational fact during a task, it includes a `**Worth remembering**` block in its task result and attaches the candidate sentence in structured completion metadata (`memory_candidates`). The human in chat sees the nomination in the reply and can ask the Chat Agent to save it to `scope:shared`.
 
 ---
 
@@ -456,18 +465,26 @@ sequenceDiagram
 3. **Learn from failed or rejected fixes (`pr-merged-persists` and `refused`)**:
    - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), `decision_memory.py from-outcome` drafts a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
 
-##### Path W2 — Day-one "first two hours" bootstrap and incremental history harvesting
+##### Path W2 — Bounded history bootstrap ("midterm" vs. multi-year) and incremental harvesting
 
-When a team installs `kube-agents` on an existing GitOps repository, the agent starts with zero institutional memory. Running `decision_memory.py bootstrap --since 2y --budget-minutes 120` scans up to two years of repository history and produces a reviewable baseline within two hours:
+Enterprise Infrastructure-as-Code repositories often span four to five years of commits, where much of the oldest history refers to retired clusters or superseded architectures. Teams can choose a history window (`--since 90d`, `180d`, or `2y`) and wall-clock budget (`--budget-minutes`) when running `decision_memory.py bootstrap`:
+
+| History window                                 | Typical PRs & issues scanned | Processing time & compute cost                                          | Harvested records (`DEC` + `LES`) | Storage footprint (Git + Hindsight `pgvector`)             | When to choose                                                                                                     |
+| ---------------------------------------------- | ---------------------------: | ----------------------------------------------------------------------- | --------------------------------: | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **3 months ("Midterm memory", `--since 90d`)** |             $150\text{–}400$ | $< 3\text{ min}$ (deterministic AST diff; $0$ LLM calls on routine PRs) |                    $15\text{–}35$ | $\approx 50\text{ KB}$ in Git; $< 100\text{ KB}$ in DB     | Fast initial rollout focused on recent change-management decisions and active incident fixes.                      |
+| **6 months (`--since 180d`)**                  |             $400\text{–}900$ | $5\text{–}12\text{ min}$                                                |                    $30\text{–}70$ | $\approx 120\text{ KB}$ in Git; $\approx 250\text{ KB}$ DB | Balanced onboarding covering two quarterly release cycles and seasonal traffic patterns.                           |
+| **2 years (`--since 2y`, default ceiling)**    |         $1,500\text{–}4,000$ | $30\text{–}120\text{ min}$ (bounded by `--budget-minutes 120`)          |                  $100\text{–}250$ | $\approx 450\text{ KB}$ in Git; $< 1\text{ MB}$ in DB      | Full historical backfill for mature fleets ($< 0.02\%$ of the default $8\text{ GiB}$ Hindsight PostgreSQL volume). |
+
+Running `decision_memory.py bootstrap --since 2y --budget-minutes 120` executes four stages:
 
 | Stage                                | Time window                | What happens                                                                                                                                                                                                           | Output                                                                        |
 | ------------------------------------ | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| **1. Fast Git & PR metadata scan**   | $0\text{–}15\text{ min}$   | Scans 2 years of commit history and closed/merged PR and issue metadata without LLM calls. Identifies revert chains, closed unmerged PRs on governed files, and high-churn resource fields.                            | Ranked list of $50\text{–}150$ high-signal pull requests out of thousands.    |
+| **1. Fast Git & PR metadata scan**   | $0\text{–}15\text{ min}$   | Scans commit history and closed/merged PR and issue metadata within the `--since` window without LLM calls. Identifies revert chains, closed unmerged PRs on governed files, and high-churn resource fields.           | Ranked list of $50\text{–}150$ high-signal pull requests out of thousands.    |
 | **2. Five-way deterministic triage** | $15\text{–}30\text{ min}$  | Compares each candidate's diff against the current `HEAD` tree and classifies it into `current`, `superseded`, `rejected`, `anachronistic` (deleted cluster/workload), or `noise` (formatting/version bumps).          | Filtered set of `current`, `superseded`, and `rejected` candidates at `HEAD`. |
 | **3. Guard & record synthesis**      | $30\text{–}90\text{ min}$  | Diffs pre-revert and post-revert YAML/HCL ASTs to synthesize machine-checked `guard.expect` rules, links `supersedes` chains, and writes `DEC-YYYY-NNN.md` and `LES-YYYY-NNN.md` files.                                | Scoped decision and lesson files with verifiable PR and issue links.          |
 | **4. Baseline "State of Being" PR**  | $90\text{–}120\text{ min}$ | Opens a single onboarding pull request containing `knowledge/STATE_OF_BEING.md` (fleet summary, active guards, superseded policies, and uncovered areas) plus the initial `knowledge/decisions/` and `lessons/` files. | Day-one institutional memory ready for team review within 2 hours.            |
 
-After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges and bounded backfill slices.
+For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
 
 ##### Path W3 — Capture explicit architectural decisions from chat
 
