@@ -14655,6 +14655,41 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
             self.assertNotIn("no longer reproduces", body)
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
 
+    def test_a_clean_run_over_the_gap_keeps_held_ids_past_the_cap(self):
+        """The clean branch keeps the body as it is, so an id past the cap is still on it."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.previous_ledger(make_finding(), self.stage_finding(), other)
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {past_cap}")]}
+        )
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertNotIn("stops tracking", self.err)
+        self.assertIn(f"HELD: {past_cap}", self.err)
+        self.assertNotIn(past_cap, payload.get(audit_report.UNREPORTED_UNDER_GAP_KEY, []))
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        for body in posted:
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_a_findings_run_over_the_gap_caps_held_ids_and_says_so(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.previous_ledger(make_finding(), self.stage_finding(), other)
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertNotIn(past_cap, audit_report.parse_delta_block(self.written_body()))
+        self.assertIn("stops tracking 1 previous finding(s) on a target this run did not check", self.err)
+        self.assertIn(past_cap, self.err)
+
     def test_a_remediate_on_a_held_row_is_deferred_on_the_findings_branch(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.previous_ledger(make_finding(), self.stage_finding())
@@ -21774,6 +21809,40 @@ class TestFinishManifestFlag(HarnessTestCase):
         # The clean branch of the test above: the document reports nothing.
         # #6 covers api (declared, so shielded) and far on dr-west, which this
         # run did not read, so #6 stays open; #9 covers api alone and is closed.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[api, far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        previous_body = published_body(previous_doc, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id])),
+            pr(6, "platform-agent/fix-default-sa-far", body=audit_report.delta_block([api_id, far_id])),
+        ])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_partial_clean_run_keeps_the_pull_request_of_a_not_re_checked_finding_past_the_cap(self):
+        # The test above with far past the cap: the clean branch keeps the
+        # body, so far is still on the ledger and #6 stays open.
+        self.patch_attr("MAX_HELD_IDS", 0)
         path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
         api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
         far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")

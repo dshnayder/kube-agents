@@ -1106,7 +1106,7 @@ of each finding the previous run kept this way. The note and id-only tiers of th
 write no row, so without that key the next gap run could not place the id and the finding would
 come back as new on the next complete run. An id with no known place is not kept, and the run log
 names it, because a row held by id alone would never get a place back and would stay for as long as
-any gap stands. The rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how
+any gap stands. On the findings run the rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how
 many it did not show, in every tier except the id-only one. The id stays in the marker, so the next complete run
 joins against it, and it is not in `resolved` and not stale for the stale-close pass. It is not in
 the held-id list that a run without a manifest carries (collector design §3.3), so the row goes away
@@ -1117,7 +1117,8 @@ gap keeps `resolved` at `0` does not change. A finding kept this way counts as p
 not listed under `unreported_under_gap`.
 
 The clean run over a gap renders no rows, because it comments and leaves the body as it was, and it
-keeps the stored `not_rechecked` places. It still uses the ids: a `/remediate` on one is deferred,
+keeps the stored `not_rechecked` places. It still uses the ids, all of them with no cap, because the
+body it keeps carries each one: a `/remediate` on one is deferred,
 not answered as "no longer reproduces", and the shield's close counts them as current, so it does not
 retire a pull request whose other finding was not re-checked. A run on an install with no forge
 keeps the same findings in the `current_ids` of its stored record, with their places, when the store

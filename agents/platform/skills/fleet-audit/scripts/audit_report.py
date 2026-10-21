@@ -18338,24 +18338,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Only over a gap: a run with no gap checked every target. The clean
     # branch keeps the previous body as it is over a gap, so it renders no
     # rows, but it uses the ids to defer `/remediate` and to keep the pull
-    # requests of these findings open in the shield's close. They share `MAX_HELD_IDS` with the collector-held entries, which come
-    # first.
+    # requests of these findings open in the shield's close. On the findings
+    # branch they share `MAX_HELD_IDS` with the collector-held entries, which
+    # come first. The clean branch has no cap: the body it keeps still carries
+    # every id, so each one stays unread.
     unread_entries: list[dict] = []
-    unread_overflow = 0
+    unread_dropped: list[dict] = []
     if existing_issue and delta_known and gaps:
         unread_entries = unread_held_entries(
             previous_body, memory, data, exclude=held_exclude | held_ids | _declared_ids(data)
         )
-        room = max(MAX_HELD_IDS - len(held_entries), 0)
-        if unread_entries[room:]:
-            log(
-                f"WARNING: the ledger stops tracking {len(unread_entries[room:])} previous "
-                "finding(s) on a target this run did not check — it holds at most "
-                f"{MAX_HELD_IDS} at once: "
-                + ", ".join(entry["id"] for entry in unread_entries[room:])
-            )
-        unread_overflow = len(unread_entries[room:])
-        unread_entries = unread_entries[:room]
+        if findings:
+            room = max(MAX_HELD_IDS - len(held_entries), 0)
+            unread_entries, unread_dropped = unread_entries[:room], unread_entries[room:]
+    unread_overflow = len(unread_dropped)
     unread_ids = {entry["id"] for entry in unread_entries}
     for entry in unread_entries:
         log(
@@ -19056,6 +19052,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "ids first. They stay on the JSON line as unpublished_candidates while "
             "the collector flags them and their pull requests stay open: "
             f"{', '.join(entry['id'] for entry in held_dropped)}"
+        )
+    if unread_dropped:
+        log(
+            f"WARNING: the ledger stops tracking {unread_overflow} previous "
+            "finding(s) on a target this run did not check — it holds at most "
+            f"{MAX_HELD_IDS} at once: "
+            + ", ".join(entry["id"] for entry in unread_dropped)
         )
 
     ledger_comments = (
