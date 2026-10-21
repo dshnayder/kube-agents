@@ -16805,9 +16805,9 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.harness.replies = {"issue-list": self.issue_list()}
         return body
 
-    def finish(self, findings, *, scheduled, resolved_because=None):
+    def finish(self, findings, *, scheduled, resolved_because=None, skipped=None):
         """Run `finish`, and give its JSON line and the chat report it added."""
-        doc = make_doc(findings=findings)
+        doc = make_doc(findings=findings, skipped=skipped)
         if resolved_because:
             doc["resolved_because"] = resolved_because
         with patch.object(audit_report, "append_chat_report") as chat:
@@ -16929,6 +16929,40 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         gone = derived_id(obj="Namespace/a")
         self.assertEqual(out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
         self.assertIn(f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", text)
+
+    def test_a_ledger_a_human_closed_then_a_gap_does_not_resolve_unchecked_ids(self):
+        # The last scheduled run published a and c, and a human then closed
+        # the ledger. This run has a gap and does not publish c. Nobody
+        # checked c, so it is not resolved: it is named under the gap.
+        gap = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        gone = derived_id(obj="Namespace/c")
+        for findings in ([self.a], []):
+            with self.subTest(findings=len(findings)):
+                self.seed_scheduled([self.a, self.c])
+                self.harness.replies = {
+                    "issue-list": {"issues": []},
+                    "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+                }
+                out, text = self.finish(findings, scheduled=True, skipped=gap)
+                self.assertFalse(out["silent_ok"])
+                self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+                self.assertIn(gone, out[audit_report.UNREPORTED_UNDER_GAP_KEY])
+                self.assertNotIn("resolved (", text)
+
+    def test_an_id_an_on_demand_run_closed_is_resolved_under_a_later_gap(self):
+        # An on-demand run with full coverage closed the ledger. It checked
+        # a, so the next scheduled run with a gap counts a as resolved.
+        body = self.seed_scheduled([self.a])
+        self.finish([], scheduled=False, resolved_because=resolved_for(body))
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        gap = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        out, _ = self.finish([], scheduled=True, skipped=gap)
+        gone = derived_id(obj="Namespace/a")
+        self.assertEqual(out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
 
 
 class TestStandingCoverageGap(HarnessTestCase):

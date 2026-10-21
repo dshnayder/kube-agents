@@ -18300,9 +18300,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # An id that the last scheduled run published and that an on-demand
         # run dropped since then is news only when it left under a gap, which
         # puts it in `already_reported`. An id that an on-demand run resolved
-        # with full coverage is not "under a gap". With no open ledger,
-        # `already_reported` is empty, so no id of a closed ledger is reported.
+        # with full coverage is not "under a gap".
         dropped_since = set(previous_ids) | (set(scheduled_ids or []) & already_reported)
+        if not existing_issue:
+            # With no open ledger, `previous_ids` is empty. When a person
+            # closed the ledger, the newest stored record still lists the ids
+            # of its last run, and nobody checked them since. Under a gap they
+            # are not resolved. A run that closed the ledger lists no ids, so
+            # what it resolved stays resolved.
+            dropped_since |= (
+                set(scheduled_ids or [])
+                & {str(fid) for fid in (scheduled_memory or {}).get("current_ids") or []}
+            ) - scheduled_reported_baseline(scheduled_memory)
         unreported_under_gap = (
             sorted(dropped_since - published_ids - scheduled_reported)
             if gaps and not stale_scheme
