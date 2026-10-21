@@ -6396,9 +6396,8 @@ def _strip_route_notes(remediation: object) -> None:
     """Remove the route notes from a carried `remediation` note.
 
     `disclose_manual_remediation_routes` writes them again from this run's
-    manifest after the carry. It leaves a finding in its `skip` set alone, so
-    a route note copied from the previous run would stay there unchecked.
-    When the previous run cut the worker's note to give the route notes room,
+    manifest after the carry, and calls this for a finding in its `skip` set,
+    which gets no route note. When the previous run cut the worker's note to give the route notes room,
     the note before the cut (`ROUTE_UNCUT_NOTE_FIELD`) comes back in its place.
     """
     if not isinstance(remediation, dict):
@@ -15406,9 +15405,10 @@ def disclose_manual_remediation_routes(
     `declaration` is not a claim that no file declares the object, so a note
     that says "not declared" would publish a claim that nobody measured.
 
-    A finding in `skip` is left alone (`route_note_skip`): a fix that `finish`
-    wrote, that the worker declined with a published reason, or that a pull
-    request already carries.
+    A finding in `skip` gets no route note (`route_note_skip`): a fix that
+    `finish` wrote, that the worker declined with a published reason, or that
+    a pull request already carries. Only the route notes that its text copied
+    are removed.
 
     The pass first removes the route notes that the text already carries,
     which a worker that copies the previous ledger brings back, and then
@@ -15426,7 +15426,13 @@ def disclose_manual_remediation_routes(
     for finding in findings:
         fid = str(finding.get("id", ""))
         remediation = finding.get("remediation")
-        if fid in skip or not isinstance(remediation, dict) or remediation.get("kind") != "manual":
+        if not isinstance(remediation, dict) or remediation.get("kind") != "manual":
+            continue
+        if fid in skip:
+            before = remediation.get("note")
+            _strip_route_notes(remediation)
+            if remediation.get("note") != before:
+                disclosed.append(fid)
             continue
         original = str(remediation.get("note") or "")
         # The note before an earlier pass of this run cut it, when there was one.
@@ -15448,11 +15454,18 @@ def disclose_manual_remediation_routes(
 def disclose_manual_routes_and_log(
     findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str], prefix: str = ""
 ) -> None:
-    """Add the route notes, and log each finding that changed."""
-    if manifest is None:
-        return
+    """Add the route notes, and log each finding that changed.
+
+    A run with no manifest writes no route note, but it still removes the
+    route notes that a worker copied from an earlier ledger.
+    """
+    by_id = {str(finding.get("id", "")): finding for finding in findings}
     for fid in disclose_manual_remediation_routes(findings, manifest, skip):
-        log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
+        note = str((by_id[fid].get("remediation") or {}).get("note") or "")
+        if ROUTE_NOTE_PATTERN.search(note):
+            log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
+        else:
+            log(f"{prefix}{fid}: removed the route notes that its manual remediation copied from an earlier ledger.")
 
 
 class KccDeclaration(NamedTuple):

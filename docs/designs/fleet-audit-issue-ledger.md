@@ -674,9 +674,10 @@ shown as "a controller whose name the audit does not show". So a value cannot ad
 mention to the ledger, and the next pass can find and remove each whole note.
 The notes go in a paragraph of their own after the worker's note, and a code fence that the
 worker's note leaves open is closed first. A note whose path the worker's note already names as a
-whole path is not written, unless the cut below removes that mention. A candidate without these fields gets no note, because a missing
-`declaration` is not a claim that no file declares the object. A route note copied from an earlier
-ledger is removed before the notes are written again. A fix that `finish` wrote, that the worker
+whole path is not written, unless the cut below removes that mention. A candidate without these
+fields gets no note, because a missing `declaration` is not a claim that no file declares the
+object. A route note copied from an earlier ledger is removed before the notes are written again,
+also from a fix that gets no route note and on a run without a manifest. A fix that `finish` wrote, that the worker
 declined, or that a pull request already carries gets no route note, because the row already gives
 the answer. A pull request carries the fix when its delta block names the finding, or, for a
 degraded fix, when it is on the branch that the promised path names; a pull request that the

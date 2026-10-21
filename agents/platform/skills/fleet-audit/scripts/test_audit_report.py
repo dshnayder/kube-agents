@@ -20245,6 +20245,19 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertEqual(self.disclose(finding, manifest, skip={"a"}), [])
         self.assertEqual(self.note(finding), self.WORKER_NOTE)
 
+    def test_a_copied_route_note_goes_where_the_pass_writes_none(self):
+        """A skipped finding and a run with no manifest get no route note, but
+        a route note the worker copied from an earlier ledger still goes."""
+        stale = audit_report.DECLARED_NOTE.format(path="apps/old/a.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="`flux`")
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"}, reconciler="`flux`")
+        finding = self.manual(note=f"{self.WORKER_NOTE} {stale}\n\n{reconciled}")
+        self.assertEqual(self.disclose(finding, manifest, skip={"a"}), ["a"])
+        self.assertEqual(self.note(finding), self.WORKER_NOTE)
+        finding = self.manual(note=f"{self.WORKER_NOTE}\n\n{reconciled}")
+        audit_report.disclose_manual_routes_and_log([finding], None, set())
+        self.assertEqual(self.note(finding), self.WORKER_NOTE)
+
     def test_a_path_the_worker_already_named_is_not_named_again(self):
         worker = "Edit `argocd/apps/web.yaml` and set livenessProbe in the values."
         finding = self.manual(note=worker)
