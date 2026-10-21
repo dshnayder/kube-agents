@@ -1312,7 +1312,8 @@ RUN_SCHEDULED_KEY = "scheduled"
 SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
 # On the stored envelope only: the finding ids that the last scheduled run
 # published. With a ledger, these are its findings, the postures it withheld,
-# and the held ids. With no forge, they are its findings and the held ids,
+# and the held ids; for a clean run that left the body untouched, the ids
+# the body still lists. With no forge, they are its findings and the held ids,
 # which are the ids it stores as `current_ids`. Kept
 # and copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
 # published ids are not these speaks, so a finding that an on-demand run saw
@@ -18274,10 +18275,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # no record shows the ids, the run speaks.
     scheduled_memory = memory if existing_issue else newest_stored_record(audit_id, repo)
     scheduled_ids = scheduled_published_baseline(scheduled_memory)
-    ids_moved = scheduled and (
-        scheduled_ids is None
-        or (not stale_scheme and published_ids != set(scheduled_ids))
-    )
     # An id stays under `reported_under_gap` until a run publishes it again
     # or a run with full coverage does not find it. That run resolved it, so
     # a later scheduled run with a gap does not report it as dropped under a
@@ -18289,6 +18286,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         scheduled_reported = scheduled_reported_baseline(memory) - published_ids
     else:
         already_reported, scheduled_reported = set(), set()
+    # An id that a scheduled run already reported under a gap is not a move.
+    # A clean run that leaves the body untouched stores the ids the body
+    # still lists as the baseline, and reports them under a gap.
+    ids_moved = scheduled and (
+        scheduled_ids is None
+        or (
+            not stale_scheme
+            and published_ids != set(scheduled_ids) - scheduled_reported
+        )
+    )
     if scheduled:
         # An id that the last scheduled run published and that an on-demand
         # run dropped since then is news only when it left under a gap, which
@@ -18923,7 +18930,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 reported_under_gap=reported_under_gap,
                 scheduled=scheduled,
                 scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
-                scheduled_published_ids=next_scheduled_ids,
+                # A body left untouched still publishes the previous ids, so
+                # a scheduled run stores those as the scheduled baseline.
+                scheduled_published_ids=(
+                    stored_ids if scheduled and body_untouched else next_scheduled_ids
+                ),
                 scheduled_reported_under_gap=next_scheduled_reported,
             ),
             now,

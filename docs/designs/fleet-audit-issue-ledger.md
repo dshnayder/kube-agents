@@ -1160,12 +1160,14 @@ flag then reports, and does not go silent.
 The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
 the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
 last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
-it withheld, and the held ids; with no forge, its findings and the held ids, which are the ids it
+it withheld, and the held ids, or for a clean run that left the body untouched, the ids that body
+still lists; with no forge, its findings and the held ids, which are the ids it
 stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
-the channel. Its `new` and `resolved` then can be 0, so the JSON line also carries
+the channel. An id that a scheduled run already reported under a gap (`scheduled_reported_under_gap`)
+is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
 `since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
 report says them on a line of its own ("Changed since the last scheduled run: …"). A Slack card
 (`KAGE_SLACK_UX` on) replaces the text and does not show this line. When no record shows

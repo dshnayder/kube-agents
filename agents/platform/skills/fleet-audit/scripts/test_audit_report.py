@@ -16746,6 +16746,32 @@ class TestScheduledBaselineUnknownOrClosed(HarnessTestCase):
         self.assertIn(f"0 new, 1 resolved ({gone}).", chat.call_args.args[2])
         self.assertFalse(first["silent_ok"])
 
+    def test_a_held_open_clean_run_keeps_the_ids_the_body_publishes_as_the_baseline(self):
+        # A clean run over a gap leaves the body untouched, so the ledger
+        # still publishes a and c. When coverage comes back with a and c,
+        # nothing moved since the last scheduled run.
+        self.seed_scheduled([self.a, self.c])
+        held = self.finish([], scheduled=True, skipped=self.PARTIAL)
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertTrue(stored["ledger_held_open"])
+        self.assertFalse(held["silent_ok"])
+        self.assertTrue(self.finish([], scheduled=True, skipped=self.PARTIAL)["silent_ok"])
+        back = self.finish([self.a, self.c], scheduled=True)
+        self.assertEqual((back["status"], back["new"], back["resolved"]), ("UPDATED", 0, 0))
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, back)
+        self.assertTrue(back["silent_ok"])
+
+    def test_an_on_demand_run_after_a_held_open_clean_run_does_not_make_the_ids_new(self):
+        self.seed_scheduled([self.a, self.c])
+        self.finish([], scheduled=True, skipped=self.PARTIAL)
+        for skipped in (self.PARTIAL, None):
+            with self.subTest(on_demand_gap=bool(skipped)):
+                self.finish([self.a, self.c] if skipped is None else [], scheduled=False, skipped=skipped)
+                back = self.finish([self.a, self.c], scheduled=True)
+                self.assertEqual((back["new"], back["resolved"]), (0, 0))
+                self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, back)
+                self.assertTrue(back["silent_ok"])
+
 
 class TestScheduledChangeIsSaid(HarnessTestCase):
     """A scheduled run that speaks because its ids moved says what moved.
@@ -17028,8 +17054,8 @@ class TestStandingCoverageGap(HarnessTestCase):
             status="CLEAN",
             ledger_held_open=True,
             reported_under_gap=audit_report.parse_delta_block(previous),
-            # A clean run publishes no id.
-            **{audit_report.SCHEDULED_PUBLISHED_IDS_KEY: []},
+            # The untouched body still publishes its ids.
+            **{audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(previous)},
         )
         self.harness.replies = {"issue-list": self.issue_list()}
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
