@@ -15113,14 +15113,13 @@ class TestUnreadTargetReason(unittest.TestCase):
         self.assertEqual([(e["id"], e["title"]) for e in entries], [("rendered", "Shown")])
 
     def truncated_previous(self):
-        """A previous body the budget truncated: prod findings rendered, stage-eu's minor cut."""
-        # Long excerpts truncate the body with few enough ids that the
-        # complete list stays under ALL_FINDINGS_BLOCK_CAP.
+        """A previous body the budget truncated: prod findings named, stage-eu's minor omitted."""
+        # More criticals than one line each can name, so the body names
+        # only criticals and omits the minor: a finding that a name fits is
+        # listed on one line, and is in the hidden block.
         prod = [
-            make_finding(
-                fid=f"p-{n:04d}", severity="critical", cluster="prod-us-east", excerpt="x" * 3000
-            )
-            for n in range(60)
+            make_finding(fid=f"p-{n:04d}", severity="critical", cluster="prod-us-east")
+            for n in range(400)
         ]
         cut = make_finding(fid="cut", severity="minor", cluster="stage-eu", title="Cut for room")
         doc = make_doc(findings=prod + [cut])
@@ -15146,6 +15145,23 @@ class TestUnreadTargetReason(unittest.TestCase):
         # Without it nothing places the cut id, and it was never in the hidden
         # block, so it is not held by id alone.
         self.assertEqual(audit_report.unread_held_entries(rendered.body, None, unread, exclude=set()), [])
+
+    def test_a_finding_listed_on_one_line_keeps_its_place_without_the_store(self):
+        # The previous body listed the finding on one line (no full block),
+        # so its id is in the hidden block and its row gives the place.
+        doc = make_doc(findings=bulk_findings(250))
+        audit_report.validate_findings(doc, AUDIT)
+        rendered = audit_report.render_issue_body(doc, generated_at=NOW)
+        self.assertTrue(rendered.listed, "fixture must overflow the full rows")
+        listed = rendered.listed[-1]
+        unread = make_doc(findings=[], clusters=[{"name": "stage-eu"}], skipped=[{"cluster": "prod-us-east", "reason": "x"}])
+        entries = {e["id"]: e for e in audit_report.unread_held_entries(rendered.body, None, unread, exclude=set())}
+        entry = entries[listed["id"]]
+        self.assertEqual(entry["title"], listed["title"])
+        self.assertEqual(
+            (entry["cluster"], entry["namespace"], entry["object"]),
+            (listed["cluster"], listed["namespace"], listed["object"]),
+        )
 
     def test_a_cut_id_on_a_target_that_was_checked_is_not_kept(self):
         rendered, doc, cut_id = self.truncated_previous()
