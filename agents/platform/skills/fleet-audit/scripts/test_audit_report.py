@@ -20430,6 +20430,40 @@ class TestManualRemediationRoutes(unittest.TestCase):
                 self.assertIn(added, rendered)
                 self.assertNotIn(added + " …(truncated)", rendered)
 
+    def test_the_worker_note_is_never_dropped_without_the_truncation_mark(self):
+        """A path of 1,730 characters left room for the route notes only, and
+        the worker's note went with no mark. Now a path or a reconciler past
+        its cap is not shown, and route notes with no room for the mark are
+        left out."""
+        worker = "x" * audit_report.MAX_NOTE_CHARS
+        path = ("apps/" * audit_report.MAX_NOTE_CHARS)[:1730]
+        finding = self.manual(note=worker)
+        self.assertEqual(self.disclose(finding, self.manifest(declaration={"path": path})), [])
+        self.assertEqual(self.note(finding), worker)
+        name = "r" * audit_report.ROUTE_RECONCILER_MAX_CHARS
+        finding = self.manual(note=worker)
+        self.disclose(finding, self.manifest(reconciler=f"`{name}`"))
+        self.assertIn(audit_report.RECONCILER_UNNAMED, self.note(finding))
+        self.assertNotIn(name, self.note(finding))
+        crowded = "y" * (audit_report.MAX_NOTE_CHARS - len(audit_report.ROUTE_PARAGRAPH_BREAK) - 1)
+        self.assertEqual(audit_report._fit_route_notes(worker, crowded), (worker, ""))
+
+    def test_the_longest_route_notes_leave_room_for_the_worker_note(self):
+        path = "a" * audit_report.ROUTE_PATH_MAX_CHARS
+        lede = "the Helm release `"
+        name = "r" * (audit_report.ROUTE_RECONCILER_MAX_CHARS - len(lede) - len("`"))
+        manifest = self.manifest(
+            release_declaration={"path": path, "renderer": "kustomize"}, reconciler=f"{lede}{name}`"
+        )
+        finding = self.manual(note="Set the probe. " + "x" * audit_report.MAX_NOTE_CHARS)
+        self.disclose(finding, manifest)
+        note = self.note(finding)
+        self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+        self.assertTrue(note.startswith("Set the probe. x"), note[:40])
+        self.assertIn("…(truncated)", note)
+        self.assertIn(f"`{path}`", note)
+        self.assertIn(name, note)
+
     def test_a_carried_cut_note_is_whole_again_when_there_is_room(self):
         """The carry copies the stored note. A cut made only to give the route
         notes room must not stay on the note after the route notes are gone."""

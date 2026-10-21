@@ -1524,6 +1524,13 @@ RECONCILED_NOTE = (
 # location note.
 ROUTE_PATH_TEXT = r"[A-Za-z0-9_./-]+"
 ROUTE_PATH_PATTERN = re.compile(ROUTE_PATH_TEXT)
+# The longest path and the longest reconciler phrase that a route note shows.
+# The two longest notes with values at these caps take less than
+# `MAX_NOTE_CHARS`, so the route notes always leave room for the start of the
+# worker's note and its truncation mark. A longer path gets no location note,
+# and a longer reconciler is shown as `RECONCILER_UNNAMED`.
+ROUTE_PATH_MAX_CHARS = 512
+ROUTE_RECONCILER_MAX_CHARS = 512
 # A name in a reconciler: a Helm release, an Argo CD Application, or an
 # `app.kubernetes.io/managed-by` label value.
 ROUTE_NAME_TEXT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -15244,11 +15251,12 @@ def _field_path(candidate: dict, field: str) -> str:
 
     `""` also when the path has a character that `ROUTE_PATH_PATTERN` does not
     accept: no location note is better than a note that a file name can
-    change into a link or a mention.
+    change into a link or a mention. And `""` when the path is longer than
+    `ROUTE_PATH_MAX_CHARS`, so that the route notes cannot fill the note.
     """
     value = candidate.get(field)
     path = str(value.get("path") or "").strip() if isinstance(value, dict) else ""
-    return path if ROUTE_PATH_PATTERN.fullmatch(path) else ""
+    return path if len(path) <= ROUTE_PATH_MAX_CHARS and ROUTE_PATH_PATTERN.fullmatch(path) else ""
 
 
 def _shown_reconciler(candidate: dict) -> str:
@@ -15256,10 +15264,13 @@ def _shown_reconciler(candidate: dict) -> str:
 
     The phrase comes from annotations on the live object. When it is not
     exactly one of the phrases `collect.reconciler_of` writes, with safe
-    names, the note shows `RECONCILER_UNNAMED` in its place.
+    names, or is longer than `ROUTE_RECONCILER_MAX_CHARS`, the note shows
+    `RECONCILER_UNNAMED` in its place.
     """
     reconciler = str(candidate.get("reconciler") or "").strip()
-    if not reconciler or RECONCILER_PATTERN.fullmatch(reconciler):
+    if not reconciler:
+        return reconciler
+    if len(reconciler) <= ROUTE_RECONCILER_MAX_CHARS and RECONCILER_PATTERN.fullmatch(reconciler):
         return reconciler
     return RECONCILER_UNNAMED
 
@@ -15334,7 +15345,9 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
     A worker note that leaves a code fence open gets the fence closed, so the
     route notes after it are prose. A cut never goes inside a code block: a
     worker note with a fence is cut only before its first fence, and when
-    that does not give enough space the route notes are left out.
+    that does not give enough space the route notes are left out. A cut
+    always ends with `ROUTE_NOTE_TRUNCATED`, and route notes that leave no
+    room for it are left out too.
 
     The length is measured after `publishable_text`, as the renderer measures
     it: an escaped comment opener and a redaction placeholder make the text
@@ -15350,7 +15363,7 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
         return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
 
     def cut(room: int) -> str:
-        return worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED
+        return (worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
 
     if fits(worker_note):
         return worker_note, added
@@ -15370,9 +15383,11 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
             low = middle
         else:
             high = middle - 1
-    if low and fits(cut(low)):
+    # The mark stays even when no character of the worker's note fits; route
+    # notes that leave no room for the mark are left out.
+    if fits(cut(low)):
         return cut(low), added
-    return "", added
+    return worker_note, ""
 
 
 def disclose_manual_remediation_routes(

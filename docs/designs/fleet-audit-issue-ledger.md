@@ -671,7 +671,10 @@ The paths come from file names in the repository and the reconciler from annotat
 object, so a note shows only letters, digits and `_./-` from them. A path with another character
 gets no location note. A reconciler that is not exactly one of the phrases the collector writes is
 shown as "a controller whose name the audit does not show". So a value cannot add a link or a
-mention to the ledger, and the next pass can find and remove each whole note.
+mention to the ledger, and the next pass can find and remove each whole note. A path or a
+reconciler longer than 512 characters is not shown either (`ROUTE_PATH_MAX_CHARS`,
+`ROUTE_RECONCILER_MAX_CHARS`), so the route notes always leave room for the start of the worker's
+note and its ` …(truncated)` mark.
 The notes go in a paragraph of their own after the worker's note, and a code fence that the
 worker's note leaves open is closed first. A note whose path the worker's note already names as a
 whole path is not written, unless the cut below removes that mention. A candidate without these
