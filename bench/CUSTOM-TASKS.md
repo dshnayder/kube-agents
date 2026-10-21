@@ -455,7 +455,8 @@ line each while they fit and, when it omits any, lists every filed id in a hidde
 `audit-findings-all` block.
 `every_finding_named: true` fails when a filed id is neither a finding heading nor a code span in
 the body a person reads. Collector-held ids, which the held span records in its own comment, are
-not graded. Above the block's 12,000-character cap the block is left out; the check then
+not graded. Nor are the ids under _Not re-checked this run_, which the held span records in a
+second comment, `<!-- audit-not-rechecked-ids: [...] -->`. Above the block's 12,000-character cap the block is left out; the check then
 fails on the renderer's omission notice instead.
 
 **`scope: finding_ids`.** Reach for it whenever the phrase is a **cluster** name. The rendered

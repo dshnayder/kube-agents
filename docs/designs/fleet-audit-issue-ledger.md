@@ -1122,10 +1122,15 @@ check that applies there did not run; when no entry names it and its project tar
 previous marker and the findings of the stored document that the previous body renders, which adds
 the findings the body budget cut. A finding that the document lists under `resolved_because` is not a
 candidate, because the run says it is gone. The place of each finding comes from its row on the previous
-body, from that stored document, or from `not_rechecked` on the stored record: the title and place
+body (a full block, or a one-line row under _Listed without detail_), from that stored document, or
+from `not_rechecked` on the stored record: the title and place
 of each finding the previous run kept this way. The note and id-only tiers of the held span ([collector design §3.3](fleet-audit-collector-manifest.md#33-resolution--still_flagged_ids-collector_held_entries))
 write no row, so without that key the next gap run could not place the id and the finding would
-come back as new on the next complete run. An id with no known place is not kept, and the run log
+come back as new on the next complete run. The one-line rows of a body that overflows (§7.1) fill
+most of the room that the findings leave, so the held span often falls to one of these two tiers.
+Every tier writes the ids of these findings in a second renderer-owned list inside the held span,
+`<!-- audit-not-rechecked-ids: [...] -->`. No run reads that list back. It lets a reader of the
+body tell these ids from findings that the body cut for space. An id with no known place is not kept, and the run log
 names it, because a row held by id alone would never get a place back and would stay for as long as
 any gap stands. On the findings run the rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how
 many it did not show, in every tier except the id-only one. The id stays in the marker, so the next complete run

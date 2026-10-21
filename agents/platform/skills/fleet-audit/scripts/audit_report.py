@@ -1126,6 +1126,14 @@ HELD_SECTION_END = "<!-- audit-held:end -->"
 # inference from it manufactured holds on streams that never had a manifest.
 HELD_IDS_COMMENT = "audit-held-ids"
 HELD_IDS_RE = re.compile(rf"<!--[ \t]*{HELD_IDS_COMMENT}:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Inside the same span every tier also writes the ids under _Not re-checked
+# this run_ (`UNREAD_HELD_HEADING`) as a second list. No run reads it back: the
+# next run reads these ids from the hidden block and their places from the
+# report store. It is for a reader of the body. The note and id-only tiers
+# show no row for them, and without the list a reader cannot tell them from
+# findings that the body cut for space (the bench's `every_finding_named`
+# check reads it for that reason).
+NOT_RECHECKED_IDS_COMMENT = "audit-not-rechecked-ids"
 HELD_CHECK_LINE_RE = re.compile(
     r"^- \*\*Check:\*\* `([^`\n]*)` — the collector ran `([^`\n]*)` there", re.M
 )
@@ -8621,7 +8629,8 @@ def unread_held_entries(
     the withheld postures, the declared entries and the collector-held ids),
     and less the ids the document lists under `resolved_because`: the run
     says that those are gone, so it does not also say it did not check them.
-    The place of each comes from its row on the previous body, or else from
+    The place of each comes from its row on the previous body (a full block,
+    or a one-line row under _Listed without detail_), or else from
     that same stored document, or else from the stored entries the previous
     run kept as not re-checked (`NOT_RECHECKED_KEY`), which is where the
     place of a held id with no row is. An id with no known place is not
@@ -11278,7 +11287,7 @@ def _render_held_note(
         HELD_SECTION_HEADING,
         "",
         opening,
-    ] + _render_held_overflow(overflow, noun) + unread_lines + _held_span_close(held)
+    ] + _render_held_overflow(overflow, noun) + unread_lines + _held_span_close(held + unread)
 
 
 def _held_span_close(held: list[dict]) -> list[str]:
@@ -11287,13 +11296,16 @@ def _held_span_close(held: list[dict]) -> list[str]:
     The list leaves out the entries held because this run did not check
     their target (`UNREAD_REASON_KEY`). A run without a manifest carries the
     list unchanged, and those entries must go when a run checks the target
-    again. Their ids stay in the hidden block, which the next run reads.
+    again. Their ids stay in the hidden block, which the next run reads, and
+    they go in a second list (`NOT_RECHECKED_IDS_COMMENT`) when there are any.
     """
+    unread = [str(e.get("id", "")) for e in held if e.get(UNREAD_REASON_KEY)]
     return [
         "",
         held_ids_comment(
             [str(e.get("id", "")) for e in held if not e.get(UNREAD_REASON_KEY)]
         ),
+        *([f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"] if unread else []),
         HELD_SECTION_END,
     ]
 

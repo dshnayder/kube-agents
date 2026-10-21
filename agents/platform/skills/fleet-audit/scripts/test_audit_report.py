@@ -15246,6 +15246,44 @@ class TestUnreadHeldRendering(unittest.TestCase):
         body = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread], unread_overflow=3).body
         self.assertIn("_3 more previous finding(s) are on a target", body)
 
+    def test_every_tier_lists_its_id_apart_from_the_held_ids(self):
+        unread, flagged = self.entries()
+        for held in ([unread], [flagged, unread]):
+            for lines in (
+                audit_report._render_collector_held(held),
+                audit_report._render_collector_held(held, detail=False),
+                audit_report._render_held_note(held),
+                audit_report._render_held_ids_only(held),
+            ):
+                text = "\n".join(lines)
+                with self.subTest(held=len(held), text=text[:60]):
+                    self.assertIn(
+                        f'<!-- {audit_report.NOT_RECHECKED_IDS_COMMENT}: ["{unread["id"]}"] -->', text
+                    )
+                    self.assertNotIn(unread["id"], audit_report.parse_held_ids(text))
+        # No list when nothing is held for an unchecked target.
+        self.assertNotIn(
+            audit_report.NOT_RECHECKED_IDS_COMMENT,
+            "\n".join(audit_report._render_held_ids_only([flagged])),
+        )
+
+    def test_a_body_that_lists_findings_on_one_line_keeps_its_id(self):
+        # The one-line rows fill most of the room that the findings leave, so
+        # the held span can fall to a tier with no row. In every tier the id
+        # is in the hidden block and in the not-re-checked list, and not in
+        # the held ids.
+        unread, _ = self.entries()
+        for count in (250, 1000):
+            rendered = audit_report.render_issue_body(
+                make_doc(findings=bulk_findings(count)), generated_at=NOW, held=[unread]
+            )
+            with self.subTest(count=count):
+                self.assertTrue(rendered.listed)
+                self.assertIn(unread["id"], audit_report.parse_delta_block(rendered.body))
+                self.assertIn(f'{audit_report.NOT_RECHECKED_IDS_COMMENT}: ["{unread["id"]}"]', rendered.body)
+                self.assertEqual(audit_report.parse_held_ids(rendered.body), [])
+                self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
     def test_the_body_keeps_its_id_in_the_hidden_block(self):
         unread, _ = self.entries()
         rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread])
