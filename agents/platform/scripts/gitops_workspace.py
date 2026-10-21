@@ -88,6 +88,14 @@ MANAGED_REPOS_KEY = "managed_repos"
 CONTEXT_REPOS_KEY = "context_repos"
 
 
+#: The gitops-state ConfigMap key that names the repository with role gitops,
+#: as one `managed_repos` entry (`{"type", "url"}`). The operator writes it
+#: only when exactly one repository has that role, and removes it when none
+#: has or when two have it (`gitopsStateGitOpsRepoKey` in
+#: `platformagent_controller.go`).
+GITOPS_REPO_KEY = "gitops_repo"
+
+
 def agent_home() -> str:
     """The agent's data root — which is not always `/opt/data`.
 
@@ -1694,14 +1702,6 @@ def get_context_github_repo_entries() -> list[dict]:
     rule, same warning, same one-way relationship to the managed list.
     """
     return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True, enterprise=True)
-
-
-#: The gitops-state ConfigMap key that names the repository with role gitops,
-#: as one `managed_repos` entry (`{"type", "url"}`). The operator writes it
-#: only when exactly one repository has that role, and removes it when none
-#: has or when two have it (`gitopsStateGitOpsRepoKey` in
-#: `platformagent_controller.go`).
-GITOPS_REPO_KEY = "gitops_repo"
 
 
 def gitops_repo_key_text() -> str:
