@@ -16829,6 +16829,35 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.assertTrue(out["silent_ok"])
         self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
 
+    def test_a_baseline_in_an_old_id_scheme_is_not_known(self):
+        # The last scheduled run wrote its ids under the previous scheme. An
+        # on-demand run then rewrote the body under this scheme. The old ids
+        # are spelled differently, so they are not resolved.
+        old_scheme = audit_report.ID_SCHEME - 1
+        body = published_body(make_doc(findings=[self.a]), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {old_scheme} -->",
+        )
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: ["old-spelling-of-a"],
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.finish([self.a], scheduled=False)
+        out, text = self.finish([self.a], scheduled=True)
+        self.assertFalse(out["silent_ok"])
+        self.assertIsNone(out[audit_report.SINCE_SCHEDULED_KEY])
+        self.assertIn("The change since the last scheduled run is not known", text)
+        self.assertNotIn("old-spelling-of-a", text)
+        # The baseline is in this scheme now.
+        self.assertTrue(self.finish([self.a], scheduled=True)[0]["silent_ok"])
+
 
 class TestStandingCoverageGap(HarnessTestCase):
     """A coverage gap that did not change since the stored run is not news.

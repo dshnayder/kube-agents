@@ -7972,9 +7972,16 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
     saw first. So every stream speaks once after the upgrade that adds this
     key, and once after the store is rebuilt from the ledger
     (`seed_memory_from_ledger` writes no baseline).
+
+    A record written under another `id_scheme` also gives None: its ids are
+    spelled differently, so a compare would call each renamed id new and
+    each old id resolved. An on-demand run then copies None forward, so
+    the baseline in a record of this scheme is always in this scheme.
     """
     if memory == {}:
         return []
+    if (memory or {}).get("id_scheme") != ID_SCHEME:
+        return None
     stored = (memory or {}).get(SCHEDULED_PUBLISHED_IDS_KEY)
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
 
