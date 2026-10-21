@@ -3730,21 +3730,41 @@ def memory_matches_ledger(
     return False
 
 
+def store_never_published(directory: Path) -> bool:
+    """Whether no run that published to this ledger has written `directory`.
+
+    True when the directory does not exist, or when its `latest.json` is a
+    marked envelope (`is_diverted`) and the `runs/` ring holds no envelope
+    that is not marked: a run that could not reach the repository creates
+    the directory, but it leaves no memory of the ledger. An unreadable or
+    absent `latest.json` in a directory that exists is a lost memory, not a
+    store that was never written.
+    """
+    if not directory.exists():
+        return True
+    try:
+        latest = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return is_diverted(latest) and _newest_published_envelope(directory / REPORT_RUNS_DIR) is None
+
+
 def previous_run_memory(
     audit_id: str, issue_number: int | None, repo: str, live_body: str | None
 ) -> dict | None:
-    """The memory `start` and `finish` join against: the store, or — where the
-    store has no directory for this ledger at all — one seed off the ledger.
+    """The memory `start` and `finish` join against: the store, or — where no
+    run that published to this ledger wrote the store (`store_never_published`)
+    — one seed off the ledger.
 
     `live_body` is the open ledger's body as `find_existing_issue` listed it;
     a stored record whose id block it does not carry is a lost memory (see
-    `memory_matches_ledger`), not a reason to re-seed: a store that exists is
-    never replaced by the issue.
+    `memory_matches_ledger`), not a reason to re-seed: a store that a
+    published run wrote is never replaced by the issue.
     """
     if issue_number is None:
         return None
     try:
-        never_stored = not reports_dir_for(audit_id, repo).exists()
+        never_stored = store_never_published(reports_dir_for(audit_id, repo))
     except ValueError:
         never_stored = False
     if never_stored:

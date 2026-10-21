@@ -25331,6 +25331,37 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
         self.assertIs(stored["ledger_held_open"], True)
 
+    def test_a_store_of_only_unreachable_runs_is_seeded_from_the_ledger(self):
+        """A run that could not reach the repository stored a marked envelope
+        in its directory. That is not a published memory, so the next run that
+        reaches the repository still seeds once from the ledger's block."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        diverted = {
+            "repo": "acme/fleet", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "r"},
+        }
+        audit_report.write_report(AUDIT, diverted, NOW)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertIn("seeding this run's memory once", self.err)
+        self.assertEqual(self.stored()["ledger_body"], previous)
+
+    def test_a_store_with_a_published_run_is_not_seeded_again(self):
+        """A published envelope in the ring is a memory: a marked `latest.json`
+        on top of it does not make the store look never written."""
+        directory = audit_report.reports_dir_for(AUDIT, "acme/fleet")
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        diverted = {
+            "repo": "acme/fleet", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "r"},
+        }
+        audit_report.write_report(AUDIT, diverted, NOW + timedelta(hours=1))
+        self.assertTrue(audit_report.is_diverted(json.loads((directory / "latest.json").read_text())))
+        self.assertFalse(audit_report.store_never_published(directory))
+
     def test_a_held_open_run_after_a_seed_carries_no_empty_document(self):
         """Seeded off the block, then held open twice: neither memory wrote
         the body, so neither run's empty document may ride forward as the
