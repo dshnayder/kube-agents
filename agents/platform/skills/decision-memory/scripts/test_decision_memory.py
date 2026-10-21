@@ -619,6 +619,119 @@ class MultiForgeTests(unittest.TestCase):
         self.assertIn("!15", str(dec.evidence.get("breaking_pr", "")))
 
 
+class FakeLLM(BaseHTTPRequestHandler):
+    """Minimal OpenAI-compatible /v1/chat/completions mock for OKF synthesis tests."""
+    responses = []
+    calls = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n)) if n else {}
+        FakeLLM.calls.append(body)
+        reply = FakeLLM.responses.pop(0) if FakeLLM.responses else {}
+        payload = {"choices": [{"message": {"content": json.dumps(reply)}}]}
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+class LLMSynthesisTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), FakeLLM)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.llm_url = f"http://127.0.0.1:{cls.srv.server_port}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        FakeLLM.responses, FakeLLM.calls = [], []
+        self.r = Repo()
+
+    def tearDown(self):
+        self.r.close()
+
+    def test_from_outcome_synthesizes_okf_and_verifies_guard_against_head(self):
+        # Valid guard that passes against HEAD (checkout.yaml has 256Mi on container[name=app])
+        FakeLLM.responses.append({
+            "title": "Keep checkout memory request at 256Mi or higher",
+            "root_cause": "Lowering checkout memory below 256Mi triggered ExitCode 137 under load.",
+            "fix": "Restored resources.requests.memory to 256Mi in PR #44.",
+            "verification": "Zero OOMKills observed for 24 hours after rollout.",
+            "prevention": "Enforce a minimum memory request of 256Mi on checkout.",
+            "guard": {
+                "rule": "Keep checkout memory request >= 256Mi.",
+                "severity": "block",
+                "expect": {
+                    "file": "clusters/prod-eu/payments/checkout.yaml",
+                    "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                    "op": ">=",
+                    "value": "256Mi",
+                },
+            },
+        })
+        outcome = {
+            "pull_request": "https://github.com/acme/gitops/pull/44",
+            "title": "raw pr title",
+            "merged_at": "2026-10-12T10:00:00Z",
+            "merged_by": "bob",
+            "commit": "abc123",
+            "files": ["clusters/prod-eu/payments/checkout.yaml"],
+            "cluster": "prod-eu",
+            "pr_body": "Messy PR description about fixing checkout memory.",
+        }
+        f = self.r.path.parent / "outcome_llm.json"
+        f.write_text(json.dumps(outcome))
+        rc, out = self.r.run("from-outcome", str(f), "--llm-url", self.llm_url, "--write")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["llm_synthesized"])
+        self.assertTrue(out["valid"], out["problems"])
+        rec = dm.parse_record((self.r.path / out["path"]).read_text(), out["path"])
+        self.assertEqual(rec.title, "Keep checkout memory request at 256Mi or higher")
+        self.assertEqual(rec.guard["expect"]["value"], "256Mi")
+
+    def test_from_outcome_drops_hallucinated_guard_that_fails_on_head(self):
+        # Hallucinated guard expecting 1Gi (fails on HEAD where checkout.yaml has 256Mi)
+        FakeLLM.responses.append({
+            "title": "Synthesized lesson with bad guard",
+            "root_cause": "Root cause text.",
+            "fix": "Fix text.",
+            "verification": "Verified.",
+            "prevention": "Prevention text.",
+            "guard": {
+                "rule": "Hallucinated 1Gi requirement.",
+                "severity": "block",
+                "expect": {
+                    "file": "clusters/prod-eu/payments/checkout.yaml",
+                    "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                    "op": ">=",
+                    "value": "1Gi",
+                },
+            },
+        })
+        outcome = {
+            "pull_request": "https://github.com/acme/gitops/pull/45",
+            "title": "raw title",
+            "merged_at": "2026-10-12T10:00:00Z",
+            "files": ["clusters/prod-eu/payments/checkout.yaml"],
+        }
+        f = self.r.path.parent / "outcome_bad_guard.json"
+        f.write_text(json.dumps(outcome))
+        rc, out = self.r.run("from-outcome", str(f), "--llm-url", self.llm_url, "--write")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["llm_synthesized"])
+        rec = dm.parse_record((self.r.path / out["path"]).read_text(), out["path"])
+        self.assertEqual(rec.guard, {})
+
+
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")
 class LiveHindsightTests(unittest.TestCase):
     def test_round_trip(self):

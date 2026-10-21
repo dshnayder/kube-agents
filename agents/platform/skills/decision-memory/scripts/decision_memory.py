@@ -72,6 +72,8 @@ DEFAULT_SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 WITHDRAWN_EVAL_PROBE_TITLE = "[withdrawn-eval-probe]"
 DEFAULT_QUOTA_PATH = "spec.hard.requests\\.memory"
 DEFAULT_QUOTA_CEILING = "32Gi"
+DEFAULT_LLM_MODEL = "model-default"
+DEFAULT_LLM_TIMEOUT_SECONDS = 30.0
 
 BANK_CONFIG = {
     # Records are retained verbatim: `chunks` runs no LLM, so an identifier, a
@@ -804,6 +806,132 @@ def slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:60]
 
 
+def _resolve_llm_config(a: Any) -> Tuple[Optional[str], str, str]:
+    """Resolve OpenAI-compatible LLM base URL, model, and API key for record synthesis."""
+    if getattr(a, "no_llm", False):
+        return None, "", ""
+    base = (
+        getattr(a, "llm_url", None)
+        or os.environ.get("DECISION_MEMORY_LLM_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("LITELLM_BASE_URL")
+        or ""
+    ).strip()
+    if not base and os.environ.get("INFERENCE_GATEWAY_SERVICE_HOST"):
+        base = "http://inference-gateway/v1"
+    model = (
+        getattr(a, "llm_model", None)
+        or os.environ.get("DECISION_MEMORY_LLM_MODEL")
+        or os.environ.get("API_SERVER_MODEL_NAME")
+        or DEFAULT_LLM_MODEL
+    ).strip()
+    api_key = (
+        os.environ.get("DECISION_MEMORY_LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or "local"
+    ).strip()
+    return (base.rstrip("/") if base else None), model, api_key
+
+
+def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    text = raw.strip()
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        text = m.group(1)
+    else:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _guard_passes_on_head(repo: Path, guard: Dict[str, Any], resources: List[str]) -> bool:
+    """Verify that a candidate guard passes against the current repository worktree."""
+    exp = (guard or {}).get("expect")
+    if not isinstance(exp, dict):
+        return False
+    if not all(k in exp for k in ("file", "path", "op", "value")):
+        return False
+    if exp.get("op") not in VALID_OPS:
+        return False
+    if exp.get("path") != "$text":
+        try:
+            _path_tokens(str(exp["path"]))
+        except ValueError:
+            return False
+    matched_files = worktree_files(repo, [str(exp["file"])])
+    if not matched_files:
+        return False
+    results = evaluate_guard(exp, matched_files, resources)
+    return bool(results) and all(r["ok"] for r in results)
+
+
+def _llm_synthesize_record(
+    llm_url: Optional[str],
+    llm_model: str,
+    llm_api_key: str,
+    record_type: str,
+    context_payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Call an OpenAI-compatible chat completions endpoint to synthesize an OKF record."""
+    if not llm_url:
+        return None
+    if record_type == "decision":
+        schema_hint = (
+            '{"title": "<concise decision title>", '
+            '"context": "<why the decision was needed>", '
+            '"decision": "<the architectural rule and trade-offs>", '
+            '"consequences": "<how future changes must comply>", '
+            '"guard": {"rule": "<1-line invariant>", "severity": "block", '
+            '"expect": {"file": "<path>", "path": "<yaml_path_or_$text>", "op": "<op>", "value": "<val>"}}}'
+        )
+    else:
+        schema_hint = (
+            '{"title": "<concise lesson title>", '
+            '"root_cause": "<what happened and why it failed>", '
+            '"fix": "<what change resolved it>", '
+            '"verification": "<how resolution was verified>", '
+            '"prevention": "<rule to prevent repeat outage>", '
+            '"guard": {"rule": "<1-line invariant>", "severity": "block", '
+            '"expect": {"file": "<path>", "path": "<yaml_path_or_$text>", "op": "<op>", "value": "<val>"}}}'
+        )
+    prompt = (
+        "You are synthesizing a Kubernetes GitOps Operational Knowledge Format (OKF) "
+        f"{record_type} record from pull request and incident history.\n"
+        "Preserve all exact identifiers, PR/issue numbers, file paths, and resource quantities.\n"
+        "Return ONLY valid JSON matching this schema (omit 'guard' if no machine-checkable invariant applies):\n"
+        f"{schema_hint}\n\n"
+        f"Input evidence:\n{json.dumps(context_payload, indent=2, default=str)}"
+    )
+    body = json.dumps({
+        "model": llm_model,
+        "messages": [
+            {"role": "system", "content": "Respond with a single JSON object only."},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{llm_url}/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {llm_api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DEFAULT_LLM_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+        return _extract_json_object(str(content))
+    except Exception:
+        return None
+
+
 def cmd_from_outcome(a) -> Dict[str, Any]:
     """Draft a lesson from a merged fix and its verified resolution.
 
@@ -813,6 +941,7 @@ def cmd_from_outcome(a) -> Dict[str, Any]:
     """
     o = json.loads(Path(a.outcome).read_text())
     repo = Path(a.repo)
+    llm_url, llm_model, llm_key = _resolve_llm_config(a)
     merged = str(o.get("merged_at") or _dt.date.today().isoformat())[:10]
     rid = _next_id(repo, "lesson", int(merged[:4]))
     scope = {"paths": sorted(set(o.get("files") or []))}
@@ -822,32 +951,48 @@ def cmd_from_outcome(a) -> Dict[str, Any]:
         scope["clusters"] = [o["cluster"]]
     if o.get("check"):
         scope["checks"] = [o["check"]]
+
+    synth = _llm_synthesize_record(llm_url, llm_model, llm_key, "lesson", o) if llm_url else None
+    title = str((synth or {}).get("title") or o.get("title") or "").strip()
+    root_cause = str((synth or {}).get("root_cause") or o.get("root_cause") or o.get("pr_body") or "").strip()
+    fix_text = str((synth or {}).get("fix") or o.get("fix") or "").strip()
+    ver_text = str(
+        (synth or {}).get("verification")
+        or (o.get("resolution") or {}).get("summary")
+        or "The finding did not recur after the merge."
+    ).strip()
+    prev_text = str((synth or {}).get("prevention") or o.get("prevention") or "").strip()
+
     meta: Dict[str, Any] = {
-        "type": "lesson", "id": rid, "title": o["title"], "status": "active", "date": merged,
+        "type": "lesson", "id": rid, "title": title, "status": "active", "date": merged,
         "scope": scope,
     }
-    if o.get("guard"):
-        meta["guard"] = o["guard"]
+    guard = o.get("guard")
+    if not guard and isinstance((synth or {}).get("guard"), dict):
+        cand_guard = synth["guard"]
+        if _guard_passes_on_head(repo, cand_guard, scope.get("resources") or []):
+            guard = cand_guard
+    if guard:
+        meta["guard"] = guard
     meta["evidence"] = {k: v for k, v in {
         "pull_request": o.get("pull_request"), "commit": o.get("commit"),
         "merged_by": o.get("merged_by"), "finding_id": o.get("finding_id"),
         "resolution": o.get("resolution"), "incident": o.get("incident"),
     }.items() if v}
     body = "\n".join([
-        "## What happened", "", str(o.get("root_cause", "")).strip(), "",
-        "## What fixed it", "", str(o.get("fix", "")).strip(), "",
-        "## How we know it worked", "",
-        str((o.get("resolution") or {}).get("summary", "The finding did not recur after the merge.")).strip(), "",
-        "## Prevent it next time", "", str(o.get("prevention", "")).strip(),
+        "## What happened", "", root_cause, "",
+        "## What fixed it", "", fix_text, "",
+        "## How we know it worked", "", ver_text, "",
+        "## Prevent it next time", "", prev_text,
     ])
-    rel = f"knowledge/lessons/{rid}-{slug(o['title'])}.md"
+    rel = f"knowledge/lessons/{rid}-{slug(title)}.md"
     text = render_record(meta, body)
     errs = validate_record(parse_record(text, rel))
     if a.write and not errs:
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(text)
     return {"id": rid, "path": rel, "valid": not errs, "problems": errs, "written": bool(a.write and not errs),
-            "content": text}
+            "llm_synthesized": bool(synth), "content": text}
 
 
 def _reverted(repo: Path, commit: str) -> Optional[Dict[str, str]]:
@@ -1308,6 +1453,8 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
 
     written: List[str] = []
     triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
+    llm_synthesized_count = 0
+    llm_url, llm_model, llm_key = _resolve_llm_config(a)
     pr_to_record_id: Dict[int, str] = {}
     allocated_ids: Dict[Tuple[str, int], int] = {}
 
@@ -1341,10 +1488,18 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             old_pr_obj = pr_by_num.get(old_rev_pr, {})
             scoped_files = sorted(set(files + (old_pr_obj.get("_files") or [])))
             rid = _alloc_id("decision", year)
+            synth = _llm_synthesize_record(
+                llm_url, llm_model, llm_key, "decision",
+                {"pr_number": num, "title": title, "body": body, "files": scoped_files,
+                 "supersedes_pr": old_rev_pr, "incident": inc},
+            ) if llm_url else None
+            if synth:
+                llm_synthesized_count += 1
+            rec_title = str((synth or {}).get("title") or title).strip()
             meta: Dict[str, Any] = {
                 "type": "decision",
                 "id": rid,
-                "title": title,
+                "title": rec_title,
                 "status": "active",
                 "date": date_str,
                 "scope": {"paths": scoped_files},
@@ -1356,17 +1511,24 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             }
             if old_rec_id:
                 meta["supersedes"] = [old_rec_id]
-            rec_body = "\n".join([
+            rec_body_lines = [
                 "## Context",
                 "",
-                body.strip(),
+                str((synth or {}).get("context") or body).strip(),
                 "",
+            ]
+            if (synth or {}).get("decision"):
+                rec_body_lines.extend(["## Decision", "", str(synth["decision"]).strip(), ""])
+            if (synth or {}).get("consequences"):
+                rec_body_lines.extend(["## Consequences", "", str(synth["consequences"]).strip(), ""])
+            rec_body_lines.extend([
                 "## Superseded Incident & Freeze",
                 "",
                 f"Supersedes earlier revert PR #{old_rev_pr} and Incident #{inc_num} ({inc.get('title', '')}).",
                 "The prerequisite upgrade has landed and the temporary freeze is lifted.",
             ])
-            rel = f"knowledge/decisions/{rid}-{slug(title)}.md"
+            rec_body = "\n".join(rec_body_lines)
+            rel = f"knowledge/decisions/{rid}-{slug(rec_title)}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                 (repo / rel).write_text(render_record(meta, rec_body))
@@ -1405,10 +1567,23 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                     "value": q_val,
                 },
             }
+            synth = _llm_synthesize_record(
+                llm_url, llm_model, llm_key, "decision",
+                {"pr_number": num, "title": title, "body": body, "rejected_pr": rej_num,
+                 "rejected_comments": comments, "incident": inc, "files": sorted(set(rej_files + files))},
+            ) if llm_url else None
+            if synth:
+                llm_synthesized_count += 1
+                if isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
+                    guard = synth["guard"]
+            rec_title = str(
+                (synth or {}).get("title")
+                or f"Hard multi-tenant quota ceiling on {target_file} (rejected PR #{rej_num})"
+            ).strip()
             meta = {
                 "type": "decision",
                 "id": rid,
-                "title": f"Hard multi-tenant quota ceiling on {target_file} (rejected PR #{rej_num})",
+                "title": rec_title,
                 "status": "active",
                 "date": date_str,
                 "scope": {"paths": sorted(set(rej_files + files))},
@@ -1419,11 +1594,15 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                     "incident": _format_issue_ref(inc, inc_num, gh_repo),
                 },
             }
-            rec_body = "\n".join([
+            rec_body_lines = [
                 "## Architectural Decision",
                 "",
-                comments.strip() or body.strip(),
+                str((synth or {}).get("decision") or comments or body).strip(),
                 "",
+            ]
+            if (synth or {}).get("consequences"):
+                rec_body_lines.extend(["## Consequences", "", str(synth["consequences"]).strip(), ""])
+            rec_body_lines.extend([
                 "## Incident & Workload Fix",
                 "",
                 f"Incident #{inc_num}: {inc.get('title', '')}",
@@ -1433,6 +1612,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 f"Rejected quota increase in PR #{rej_num}; resolved at workload level in PR #{num}:",
                 body.strip(),
             ])
+            rec_body = "\n".join(rec_body_lines)
             rel = f"knowledge/decisions/{rid}-{slug(meta['title'])}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -1452,11 +1632,21 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             target_file = files[0] if files else ""
             commit_sha = pr.get("merge_commit_sha") or ""
             guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            synth = _llm_synthesize_record(
+                llm_url, llm_model, llm_key, "lesson",
+                {"pr_number": num, "title": title, "body": body, "breaking_pr": brk_num,
+                 "breaking_title": brk_pr.get("title", ""), "incident": inc, "files": files},
+            ) if llm_url else None
+            if synth:
+                llm_synthesized_count += 1
+                if not guard and isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
+                    guard = synth["guard"]
             rid = _alloc_id("lesson", year)
+            rec_title = str((synth or {}).get("title") or inc.get("title") or title).strip()
             meta = {
                 "type": "lesson",
                 "id": rid,
-                "title": inc.get("title") or title,
+                "title": rec_title,
                 "status": "active",
                 "date": date_str,
                 "scope": {"paths": files},
@@ -1469,18 +1659,21 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             }
             if guard:
                 meta["guard"] = guard
-            rec_body = "\n".join([
+            rec_body_lines = [
                 "## What happened",
                 "",
                 f"Breaking PR #{brk_num} ({brk_pr.get('title', '')}) triggered Incident #{inc_num}:",
                 "",
-                (inc.get("body") or "").strip(),
+                str((synth or {}).get("root_cause") or inc.get("body") or "").strip(),
                 "",
                 "## What fixed it",
                 "",
                 f"Revert/Fix PR #{num} ({title}):",
-                body.strip(),
-            ])
+                str((synth or {}).get("fix") or body).strip(),
+            ]
+            if (synth or {}).get("prevention"):
+                rec_body_lines.extend(["", "## Prevent it next time", "", str(synth["prevention"]).strip()])
+            rec_body = "\n".join(rec_body_lines)
             rel = f"knowledge/lessons/{rid}-{slug(title)}.md"
             if a.write:
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -1489,6 +1682,61 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             pr_to_record_id[num] = rid
             triage_counts["revert-lesson"] += 1
             continue
+
+        # Case 4: Natural-language incident fix or rejected governance PR synthesized via LLM
+        if llm_url and files and merged and m_fix:
+            inc_num = int(m_fix.group(1))
+            inc = issue_by_num.get(inc_num, {})
+            target_file = files[0]
+            commit_sha = pr.get("merge_commit_sha") or ""
+            guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            synth = _llm_synthesize_record(
+                llm_url, llm_model, llm_key, "lesson",
+                {"pr_number": num, "title": title, "body": body, "incident": inc, "files": files},
+            )
+            if synth:
+                llm_synthesized_count += 1
+                if not guard and isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], []):
+                    guard = synth["guard"]
+                rid = _alloc_id("lesson", year)
+                rec_title = str(synth.get("title") or inc.get("title") or title).strip()
+                meta = {
+                    "type": "lesson",
+                    "id": rid,
+                    "title": rec_title,
+                    "status": "active",
+                    "date": date_str,
+                    "scope": {"paths": files},
+                    "evidence": {
+                        "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                        "incident": _format_issue_ref(inc, inc_num, gh_repo),
+                        "commit": commit_sha[:12] if commit_sha else "",
+                    },
+                }
+                if guard:
+                    meta["guard"] = guard
+                rec_body = "\n".join([
+                    "## What happened",
+                    "",
+                    str(synth.get("root_cause") or inc.get("body") or body).strip(),
+                    "",
+                    "## What fixed it",
+                    "",
+                    f"Fix PR #{num} ({title}):",
+                    str(synth.get("fix") or body).strip(),
+                    "",
+                    "## Prevent it next time",
+                    "",
+                    str(synth.get("prevention") or "").strip(),
+                ])
+                rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                if a.write:
+                    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (repo / rel).write_text(render_record(meta, rec_body))
+                    written.append(rel)
+                pr_to_record_id[num] = rid
+                triage_counts["revert-lesson"] += 1
+                continue
 
         triage_counts["routine"] += 1
 
@@ -1532,6 +1780,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
         "prs_scanned": len(prs),
         "issues_scanned": len(issues),
         "triage": triage_counts,
+        "llm_synthesized": llm_synthesized_count,
         "written": written,
         "index": idx_res,
     }
@@ -1544,6 +1793,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     or os.environ.get("HINDSIGHT_API_URL"))
     ap.add_argument("--bank", default=os.environ.get("DECISION_MEMORY_BANK", DEFAULT_BANK_ID))
     ap.add_argument("--repo-id", default=None)
+    ap.add_argument("--llm-url", default=None, help="OpenAI-compatible LLM base URL for OKF synthesis")
+    ap.add_argument("--llm-model", default=None, help="Model name for OKF synthesis (default: model-default)")
+    ap.add_argument("--no-llm", action="store_true", help="Disable LLM synthesis and use deterministic extraction")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("validate")
     p = sub.add_parser("index")
@@ -1562,6 +1814,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("from-outcome")
     p.add_argument("outcome", help="outcome JSON file")
     p.add_argument("--write", action="store_true")
+    p.add_argument("--llm-url", default=None, help="OpenAI-compatible LLM base URL for OKF synthesis")
+    p.add_argument("--llm-model", default=None, help="Model name for OKF synthesis")
+    p.add_argument("--no-llm", action="store_true", help="Disable LLM synthesis")
     p = sub.add_parser("dream")
     p.add_argument("--recurrence-threshold", type=int, default=2)
     p.add_argument("--since-days", type=int, default=7)
@@ -1575,6 +1830,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--since", default="2y", help="history window to harvest (for example, 2y or 180d)")
     p.add_argument("--budget-minutes", type=int, default=120, help="wall-clock budget in minutes for bootstrap")
     p.add_argument("--write", action="store_true", help="write harvested records into knowledge/")
+    p.add_argument("--llm-url", default=None, help="OpenAI-compatible LLM base URL for OKF synthesis")
+    p.add_argument("--llm-model", default=None, help="Model name for OKF synthesis")
+    p.add_argument("--no-llm", action="store_true", help="Disable LLM synthesis")
     a = ap.parse_args(argv)
     handlers = {"validate": cmd_validate, "index": cmd_index, "check": cmd_check, "why": cmd_why,
                 "from-outcome": cmd_from_outcome, "dream": cmd_dream, "bootstrap": cmd_bootstrap}
