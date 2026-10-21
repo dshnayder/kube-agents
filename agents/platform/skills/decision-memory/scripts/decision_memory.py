@@ -20,6 +20,7 @@ Subcommands:
   why       explain the recorded rationale (or the history) behind a path
   from-outcome  draft a lesson record from a merged fix PR / resolved finding
   dream     nightly pass: verify, detect reverts/supersession/recurrence, reconcile index
+  bootstrap harvest historical PRs, issues, and revert commits into initial records
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -54,8 +56,22 @@ RECORD_DIRS = ("knowledge/decisions", "knowledge/lessons")
 RECORD_TYPES = ("decision", "lesson")
 STATUSES = ("proposed", "active", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
+VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
 RECORD_STRATEGY = "record"
 DOC_PREFIX = "okf:"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+DEFAULT_PAGE_SIZE = 100
+DEFAULT_RECALL_MAX_TOKENS = 2048
+MAX_CONTEXT_LENGTH = 200
+MAX_SEMANTIC_TEXT_SNIPPET = 160
+MAX_COMMIT_BODY_SNIPPET = 600
+MAX_SLUG_LENGTH = 60
+COMMIT_SHORT_SHA_LENGTH = 12
+DEFAULT_VCS_ROOT = "/opt/data/scratch/vcs"
+DEFAULT_SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+WITHDRAWN_EVAL_PROBE_TITLE = "[withdrawn-eval-probe]"
+DEFAULT_QUOTA_PATH = "spec.hard.requests\\.memory"
+DEFAULT_QUOTA_CEILING = "32Gi"
 
 BANK_CONFIG = {
     # Records are retained verbatim: `chunks` runs no LLM, so an identifier, a
@@ -181,6 +197,8 @@ def render_record(meta: Dict[str, Any], body: str) -> str:
 
 
 def validate_record(rec: Record) -> List[str]:
+    if rec.meta.get("_parse_error"):
+        return [str(rec.meta["_parse_error"])]
     errs = []
     if rec.type not in RECORD_TYPES:
         errs.append(f"type must be one of {RECORD_TYPES}")
@@ -198,8 +216,17 @@ def validate_record(rec: Record) -> List[str]:
         if g.get("severity") and g["severity"] not in SEVERITIES:
             errs.append(f"guard.severity must be one of {SEVERITIES}")
         exp = g.get("expect")
-        if exp and not all(k in exp for k in ("file", "path", "op", "value")):
-            errs.append("guard.expect needs file, path, op, value")
+        if exp:
+            if not all(k in exp for k in ("file", "path", "op", "value")):
+                errs.append("guard.expect needs file, path, op, value")
+            else:
+                if exp.get("op") not in VALID_OPS:
+                    errs.append(f"guard.expect.op must be one of {VALID_OPS}")
+                if exp.get("path") != "$text":
+                    try:
+                        _path_tokens(str(exp["path"]))
+                    except ValueError as exc:
+                        errs.append(f"guard.expect.path is invalid: {exc}")
     if rec.type == "lesson" and not rec.evidence.get("pull_request"):
         errs.append("a lesson needs evidence.pull_request — it is learned from a merged fix")
     if rec.status == "superseded" and not rec.meta.get("superseded_by"):
@@ -216,7 +243,11 @@ def load_records(repo: Path) -> List[Record]:
         for p in sorted(base.glob("*.md")):
             if p.name.lower() in ("index.md", "readme.md"):
                 continue
-            out.append(parse_record(p.read_text(), str(p.relative_to(repo))))
+            rel = str(p.relative_to(repo))
+            try:
+                out.append(parse_record(p.read_text(), rel))
+            except (ValueError, yaml.YAMLError) as exc:
+                out.append(Record(path=rel, meta={"_parse_error": str(exc)}, body=""))
     return out
 
 
@@ -284,10 +315,19 @@ def compare(actual: Any, op: str, expected: Any) -> bool:
     a, e = quantity(actual), quantity(expected)
     if a is None or e is None:
         return False
-    return {">=": a >= e, ">": a > e, "<=": a <= e, "<": a < e}[op]
+    ops = {">=": a >= e, ">": a > e, "<=": a <= e, "<": a < e}
+    return ops.get(op, False)
 
 
-def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str]) -> List[Dict[str, Any]]:
+def _doc_resource_id(doc: Any) -> Optional[str]:
+    if isinstance(doc, dict) and doc.get("kind") and isinstance(doc.get("metadata"), dict):
+        md = doc["metadata"]
+        return f"{doc['kind']}/{md.get('namespace', '')}/{md.get('name', '')}"
+    return None
+
+
+def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str],
+                   scope_resources: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Evaluate a guard over {path: content}. One result per matching document."""
     results = []
     op = expect["op"]
@@ -301,7 +341,22 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str]) -> List[Dict[s
         try:
             docs = [d for d in yaml.safe_load_all(content) if d is not None]
         except yaml.YAMLError:
+            results.append({"file": fpath, "actual": None, "ok": False})
             continue
+        if not docs:
+            results.append({"file": fpath, "actual": None, "ok": op == "absent"})
+            continue
+        if len(docs) > 1 and scope_resources:
+            scoped = [
+                d for d in docs
+                if _doc_resource_id(d) and any(fnmatch.fnmatch(_doc_resource_id(d) or "", g) for g in scope_resources)
+            ]
+            if scoped:
+                docs = scoped
+        if len(docs) > 1:
+            non_null = [d for d in docs if yaml_get(d, expect["path"]) is not None]
+            if non_null:
+                docs = non_null
         for doc in docs:
             actual = yaml_get(doc, expect["path"])
             if actual is None and op not in ("absent", "present"):
@@ -320,23 +375,53 @@ def _resources_in(content: str) -> List[str]:
     out = []
     try:
         for d in yaml.safe_load_all(content):
-            if isinstance(d, dict) and d.get("kind") and isinstance(d.get("metadata"), dict):
-                md = d["metadata"]
-                out.append(f"{d['kind']}/{md.get('namespace', '')}/{md.get('name', '')}")
+            rid = _doc_resource_id(d)
+            if rid:
+                out.append(rid)
     except yaml.YAMLError:
         pass
     return out
 
 
+def _select_precedence_winners(records: List[Record], target_files: Iterable[str]) -> List[Record]:
+    """Apply Precedence Rules 3 and 4 when multiple active records guard the same YAML path on a file."""
+    grouped: Dict[Tuple[str, str], List[Record]] = {}
+    ungrouped: List[Record] = []
+    tfiles = list(target_files)
+    for rec in records:
+        exp = rec.guard.get("expect")
+        if not exp:
+            ungrouped.append(rec)
+            continue
+        matched_targets = [f for f in tfiles if fnmatch.fnmatch(f, exp["file"])]
+        if not matched_targets:
+            ungrouped.append(rec)
+            continue
+        for mf in matched_targets:
+            grouped.setdefault((mf, exp["path"]), []).append(rec)
+    suppressed_ids = set()
+    for (_mf, _path), group in grouped.items():
+        if len(group) <= 1:
+            continue
+        # Rule 4: narrower cluster scope (non-empty clusters) outranks fleet-wide (empty clusters).
+        has_narrow = any(bool(r.scope["clusters"]) for r in group)
+        has_broad = any(not r.scope["clusters"] for r in group)
+        if has_narrow and has_broad:
+            for r in group:
+                if not r.scope["clusters"]:
+                    suppressed_ids.add(r.id)
+    return [r for r in records if r.id not in suppressed_ids]
+
+
 def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
     """changed: {path: new content, or None if deleted}. Returns findings."""
-    rec_list = list(records)
+    rec_list = [r for r in records if not r.meta.get("_parse_error")]
     by_id = {r.id: r for r in rec_list}
+    active_candidates = [r for r in rec_list if r.status in ("active", "proposed")]
+    effective_records = _select_precedence_winners(active_candidates, changed.keys())
     findings = []
     new_resources = {p: _resources_in(c) for p, c in changed.items() if c}
-    for rec in rec_list:
-        if rec.status not in ("active", "proposed"):
-            continue
+    for rec in effective_records:
         s = rec.scope
         hits = set()
         for p in changed:
@@ -351,8 +436,8 @@ def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -
         detail = []
         exp = rec.guard.get("expect")
         if exp:
-            files = {p: c for p, c in changed.items() if c and p in hits}
-            detail = evaluate_guard(exp, files)
+            files = {p: c for p, c in changed.items() if c is not None and p in hits}
+            detail = evaluate_guard(exp, files, s["resources"])
             deleted = [p for p in hits if changed.get(p) is None and fnmatch.fnmatch(p, exp["file"])]
             if any(not d["ok"] for d in detail) or deleted:
                 verdict = "violates"
@@ -489,14 +574,17 @@ class Hindsight:
         self._req("PATCH", "/config", {"updates": BANK_CONFIG})
 
     def retain(self, rec: Record, repo_id: str) -> None:
+        text = rec.render_for_index()
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         item = {
-            "content": rec.render_for_index(),
+            "content": text,
             "document_id": rec.document_id(repo_id),
             "update_mode": "replace",
             "context": f"{rec.id}: {rec.title}"[:200],
             "tags": rec.tags(),
             "metadata": {"id": rec.id, "type": rec.type, "status": rec.status, "path": rec.path,
-                         "pull_request": str(rec.evidence.get("pull_request") or "")},
+                         "pull_request": str(rec.evidence.get("pull_request") or ""),
+                         "sha256": sha},
             "strategy": RECORD_STRATEGY,
         }
         if rec.meta.get("date"):
@@ -629,9 +717,12 @@ def cmd_index(a) -> Dict[str, Any]:
     for doc_id, rec in wanted.items():
         cur = existing.get(doc_id)
         if cur and sorted(cur.get("tags") or []) == rec.tags() and not a.force:
-            # Same tags; let Hindsight's content hash decide whether text changed.
+            text = rec.render_for_index()
+            sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
             meta = cur.get("document_metadata") or {}
-            if meta.get("status") == rec.status and (cur.get("text_length") or 0) == len(rec.render_for_index()):
+            stored_sha = meta.get("sha256")
+            content_matches = (stored_sha == sha) if stored_sha else ((cur.get("text_length") or 0) == len(text))
+            if meta.get("status") == rec.status and content_matches:
                 unchanged.append(rec.id)
                 continue
         hs.retain(rec, repo_id)
@@ -669,7 +760,8 @@ def cmd_check(a) -> Dict[str, Any]:
             semantic = [{"id": None, "text": f"semantic search unreachable: {e}", "document_id": None}]
     verdict = "block" if any(f["severity"] == "block" for f in findings) else \
         "warn" if any(f["severity"] == "warn" for f in findings) else "ok"
-    return {"verdict": verdict, "changed": sorted(changed), "findings": findings, "semantic": semantic,
+    status = "found" if (findings or semantic) else "no_match"
+    return {"status": status, "verdict": verdict, "changed": sorted(changed), "findings": findings, "semantic": semantic,
             "markdown": render_check_markdown(findings, semantic)}
 
 
@@ -690,7 +782,8 @@ def cmd_why(a) -> Dict[str, Any]:
     uncovered = [h for h in hist if h["pull_request"] and not any(
         bool(re.search(rf"(?:[#!/]|^){re.escape(h['pull_request'])}(?:\b|\)|$)", str(g.get("pull_request") or "")))
         for g in governing)]
-    return {"path": target, "resources": resources, "records": governing, "history": hist,
+    return {"status": "found" if governing else "no_match",
+            "path": target, "resources": resources, "records": governing, "history": hist,
             "history_without_record": uncovered,
             "note": ("Recorded rationale exists; cite the record ids." if governing else
                      "No recorded decision governs this path. The history is evidence of what changed, "
@@ -803,7 +896,7 @@ def cmd_dream(a) -> Dict[str, Any]:
             continue
         exp = rec.guard.get("expect")
         if exp:
-            results = evaluate_guard(exp, worktree_files(repo, [exp["file"]]))
+            results = evaluate_guard(exp, worktree_files(repo, [exp["file"]]), rec.scope["resources"])
             bad = [r for r in results if not r["ok"]]
             if bad:
                 report["at_risk"].append({"id": rec.id, "title": rec.title, "violations": bad,
@@ -874,9 +967,8 @@ def cmd_dream(a) -> Dict[str, Any]:
                  and not f.startswith("knowledge/")]
         if not infra:
             continue
-        m = PR_REF.search(subject)
-        pr = (m.group(1) or m.group(2)) if m else None
-        if pr in known_prs:
+        pr = _match_pr_num(subject)
+        if pr and pr in known_prs:
             continue
         if any(fnmatch.fnmatch(f, g) for f in infra for g in governed) or a.include_ungoverned:
             report["uncovered_changes"].append({"commit": sha[:12], "subject": subject, "pull_request": pr,
@@ -945,17 +1037,30 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
         return None
 
     if target_file.endswith(".tf"):
-        m = re.search(r'droid_build_farm"[\s\S]*?max_surge\s*=\s*(\d+)', new_raw) or re.search(r"max_surge\s*=\s*(\d+)", new_raw)
-        if m:
-            val = m.group(1)
+        m_named = re.search(r'"([A-Za-z0-9_-]+)"\s*\{[\s\S]*?\b(max_surge|max_unavailable|node_count|min_node_count|max_node_count)\s*=\s*(\d+)', new_raw)
+        if m_named:
+            res_name, key_name, val = m_named.group(1), m_named.group(2), m_named.group(3)
             return {
-                "rule": f"Keep droid_build_farm max_surge = {val} in {target_file}.",
+                "rule": f"Keep {res_name} {key_name} = {val} in {target_file}.",
                 "severity": "block",
                 "expect": {
                     "file": target_file,
                     "path": "$text",
                     "op": "regex",
-                    "value": rf"droid_build_farm[\s\S]*?max_surge\s*=\s*{val}\b",
+                    "value": rf"{re.escape(res_name)}[\s\S]*?{re.escape(key_name)}\s*=\s*{val}\b",
+                },
+            }
+        m = re.search(r"\b(max_surge|max_unavailable|node_count)\s*=\s*(\d+)", new_raw)
+        if m:
+            key_name, val = m.group(1), m.group(2)
+            return {
+                "rule": f"Keep {key_name} = {val} in {target_file}.",
+                "severity": "block",
+                "expect": {
+                    "file": target_file,
+                    "path": "$text",
+                    "op": "regex",
+                    "value": rf"{re.escape(key_name)}\s*=\s*{val}\b",
                 },
             }
         return None
@@ -1158,8 +1263,45 @@ def _format_issue_ref(inc_obj: Dict[str, Any], num: int, repo_id: str) -> str:
     return f"https://github.com/{repo_id}/issues/{num} (#{num})"
 
 
+def _parse_since_cutoff(since_spec: Optional[str]) -> Optional[str]:
+    if not since_spec:
+        return None
+    s = str(since_spec).strip()
+    m = re.fullmatch(r"(\d+)\s*([ydm])", s, re.I)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        days = n * 365 if unit == "y" else (n * 30 if unit == "m" else n)
+        return (_dt.date.today() - _dt.timedelta(days=days)).isoformat()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    return None
+
+
+def _infer_quota_ceiling(repo: Path, target_file: str, comments_and_body: str) -> Tuple[str, str]:
+    """Infer ResourceQuota ceiling field and value from the target YAML or reviewer comments."""
+    if target_file and (repo / target_file).is_file():
+        try:
+            for doc in yaml.safe_load_all((repo / target_file).read_text()):
+                if isinstance(doc, dict) and doc.get("kind") == "ResourceQuota":
+                    hard = (doc.get("spec") or {}).get("hard") or {}
+                    if "requests.memory" in hard:
+                        return "spec.hard.requests\\.memory", str(hard["requests.memory"])
+                    for k, v in hard.items():
+                        safe_k = str(k).replace(".", "\\.")
+                        return f"spec.hard.{safe_k}", str(v)
+        except Exception:
+            pass
+    m_qty = re.search(r"\b(\d+(?:\.\d+)?(?:Ki|Mi|Gi|Ti|m|k|M|G|T))\b", comments_and_body)
+    return "spec.hard.requests\\.memory", (m_qty.group(1) if m_qty else "32Gi")
+
+
 def cmd_bootstrap(a) -> Dict[str, Any]:
     """First Two Hours Bootstrap: harvest historical PRs/MRs, reverts, rejected proposals, and issues."""
+    import time
+    t_start = time.monotonic()
+    budget_sec = float(getattr(a, "budget_minutes", 120) or 120) * 60.0
+    cutoff_date = _parse_since_cutoff(getattr(a, "since", None))
+
     repo = Path(a.repo)
     gh_repo = a.github_repo or repo_identity(repo)
     by_pr, by_sha = _git_commit_index(repo)
@@ -1174,6 +1316,12 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
         issues = [_normalize_issue(i) for i in raw_issues]
 
     prs = [p for p in prs if p.get("title") != "[withdrawn-eval-probe]"]
+    if cutoff_date:
+        prs = [
+            p for p in prs
+            if not (p.get("merged_at") or p.get("created_at"))
+            or str(p.get("merged_at") or p.get("created_at"))[:10] >= cutoff_date
+        ]
     pr_by_num = {int(p["number"]): p for p in prs}
     issue_by_num = {int(i["number"]): i for i in issues}
 
@@ -1191,9 +1339,21 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
     written: List[str] = []
     triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
     pr_to_record_id: Dict[int, str] = {}
+    allocated_ids: Dict[Tuple[str, int], int] = {}
+
+    def _alloc_id(kind: str, yr: int) -> str:
+        prefix = "LES" if kind == "lesson" else "DEC"
+        key = (prefix, yr)
+        if key not in allocated_ids:
+            existing_id = _next_id(repo, kind, yr)
+            allocated_ids[key] = int(existing_id.rsplit("-", 1)[-1]) - 1
+        allocated_ids[key] += 1
+        return f"{prefix}-{yr}-{allocated_ids[key]:03d}"
 
     # Sort PRs chronologically by number
     for pr in sorted(prs, key=lambda x: int(x["number"])):
+        if (time.monotonic() - t_start) > budget_sec:
+            break
         num = int(pr["number"])
         title = pr.get("title") or ""
         body = pr.get("body") or ""
@@ -1210,7 +1370,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             inc = issue_by_num.get(inc_num, {})
             old_pr_obj = pr_by_num.get(old_rev_pr, {})
             scoped_files = sorted(set(files + (old_pr_obj.get("_files") or [])))
-            rid = _next_id(repo, "decision", year)
+            rid = _alloc_id("decision", year)
             meta: Dict[str, Any] = {
                 "type": "decision",
                 "id": rid,
@@ -1263,15 +1423,16 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             rej_files = rej_pr.get("_files") or []
             target_file = rej_files[0] if rej_files else (files[0] if files else "")
             comments = "\n\n".join(c.get("body", "") for c in (rej_pr.get("_comments") or []))
-            rid = _next_id(repo, "decision", year)
+            rid = _alloc_id("decision", year)
+            q_path, q_val = _infer_quota_ceiling(repo, target_file, comments + "\n" + body)
             guard = {
-                "rule": f"Do not raise {target_file} above 32Gi; right-size offending workloads instead (rejected in PR #{rej_num}, fixed in PR #{num}).",
+                "rule": f"Do not raise {target_file} above {q_val}; right-size offending workloads instead (rejected in PR #{rej_num}, fixed in PR #{num}).",
                 "severity": "block",
                 "expect": {
                     "file": target_file,
-                    "path": "spec.hard.requests\\.memory",
+                    "path": q_path,
                     "op": "<=",
-                    "value": "32Gi",
+                    "value": q_val,
                 },
             }
             meta = {
@@ -1321,7 +1482,7 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             target_file = files[0] if files else ""
             commit_sha = pr.get("merge_commit_sha") or ""
             guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
-            rid = _next_id(repo, "lesson", year)
+            rid = _alloc_id("lesson", year)
             meta = {
                 "type": "lesson",
                 "id": rid,
@@ -1441,6 +1602,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--github-repo", default=None, help="owner/repo on GitHub")
     p.add_argument("--prs-json", default=None, help="optional local JSON file of PRs")
     p.add_argument("--issues-json", default=None, help="optional local JSON file of Issues")
+    p.add_argument("--since", default="2y", help="history window to harvest (for example, 2y or 180d)")
+    p.add_argument("--budget-minutes", type=int, default=120, help="wall-clock budget in minutes for bootstrap")
     p.add_argument("--write", action="store_true", help="write harvested records into knowledge/")
     a = ap.parse_args(argv)
     handlers = {"validate": cmd_validate, "index": cmd_index, "check": cmd_check, "why": cmd_why,

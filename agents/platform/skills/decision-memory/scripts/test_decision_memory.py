@@ -420,8 +420,13 @@ class FakeHindsight(BaseHTTPRequestHandler):
         FakeHindsight.calls.append(("POST", self.path, body))
         if self.path.endswith("/memories"):
             for it in body["items"]:
-                FakeHindsight.docs[it["document_id"]] = {"id": it["document_id"], "tags": it["tags"],
-                                                        "text": it["content"]}
+                FakeHindsight.docs[it["document_id"]] = {
+                    "id": it["document_id"],
+                    "tags": it["tags"],
+                    "text": it["content"],
+                    "text_length": len(it["content"]),
+                    "document_metadata": it.get("metadata") or {},
+                }
             return self._send({"success": True})
         if self.path.endswith("/memories/recall"):
             res = [{"text": d["text"], "tags": d["tags"], "document_id": d["id"]} for d in FakeHindsight.docs.values()]
@@ -473,6 +478,12 @@ class IndexTests(unittest.TestCase):
         self.assertIn("scope:shared", item["tags"])
         patch = [c for c in FakeHindsight.calls if c[0] == "PATCH"][0][2]
         self.assertFalse(patch["updates"]["enable_observations"])
+        # Same-length edit (e.g. changing 832Mi to 999Mi) still triggers upsert via sha256 check
+        quota_rec = self.r.path / "knowledge/decisions/DEC-2026-001-payments-quota.md"
+        quota_rec.write_text(quota_rec.read_text().replace("832Mi", "999Mi"))
+        rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
+        self.assertEqual(out["upserted"], ["DEC-2026-001"])
+        self.assertEqual(out["unchanged"], ["LES-2026-001"])
         os.remove(self.r.path / "knowledge/decisions/DEC-2026-001-payments-quota.md")
         self.r.commit("knowledge: retire DEC-2026-001")
         rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")

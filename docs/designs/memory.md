@@ -1700,7 +1700,7 @@ guard: # optional machine-checked invariant
   expect:
     file: "clusters/*/payments/checkout.yaml"
     path: "spec.template.spec.containers[name=app].resources.requests.memory"
-    op: ">=" # == | != | >= | > | <= | < | in | contains
+    op: ">=" # == | != | >= | > | <= | < | present | absent | regex
     value: 256Mi # parses Kubernetes quantities (Ki, Mi, Gi, m)
 evidence: # pull_request is mandatory for type: lesson
   pull_request: https://github.com/acme/gitops/pull/31
@@ -1903,7 +1903,7 @@ When `submit_suggestion.py` (or a CI job) runs `decision_memory.py check --repo 
    - **YAML selector walk (`yaml_get`).** Resolves dot-separated paths, list selectors such as `containers[name=checkout]`, and escaped dots such as `spec.hard.requests\.memory`.
    - **Kubernetes quantity normalization (`quantity` and `compare`).** Converts Kubernetes units (`m`, `Ki`, `Mi`, `Gi`, `Ti`) into canonical float base units so comparisons such as `224Mi >= 512Mi` evaluate numerically rather than lexically. Supports `>=`, `>`, `<=`, `<`, `==`, `!=`, `present`, `absent`, and `regex`.
    - **Raw text matching (`path: "$text"`).** Evaluates `op: "regex"` against raw file text for non-YAML files such as Terraform HCL (`max_surge\s*=\s*1\b`).
-5. **Resolve `supersedes` chains and format the verdict (`render_check_markdown`).** Attaches any records listed in `supersedes` so the output explains why an older freeze no longer applies (`BB-10`). If any guard fails with `severity: block`, `check` returns `verdict: "block"` with the record ID, failed assertion, historical PR/issue links (`breaking_pr`, `incident`, `pull_request`), and Markdown body; `submit_suggestion.py` aborts the push and prints that block report to `stderr`.
+5. **Resolve `supersedes` chains and format the verdict (`render_check_markdown`).** Attaches any records listed in `supersedes` so the output explains why an older freeze no longer applies (`BB-10`). If any guard fails with `severity: block`, `check` returns `verdict: "block"` with the record ID, failed assertion, historical PR/issue links (`breaking_pr`, `incident`, `pull_request`), and Markdown body; `submit_suggestion.py` aborts the push and prints that block report to `stdout`.
 
 ---
 

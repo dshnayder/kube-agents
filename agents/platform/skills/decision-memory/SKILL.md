@@ -3,16 +3,16 @@ name: decision-memory
 description: Check, recall, and explain infrastructure decisions and lessons in the GitOps repository. Validate changes against guards, explain configuration rationale, and draft lessons from verified outcomes.
 ---
 
-# decision-memory
+# Task
 
-The GitOps repository stores infrastructure decisions and operational lessons as reviewed records under `knowledge/decisions/` and `knowledge/lessons/` (`docs/architecture/06-api-and-data-contracts.md` §5).
+The GitOps repository stores infrastructure decisions and operational lessons as reviewed Operational Knowledge Format (OKF) records under `knowledge/decisions/` and `knowledge/lessons/`.
 Use this skill to check those records before you modify a file or review a change.
 Every record update requires a pull request that a human merges.
 
 All commands output JSON (or Markdown with `--markdown`) and run against a local GitOps repository checkout.
-`scripts/decision_memory.py` does not import any agent harness packages.
+The helper script does not import any agent harness packages.
 
-## When to use
+## Workflow
 
 | Scenario                                                                   | Command                                | Required action                                                                                                                                                                 |
 | -------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -28,7 +28,7 @@ All commands output JSON (or Markdown with `--markdown`) and run against a local
 - `consistent`: The change satisfies the evaluated guard.
 - `semantic`: The Hindsight index returned similar records outside the explicit file scope. Verify whether they apply.
 
-When `check` returns `no_match`, report _"No recorded decision governs these paths"_.
+When `check` or `why` returns `status: "no_match"`, report _"No recorded decision governs these paths"_ (or _"No recorded decision governs this path"_).
 Never claim that no decision exists.
 
 ## Record schema
@@ -51,7 +51,7 @@ guard: # optional machine-checked rule
   expect:
     file: "clusters/*/payments/checkout.yaml"
     path: "spec.template.spec.containers[name=app].resources.requests.memory"
-    op: ">=" # == != >= > <= < in contains
+    op: ">=" # == | != | >= | > | <= | < | present | absent | regex
     value: 256Mi
 evidence:
   pull_request: https://github.com/acme/gitops/pull/31
@@ -71,12 +71,13 @@ Escape literal dots inside YAML keys with a backslash: `spec.hard.requests\.memo
 ## Commands
 
 ```bash
-python3 scripts/decision_memory.py --repo <clone> validate
-python3 scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
-python3 scripts/decision_memory.py --repo <clone> why clusters/prod-eu/payments/quota.yaml
-python3 scripts/decision_memory.py --repo <clone> from-outcome outcome.json
-python3 scripts/decision_memory.py --repo <clone> dream
-python3 scripts/decision_memory.py --repo <clone> index
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> validate
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why clusters/prod-eu/payments/quota.yaml
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> from-outcome outcome.json
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> dream
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> index
 ```
 
 Pass `--hindsight-url` (or set `HINDSIGHT_API_URL`) to query the `kube-agents-decisions` Hindsight bank.
