@@ -986,7 +986,7 @@ class LabelsCapabilityTest(BrokerCase):
 
     def test_a_broker_older_than_the_field_reads_as_labels(self):
         # The agent image and the broker image can differ by a release.
-        provider = self.provider(capabilities={"acknowledge": True})
+        provider = self.provider(capabilities={"forge": "github", "acknowledge": True, "missing": []})
         self.assertTrue(provider.supports_labels(REPO))
 
     def test_capabilities_that_cannot_be_read_read_as_labels(self):
@@ -1042,12 +1042,24 @@ class ListOpenPrsTest(BrokerCase):
     def test_on_a_forge_with_labels_a_description_line_changes_nothing(self):
         # GitHub and GitLab: the label is the only opt-out, as before.
         provider = self.provider(
-            capabilities={"labels": True},
+            capabilities={"forge": "github", "labels": True, "missing": []},
             **{"proposal-list": {"proposals": [proposal(1, body="agent:ignore")]}},
         )
         (pr,) = provider.list_open_prs(REPO)
         self.assertFalse(pr.is_ignored)
         self.assertEqual((), pr.labels)
+
+    def test_unreadable_capabilities_keep_a_parked_proposal_parked(self):
+        # Review: answering "has labels" on a failed read swept a proposal a
+        # person had parked on a forge with no labels.
+        self.broker.refuse["capabilities"] = vcs_client.VcsError("down")
+        self.broker.answers["proposal-list"] = {
+            "proposals": [proposal(1, body="agent:ignore"), proposal(2, body="Fix.")]
+        }
+        provider = forge.provider_for()
+        with self.assertLogs(forge.LOGGER, logging.INFO):
+            ignored = {pr.number: pr.is_ignored for pr in provider.list_open_prs(REPO)}
+        self.assertEqual({1: True, 2: False}, ignored)
 
     def test_no_description_line_means_no_capabilities_call(self):
         # A forge with labels makes exactly the calls it made before.

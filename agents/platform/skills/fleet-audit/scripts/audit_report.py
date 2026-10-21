@@ -12780,13 +12780,15 @@ def find_existing_issue(
     settles on the ledger everything already points at.
 
     On a forge with no labels the ledger cannot be found, and that is refused,
-    not read as "none": "none" opens a second ledger on every run. Such a forge
-    keeps its ledger in the report store (`forge_has_issue_verbs`).
+    not read as "none": "none" opens a second ledger on every run. The design
+    keeps such a forge's ledger in the report store (version-control-support.md
+    §8); the decision that sends it there is not made here.
     """
     if not forge_has_labels(repo):
         raise GitHubLookupError(
             f"the ledger for audit:{audit_id} in {repo} is found by its label, and "
-            "this forge has no labels; keep this stream's ledger in the report store"
+            "this forge has no labels, so the ledger cannot be kept on it; this "
+            "harness cannot run this audit against a repository on such a forge"
         )
     try:
         answer = forge(

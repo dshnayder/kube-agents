@@ -894,6 +894,25 @@ class NoIssueTrackerForge(FakeForge):
 class UntrackedRepositoryTest(ResolverTest):
     """A forge with no issue tracker has nothing to poll, and that is not a fault."""
 
+    def setUp(self):
+        resolver._NO_TRACKER.clear()
+        self.addCleanup(resolver._NO_TRACKER.clear)
+
+    def test_the_stale_sweep_prints_no_fault_for_an_untracked_repository(self):
+        forge = NoIssueTrackerForge({"ws/infra"})
+        self.poll(forge=forge, repos=("ws/infra",))
+        self.assertNotIn("sweep skipped", self.stderr)
+        self.assertEqual(1, self.forge.verbs().count("capabilities"))
+
+    def test_a_mixed_fleet_that_refused_says_which_repositories_had_no_tracker(self):
+        forge = NoIssueTrackerForge(
+            {"ws/infra"}, refuse={"a/one": "FORGE_NOT_FOUND", "b/two": "FORGE_FORBIDDEN"}
+        )
+        payload, code = self.poll(forge=forge, repos=("a/one", "b/two", "ws/infra"))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+        self.assertIn("with an issue tracker", payload["error"])
+
     def test_a_repository_with_no_tracker_is_named_and_not_refused(self):
         forge = NoIssueTrackerForge(
             {"ws/infra"}, issues={"acme/toolkit": [issue(12, title="work", body="d")]}

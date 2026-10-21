@@ -3470,6 +3470,18 @@ class ForgeWithoutLabelsTest(unittest.TestCase):
             self.broker.issue_list({"repository": self.REPO})
         self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
 
+    def test_an_unserved_verb_with_a_label_names_the_missing_verb_first(self):
+        # Review: the label was refused first, which sent the caller to drop
+        # the label and then meet the real gap on the second call.
+        for call, payload in (
+            (self.broker.issue_list, {"labels": ["agent:delivery-watch"]}),
+            (self.broker.issue_create, {"title": "t", "labels": ["x"]}),
+        ):
+            with self.subTest(verb=call.__name__):
+                with self.assertRaises(ForgeUnsupported) as caught:
+                    call({"repository": self.REPO, **payload})
+                self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
+
     def test_an_unconfigured_forge_names_what_is_missing_not_labels(self):
         # gitlab.com on an install with no GitLab: the stub's own gap wins.
         with self.assertRaises(ForgeUnsupported) as caught:

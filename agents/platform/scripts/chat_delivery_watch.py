@@ -415,7 +415,15 @@ def advance(entry: dict, job: dict, *, silent: bool, has_output: bool = True) ->
 
 
 class LedgerError(RuntimeError):
-    """A forge step failed in a way that must not be read as 'nothing to do'."""
+    """A forge step failed in a way that must not be read as 'nothing to do'.
+
+    `repo` is the repository the failed call went to, which is not always the
+    ledger repository: a moved ledger closes its issue in the old one first.
+    """
+
+    def __init__(self, message: str, repo: str = "") -> None:
+        super().__init__(message)
+        self.repo = repo
 
 
 def verb(name: str, payload: dict, repo: str) -> dict:
@@ -432,7 +440,8 @@ def verb(name: str, payload: dict, repo: str) -> dict:
     except forge.ForgeError as refusal:
         raise LedgerError(
             f"{name} on {repo} refused: {refusal.reason}"
-            + (f": {refusal.value}" if refusal.value else "")
+            + (f": {refusal.value}" if refusal.value else ""),
+            repo,
         ) from refusal
 
 
@@ -747,7 +756,7 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
             try:
                 ledger_ref = reconcile_issue(repo, degraded, state, now, limit, recovering=bool(recovered))
             except Exception as exc:  # noqa: BLE001 - whatever GitHub does, the ALERT lines below still go out
-                if isinstance(exc, LedgerError) and not forge_keeps_ledger(repo):
+                if isinstance(exc, LedgerError) and not forge_keeps_ledger(exc.repo or repo):
                     # Not a fault: this forge has nowhere to keep the issue,
                     # so the log line below is the report, as with no forge.
                     ledger_ref = LEDGER_LOG_ONLY

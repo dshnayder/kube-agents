@@ -239,6 +239,34 @@ class NoIssueTrackerTest(WatchCase):
         out = self.cross_the_threshold()
         self.assertIn("self=error", out)
 
+    def test_a_failed_close_in_the_old_repository_is_a_fault(self) -> None:
+        # Review: the move to a forge with no tracker asked about the new
+        # repository for a failure in the old one, and went quiet.
+        old = FakeForge()
+        patcher = mock.patch.object(cdw.forge, "call", old)
+        patcher.start()
+        self.cross_the_threshold()
+        patcher.stop()
+        self.assertIsNotNone(self.state_data()["ledger"]["issue_number"])
+        os.environ[cdw.LEDGER_REPO_ENV] = "ws/bitbucket-ledger"
+
+        def call(name: str, payload: dict, repo: str) -> dict:
+            if repo == LEDGER_REPO:
+                self.forge.calls.append((name, dict(payload), repo))
+                if name == "capabilities":
+                    return {"forge": "github", "verbs": list(cdw.LEDGER_ISSUE_VERBS), "labels": True, "missing": []}
+                raise forge.ForgeError("FORGE_RATE_LIMITED", "slow down")
+            return self.forge(name, payload, repo)
+
+        patcher = mock.patch.object(cdw.forge, "call", call)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.write_store(job("a", RUN_3, HARD_ERROR))
+        rc, out = self.run_tick()
+        self.assertEqual(rc, 0)
+        self.assertIn("self=error", out)
+        self.assertNotIn(f"ledger={cdw.LEDGER_LOG_ONLY}", out)
+
     def test_a_forge_with_a_tracker_never_asks_for_capabilities(self) -> None:
         # GitHub and GitLab make exactly the calls they made before.
         self.forge = FakeForge()

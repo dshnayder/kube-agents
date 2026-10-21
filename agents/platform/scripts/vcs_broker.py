@@ -1515,8 +1515,12 @@ class VcsBroker:
         bound = self._bind(payload)
         # Before anything else that could spend a call: a forge with no labels
         # refuses a label field by name, so a filter is not silently ignored
-        # and a label write does not look done.
-        bound.forge.refuse_labels(verb, payload)
+        # and a label write does not look done. Only for a verb the forge
+        # serves (and `label-ensure`, which is the labels gap itself): an issue
+        # verb on a forge with no issue tracker is refused for that, which is
+        # the real gap, before its label field is looked at.
+        if verb == "label-ensure" or verb in bound.forge.verbs:
+            bound.forge.refuse_labels(verb, payload)
         if pinned_target:
             # Before the method is looked up and before `bound.api`, so a
             # refused target makes no forge call and spends no credential.

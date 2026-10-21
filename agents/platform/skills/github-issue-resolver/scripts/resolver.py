@@ -308,6 +308,11 @@ UNTRACKED_REFUSALS = frozenset({"FORGE_UNSUPPORTED", "LABELS_UNSUPPORTED"})
 TRACKER_VERBS = ("issue-list", "issue-view", "issue-comment", "issue-update")
 
 
+# `has_no_tracker`'s answers for this process, so the sweep and the poll ask
+# `capabilities` once per repository. Only a read answer is kept.
+_NO_TRACKER: dict = {}
+
+
 def has_no_tracker(repo: str) -> bool:
     """True when the forge of `repo` says it has no issue tracker or no labels.
 
@@ -315,10 +320,20 @@ def has_no_tracker(repo: str) -> bool:
     no extra call. An answer that cannot be read is False, and the refusal is
     then reported as before.
     """
+    if repo not in _NO_TRACKER:
+        answer = _no_tracker(repo)
+        if answer is None:
+            return False
+        _NO_TRACKER[repo] = answer
+    return _NO_TRACKER[repo]
+
+
+def _no_tracker(repo: str):
+    """`has_no_tracker`, with None when `capabilities` could not be read."""
     try:
         answer = forge("capabilities", {}, repo)
     except vcs_client.VcsError:
-        return False
+        return None
     if not answer.get("forge") or answer.get("missing"):
         # A host no forge serves, or one this install has not configured,
         # also answers with no verbs: that stays a refusal.
@@ -374,6 +389,10 @@ def sweep_stale_issues(repo: str):
             "issue-list", {"labels": [IN_PROGRESS], "limit": POLL_WINDOW}, repo
         )
     except vcs_client.VcsError as refusal:
+        if refusal.code in UNTRACKED_REFUSALS and has_no_tracker(repo):
+            # A forge with no issue tracker has nothing to sweep, and the
+            # poll names the repository in `untracked_repos`: not a fault.
+            return
         # Not fatal, as the docstring says -- but not silent either. The poll
         # that follows reports the same refusal by code; this is where the
         # message itself survives, for whoever reads the worker's stderr.
@@ -725,7 +744,8 @@ def handle_poll(args):
 
     if not all_issues:
         if refusals and len(refusals) + len(untracked) == len(repos):
-            # Every managed repository refused, so this is not a quiet fleet.
+            # Every managed repository that has an issue tracker refused, so
+            # this is not a quiet fleet.
             # When they all refused for the same reason that reason is the
             # answer -- a credential the forge has stopped accepting is one
             # fact about the install, not N facts about N repositories -- and
@@ -741,11 +761,14 @@ def handle_poll(args):
             refuse(
                 reason,
                 messages.pop() if len(messages) == 1 else (
-                    "every managed repository refused the listing"
+                    "every managed repository with an issue tracker refused the listing"
+                    if untracked
+                    else "every managed repository refused the listing"
                 ),
                 unreachable_repos=unreachable_repos,
                 refusals=refusals,
                 errors=errors,
+                **extra,
             )
         print(
             json.dumps(

@@ -840,17 +840,22 @@ class BrokerProvider:
         """Does this repository's forge carry labels on a pull request?
 
         From `capabilities`, like `supports_acknowledge`. A field that is not
-        in the answer -- a broker older than the field -- and an answer that
-        cannot be read both answer True, which is what every forge was taken
-        to have before the field existed. Only a forge that says
+        in the answer -- a broker older than the field -- answers True, which
+        is what every forge was taken to have before the field existed, and so
+        does an answer that cannot be read. Only a forge that says
         `labels: false` changes anything.
         """
+        known = self._labels_known(repo)
+        return True if known is None else known
+
+    def _labels_known(self, repo: str) -> Optional[bool]:
+        """`supports_labels`, with None when `capabilities` could not be read."""
         if repo not in self._labels:
             try:
                 answer = self._verb("capabilities", {}, repo)
             except ForgeError as error:
                 LOGGER.info("capabilities unreadable for %s: %s", repo, error)
-                return True
+                return None
             # Only a served forge's answer: an unserved host also says no labels.
             served = bool(answer.get("forge")) and not answer.get("missing")
             self._labels[repo] = not served or answer.get("labels") is not False
@@ -878,7 +883,10 @@ class BrokerProvider:
         body_ignored = {
             id(node) for node in nodes if IGNORE_BODY_RE.search(str(node.get("body") or ""))
         }
-        if body_ignored and self.supports_labels(repo):
+        # Not known is not "has labels": a proposal that a person parked with
+        # the description line stays parked for the tick, because sweeping it
+        # costs an action on it and holding it costs one tick.
+        if body_ignored and self._labels_known(repo) is True:
             body_ignored = set()
         return [
             PullRequest(

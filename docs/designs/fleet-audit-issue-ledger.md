@@ -1161,9 +1161,13 @@ A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets 
 There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
 `<!-- audit-remediation: <audit-id> -->` in its description, its author (this install) and its
 source repository (this one, not a fork). A harness close adds `<!-- audit:stale-closed -->` to the
-description before the close, under the same rule as the label: no close without it. A forge with
-no issue verbs keeps the ledger in the report store and sends it to chat, and remediation PRs
-still open. [`version-control-support.md`](version-control-support.md) §8 gives the reasons.
+description before the close, under the same rule as the label: no close without it.
+
+A forge with no issue verbs, or no labels, cannot hold the ledger issue. The design for it is in
+[`version-control-support.md`](version-control-support.md) §8, "The ledger without issues": the
+ledger goes to the report store and to chat, and remediation PRs still open on the forge. The
+harness does not make that decision yet. Until it does, a run against such a repository refuses at
+`start`, because the ledger lookup refuses rather than answer "none".
 
 ## 9. Red lines (carried forward, plus new)
 
