@@ -162,10 +162,12 @@ func TestAPI_TheTurnRecordsRequesterPrincipalAndAudienceKind(t *testing.T) {
 	}
 }
 
-// An inject conversation that carries a requester principal records an
-// identity-only route (Platform: "") for memory isolation without marking a
-// chat notify route as recorded or adding a route-lost note if the PUT fails.
-func TestAPI_InjectConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
+// A Google-authenticated A2A door conversation (backend: "a2a-google",
+// verifiedBy: "a2a-google-token") that carries a verified requester principal
+// records an identity-only route (Platform: "") for memory isolation without
+// marking a chat notify route as recorded or adding a route-lost note if the
+// PUT fails.
+func TestAPI_GoogleA2AConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
 	_, url := startServer(t)
 	store := newRouteStore(t, http.StatusOK)
 	stub := newAPIStub(t, nil)
@@ -173,34 +175,38 @@ func TestAPI_InjectConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
 	c := gatewayClient(t, url)
 
 	var auth map[string]any
-	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-inject-id", "platform")), &auth); err != nil {
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-a2a-google-id", "platform")), &auth); err != nil {
 		t.Fatal(err)
 	}
-	auth["audience"] = map[string]any{"conversation": "inject:eval/run-id", "kind": "dm"}
-	auth["requester"] = map[string]any{"principal": "hmac:fedcba9876543210fedcba9876543210"}
+	auth["audience"] = map[string]any{"conversation": "a2a:ctx-google-id", "kind": "dm"}
+	auth["requester"] = map[string]any{
+		"principal":  "hmac:fedcba9876543210fedcba9876543210",
+		"backend":    "a2a-google",
+		"verifiedBy": "a2a-google-token",
+	}
 	raw, err := json.Marshal(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := lib.NewMessageEnvelope(gatewayParty, "task-inject-id", "ctx-inject-id", "corr-inject-id",
-		messagePayload(t, "task-inject-id", "ctx-inject-id", "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	env, err := lib.NewMessageEnvelope(gatewayParty, "task-a2a-google-id", "ctx-google-id", "corr-google-id",
+		messagePayload(t, "task-a2a-google-id", "ctx-google-id", "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-inject-id"), env); err != nil {
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-a2a-google-id"), env); err != nil {
 		t.Fatal(err)
 	}
-	task := waitTerminal(t, c, "task-inject-id")
+	task := waitTerminal(t, c, "task-a2a-google-id")
 	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
-		t.Fatalf("answer = %q carries the route-lost note for an inject door", got)
+		t.Fatalf("answer = %q carries the route-lost note for a Google A2A door", got)
 	}
 	puts := store.seen()
 	want := routePut{
-		path: "PUT /v1/sessions/a2a-ctx-inject-id/route",
+		path: "PUT /v1/sessions/a2a-ctx-google-id/route",
 		auth: "Bearer kv-key",
 		body: conversationRoute{
-			Conversation: "inject:eval/run-id",
-			ContextID:    "ctx-inject-id",
+			Conversation: "a2a:ctx-google-id",
+			ContextID:    "ctx-google-id",
 			UserID:       "hmac:fedcba9876543210fedcba9876543210",
 			ChatType:     "dm",
 		},
@@ -210,57 +216,83 @@ func TestAPI_InjectConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
 	}
 }
 
-// A console conversation uses a shared credential (nats:console, backend:
-// "console", verifiedBy: "nats-grant") across all operators holding the grant.
-// It records an identity-only route with UserID cleared ("") and ChatType kept
-// so the memory provider treats the session as an interactive unattributable
-// DM rather than pooling personal memory across operators.
-func TestAPI_ConsoleConversationClearsSharedPrincipalUserID(t *testing.T) {
-	_, url := startServer(t)
-	store := newRouteStore(t, http.StatusOK)
-	stub := newAPIStub(t, nil)
-	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
-	c := gatewayClient(t, url)
-
-	var auth map[string]any
-	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-console", "platform")), &auth); err != nil {
-		t.Fatal(err)
-	}
-	auth["audience"] = map[string]any{"conversation": "console:tok-1", "kind": "dm"}
-	auth["requester"] = map[string]any{
-		"principal":  "hmac:fedcba9876543210fedcba9876543210",
-		"backend":    "console",
-		"verifiedBy": "nats-grant",
-	}
-	raw, err := json.Marshal(auth)
-	if err != nil {
-		t.Fatal(err)
-	}
-	env, err := lib.NewMessageEnvelope(gatewayParty, "task-console", "ctx-console", "corr-console",
-		messagePayload(t, "task-console", "ctx-console", "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-console"), env); err != nil {
-		t.Fatal(err)
-	}
-	task := waitTerminal(t, c, "task-console")
-	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
-		t.Fatalf("answer = %q carries the route-lost note for a console door", got)
-	}
-	puts := store.seen()
-	want := routePut{
-		path: "PUT /v1/sessions/a2a-ctx-console/route",
-		auth: "Bearer kv-key",
-		body: conversationRoute{
-			Conversation: "console:tok-1",
-			ContextID:    "ctx-console",
-			UserID:       "",
-			ChatType:     "dm",
+// Shared-credential doors (console with nats-grant, inject with inject-bearer,
+// and static-token A2A with a2a-bearer) do not record a user identity route,
+// so the memory provider treats the a2a-* session as an interactive
+// unattributable DM rather than pooling or allowing self-asserted access to
+// personal memory.
+func TestAPI_SharedCredentialDoorsDoNotRecordUserRoute(t *testing.T) {
+	cases := []struct {
+		name         string
+		taskID       string
+		ctxID        string
+		conversation string
+		backend      string
+		verifiedBy   string
+	}{
+		{
+			name:         "console",
+			taskID:       "task-console",
+			ctxID:        "ctx-console",
+			conversation: "console:tok-1",
+			backend:      "console",
+			verifiedBy:   "nats-grant",
+		},
+		{
+			name:         "inject",
+			taskID:       "task-inject",
+			ctxID:        "ctx-inject",
+			conversation: "inject:eval/run-id",
+			backend:      "inject",
+			verifiedBy:   "inject-bearer",
+		},
+		{
+			name:         "a2a-bearer",
+			taskID:       "task-a2a-bearer",
+			ctxID:        "ctx-a2a-bearer",
+			conversation: "a2a:ctx-a2a-bearer",
+			backend:      "a2a",
+			verifiedBy:   "a2a-bearer",
 		},
 	}
-	if len(puts) != 1 || puts[0] != want {
-		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			stub := newAPIStub(t, nil)
+			startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+			c := gatewayClient(t, url)
+
+			var auth map[string]any
+			if err := json.Unmarshal(authorityFor(t, mintFor(t, c, tc.taskID, "platform")), &auth); err != nil {
+				t.Fatal(err)
+			}
+			auth["audience"] = map[string]any{"conversation": tc.conversation, "kind": "dm"}
+			auth["requester"] = map[string]any{
+				"principal":  "hmac:fedcba9876543210fedcba9876543210",
+				"backend":    tc.backend,
+				"verifiedBy": tc.verifiedBy,
+			}
+			raw, err := json.Marshal(auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := lib.NewMessageEnvelope(gatewayParty, tc.taskID, tc.ctxID, "corr-"+tc.taskID,
+				messagePayload(t, tc.taskID, tc.ctxID, "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", tc.taskID), env); err != nil {
+				t.Fatal(err)
+			}
+			task := waitTerminal(t, c, tc.taskID)
+			if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+				t.Fatalf("answer = %q carries the route-lost note for %s door", got, tc.name)
+			}
+			if puts := store.seen(); len(puts) != 0 {
+				t.Fatalf("route PUTs = %+v, want none", puts)
+			}
+		})
 	}
 }
 

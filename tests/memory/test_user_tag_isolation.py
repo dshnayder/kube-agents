@@ -158,9 +158,9 @@ class TestUserTagIsolation(unittest.TestCase):
                     ),
                 )
             with closing(sqlite3.connect(state_db)) as conn, conn:
-                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
-                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-dm', NULL, 'compression')")
-                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_cont', 'a2a-ctx-dm', NULL)")
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-dm', NULL, 'compression', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_cont', 'a2a-ctx-dm', NULL, NULL)")
 
             with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
                  patch.object(kam_client, "load_hindsight", return_value=None):
@@ -213,9 +213,28 @@ class TestUserTagIsolation(unittest.TestCase):
                     ),
                 )
             with closing(sqlite3.connect(state_db)) as conn, conn:
-                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
-                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-dm', NULL, 'branched')")
-                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_branch', 'a2a-ctx-dm', NULL)")
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-dm', NULL, 'branched', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_branch', 'a2a-ctx-dm', NULL, NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-compressed', NULL, 'compression', NULL)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_fork', 'a2a-ctx-compressed', NULL, '{\"_branched_from\": \"a2a-ctx-compressed\"}')")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_delegate', 'a2a-ctx-compressed', NULL, '{\"_delegate_from\": \"a2a-ctx-compressed\"}')")
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-compressed",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM2",
+                                "context_id": "ctx-compressed",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
 
             with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
                  patch.object(kam_client, "load_hindsight", return_value=None):
@@ -223,6 +242,18 @@ class TestUserTagIsolation(unittest.TestCase):
                 p_branch.initialize("20261021_branch", hermes_home=tmp)
                 self.assertEqual(p_branch._user_tag, "")
                 self.assertEqual(p_branch._personal_disabled_reason, NO_IDENTITY_NOTICE)
+
+                p_fork = KubeAgentsMemoryProvider()
+                p_fork.initialize("20261021_fork", hermes_home=tmp)
+                self.assertEqual(p_fork._user_tag, "")
+
+                p_del = KubeAgentsMemoryProvider()
+                p_del.initialize("20261021_delegate", hermes_home=tmp)
+                self.assertEqual(p_del._user_tag, "")
+
+                p_spoof = KubeAgentsMemoryProvider()
+                p_spoof.initialize("api-attacker-session", gateway_session_key="a2a-ctx-dm", hermes_home=tmp)
+                self.assertEqual(p_spoof._user_tag, "")
 
     def test_non_a2a_interactive_and_unattended_prongs_and_default_user_id(self):
         """Verify non-A2A interactive prongs (`chat_type='dm'`, `platform='slack'`),

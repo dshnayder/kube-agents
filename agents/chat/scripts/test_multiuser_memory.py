@@ -350,22 +350,42 @@ class TestA2AAndUnattributedIdentity(MultiUserMemoryTestCase):
             "a2a-ctx-root",
             {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "ctx-root", "user_id": alice_hmac, "chat_type": "dm"},
         )
+        self._put_route(
+            "a2a-ctx-branched",
+            {"platform": "slack", "conversation": "slack:dm/D2", "context_id": "ctx-branched", "user_id": alice_hmac, "chat_type": "dm"},
+        )
         state_db = self.home / "state.db"
         with closing(sqlite3.connect(str(state_db))) as conn, conn:
-            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
-            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-root', NULL, 'compression')")
-            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_120000_abcd1234', 'a2a-ctx-root', NULL)")
-            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-branched', NULL, 'branched')")
-            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_branch', 'a2a-ctx-branched', NULL)")
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-root', NULL, 'compression', NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_120000_abcd1234', 'a2a-ctx-root', NULL, NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_fork_of_compressed', 'a2a-ctx-root', NULL, '{\"_branched_from\": \"a2a-ctx-root\"}')")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_delegate_of_compressed', 'a2a-ctx-root', NULL, '{\"_delegate_from\": \"a2a-ctx-root\"}')")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-branched', NULL, 'branched', NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_branch', 'a2a-ctx-branched', NULL, NULL)")
 
         p = mum.MultiUserFileMemoryProvider()
         p.initialize("20261021_120000_abcd1234", hermes_home=str(self.home))
         self.assertEqual(p._user_id, _expected_filename(alice_hmac)[:-3])
 
-        # Non-compression parent_session_id (e.g. 'branched') does not inherit an A2A route.
+        # Non-compression parent_session_id (e.g. 'branched') does not inherit an A2A route, even when the parent has a route row.
         p_branch = mum.MultiUserFileMemoryProvider()
         p_branch.initialize("20261021_branch", hermes_home=str(self.home))
         self.assertEqual(p_branch._user_id, "")
+
+        # A Hermes fork (_branched_from) or delegate (_delegate_from) of a compressed a2a session must not inherit the parent's route.
+        p_fork = mum.MultiUserFileMemoryProvider()
+        p_fork.initialize("20261021_fork_of_compressed", hermes_home=str(self.home))
+        self.assertEqual(p_fork._user_id, "")
+
+        p_del = mum.MultiUserFileMemoryProvider()
+        p_del.initialize("20261021_delegate_of_compressed", hermes_home=str(self.home))
+        self.assertEqual(p_del._user_id, "")
+
+        # A non-a2a session passing gateway_session_key="a2a-..." does not hijack the victim's route.
+        p_spoof = mum.MultiUserFileMemoryProvider()
+        p_spoof.initialize("api-attacker-session", gateway_session_key="a2a-ctx-root", hermes_home=str(self.home))
+        self.assertEqual(p_spoof._user_id, "")
 
 
 class TestInputValidationAndSanitization(MultiUserMemoryTestCase):
