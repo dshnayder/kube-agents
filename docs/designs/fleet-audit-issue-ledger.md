@@ -1101,7 +1101,8 @@ a check the collector lists in `checks_unevaluated`; when the check is a derived
 check that applies there did not run; when no entry names it and its project target is in
 `scope.skipped`; or when the run listed no target of its kind. The candidates are the ids in the
 previous marker and the findings of the stored document that the previous body renders, which adds
-the findings the body budget cut. The place of each finding comes from its row on the previous
+the findings the body budget cut. A finding that the document lists under `resolved_because` is not a
+candidate, because the run says it is gone. The place of each finding comes from its row on the previous
 body, from that stored document, or from `not_rechecked` on the stored record: the title and place
 of each finding the previous run kept this way. The note and id-only tiers of the held span ([collector design §3.3](fleet-audit-collector-manifest.md#33-resolution--still_flagged_ids-collector_held_entries))
 write no row, so without that key the next gap run could not place the id and the finding would

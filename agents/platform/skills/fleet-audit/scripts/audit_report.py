@@ -8588,7 +8588,9 @@ def unread_held_entries(
     the previous body cut for space: the findings of the stored document
     that the body renders (`ledger_document`, else `document`, as
     `report_finding_titles` reads them). Less `exclude` (the document's ids,
-    the withheld postures, the declared entries and the collector-held ids).
+    the withheld postures, the declared entries and the collector-held ids),
+    and less the ids the document lists under `resolved_because`: the run
+    says that those are gone, so it does not also say it did not check them.
     The place of each comes from its row on the previous body, or else from
     that same stored document, or else from the stored entries the previous
     run kept as not re-checked (`NOT_RECHECKED_KEY`), which is where the
@@ -8615,6 +8617,12 @@ def unread_held_entries(
     if not previous_ids:
         return []
     places = _stored_finding_places(memory)
+    # The document says these are gone, so they are not also "not re-checked".
+    resolved = {
+        published_id(entry)
+        for entry in data.get("resolved_because") or []
+        if isinstance(entry, dict)
+    }
     in_block = set(previous_ids)
     previous_ids = list(previous_ids) + [fid for fid in places if fid not in in_block]
     stale = from_body and parse_id_scheme(previous_body) != ID_SCHEME
@@ -8626,7 +8634,7 @@ def unread_held_entries(
         if stale and raw not in respelled:
             continue
         fid = respelled.get(raw, raw)
-        if fid in exclude or fid in entries:
+        if fid in exclude or fid in resolved or fid in entries:
             continue
         place = places.get(raw)
         if place is None:

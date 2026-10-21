@@ -14770,6 +14770,19 @@ class TestUnreadTargetReason(unittest.TestCase):
             audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b")
         )
 
+    def test_an_id_the_document_resolved_is_not_kept(self):
+        """The run says the finding is gone, so it does not also say it did not check it."""
+        place = {"check": "netpol-missing", "cluster": "stage-eu", "namespace": "payments", "object": "Namespace/payments"}
+        fid = audit_report.published_id(place)
+        body = audit_report.delta_block([fid])
+        memory = {"document": {"findings": [{**place, "id": fid, "title": "Gone"}]}}
+        data = self.doc(AUDIT, [{"name": "stage-eu", "checks_run": []}])
+        self.assertEqual(
+            [e["id"] for e in audit_report.unread_held_entries(body, memory, data, exclude=set())], [fid]
+        )
+        data["resolved_because"] = [{**place, "reason": "kubectl showed the namespace has a policy now"}]
+        self.assertEqual(audit_report.unread_held_entries(body, memory, data, exclude=set()), [])
+
     def test_a_target_of_a_kind_with_no_entry_was_not_read(self):
         audit = "gcp-networking-fabric-audit"
         checks = [{"check": c, "command": "gcloud x"} for c in audit_report.audit_target_checks(audit, "project/acme")]
