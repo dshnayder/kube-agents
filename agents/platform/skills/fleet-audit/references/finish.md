@@ -150,8 +150,8 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
   _Not re-checked this run_. A target was not checked when it is in `scope.skipped`; when the
   finding's check is on that target's roster and is in neither `checks_run` nor
   `checks_not_applicable` on it; when the check is a derived one (drift's `uncohorted`) and a roster
-  check that applies there did not run; when its project target is in `scope.skipped`; or when the
-  run listed no target of its kind. The id stays in the
+  check that applies there did not run; when no entry names the target and its project target is
+  in `scope.skipped`; or when the run listed no target of its kind. The id stays in the
   hidden block, so the next complete run reports the finding again without calling it new, or
   shows it as resolved. A finding on a target that the run read and checked is not kept: it is in
   the document, or it is gone. A finding whose target the run cannot find on the previous ledger or

@@ -745,7 +745,8 @@ headroom for the trailing marker and for anything a later section appends.
 - **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
   remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
   measured after the findings and before the evidence appendix, degrading to identity lines and then
-  to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
+  to a note rather than displacing a finding (collector design §3.3). It also carries the
+  _Not re-checked this run_ rows (§7.4). Findings are selected **severity-first**, so
   truncation only ever eats the least-severe end and criticals are structurally safe — a fleet with
   five criticals and three hundred minors publishes all five criticals no matter what. In a
   severity band, selection takes one finding for each target in turn while the band has space: no
@@ -1102,7 +1103,7 @@ check that applies there did not run; when no entry names it and its project tar
 previous marker and the findings of the stored document that the previous body renders, which adds
 the findings the body budget cut. The place of each finding comes from its row on the previous
 body, from that stored document, or from `not_rechecked` on the stored record: the title and place
-of each finding the previous run kept this way. The note and id-only tiers of the held span (§7.1)
+of each finding the previous run kept this way. The note and id-only tiers of the held span ([collector design §3.3](fleet-audit-collector-manifest.md#33-resolution--still_flagged_ids-collector_held_entries))
 write no row, so without that key the next gap run could not place the id and the finding would
 come back as new on the next complete run. An id with no known place is not kept, and the run log
 names it, because a row held by id alone would never get a place back and would stay for as long as
