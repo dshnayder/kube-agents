@@ -64,7 +64,7 @@ Both writes are atomic (`os.replace` from a temp file in the same directory). Th
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
-dropped under a gap (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
+dropped under a gap, or with no forge the ids that left under a gap (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
 run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an

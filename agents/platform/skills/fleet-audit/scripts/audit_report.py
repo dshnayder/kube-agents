@@ -1295,7 +1295,9 @@ UNACCOUNTED_KEY = "unaccounted"
 UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
 # On the stored envelope only: the ids that some run already reported under
 # `unreported_under_gap` and that are still not published. The next run does
-# not report them again. A record without the key subtracts nothing.
+# not report them again. A record without the key subtracts nothing. With no
+# forge, the ids that left under a gap and are still not stored; a run with
+# full coverage clears them. A scheduled run does not count these as resolved.
 REPORTED_UNDER_GAP_KEY = "reported_under_gap"
 # On the stored envelope only: True when the run was a scheduled run, that is,
 # its `finish` got `--scheduled`. A record without the key was written before
@@ -8095,6 +8097,7 @@ def since_last_scheduled(
     `published` is what this run published. `not_resolved` holds ids that
     left under a coverage gap: they are not resolved, and the report lists
     them on a line of their own. With no baseline the value is None.
+    When every id that moved is in `not_resolved`, the entry is left out.
     `counted_against_record` says that `new` and `resolved` count against
     `record`. When they do and `record` is a scheduled run's, they already
     say the change since the last scheduled run, so the entry is left out.
@@ -8112,12 +8115,13 @@ def since_last_scheduled(
     elif not baseline:
         return {}
     published = set(published)
-    return {
-        SINCE_SCHEDULED_KEY: {
-            "new": sorted(published - set(baseline)),
-            "resolved": sorted(set(baseline) - published - set(not_resolved)),
-        }
-    }
+    new = sorted(published - set(baseline))
+    resolved = sorted(set(baseline) - published - set(not_resolved))
+    # Every id that moved left under a gap: "0 new, 0 resolved" is not why
+    # the run speaks, so the entry is left out.
+    if not new and not resolved:
+        return {}
+    return {SINCE_SCHEDULED_KEY: {"new": new, "resolved": resolved}}
 
 
 def coverage_changed(
@@ -17596,6 +17600,20 @@ def _finish_without_forge(
     new_ids = sorted(set(current_ids) - set(previous_ids or []))
     # Over a coverage gap an absence means "not checked", not fixed.
     resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(stored_ids))
+    # The ids that left under a gap, on this run or an earlier one, and that
+    # are still not stored (`REPORTED_UNDER_GAP_KEY`). A run with full
+    # coverage clears them: its absence is a fix.
+    reported_under_gap = (
+        sorted(
+            (
+                {str(fid) for fid in (record or {}).get(REPORTED_UNDER_GAP_KEY) or []}
+                | set(previous_ids or [])
+            )
+            - set(stored_ids)
+        )
+        if gaps
+        else []
+    )
     if not delta_known:
         new_ids, resolved_ids = [], []
     # A scheduled run speaks when its ids are not the last scheduled run's,
@@ -17605,13 +17623,14 @@ def _finish_without_forge(
     ids_moved = scheduled and (
         scheduled_ids is None or set(stored_ids) != set(scheduled_ids)
     )
-    # Over a coverage gap an absence is not a fix, so nothing is resolved.
+    # An id that left under a gap is not resolved. An id that an on-demand
+    # run with full coverage resolved is resolved, also when this run has a gap.
     since_scheduled = since_last_scheduled(
         ids_moved,
         record,
         scheduled_ids,
         stored_ids,
-        not_resolved=(scheduled_ids or []) if gaps else (),
+        not_resolved=reported_under_gap,
     )
     # The findings branch's rule: quiet only when nothing changed and the run
     # could vouch for what it saw. Only a scheduled run can be quiet, but an
@@ -17676,6 +17695,7 @@ def _finish_without_forge(
             resolved_ids=resolved_ids,
             rendered_ids=stored_ids,
             delta_known=delta_known,
+            reported_under_gap=reported_under_gap,
             scheduled=scheduled,
             scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(record)),
             scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),

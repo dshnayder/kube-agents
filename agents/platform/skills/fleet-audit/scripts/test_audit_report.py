@@ -16804,6 +16804,23 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         )
         self.assertIn("Changed since the last scheduled run: 0 new, 1 resolved", text)
 
+    def test_a_finding_dropped_under_a_gap_is_not_said_as_zero_change(self):
+        # Every id that moved left under a gap, so "0 new, 0 resolved" is not
+        # the reason this run speaks: the `unreported_under_gap` line is.
+        self.seed_scheduled([self.a, self.c])
+        gap = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        doc = make_doc(findings=[self.a], skipped=gap)
+        with patch.object(audit_report, "append_chat_report"):
+            self.assertEqual(self.run_finish(doc, scheduled=False), 0, self.err)
+        gone = derived_id(obj="Namespace/c")
+        with patch.object(audit_report, "append_chat_report") as chat:
+            self.assertEqual(self.run_finish(doc, scheduled=True), 0, self.err)
+        out, text = self.stdout_json(), chat.call_args.args[2]
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual(out[audit_report.UNREPORTED_UNDER_GAP_KEY], [gone])
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+        self.assertNotIn("since the last scheduled run", text)
+
     def test_an_unknown_baseline_is_said(self):
         # A record from before `finish` stored the scheduled ids.
         body = published_body(make_doc(findings=[self.a]), generated_at=NOW)
@@ -27388,6 +27405,41 @@ class TestNoForge(BaseTestCase):
         self.assertNotIn(
             audit_report.SINCE_SCHEDULED_KEY, self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         )
+
+    GAP = ({"cluster": "dr-west", "reason": "control plane unreachable"},)
+
+    def test_a_finding_resolved_on_demand_is_resolved_on_a_scheduled_run_with_a_gap(self):
+        # The on-demand run had full coverage, so its absence is a fix. A gap
+        # on the next scheduled run does not make it "not checked".
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.finish(make_doc(findings=THREE_SEVERITIES[1:]), scheduled=False)
+        gapped = self.finish(make_doc(findings=THREE_SEVERITIES[1:], skipped=self.GAP))
+        gone = derived_id(obj="Namespace/minor-one")
+        self.assertFalse(gapped["silent_ok"])
+        self.assertEqual(gapped[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
+        self.assertIn(
+            f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", gapped["summary"]
+        )
+        self.assertTrue(self.finish(make_doc(findings=THREE_SEVERITIES[1:]))["silent_ok"])
+
+    def test_a_finding_dropped_under_a_gap_is_not_said_as_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.finish(make_doc(findings=THREE_SEVERITIES), scheduled=False)
+        gapped = self.finish(make_doc(findings=THREE_SEVERITIES[1:], skipped=self.GAP))
+        self.assertFalse(gapped["silent_ok"])
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, gapped)
+        self.assertNotIn("since the last scheduled run", gapped["summary"])
+
+    def test_a_finding_dropped_under_a_gap_on_demand_stays_not_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.finish(make_doc(findings=THREE_SEVERITIES[1:], skipped=self.GAP), scheduled=False)
+        latest = json.loads((self.store() / "latest.json").read_text())
+        self.assertEqual(
+            latest[audit_report.REPORTED_UNDER_GAP_KEY], [derived_id(obj="Namespace/minor-one")]
+        )
+        gapped = self.finish(make_doc(findings=THREE_SEVERITIES[1:], skipped=self.GAP))
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, gapped)
+        self.assertNotIn("since the last scheduled run", gapped["summary"])
 
     def test_the_summary_says_an_unknown_scheduled_baseline(self):
         doc = make_doc(findings=THREE_SEVERITIES)

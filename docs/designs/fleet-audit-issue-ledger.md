@@ -1170,7 +1170,12 @@ report says them on a line of its own ("Changed since the last scheduled run: â€
 (`KAGE_SLACK_UX` on) replaces the text and does not show this line. When no record shows
 the ids, or the record was written under another finding id scheme, the value is `null` and the
 line says that the change is not known. The key is absent when the last stored run was a scheduled
-run on the open ledger, because `new` and `resolved` then say the change.
+run on the open ledger, because `new` and `resolved` then say the change. An id that left under a
+gap, on this run or an earlier one (`reported_under_gap`), is not counted as resolved, and when
+every id that moved left under a gap the key is absent: "0 new, 0 resolved" is not why the run
+speaks. An id that an on-demand run resolved with full coverage is counted as resolved, also on a
+scheduled run with a gap. With no forge, the record keeps under `reported_under_gap` the ids that
+left under a gap, and a run with full coverage clears them.
 `new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
 that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
 published and that an on-demand run dropped since then is in `unreported_under_gap` only when it

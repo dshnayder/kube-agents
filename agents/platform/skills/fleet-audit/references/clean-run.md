@@ -103,7 +103,9 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   last scheduled run is not known. This occurs on the first run after an upgrade, after the
   report store is rebuilt from the ledger, or after a change of the finding id scheme. The key is
   absent when the last stored run was a scheduled run on the open ledger, because `new` and
-  `resolved` then say the change.
+  `resolved` then say the change. A finding that left under a coverage gap is not resolved, so the
+  key is also absent when every finding that moved left under a gap. A finding that an on-demand
+  run resolved with full coverage is resolved, also when this run has a gap.
 - **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
   this run published, and a gap holds `resolved` at 0. On a scheduled run, the list also has the
   findings of the last scheduled run that an on-demand run dropped under a gap; a finding that an
