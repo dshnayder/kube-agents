@@ -21873,6 +21873,33 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
 
+    def test_a_declared_finding_on_an_unread_target_is_not_kept_as_not_re_checked(self):
+        # far is on dr-west, where `default-sa-automount` did not run this run,
+        # but the document moved it under `declared`: the owner chose it, so
+        # it is not held as not re-checked.
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        self.declaring_replies(published_body(previous_doc, generated_at=NOW))
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        declaration = {"repo": "acme/fleet", "path": "knowledge/far-token.md", "excerpt": "needs the token"}
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "billing", "object": "Deployment/far", **declaration}])
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "default-sa-automount"]
+        dr_west = {"name": "dr-west", "location": "us-west1", "project": "acme-dr", "checks_run": roster, "limitations": "service account read failed"}
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[dr_west])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "dr-west", "namespace": "billing", "object": "Deployment/far", "title": "far", "declaration": declaration}]
+        rc = self.run_finish(doc, audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("COVERAGE GAP", self.err)
+        self.assertNotIn(f"HELD: {far_id}", self.err)
+
     def test_a_clean_run_still_closes_the_shielded_pull_request(self):
         # The clean call site: the document reports nothing, the collector
         # still emits api (declared, so declared from the manifest) and worker
@@ -23038,6 +23065,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         body = self.harness.bodies_for("issue-update")[0]
         self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
         return body, sorted(held_ids)
+
+    def test_not_re_checked_rows_share_the_cap_with_collector_held_rows(self):
+        # The collector-held row comes first and takes the one place, so the
+        # finding on the skipped cluster goes off the ledger, with a warning.
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage finding")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        b = make_finding(fid="b", title="Bravo finding")
+        previous = published_body(make_doc(findings=[make_finding(), b, stage]), generated_at=NOW)
+        self.replay_ledger(previous)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.patch_attr("MAX_HELD_IDS", 1)
+        manifest = _full_manifest(
+            names=("prod-us-east",),
+            candidates=[self.netpol_candidate(), self.netpol_candidate(object="Namespace/b")],
+        )
+        doc = make_doc(
+            findings=[b],
+            clusters=[{"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}],
+            skipped=[{"cluster": "stage-eu", "reason": "control plane unreachable"}],
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        marker = audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[0])
+        self.assertIn(derived_id(), marker)
+        self.assertNotIn(stage_id, marker)
+        self.assertIn("stops tracking 1 previous finding(s)", self.err)
 
     def test_held_ids_at_the_cap_all_ride_the_marker(self):
         body, held_ids = self.held_cap_run(audit_report.MAX_HELD_IDS)
@@ -27494,6 +27547,23 @@ class TestNoForge(BaseTestCase):
         self.finish(gap)
         fixed = self.finish(make_doc(findings=[make_finding()]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
+    def test_a_declared_finding_on_an_unread_target_is_not_kept_in_the_store(self):
+        # `default-sa-automount` did not run on stage-eu, but the document moved
+        # the finding under `declared`, so it is not kept as not re-checked.
+        sa = make_finding(fid="sa", check="default-sa-automount", cluster="stage-eu", obj="Deployment/sa", title="sa", severity="major")
+        sa_id = derived_id(check="default-sa-automount", cluster="stage-eu", obj="Deployment/sa")
+        self.finish(make_doc(findings=[make_finding(), sa]))
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "default-sa-automount"]
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        stage = {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage", "checks_run": roster, "limitations": "service account read failed"}
+        doc = make_doc(findings=[make_finding()], clusters=[prod, stage])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "stage-eu", "namespace": "payments", "object": "Deployment/sa", "title": "sa", "declaration": {"repo": "acme/fleet", "path": "knowledge/sa-token.md", "excerpt": "needs the token"}}]
+        self.finish(doc)
+        self.assertIn("COVERAGE GAP", self.err)
+        self.assertNotIn(f"HELD: {sa_id}", self.err)
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn(sa_id, latest["current_ids"])
 
     def test_a_failed_store_write_says_the_message_is_the_only_record(self):
         self.reports_dir.mkdir(parents=True)
