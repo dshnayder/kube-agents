@@ -1338,6 +1338,12 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
                 "severity": "block",
                 "expect": {"file": target_file, "path": ck, "op": op, "value": nval},
             }
+        if oval is None and (".env[" in ck or ck.startswith("env[")):
+            return {
+                "rule": f"Keep {ck} present in {target_file}.",
+                "severity": "block",
+                "expect": {"file": target_file, "path": ck, "op": "present", "value": True},
+            }
         return {
             "rule": f"Keep {ck} == {nval!r} in {target_file}.",
             "severity": "block",
