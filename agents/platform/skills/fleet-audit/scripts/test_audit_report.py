@@ -27669,6 +27669,21 @@ class TestLedgerRepositoryChoice(BaseTestCase):
         audit_report.release_in_flight(AUDIT)
         self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
 
+    def test_finish_with_another_repo_than_start_resolves_and_probes_it(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        recorder = Recorder()
+        self.patch_attr("run_cmd", recorder)
+        # `start` chose acme/terraform; `finish --repo acme/gitops` names another repository.
+        self.claim()
+        self.lease("acme/terraform")
+        audit_report.write_run_record(AUDIT, "acme/terraform", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/gitops"), ("acme/gitops", None))
+        # It probes the repository it names, and only that one.
+        self.assertEqual(
+            [(call, payload.get("repository")) for call, payload in zip(recorder.calls, recorder.payloads)],
+            [(["forge", "issue-list"], "acme/gitops")],
+        )
+
     def test_one_repository_needs_no_gitops_role(self):
         self.register(_repo_entries(self.TERRAFORM))
         self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
