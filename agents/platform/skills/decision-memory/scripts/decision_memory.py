@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decision memory: durable infrastructure decisions and lessons, learned from outcomes.
 
-Prototype for docs/designs/decision-memory.md. Harness-neutral by construction:
+Prototype for docs/designs/memory.md. Harness-neutral by construction:
 it imports nothing from Hermes or the A2A stack, talks to Hindsight over its
 REST API only, and reads and writes git. Every subcommand prints JSON on stdout
 so any harness (a Hermes skill, a mode-next worker, a Kubernetes CronJob, a CI
@@ -155,7 +155,11 @@ class Record:
             "id": self.id, "type": self.type, "status": self.status, "title": self.title,
             "path": self.path, "guard": self.guard or None,
             "pull_request": self.evidence.get("pull_request"),
+            "breaking_pr": self.evidence.get("breaking_pr"),
+            "incident": self.evidence.get("incident"),
+            "supersedes": self.meta.get("supersedes"),
             "superseded_by": self.meta.get("superseded_by"),
+            "body": self.body.strip(),
         }
 
 
@@ -266,6 +270,14 @@ def yaml_get(doc: Any, path: str) -> Any:
 
 
 def compare(actual: Any, op: str, expected: Any) -> bool:
+    if op == "absent":
+        return actual is None
+    if op == "present":
+        return actual is not None
+    if actual is None:
+        return False
+    if op == "regex":
+        return bool(re.search(str(expected), str(actual), re.M | re.S))
     if op in ("==", "!="):
         eq = str(actual) == str(expected)
         return eq if op == "==" else not eq
@@ -278,8 +290,13 @@ def compare(actual: Any, op: str, expected: Any) -> bool:
 def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str]) -> List[Dict[str, Any]]:
     """Evaluate a guard over {path: content}. One result per matching document."""
     results = []
+    op = expect["op"]
     for fpath, content in sorted(files.items()):
         if not fnmatch.fnmatch(fpath, expect["file"]):
+            continue
+        if expect["path"] == "$text":
+            results.append({"file": fpath, "actual": "<text>",
+                            "ok": compare(content, op, expect["value"])})
             continue
         try:
             docs = [d for d in yaml.safe_load_all(content) if d is not None]
@@ -287,10 +304,11 @@ def evaluate_guard(expect: Dict[str, Any], files: Dict[str, str]) -> List[Dict[s
             continue
         for doc in docs:
             actual = yaml_get(doc, expect["path"])
-            if actual is None:
+            if actual is None and op not in ("absent", "present"):
+                results.append({"file": fpath, "actual": None, "ok": False})
                 continue
             results.append({"file": fpath, "actual": actual,
-                            "ok": compare(actual, expect["op"], expect["value"])})
+                            "ok": compare(actual, op, expect["value"])})
     return results
 
 
@@ -312,9 +330,11 @@ def _resources_in(content: str) -> List[str]:
 
 def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
     """changed: {path: new content, or None if deleted}. Returns findings."""
+    rec_list = list(records)
+    by_id = {r.id: r for r in rec_list}
     findings = []
     new_resources = {p: _resources_in(c) for p, c in changed.items() if c}
-    for rec in records:
+    for rec in rec_list:
         if rec.status not in ("active", "proposed"):
             continue
         s = rec.scope
@@ -340,8 +360,10 @@ def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -
             elif detail:
                 verdict = "consistent"
         severity = rec.guard.get("severity", "warn") if verdict == "violates" else "info"
+        superseded_records = [by_id[oid].summary() for oid in (rec.meta.get("supersedes") or []) if oid in by_id]
         findings.append({**rec.summary(), "verdict": verdict, "severity": severity,
-                         "files": sorted(hits), "guard_results": detail})
+                         "files": sorted(hits), "guard_results": detail,
+                         "superseded_records": superseded_records})
     order = {"block": 0, "warn": 1, "info": 2}
     findings.sort(key=lambda f: (order.get(f["severity"], 3), f["id"]))
     return findings
@@ -353,14 +375,27 @@ def render_check_markdown(findings: List[Dict[str, Any]], semantic: List[Dict[st
     lines = ["### Prior decisions and lessons this change touches", ""]
     icon = {"violates": "⛔", "consistent": "✅", "related": "ℹ️"}
     for f in findings:
-        pr = f" — learned in {f['pull_request']}" if f.get("pull_request") else ""
-        lines.append(f"- {icon[f['verdict']]} **{f['id']}** ({f['type']}): {f['title']}{pr}")
+        ev_parts = []
+        if f.get("breaking_pr"):
+            ev_parts.append(f"breaking PR: {f['breaking_pr']}")
+        if f.get("incident"):
+            ev_parts.append(f"incident: {f['incident']}")
+        if f.get("pull_request"):
+            ev_parts.append(f"learned in: {f['pull_request']}")
+        ev_str = f" ({', '.join(ev_parts)})" if ev_parts else ""
+        lines.append(f"- {icon[f['verdict']]} **{f['id']}** ({f['type']}, status={f['status']}): {f['title']}{ev_str}")
         if f.get("guard") and f["guard"].get("rule"):
             lines.append(f"  - Guard ({f['guard'].get('severity', 'warn')}): {f['guard']['rule']}")
         for g in f["guard_results"]:
             if not g["ok"]:
                 what = "deleted" if g.get("deleted") else f"is now `{g['actual']}`"
                 lines.append(f"  - `{g['file']}` {what}")
+        if f.get("superseded_records"):
+            for sr in f["superseded_records"]:
+                lines.append(f"  - Supersedes **{sr['id']}** ({sr['title']}, {sr.get('pull_request') or ''}, incident {sr.get('incident') or ''})")
+        if f.get("body"):
+            for bline in f["body"].splitlines():
+                lines.append(f"  > {bline}")
     if semantic:
         lines += ["", "Possibly related (semantic match, not path-scoped — verify before relying on it):"]
         for s in semantic:
@@ -397,7 +432,20 @@ def worktree_files(repo: Path, globs: Iterable[str]) -> Dict[str, str]:
     return files
 
 
-PR_REF = re.compile(r"\(#(\d+)\)|Merge pull request #(\d+)")
+PR_REF = re.compile(
+    r"\([#!]\s*(\d+)\)"
+    r"|Merge pull request #(\d+)"
+    r"|See merge request [\w./-]*!(\d+)"
+    r"|Merged in [^\n(]*\(pull request #(\d+)\)",
+    re.I,
+)
+
+
+def _match_pr_num(text: str) -> Optional[str]:
+    m = PR_REF.search(text)
+    if not m:
+        return None
+    return next((g for g in m.groups() if g), None)
 
 
 def history(repo: Path, path: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -409,9 +457,8 @@ def history(repo: Path, path: str, limit: int = 10) -> List[Dict[str, Any]]:
         if not entry:
             continue
         sha, author, date, subject, body = (entry.split("\x1f") + [""] * 5)[:5]
-        m = PR_REF.search(subject + "\n" + body)
         out.append({"commit": sha[:12], "author": author, "date": date, "subject": subject,
-                    "pull_request": (m.group(1) or m.group(2)) if m else None,
+                    "pull_request": _match_pr_num(subject + "\n" + body),
                     "body": body.strip()[:600]})
     return out
 
@@ -507,15 +554,48 @@ def semantic_related(hs: Hindsight, query: str, exclude: Iterable[str]) -> List[
 # Commands
 # --------------------------------------------------------------------------
 
+def _parse_remote_url_identity(url: str) -> Optional[str]:
+    url = url.strip()
+    if not url:
+        return None
+    if "://" in url:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.strip("/")
+    elif ":" in url:
+        m = re.match(r"^(?:[^@]+@)?[^:/]+:(.+)$", url)
+        path = m.group(1).strip("/") if m else ""
+    else:
+        path = url.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if path.startswith("scm/"):
+        path = path[4:]
+    return path if "/" in path else None
+
+
 def repo_identity(repo: Path) -> str:
+    resolved = repo.resolve()
+    vcs_root = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", "/opt/data/scratch/vcs"))
+    sessions_dir = vcs_root / ".sessions"
+    if sessions_dir.is_dir():
+        for sf in sessions_dir.glob("*.json"):
+            try:
+                sdata = json.loads(sf.read_text())
+                if Path(sdata.get("path", "")).resolve() == resolved:
+                    raw_ident = str(sdata.get("repo") or sdata.get("spec") or "").strip()
+                    ident = _parse_remote_url_identity(raw_ident) or raw_ident
+                    if ident:
+                        return str(ident)
+            except Exception:
+                continue
     try:
         url = git(repo, "remote", "get-url", "origin").strip()
-        m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", url)
-        if m:
-            return m.group(1)
+        ident = _parse_remote_url_identity(url)
+        if ident:
+            return ident
     except subprocess.CalledProcessError:
         pass
-    return repo.resolve().name
+    return resolved.name
 
 
 def cmd_validate(a) -> Dict[str, Any]:
@@ -608,7 +688,8 @@ def cmd_why(a) -> Dict[str, Any]:
     governing.sort(key=lambda r: (r["status"] != "active", r["date"]), reverse=False)
     hist = history(repo, target, a.limit)
     uncovered = [h for h in hist if h["pull_request"] and not any(
-        str(g.get("pull_request") or "").rstrip("/").endswith("/" + h["pull_request"]) for g in governing)]
+        bool(re.search(rf"(?:[#!/]|^){re.escape(h['pull_request'])}(?:\b|\)|$)", str(g.get("pull_request") or "")))
+        for g in governing)]
     return {"path": target, "resources": resources, "records": governing, "history": hist,
             "history_without_record": uncovered,
             "note": ("Recorded rationale exists; cite the record ids." if governing else
@@ -824,6 +905,507 @@ def apply_edits(repo: Path, edits: List[Dict[str, Any]]) -> List[str]:
     return touched
 
 
+# --------------------------------------------------------------------------
+# First Two Hours Bootstrap Harvester
+# --------------------------------------------------------------------------
+
+def _flatten_yaml_leaves(obj: Any, prefix: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            safe_k = str(k).replace(".", "\\.")
+            sub = f"{prefix}.{safe_k}" if prefix else safe_k
+            if isinstance(v, (dict, list)):
+                out.update(_flatten_yaml_leaves(v, sub))
+            else:
+                out[sub] = v
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            if isinstance(item, dict) and "name" in item:
+                sel = f"{prefix}[name={item['name']}]"
+                for k, v in item.items():
+                    if k == "name":
+                        continue
+                    safe_k = str(k).replace(".", "\\.")
+                    sub = f"{sel}.{safe_k}"
+                    if isinstance(v, (dict, list)):
+                        out.update(_flatten_yaml_leaves(v, sub))
+                    else:
+                        out[sub] = v
+            elif not isinstance(item, (dict, list)):
+                out[f"{prefix}[{idx}]"] = item
+    return out
+
+
+def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> Optional[Dict[str, Any]]:
+    try:
+        old_raw = git(repo, "show", f"{commit_sha}^:{target_file}")
+        new_raw = git(repo, "show", f"{commit_sha}:{target_file}")
+    except subprocess.CalledProcessError:
+        return None
+
+    if target_file.endswith(".tf"):
+        m = re.search(r'droid_build_farm"[\s\S]*?max_surge\s*=\s*(\d+)', new_raw) or re.search(r"max_surge\s*=\s*(\d+)", new_raw)
+        if m:
+            val = m.group(1)
+            return {
+                "rule": f"Keep droid_build_farm max_surge = {val} in {target_file}.",
+                "severity": "block",
+                "expect": {
+                    "file": target_file,
+                    "path": "$text",
+                    "op": "regex",
+                    "value": rf"droid_build_farm[\s\S]*?max_surge\s*=\s*{val}\b",
+                },
+            }
+        return None
+
+    try:
+        old_doc = next((d for d in yaml.safe_load_all(old_raw) if isinstance(d, dict)), None)
+        new_doc = next((d for d in yaml.safe_load_all(new_raw) if isinstance(d, dict)), None)
+    except yaml.YAMLError:
+        return None
+    if not old_doc or not new_doc:
+        return None
+
+    old_leaves = _flatten_yaml_leaves(old_doc)
+    new_leaves = _flatten_yaml_leaves(new_doc)
+
+    # Check if a key was removed in the fix (e.g. limits.cpu removed)
+    removed = [k for k in old_leaves if k not in new_leaves and "tolerations" not in k]
+    for rk in removed:
+        if "limits.cpu" in rk:
+            return {
+                "rule": f"Do not set {rk} in {target_file} (must remain absent to prevent CFS throttling).",
+                "severity": "block",
+                "expect": {"file": target_file, "path": rk, "op": "absent", "value": True},
+            }
+
+    # Check changed or added leaves
+    changed = [k for k in new_leaves if old_leaves.get(k) != new_leaves[k]]
+    for ck in changed:
+        nval = new_leaves[ck]
+        oval = old_leaves.get(ck)
+        nq, oq = quantity(nval), quantity(oval) if oval is not None else None
+        if nq is not None and oq is not None:
+            op = ">=" if nq > oq else "<="
+            return {
+                "rule": f"Keep {ck} {op} {nval} in {target_file} (was {oval} in breaking change).",
+                "severity": "block",
+                "expect": {"file": target_file, "path": ck, "op": op, "value": nval},
+            }
+        return {
+            "rule": f"Keep {ck} == {nval!r} in {target_file}.",
+            "severity": "block",
+            "expect": {"file": target_file, "path": ck, "op": "==", "value": nval},
+        }
+    return None
+
+
+def _git_commit_index(repo: Path) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Index local git commits by proposal number (#N or !N) and commit SHA."""
+    by_pr: Dict[int, Dict[str, Any]] = {}
+    by_sha: Dict[str, Dict[str, Any]] = {}
+    try:
+        raw = git(repo, "log", "--format=%x1e%H%x1f%s%x1f%b%x1f", "--name-only")
+    except subprocess.CalledProcessError:
+        return by_pr, by_sha
+    for entry in raw.split("\x1e"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("\x1f", 3)
+        if len(parts) < 4:
+            continue
+        sha, subject, body, files_blob = parts
+        files = [f.strip() for f in files_blob.splitlines() if f.strip()]
+        info = {"sha": sha.strip(), "files": files}
+        by_sha[sha.strip()] = info
+        pr_str = _match_pr_num(subject + "\n" + body)
+        if pr_str and pr_str.isdigit():
+            by_pr.setdefault(int(pr_str), info)
+    return by_pr, by_sha
+
+
+def _files_from_diff(diff_text: str) -> List[str]:
+    files = []
+    for m in re.finditer(r"^\+\+\+ b/(.+)$", diff_text or "", re.M):
+        p = m.group(1).strip()
+        if p and p != "/dev/null" and p not in files:
+            files.append(p)
+    return files
+
+
+def _normalize_proposal(raw: Dict[str, Any], by_pr: Dict[int, Dict[str, Any]],
+                        by_sha: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    p = dict(raw)
+    num = int(p["number"])
+    if not p.get("merged_at") and p.get("state") == "merged":
+        p["merged_at"] = p.get("closed") or p.get("updated") or p.get("created") or _dt.date.today().isoformat()
+    if not p.get("created_at") and p.get("created"):
+        p["created_at"] = p["created"]
+    if not p.get("html_url") and p.get("url"):
+        p["html_url"] = p["url"]
+    cinfo = by_pr.get(num) or by_sha.get(str(p.get("merge_commit_sha") or p.get("sourceRevision") or ""))
+    if cinfo:
+        if not p.get("merge_commit_sha"):
+            p["merge_commit_sha"] = cinfo["sha"]
+        if not p.get("_files") and cinfo.get("files"):
+            p["_files"] = cinfo["files"]
+    if not p.get("_files") and p.get("diff"):
+        p["_files"] = _files_from_diff(str(p.get("diff") or ""))
+    if not p.get("_comments") and p.get("comments"):
+        p["_comments"] = [{"user": c.get("author") or c.get("user"), "body": c.get("body", "")}
+                          for c in (p.get("comments") or [])]
+    return p
+
+
+def _normalize_issue(raw: Dict[str, Any]) -> Dict[str, Any]:
+    i = dict(raw)
+    if not i.get("created_at") and i.get("created"):
+        i["created_at"] = i["created"]
+    if not i.get("html_url") and i.get("url"):
+        i["html_url"] = i["url"]
+    return i
+
+
+def _load_vcs_client() -> Any:
+    for candidate in (
+        Path(__file__).resolve().parents[3] / "scripts",
+        Path("/opt/defaults/scripts"),
+        Path("/opt/data/scripts"),
+    ):
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.append(str(candidate))
+    import vcs_client  # type: ignore
+    return vcs_client
+
+
+def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fetch proposals and issues across GitHub, GitLab, and Bitbucket via vcs_client."""
+    vc = _load_vcs_client()
+    prs: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        resp = vc.forge("proposal-list", {"state": "all", "limit": 100, "page": page}, repository=repo_spec)
+        batch = resp.get("proposals") or []
+        prs.extend(batch)
+        if not resp.get("truncated") or not batch:
+            break
+        page += 1
+
+    issues_resp = vc.forge("issue-list", {"state": "all", "limit": 100}, repository=repo_spec)
+    issues = [_normalize_issue(i) for i in (issues_resp.get("issues") or [])]
+
+    by_pr, by_sha = _git_commit_index(repo)
+    normalized_prs: List[Dict[str, Any]] = []
+    for raw_pr in prs:
+        pr = _normalize_proposal(raw_pr, by_pr, by_sha)
+        if not pr.get("merged_at") and pr.get("state") == "closed" and pr.get("title") != "[withdrawn-eval-probe]":
+            try:
+                view = vc.forge(
+                    "proposal-view",
+                    {"number": int(pr["number"]), "comments": True, "diff": True, "limit": 100},
+                    repository=repo_spec,
+                )
+                pr["_comments"] = view.get("comments") or []
+                if not pr.get("_files") and view.get("diff"):
+                    pr["_files"] = _files_from_diff(view["diff"])
+            except Exception:
+                pass
+        normalized_prs.append(pr)
+    return normalized_prs, issues
+
+
+def _gh_fetch_all(github_repo: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    prs_raw = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{github_repo}/pulls?state=all&per_page=100"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    issues_raw = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{github_repo}/issues?state=all&per_page=100"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    prs = json.loads(prs_raw) if prs_raw.strip() else []
+    issues = [i for i in (json.loads(issues_raw) if issues_raw.strip() else []) if "pull_request" not in i]
+    for pr in prs:
+        if not pr.get("merged_at") and pr.get("state") == "closed" and pr.get("title") != "[withdrawn-eval-probe]":
+            c_raw = subprocess.run(
+                ["gh", "api", f"repos/{github_repo}/issues/{pr['number']}/comments"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            pr["_comments"] = json.loads(c_raw) if c_raw.strip() else []
+        f_raw = subprocess.run(
+            ["gh", "api", f"repos/{github_repo}/pulls/{pr['number']}/files"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        pr["_files"] = [f["filename"] for f in (json.loads(f_raw) if f_raw.strip() else [])]
+    return prs, issues
+
+
+def _format_proposal_ref(pr_obj: Dict[str, Any], num: int, repo_id: str) -> str:
+    url = pr_obj.get("html_url") or pr_obj.get("url")
+    sigil = "!" if (url and "/-/merge_requests/" in str(url)) else "#"
+    if url:
+        return f"{url} ({sigil}{num})"
+    return f"https://github.com/{repo_id}/pull/{num} (#{num})"
+
+
+def _format_issue_ref(inc_obj: Dict[str, Any], num: int, repo_id: str) -> str:
+    url = inc_obj.get("html_url") or inc_obj.get("url")
+    if url:
+        return f"{url} (#{num})"
+    return f"https://github.com/{repo_id}/issues/{num} (#{num})"
+
+
+def cmd_bootstrap(a) -> Dict[str, Any]:
+    """First Two Hours Bootstrap: harvest historical PRs/MRs, reverts, rejected proposals, and issues."""
+    repo = Path(a.repo)
+    gh_repo = a.github_repo or repo_identity(repo)
+    by_pr, by_sha = _git_commit_index(repo)
+    if a.prs_json and a.issues_json:
+        prs = [_normalize_proposal(p, by_pr, by_sha) for p in json.loads(Path(a.prs_json).read_text())]
+        issues = [_normalize_issue(i) for i in json.loads(Path(a.issues_json).read_text())]
+    elif os.environ.get("CREDENTIAL_PROXY_URL", "").strip():
+        prs, issues = _vcs_fetch_all(repo, gh_repo)
+    else:
+        raw_prs, raw_issues = _gh_fetch_all(gh_repo)
+        prs = [_normalize_proposal(p, by_pr, by_sha) for p in raw_prs]
+        issues = [_normalize_issue(i) for i in raw_issues]
+
+    prs = [p for p in prs if p.get("title") != "[withdrawn-eval-probe]"]
+    pr_by_num = {int(p["number"]): p for p in prs}
+    issue_by_num = {int(i["number"]): i for i in issues}
+
+    re_reverts = re.compile(r"Reverts\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)", re.I)
+    re_fixes = re.compile(
+        r"(?:fixes|resolves|mitigates|closes)\s+(?:SEV-\d+\s+Incident\s+|Incident\s+|issue\s+)?[#!]\s*(\d+)",
+        re.I,
+    )
+    re_rejected = re.compile(r"rejection of\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)", re.I)
+    re_supersedes = re.compile(
+        r"Supersedes Freeze from Incident\s+[#!]\s*(\d+)\s*/\s*Revert\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)",
+        re.I,
+    )
+
+    written: List[str] = []
+    triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
+    pr_to_record_id: Dict[int, str] = {}
+
+    # Sort PRs chronologically by number
+    for pr in sorted(prs, key=lambda x: int(x["number"])):
+        num = int(pr["number"])
+        title = pr.get("title") or ""
+        body = pr.get("body") or ""
+        merged = pr.get("merged_at")
+        files = pr.get("_files") or []
+        date_str = str(merged or pr.get("created_at") or _dt.date.today().isoformat())[:10]
+        year = int(date_str[:4])
+
+        # Case 1: Superseding PR (e.g. BB-10 PR #33)
+        m_sup = re_supersedes.search(body)
+        if merged and m_sup:
+            inc_num, old_rev_pr = int(m_sup.group(1)), int(m_sup.group(2))
+            old_rec_id = pr_to_record_id.get(old_rev_pr)
+            inc = issue_by_num.get(inc_num, {})
+            old_pr_obj = pr_by_num.get(old_rev_pr, {})
+            scoped_files = sorted(set(files + (old_pr_obj.get("_files") or [])))
+            rid = _next_id(repo, "decision", year)
+            meta: Dict[str, Any] = {
+                "type": "decision",
+                "id": rid,
+                "title": title,
+                "status": "active",
+                "date": date_str,
+                "scope": {"paths": scoped_files},
+                "evidence": {
+                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                    "incident": _format_issue_ref(inc, inc_num, gh_repo),
+                    "breaking_pr": f"#{old_rev_pr}",
+                },
+            }
+            if old_rec_id:
+                meta["supersedes"] = [old_rec_id]
+            rec_body = "\n".join([
+                "## Context",
+                "",
+                body.strip(),
+                "",
+                "## Superseded Incident & Freeze",
+                "",
+                f"Supersedes earlier revert PR #{old_rev_pr} and Incident #{inc_num} ({inc.get('title', '')}).",
+                "The prerequisite upgrade has landed and the temporary freeze is lifted.",
+            ])
+            rel = f"knowledge/decisions/{rid}-{slug(title)}.md"
+            if a.write:
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                (repo / rel).write_text(render_record(meta, rec_body))
+                written.append(rel)
+                # Reconcile superseded status on the old record
+                if old_rec_id:
+                    for rec in load_records(repo):
+                        if rec.id == old_rec_id:
+                            rec.meta["status"] = "superseded"
+                            rec.meta["superseded_by"] = rid
+                            (repo / rec.path).write_text(render_record(rec.meta, rec.body))
+            pr_to_record_id[num] = rid
+            triage_counts["superseded"] += 1
+            continue
+
+        # Case 2: Revert / Fix PR resolving an Incident after a Rejected PR (e.g. BB-02)
+        m_rej = re_rejected.search(body)
+        m_fix = re_fixes.search(body + " " + title)
+        if merged and m_rej and m_fix:
+            rej_num = int(m_rej.group(1))
+            inc_num = int(m_fix.group(1))
+            rej_pr = pr_by_num.get(rej_num, {})
+            inc = issue_by_num.get(inc_num, {})
+            rej_files = rej_pr.get("_files") or []
+            target_file = rej_files[0] if rej_files else (files[0] if files else "")
+            comments = "\n\n".join(c.get("body", "") for c in (rej_pr.get("_comments") or []))
+            rid = _next_id(repo, "decision", year)
+            guard = {
+                "rule": f"Do not raise {target_file} above 32Gi; right-size offending workloads instead (rejected in PR #{rej_num}, fixed in PR #{num}).",
+                "severity": "block",
+                "expect": {
+                    "file": target_file,
+                    "path": "spec.hard.requests\\.memory",
+                    "op": "<=",
+                    "value": "32Gi",
+                },
+            }
+            meta = {
+                "type": "decision",
+                "id": rid,
+                "title": f"Hard multi-tenant quota ceiling on {target_file} (rejected PR #{rej_num})",
+                "status": "active",
+                "date": date_str,
+                "scope": {"paths": sorted(set(rej_files + files))},
+                "guard": guard,
+                "evidence": {
+                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                    "breaking_pr": _format_proposal_ref(rej_pr, rej_num, gh_repo),
+                    "incident": _format_issue_ref(inc, inc_num, gh_repo),
+                },
+            }
+            rec_body = "\n".join([
+                "## Architectural Decision",
+                "",
+                comments.strip() or body.strip(),
+                "",
+                "## Incident & Workload Fix",
+                "",
+                f"Incident #{inc_num}: {inc.get('title', '')}",
+                "",
+                inc.get("body", "").strip(),
+                "",
+                f"Rejected quota increase in PR #{rej_num}; resolved at workload level in PR #{num}:",
+                body.strip(),
+            ])
+            rel = f"knowledge/decisions/{rid}-{slug(meta['title'])}.md"
+            if a.write:
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                (repo / rel).write_text(render_record(meta, rec_body))
+                written.append(rel)
+            pr_to_record_id[num] = rid
+            triage_counts["decision"] += 1
+            continue
+
+        # Case 3: Revert / Fix PR reverting a Breaking PR that caused an Incident (BB-01, 03..10)
+        m_rev = re_reverts.search(body)
+        if merged and m_rev and m_fix:
+            brk_num = int(m_rev.group(1))
+            inc_num = int(m_fix.group(1))
+            brk_pr = pr_by_num.get(brk_num, {})
+            inc = issue_by_num.get(inc_num, {})
+            target_file = files[0] if files else ""
+            commit_sha = pr.get("merge_commit_sha") or ""
+            guard = _infer_guard_from_commit(repo, commit_sha, target_file) if (commit_sha and target_file) else None
+            rid = _next_id(repo, "lesson", year)
+            meta = {
+                "type": "lesson",
+                "id": rid,
+                "title": inc.get("title") or title,
+                "status": "active",
+                "date": date_str,
+                "scope": {"paths": files},
+                "evidence": {
+                    "pull_request": _format_proposal_ref(pr, num, gh_repo),
+                    "breaking_pr": _format_proposal_ref(brk_pr, brk_num, gh_repo),
+                    "incident": _format_issue_ref(inc, inc_num, gh_repo),
+                    "commit": commit_sha[:12] if commit_sha else "",
+                },
+            }
+            if guard:
+                meta["guard"] = guard
+            rec_body = "\n".join([
+                "## What happened",
+                "",
+                f"Breaking PR #{brk_num} ({brk_pr.get('title', '')}) triggered Incident #{inc_num}:",
+                "",
+                (inc.get("body") or "").strip(),
+                "",
+                "## What fixed it",
+                "",
+                f"Revert/Fix PR #{num} ({title}):",
+                body.strip(),
+            ])
+            rel = f"knowledge/lessons/{rid}-{slug(title)}.md"
+            if a.write:
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                (repo / rel).write_text(render_record(meta, rec_body))
+                written.append(rel)
+            pr_to_record_id[num] = rid
+            triage_counts["revert-lesson"] += 1
+            continue
+
+        triage_counts["routine"] += 1
+
+    # Write STATE_OF_BEING.md
+    if a.write:
+        records = load_records(repo)
+        sob_lines = [
+            f"# State of Being — `{gh_repo}`",
+            "",
+            "Generated by the Decision Memory First-Two-Hours Bootstrap Harvester.",
+            "",
+            "## Active Decisions and Lessons",
+            "",
+        ]
+        for r in records:
+            if r.status == "active":
+                sob_lines.append(
+                    f"- **{r.id}** ({r.type}): {r.title} — paths: `{', '.join(r.scope['paths'])}` "
+                    f"(fix: {r.evidence.get('pull_request', '')}, incident: {r.evidence.get('incident', '')}, "
+                    f"breaking: {r.evidence.get('breaking_pr', '')})"
+                )
+        sob_lines.extend(["", "## Superseded Records", ""])
+        for r in records:
+            if r.status == "superseded":
+                sob_lines.append(
+                    f"- ~~**{r.id}**~~ ({r.type}): {r.title} — **Superseded by {r.meta.get('superseded_by')}**"
+                )
+        sob_path = repo / "knowledge/STATE_OF_BEING.md"
+        sob_path.parent.mkdir(parents=True, exist_ok=True)
+        sob_path.write_text("\n".join(sob_lines) + "\n")
+        written.append("knowledge/STATE_OF_BEING.md")
+
+    idx_res = None
+    if a.hindsight_url and a.write:
+        ns = argparse.Namespace(repo=str(repo), repo_id=gh_repo, hindsight_url=a.hindsight_url,
+                                bank=a.bank, force=True)
+        idx_res = cmd_index(ns)
+
+    return {
+        "github_repo": gh_repo,
+        "prs_scanned": len(prs),
+        "issues_scanned": len(issues),
+        "triage": triage_counts,
+        "written": written,
+        "index": idx_res,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=".", help="GitOps repository checkout")
@@ -855,9 +1437,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--infra-glob", nargs="*", default=["clusters/**", "fleet/**", "policy/**"])
     p.add_argument("--include-ungoverned", action="store_true")
     p.add_argument("--apply", action="store_true", help="write proposed edits into the working tree")
+    p = sub.add_parser("bootstrap")
+    p.add_argument("--github-repo", default=None, help="owner/repo on GitHub")
+    p.add_argument("--prs-json", default=None, help="optional local JSON file of PRs")
+    p.add_argument("--issues-json", default=None, help="optional local JSON file of Issues")
+    p.add_argument("--write", action="store_true", help="write harvested records into knowledge/")
     a = ap.parse_args(argv)
     handlers = {"validate": cmd_validate, "index": cmd_index, "check": cmd_check, "why": cmd_why,
-                "from-outcome": cmd_from_outcome, "dream": cmd_dream}
+                "from-outcome": cmd_from_outcome, "dream": cmd_dream, "bootstrap": cmd_bootstrap}
     result = handlers[a.cmd](a)
     if a.cmd == "dream" and a.apply:
         result["applied"] = apply_edits(Path(a.repo), result["proposed_edits"])

@@ -277,9 +277,15 @@ say nothing and hide the real cause. A card that prepared before an upgrade
 cannot submit after one; its clone was on a volume this script no longer has.
 Prepare again. Do not write new commands with these flags.
 
-### Step 4: Confirm Suggestion
+### Step 4: Confirm Suggestion (or Report Decision Memory Refusal)
 
-Record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
+`submit` automatically evaluates the staged changes against any active Decision Memory records (`knowledge/decisions/*.md` and `knowledge/lessons/*.md`) in the repository:
+
+- If `submit` refuses with `DECISION MEMORY GUARD BLOCKED THIS CHANGE`:
+  - **Stop immediately.** Do **not** open a pull request, do **not** modify `knowledge/`, and do **not** pass `--override-decision` unless the user explicitly named that record ID to override.
+  - Report the refusal to the user: explain why the change was rejected, describe the exact failure mechanism from the record, and cite the record ID (`DEC-...` / `LES-...`), breaking PR `#`, Incident Issue `#`, and revert/fix PR `#` printed by `submit`.
+- If `submit` succeeds and prints a `### Prior decisions and lessons this change touches` block (for example, when an earlier freeze was **superseded** by a later decision record), include both the PR URL and the supersession context (citing both the superseded incident/revert and the superseding PR `#`) in your confirmation to the user.
+- Otherwise, record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
 
 ### Step 5: Addressing Review Feedback on an Existing PR
 

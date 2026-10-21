@@ -487,6 +487,127 @@ class IndexTests(unittest.TestCase):
         self.assertEqual([s["id"] for s in out["semantic"]], ["DEC-2026-001"])
 
 
+class MultiForgeTests(unittest.TestCase):
+    def setUp(self):
+        self.r = Repo()
+
+    def tearDown(self):
+        self.r.close()
+
+    def test_parse_remote_url_identity_supports_github_gitlab_bitbucket(self):
+        self.assertEqual(dm._parse_remote_url_identity("https://github.com/acme/gitops.git"), "acme/gitops")
+        self.assertEqual(dm._parse_remote_url_identity("git@gitlab.com:acme/platform/infra/gitops.git"), "acme/platform/infra/gitops")
+        self.assertEqual(dm._parse_remote_url_identity("https://gitlab.example.com/group/sub/repo"), "group/sub/repo")
+        self.assertEqual(dm._parse_remote_url_identity("https://bitbucket.example.com/scm/proj/gitops.git"), "proj/gitops")
+        self.assertEqual(dm._parse_remote_url_identity("acme/sub/gitops"), "acme/sub/gitops")
+
+    def test_repo_identity_reads_vcs_session_when_remote_stripped(self):
+        vcs_root = self.r.path / "vcs-scratch"
+        sessions_dir = vcs_root / ".sessions"
+        sessions_dir.mkdir(parents=True)
+        worktree = vcs_root / "work-123"
+        worktree.mkdir()
+        (sessions_dir / "s1.json").write_text(json.dumps({
+            "path": str(worktree),
+            "repo": "https://gitlab.com/acme/sub/gitops.git",
+        }))
+        old_env = os.environ.get("KUBE_AGENTS_VCS_ROOT")
+        os.environ["KUBE_AGENTS_VCS_ROOT"] = str(vcs_root)
+        try:
+            self.assertEqual(dm.repo_identity(worktree), "acme/sub/gitops")
+        finally:
+            if old_env is None:
+                os.environ.pop("KUBE_AGENTS_VCS_ROOT", None)
+            else:
+                os.environ["KUBE_AGENTS_VCS_ROOT"] = old_env
+
+    def test_pr_ref_matches_github_gitlab_and_bitbucket_merge_commits(self):
+        self.assertEqual(dm._match_pr_num("feat: bump mem (#42)"), "42")
+        self.assertEqual(dm._match_pr_num("Merge pull request #17 from acme/fix"), "17")
+        self.assertEqual(dm._match_pr_num("fix: quota (!88)"), "88")
+        self.assertEqual(dm._match_pr_num("Merge branch 'fix'\n\nSee merge request acme/sub/gitops!104"), "104")
+        self.assertEqual(dm._match_pr_num("Merged in feature/foo (pull request #53)"), "53")
+
+    def test_bootstrap_supports_gitlab_merge_requests_and_vcs_client_schema(self):
+        # Create a GitLab-style commit on the repo so _git_commit_index can link it
+        self.r.write("clusters/prod-eu/payments/checkout.yaml", DEPLOY.format(mem="64Mi"))
+        self.r.commit("feat(payments): lower checkout memory to 64Mi (!10)")
+        self.r.write("clusters/prod-eu/payments/checkout.yaml", DEPLOY.format(mem="256Mi"))
+        self.r.commit("Revert \"feat(payments): lower checkout memory to 64Mi\"\n\nSee merge request acme/gitops!12")
+
+        # Normalized vcs_client proposal-list / issue-list schema
+        prs = [
+            {
+                "number": 10,
+                "title": "feat(payments): lower checkout memory to 64Mi",
+                "state": "merged",
+                "url": "https://gitlab.com/acme/gitops/-/merge_requests/10",
+                "body": "Cut memory request.",
+            },
+            {
+                "number": 12,
+                "title": "revert(payments): restore checkout memory to 256Mi",
+                "state": "merged",
+                "url": "https://gitlab.com/acme/gitops/-/merge_requests/12",
+                "body": "Reverts !10\nFixes #11\n64Mi caused OOMKilled (ExitCode 137) under load.",
+            },
+            {
+                "number": 15,
+                "title": "feat(payments): raise namespace quota to 64Gi",
+                "state": "closed",
+                "url": "https://gitlab.com/acme/gitops/-/merge_requests/15",
+                "body": "Raise namespace quota.",
+                "diff": "--- a/clusters/prod-eu/payments/namespace-quota.yaml\n+++ b/clusters/prod-eu/payments/namespace-quota.yaml\n@@ -1 +1 @@\n",
+                "_comments": [{"user": "sec-reviewer", "body": "Rejected: 32Gi is our multi-tenant ceiling."}],
+            },
+            {
+                "number": 16,
+                "title": "fix(payments): right-size batch worker after rejection of MR !15",
+                "state": "merged",
+                "url": "https://gitlab.com/acme/gitops/-/merge_requests/16",
+                "body": "Follows rejection of MR !15\nFixes #14\nRight-size worker instead of raising namespace quota.",
+            },
+        ]
+        issues = [
+            {
+                "number": 11,
+                "title": "incident: checkout OOMKilled after !10",
+                "state": "closed",
+                "body": "Pod crashed with ExitCode 137 after merge request !10.",
+            },
+            {
+                "number": 14,
+                "title": "incident: payments quota exceeded",
+                "state": "closed",
+                "body": "Batch worker exceeded namespace memory quota.",
+            },
+        ]
+        prs_file = self.r.path / "gitlab_prs.json"
+        issues_file = self.r.path / "gitlab_issues.json"
+        prs_file.write_text(json.dumps(prs))
+        issues_file.write_text(json.dumps(issues))
+
+        rc, out = self.r.run(
+            "bootstrap",
+            "--prs-json", str(prs_file),
+            "--issues-json", str(issues_file),
+            "--write",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["triage"]["revert-lesson"], 1)
+        self.assertEqual(out["triage"]["decision"], 1)
+        records = {rec.id: rec for rec in dm.load_records(self.r.path)}
+        self.assertIn("LES-2026-002", records)
+        les = records["LES-2026-002"]
+        self.assertIn("clusters/prod-eu/payments/checkout.yaml", les.scope["paths"])
+        self.assertIn("!12", str(les.evidence.get("pull_request", "")))
+        self.assertIn("!10", str(les.evidence.get("breaking_pr", "")))
+        self.assertIn("DEC-2026-002", records)
+        dec = records["DEC-2026-002"]
+        self.assertIn("clusters/prod-eu/payments/namespace-quota.yaml", dec.scope["paths"])
+        self.assertIn("!15", str(dec.evidence.get("breaking_pr", "")))
+
+
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")
 class LiveHindsightTests(unittest.TestCase):
     def test_round_trip(self):

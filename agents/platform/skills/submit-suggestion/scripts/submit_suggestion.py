@@ -578,6 +578,44 @@ def pending_changes(session: dict) -> str:
     return vcs_client.local(session, ["status", "--porcelain"], "status")["stdout"].strip()
 
 
+def _check_decision_memory(workspace: str, base: str, override: str | None = None) -> dict | None:
+    """Run Decision Memory check on the staged/committed change before publishing."""
+    ws = Path(workspace)
+    if not ((ws / "knowledge/decisions").is_dir() or (ws / "knowledge/lessons").is_dir()):
+        return None
+    dm_script = Path(__file__).resolve().parents[2] / "decision-memory/scripts/decision_memory.py"
+    if not dm_script.is_file():
+        return None
+    res = subprocess.run(
+        [sys.executable, str(dm_script), "--repo", str(ws), "check", "--base", base, "--head", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if not res.stdout.strip():
+        return None
+    try:
+        out = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+    if out.get("verdict") == "block":
+        blocking_ids = [f["id"] for f in out.get("findings", []) if f.get("severity") == "block"]
+        if not override or override not in blocking_ids:
+            msg = (
+                "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+                f"{out.get('markdown', '')}\n\n"
+                "Do NOT open this Pull Request. In your final response (and kanban_complete result), "
+                "you MUST quote the exact Breaking PR (#...), Incident Issue (#...), and Revert/Fix PR (#...) "
+                "numbers and the technical root-cause details from the block above verbatim."
+            )
+            print(msg)
+            raise PermissionError(msg)
+    elif out.get("findings"):
+        print(
+            "DECISION MEMORY CONTEXT (include the superseding PR # and superseded incident/PR # in your final summary):\n"
+            f"{out.get('markdown', '')}\n"
+        )
+    return out
+
+
 def handle_submit(args) -> int:
     body = _submit_body(args)
     if not args.keep_description and not (args.title and body):
@@ -748,6 +786,12 @@ def handle_submit(args) -> int:
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=copy_key)
 
+    dm_out = _check_decision_memory(session["path"], base, getattr(args, "override_decision", None))
+    if dm_out and dm_out.get("findings") and not args.keep_description:
+        md_section = dm_out.get("markdown", "")
+        if md_section and "### Prior decisions and lessons" not in body:
+            body = body.rstrip() + "\n\n" + md_section + "\n"
+
     if vcs_client.already_published(session, branch):
         # The state a retry has to be able to walk back into: the publish landed
         # and the forge call after it did not — a rate limit, a 5xx, a body the
@@ -806,6 +850,8 @@ def handle_submit(args) -> int:
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {url}")
+    if dm_out and dm_out.get("findings"):
+        log(dm_out.get("markdown", ""))
 
     # Print raw URL to stdout for the MCP tool to parse
     print(url)
@@ -1004,6 +1050,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--base", default=None,
         help="The branch this merges into (default: the open proposal's, else "
              "the base the broker pins, else the branch the copy was taken of)",
+    )
+    submit.add_argument(
+        "--override-decision", default=None,
+        help="Explicitly override a blocking Decision Memory record ID when instructed by an operator",
     )
 
     for command in (prepare, submit):
