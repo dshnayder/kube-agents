@@ -211,7 +211,9 @@ close over findings the document does not account for would have nothing to chec
 document would close the ledger and its pull requests. The body's hidden block is the id set the
 last run published, so it stands in for the store this once; the run writes the store, and every
 later run reads that. The seed is the body `find_existing_issue` already listed, so it has no failure
-point of its own; `gh issue view` fetches it only when the listing brought no body.
+point of its own; `gh issue view` fetches it only when the listing brought no body. A memory seeded
+from the ledger has no scheduled baseline (`scheduled_published_ids`), so the first scheduled run
+that reads it speaks once.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
 its `latest.json` is missing, unreadable, written for another issue, or names a different id set from the ledger's

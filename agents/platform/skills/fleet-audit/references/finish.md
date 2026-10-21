@@ -48,7 +48,7 @@ for this stream, rewrites (or opens) the ledger issue, comments the delta, opens
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
 JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
 pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
-`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
+`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
