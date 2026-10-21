@@ -566,14 +566,25 @@ def handle_prepare(args) -> int:
                 )
         started_from = base
 
-    print(json.dumps({
+    ws = Path(cloned["path"])
+    has_dm = any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS)
+    if has_dm:
+        log(
+            "Decision Memory records exist in knowledge/. Run "
+            '`python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py '
+            f"--repo {ws} why <path>` before modifying governed files."
+        )
+    out_payload = {
         "workspace": cloned["path"],
         "repo": repo,
         "branch": branch,
         "base": base,
         "started_from": started_from,
         "proposal": (proposal or {}).get("url", ""),
-    }))
+    }
+    if has_dm:
+        out_payload["decision_memory"] = True
+    print(json.dumps(out_payload))
     return 0
 
 
@@ -596,7 +607,13 @@ def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
     return session.get("baseRevision") or base
 
 
-def _check_decision_memory(session: dict, base: str, override: str | None = None) -> dict | None:
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    override: str | None = None,
+    repo: str | None = None,
+    copy_key: str | None = None,
+) -> dict | None:
     """Run Decision Memory check on the staged/committed change before publishing."""
     ws = Path(session["path"])
     if not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
@@ -620,18 +637,22 @@ def _check_decision_memory(session: dict, base: str, override: str | None = None
         blocking_ids = [f["id"] for f in out.get("findings", []) if f.get("severity") == "block"]
         overrides = {s.strip() for s in str(override or "").split(",") if s.strip()}
         if not blocking_ids or not set(blocking_ids).issubset(overrides):
+            if repo and copy_key:
+                with contextlib.suppress(Exception):
+                    vcs_client.discard(repo, key=copy_key)
             msg = (
                 "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                 f"{out.get('markdown', '')}\n\n"
-                "Do NOT open this Pull Request. In your final response (and kanban_complete result), "
-                "you MUST quote the exact Breaking PR (#...), Incident Issue (#...), and Revert/Fix PR (#...) "
-                "numbers and the technical root-cause details from the block above verbatim."
+                "Do NOT open this Pull Request. The working copy has been discarded. "
+                "In your final response (and kanban_complete result), you MUST quote the record IDs "
+                "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
+                "and the technical root-cause details from the block above verbatim."
             )
             log(msg)
             raise PermissionError(msg)
     elif out.get("findings"):
         log(
-            "DECISION MEMORY CONTEXT (include the superseding PR # and superseded incident/PR # in your final summary):\n"
+            "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
             f"{out.get('markdown', '')}"
         )
     return out
@@ -807,7 +828,9 @@ def handle_submit(args) -> int:
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=copy_key)
 
-    dm_out = _check_decision_memory(session, base, getattr(args, "override_decision", None))
+    dm_out = _check_decision_memory(
+        session, base, getattr(args, "override_decision", None), repo=repo, copy_key=copy_key
+    )
     if dm_out and dm_out.get("findings") and not args.keep_description:
         md_section = dm_out.get("markdown", "")
         if md_section and DECISION_MEMORY_HEADING not in body:

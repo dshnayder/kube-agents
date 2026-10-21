@@ -277,6 +277,55 @@ class WhyAndOutcomeTests(unittest.TestCase):
         self.assertEqual(out["history"][0]["pull_request"], "31")
         self.assertEqual([h["pull_request"] for h in out["history_without_record"]], ["5"])
 
+    def test_why_accepts_multiple_paths_and_flag_path(self):
+        rc, out = self.r.run(
+            "why",
+            "clusters/prod-eu/payments/checkout.yaml",
+            "--path", "clusters/prod-eu/payments/quota.yaml",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "found")
+        self.assertEqual(sorted(x["id"] for x in out["records"]), ["DEC-2026-001", "LES-2026-001"])
+        self.assertEqual(len(out["results"]), 2)
+
+    def test_bootstrap_records_rejected_proposal_on_cited_records(self):
+        prs = [
+            {
+                "number": 270,
+                "title": "perf(payments): lower checkout memory to 64Mi",
+                "state": "closed",
+                "url": "https://github.com/acme/gitops/pull/270",
+                "body": "Lower checkout memory request.",
+                "_comments": [
+                    {
+                        "user": "reviewer",
+                        "body": "Rejected: lowering memory violates LES-2026-001.",
+                    }
+                ],
+            }
+        ]
+        prs_file = self.r.path / "rejected_prs.json"
+        issues_file = self.r.path / "rejected_issues.json"
+        prs_file.write_text(json.dumps(prs))
+        issues_file.write_text("[]")
+        rc, out = self.r.run(
+            "bootstrap",
+            "--prs-json", str(prs_file),
+            "--issues-json", str(issues_file),
+            "--write",
+        )
+        self.assertEqual(rc, 0)
+        rec = dm.parse_record((self.r.path / "knowledge/lessons/LES-2026-001-checkout-oom.md").read_text(), "x")
+        self.assertEqual(
+            rec.evidence.get("rejected_proposals"),
+            ["https://github.com/acme/gitops/pull/270 (#270)"],
+        )
+        rc_why, out_why = self.r.run("why", "clusters/prod-eu/payments/checkout.yaml")
+        self.assertEqual(
+            out_why["records"][0]["rejected_proposals"],
+            ["https://github.com/acme/gitops/pull/270 (#270)"],
+        )
+
     def test_why_without_record_says_so(self):
         self.r.write("clusters/prod-eu/web/frontend.yaml", "kind: ConfigMap\nmetadata: {name: f}\n")
         self.r.commit("feat: frontend (#40)")

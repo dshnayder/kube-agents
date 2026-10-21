@@ -160,6 +160,8 @@ class Record:
             lines.append(f"Guard ({self.guard.get('severity', 'warn')}): {self.guard['rule']}")
         if ev.get("pull_request"):
             lines.append(f"Pull request: {ev['pull_request']}")
+        if ev.get("rejected_proposals"):
+            lines.append("Rejected proposals: " + ", ".join(str(x) for x in ev["rejected_proposals"]))
         if self.meta.get("supersedes"):
             lines.append("Supersedes: " + ", ".join(self.meta["supersedes"]))
         if self.meta.get("superseded_by"):
@@ -175,6 +177,7 @@ class Record:
             "pull_request": self.evidence.get("pull_request"),
             "breaking_pr": self.evidence.get("breaking_pr"),
             "incident": self.evidence.get("incident"),
+            "rejected_proposals": self.evidence.get("rejected_proposals"),
             "supersedes": self.meta.get("supersedes"),
             "superseded_by": self.meta.get("superseded_by"),
             "body": self.body.strip(),
@@ -469,6 +472,8 @@ def render_check_markdown(findings: List[Dict[str, Any]], semantic: List[Dict[st
             ev_parts.append(f"incident: {f['incident']}")
         if f.get("pull_request"):
             ev_parts.append(f"learned in: {f['pull_request']}")
+        if f.get("rejected_proposals"):
+            ev_parts.append("rejected proposals: " + ", ".join(str(x) for x in f["rejected_proposals"]))
         ev_str = f" ({', '.join(ev_parts)})" if ev_parts else ""
         lines.append(f"- {icon[f['verdict']]} **{f['id']}** ({f['type']}, status={f['status']}): {f['title']}{ev_str}")
         if f.get("guard") and f["guard"].get("rule"):
@@ -642,8 +647,15 @@ class Hindsight:
             return json.loads(raw) if raw else None
 
     def ensure_bank(self) -> None:
-        self._req("PUT", "", {"mission": BANK_CONFIG["reflect_mission"]})
-        self._req("PATCH", "/config", {"updates": BANK_CONFIG})
+        if self.bank == DEFAULT_BANK_ID:
+            self._req("PUT", "", {"mission": BANK_CONFIG["reflect_mission"]})
+            self._req("PATCH", "/config", {"updates": BANK_CONFIG})
+        else:
+            cur = self._req("GET", "/config") or {}
+            cfg = cur.get("config") if isinstance(cur, dict) and isinstance(cur.get("config"), dict) else cur
+            strats = dict((cfg.get("retain_strategies") if isinstance(cfg, dict) else None) or {})
+            strats.update(BANK_CONFIG["retain_strategies"])
+            self._req("PATCH", "/config", {"updates": {"retain_strategies": strats}})
 
     def retain(self, rec: Record, repo_id: str) -> None:
         text = rec.render_for_index()
@@ -837,10 +849,7 @@ def cmd_check(a) -> Dict[str, Any]:
             "markdown": render_check_markdown(findings, semantic)}
 
 
-def cmd_why(a) -> Dict[str, Any]:
-    repo = Path(a.repo)
-    target = a.path
-    records = [r for r in load_records(repo) if not validate_record(r)]
+def _why_single_path(repo: Path, target: str, records: List[Record], limit: int) -> Dict[str, Any]:
     content = (repo / target).read_text() if (repo / target).exists() else None
     resources = _resources_in(content) if content else []
     governing = []
@@ -850,7 +859,7 @@ def cmd_why(a) -> Dict[str, Any]:
                 any(fnmatch.fnmatch(r, g) for r in resources for g in s["resources"]):
             governing.append(rec.summary() | {"date": str(rec.meta.get("date", ""))})
     governing.sort(key=lambda r: (r["status"] != "active", r["date"]), reverse=False)
-    hist = history(repo, target, a.limit)
+    hist = history(repo, target, limit)
     uncovered = [h for h in hist if h["pull_request"] and not any(
         bool(re.search(rf"(?:[#!/]|^){re.escape(h['pull_request'])}(?:\b|\)|$)", str(g.get("pull_request") or "")))
         for g in governing)]
@@ -860,6 +869,40 @@ def cmd_why(a) -> Dict[str, Any]:
             "note": ("Recorded rationale exists; cite the record ids." if governing else
                      "No recorded decision governs this path. The history is evidence of what changed, "
                      "not of why — say so, and offer to draft a decision record from it.")}
+
+
+def cmd_why(a) -> Dict[str, Any]:
+    repo = Path(a.repo)
+    raw_paths = list(getattr(a, "path", None) or []) + list(getattr(a, "flag_paths", None) or [])
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    targets = [str(p).strip() for p in raw_paths if str(p).strip()]
+    if not targets:
+        raise ValueError("why requires at least one path")
+    records = [r for r in load_records(repo) if not validate_record(r)]
+    limit = getattr(a, "limit", 10)
+    if len(targets) == 1:
+        return _why_single_path(repo, targets[0], records, limit)
+    per_path = [_why_single_path(repo, t, records, limit) for t in targets]
+    combined_records = []
+    seen_ids = set()
+    for item in per_path:
+        for rec in item["records"]:
+            if rec["id"] not in seen_ids:
+                seen_ids.add(rec["id"])
+                combined_records.append(rec)
+    any_found = any(item["status"] == "found" for item in per_path)
+    return {
+        "status": "found" if any_found else "no_match",
+        "paths": targets,
+        "records": combined_records,
+        "results": per_path,
+        "note": (
+            "Recorded rationale exists; cite the record ids."
+            if any_found
+            else "No recorded decision governs these paths."
+        ),
+    }
 
 
 def _next_id(repo: Path, kind: str, year: int) -> str:
@@ -1455,10 +1498,13 @@ def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], Li
     }
 
     by_pr, by_sha = _git_commit_index(repo)
+    re_eval_noise = re.compile(r"eval-spend|probe:|\[withdrawn-eval-probe\]", re.I)
     normalized_prs: List[Dict[str, Any]] = []
     for raw_pr in prs:
         pr = _normalize_proposal(raw_pr, by_pr, by_sha)
-        if int(pr["number"]) in referenced_rejected and not pr.get("merged_at") and pr.get("state") == "closed":
+        is_closed_unmerged = not pr.get("merged_at") and pr.get("state") == "closed"
+        is_eval_noise = bool(re_eval_noise.search(f"{pr.get('title', '')} {pr.get('body', '')}"))
+        if is_closed_unmerged and (int(pr["number"]) in referenced_rejected or not is_eval_noise):
             try:
                 view = vc.forge(
                     "proposal-view",
@@ -1913,6 +1959,75 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 pr_to_record_id[num] = rid
                 continue
 
+        # Case 5: Closed-unmerged (rejected) PR with reviewer/rejection comments
+        if not merged and pr.get("state") == "closed" and not re_eval_noise.search(title + " " + body):
+            comments_text = "\n\n".join(str(c.get("body") or "") for c in (pr.get("_comments") or [])).strip()
+            cited_ids = sorted(set(re.findall(r"\b(?:DEC|LES)-\d{4}-\d{3,}\b", comments_text + "\n" + body)))
+            rej_ref = _format_proposal_ref(pr, num, gh_repo)
+            if cited_ids and a.write:
+                matched_existing = False
+                for rec in load_records(repo):
+                    if rec.id in cited_ids:
+                        ev = dict(rec.meta.get("evidence") or {})
+                        rej_list = [str(x) for x in (ev.get("rejected_proposals") or [])]
+                        if rej_ref not in rej_list:
+                            rej_list.append(rej_ref)
+                        ev["rejected_proposals"] = rej_list
+                        rec.meta["evidence"] = ev
+                        (repo / rec.path).write_text(render_record(rec.meta, rec.body))
+                        if rec.path not in written:
+                            written.append(rec.path)
+                        matched_existing = True
+                if matched_existing:
+                    triage_counts["revert-lesson"] += 1
+                    continue
+            if llm_url and comments_text and live_files and re.search(r"\b(?:reject|violat|do not|must not|cannot|blocked)\b", comments_text, re.I):
+                synth = _llm_synthesize_record(
+                    llm_url, llm_model, llm_key, "lesson",
+                    {"rejected_pr": num, "title": title, "body": body, "rejection_comments": comments_text, "files": live_files},
+                )
+                if synth:
+                    llm_synthesized_count += 1
+                    guard = synth.get("guard") if (isinstance(synth.get("guard"), dict) and _guard_passes_on_head(repo, synth["guard"], [])) else None
+                    rid = _alloc_id("lesson", year)
+                    rec_title = str(synth.get("title") or f"Rejected proposal #{num}: {title}").strip()
+                    meta = {
+                        "type": "lesson",
+                        "id": rid,
+                        "title": rec_title,
+                        "status": "active",
+                        "date": date_str,
+                        "scope": {"paths": live_files},
+                        "evidence": {
+                            "pull_request": rej_ref,
+                            "rejected_proposals": [rej_ref],
+                        },
+                    }
+                    if guard:
+                        meta["guard"] = guard
+                    rec_body = "\n".join([
+                        "## What happened",
+                        "",
+                        str(synth.get("root_cause") or comments_text).strip(),
+                        "",
+                        "## What fixed it",
+                        "",
+                        f"Rejected PR #{num} ({title}):",
+                        str(synth.get("fix") or comments_text).strip(),
+                        "",
+                        "## Prevent it next time",
+                        "",
+                        str(synth.get("prevention") or "").strip(),
+                    ])
+                    rel = f"knowledge/lessons/{rid}-{slug(rec_title)}.md"
+                    if a.write:
+                        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                        (repo / rel).write_text(render_record(meta, rec_body))
+                        written.append(rel)
+                    pr_to_record_id[num] = rid
+                    triage_counts["revert-lesson"] += 1
+                    continue
+
         triage_counts["routine"] += 1
 
     # Write STATE_OF_BEING.md
@@ -1984,7 +2099,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--semantic-limit", type=int, default=5)
     p.add_argument("--markdown", action="store_true", help="print only the markdown section")
     p = sub.add_parser("why")
-    p.add_argument("path")
+    p.add_argument("path", nargs="*", help="One or more repository-relative file paths")
+    p.add_argument("--path", "--file", dest="flag_paths", action="append", default=[],
+                   help="Repository-relative file path (may be repeated)")
     p.add_argument("--limit", type=int, default=10)
     p = sub.add_parser("from-outcome")
     p.add_argument("outcome", help="outcome JSON file")

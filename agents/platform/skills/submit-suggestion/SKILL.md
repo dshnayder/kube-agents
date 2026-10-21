@@ -170,7 +170,7 @@ sandbox cannot read the branch at all; `prepare` then refuses the name with
 
 ### Step 2: Make the Changes
 
-Generate or edit the files **inside the returned `workspace`**.
+Generate or edit the files **inside the returned `workspace`**. If Step 1 reported `"decision_memory": true` (or `knowledge/` exists in `workspace`), run `python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <workspace> why <path>` on the target files before editing so your change respects active `DEC-YYYY-NNN` and `LES-YYYY-NNN` guards. If a guard blocks the requested change, stop immediately without opening a pull request and report the blocking record IDs and evidence to the user.
 
 `git` here holds no credential and cannot reach a forge; it works on the
 working copy and nothing else, and `submit` is what sends the result.
