@@ -257,6 +257,24 @@ def _git_refused_credential(stderr: Any) -> bool:
     return any(marker in text for marker in _GIT_CREDENTIAL_REFUSED)
 
 
+def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceError | None:
+    """The forge's own answer to a git call that its server refused, or None.
+
+    For a forge whose git refusal means more than "the token is not valid"
+    (`git_refused`). Only the forge's own text goes back: git's output can
+    carry the remote URL, so none of it does. Every other forge, and every
+    other failure, keeps the caller's own handling. git asks for a username
+    when the helper has no token too -- a Secret that is not there yet, or an
+    empty file -- so the credential is read first, and that case is
+    FORGE_CREDENTIAL_UNAVAILABLE, not the forge's refusal.
+    """
+    if not forge.git_refused or not _git_refused_credential(stderr):
+        return None
+    forge.credential.headers(repo)
+    LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
+    return WorkspaceError(forge.git_refused, status=401, code="FORGE_UNAUTHENTICATED")
+
+
 def _login_key(login: str) -> str:
     """One spelling for two sources that mark an automation differently.
 
@@ -519,20 +537,9 @@ class VcsBroker:
                 # valid" says what it means. Only the forge's own text goes
                 # back: git's output can carry the remote URL, so none of it
                 # does. Every other forge keeps the generic git failure.
-                if forge.git_refused and _git_refused_credential(exc.stderr):
-                    # git asks for a username when the helper has no token
-                    # too: a Secret that is not there yet, or an empty file.
-                    # Reading the credential names that case
-                    # (FORGE_CREDENTIAL_UNAVAILABLE), so only a token the
-                    # forge refused gets the forge's text.
-                    forge.credential.headers(repo)
-                    LOGGER.warning(
-                        "git refused the %s credential for a %s call (rc=%s)",
-                        forge.name, args[0] if args else "git", exc.returncode,
-                    )
-                    raise WorkspaceError(
-                        forge.git_refused, status=401, code="FORGE_UNAUTHENTICATED"
-                    ) from exc
+                refusal = _git_refusal(forge, repo, exc.stderr, args[0] if args else "git")
+                if refusal is not None:
+                    raise refusal from exc
                 raise
 
         return run
@@ -1231,6 +1238,9 @@ class VcsBroker:
                         status=409,
                         code="DELETE_REFUSED",
                     )
+                refusal = _git_refusal(bound.forge, bound.repo, pushed.stderr, "push")
+                if refusal is not None:
+                    raise refusal
                 raise subprocess.CalledProcessError(
                     pushed.returncode, ["git", *argv], pushed.stdout, pushed.stderr
                 )
@@ -1258,6 +1268,9 @@ class VcsBroker:
             return ""
         if listed.returncode != 0:
             refusal = self._tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
+            refusal = _git_refusal(bound.forge, bound.repo, listed.stderr, "ls-remote")
             if refusal is not None:
                 raise refusal
             raise WorkspaceError(

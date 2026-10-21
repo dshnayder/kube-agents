@@ -274,7 +274,8 @@ func TestBitbucketDataCenterResolvesProjectKeyAndRepository(t *testing.T) {
 		"https://bitbucket.example.com/scm/ACME/infra.git":    "clone or web URL",
 		"https://bitbucket.example.com/projects/ACME/repos/x": "clone or web URL",
 		"https://bitbucket.example.com/users/jdoe/repos/x":    "clone or web URL",
-		"USERS/tools":                          "clone or web URL",
+		"USERS/tools":                          "a word of the bitbucket-datacenter URL layout",
+		"scm/tools":                            "a word of the bitbucket-datacenter URL layout",
 		"ACME/team/infra":                      "at most 2",
 		"2ACME/infra":                          "invalid bitbucket-datacenter namespace",
 		"https://other.example.com/ACME/infra": "not a bitbucket-datacenter host",
@@ -384,16 +385,19 @@ func TestIdentityIsForBitbucketForgesOnly(t *testing.T) {
 	github.Identity = "agent"
 	bad := bbForge("bb", "acme")
 	bad.Identity = "two words"
+	notUUID := bbForge("bb", "acme")
+	notUUID.Identity = "jdoe"
 	long := dcForge("dc", "bitbucket.example.com", "ACME")
 	long.Identity = strings.Repeat("a", MaxForgeIdentityLength+1)
 	for name, tc := range map[string]struct {
 		forge ForgeSpec
 		want  string
 	}{
-		"gitlab":   {gitlab, "does not read identity"},
-		"github":   {github, "does not read identity"},
-		"a space":  {bad, "is not one login"},
-		"too long": {long, "is not one login"},
+		"gitlab":              {gitlab, "does not read identity"},
+		"github":              {github, "does not read identity"},
+		"a space":             {bad, "is not one login"},
+		"not a UUID on Cloud": {notUUID, "is not an account UUID"},
+		"too long":            {long, "is not one login"},
 	} {
 		resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{tc.forge}}).ResolveGit()
 		if got := problemPaths(resolved)["forges[0].identity"]; !strings.Contains(got, tc.want) {
@@ -406,6 +410,16 @@ func TestIdentityIsForBitbucketForgesOnly(t *testing.T) {
 		Repositories: []RepositorySpec{repo("bb", "infra", RepositoryRoleGitOps)}}).ResolveGit()
 	if forges := refused.BrokerForges("/t", "/c"); forges != nil {
 		t.Errorf("BrokerForges() = %+v, expected none for a forge refused for its identity", forges)
+	}
+	// A Cloud UUID is accepted with its braces or without them; the broker
+	// writes it with them.
+	for _, uuid := range []string{"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}", "0F3B2C1D-AAAA-BBBB-CCCC-0123456789AB"} {
+		cloud := bbForge("bb", "acme")
+		cloud.Identity = uuid
+		resolved, _ := (&IntegrationSpec{Forges: []ForgeSpec{cloud}}).ResolveGit()
+		if got := problemPaths(resolved); len(got) != 0 {
+			t.Errorf("Problems() = %v for the Cloud identity %q", got, uuid)
+		}
 	}
 	good := dcForge("dc", "bitbucket.example.com", "ACME")
 	good.Identity = "svc_agent.1@example.com"

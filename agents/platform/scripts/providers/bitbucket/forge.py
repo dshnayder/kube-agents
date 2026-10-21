@@ -178,7 +178,7 @@ class BitbucketCloudForge(Forge):
             # as a bad tokenPath does, and not the first context clone.
             self._stored(read_token_path)
         self.allowed_paths = tuple(_allowed_prefix(path) for path in allowed_paths)
-        self.identity = identity.strip()
+        self.identity = _account_uuid(identity)
 
     @staticmethod
     def _stored(token_path: str) -> StaticFileCredential:
@@ -364,15 +364,20 @@ class BitbucketCloudForge(Forge):
         """`item` with its abbreviated `sourceRevision` expanded to the full id.
 
         The revision is compared with what git reads off the remote, which is
-        a full id. A commit that cannot be read -- a fork deleted since, a
-        branch that was never pushed -- keeps the hash Bitbucket gave.
+        a full id. A commit that cannot be read, and a commit on a fork, keep
+        the hash Bitbucket gave.
         """
         short = str(item.get("sourceRevision") or "")
         if not _HASH_RE.fullmatch(short) or _FULL_HASH_RE.fullmatch(short):
             return item
-        holder = item.get("sourceRepo") or repo
+        # Only for a source in this repository. A fork can be in any
+        # workspace, outside `allowed_paths`, and the token is not spent
+        # there; a fork's revision also decides nothing, because a proposal
+        # from another repository is never this install's.
+        if item.get("sourceRepo") != repo:
+            return item
         try:
-            node = api("GET", f"{self._repo(holder)}/commit/{short}") or {}
+            node = api("GET", f"{self._repo(repo)}/commit/{short}") or {}
         except WorkspaceError:
             return item
         full = str(node.get("hash") or "")
@@ -585,6 +590,31 @@ class BitbucketCloudForge(Forge):
         )
         commits = [translate.commit(node) for node in reversed(nodes)]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
+
+
+#: An account UUID, with or without the braces Bitbucket Cloud writes it in.
+_UUID_RE = re.compile(r"\{?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}?")
+
+
+def _account_uuid(identity: str) -> str:
+    """A configured identity as Bitbucket Cloud writes an author: `{uuid}`.
+
+    Every author and reviewer is compared by its `uuid`, which Bitbucket
+    writes with braces. A UUID copied without them would match no author,
+    and the install would read its own proposals as another account's, so it
+    is put in braces here. A value that is not a UUID stops the build, as a
+    bad tokenPath does, because no author can ever match it.
+    """
+    trimmed = identity.strip()
+    if not trimmed:
+        return ""
+    match = _UUID_RE.fullmatch(trimmed)
+    if not match or (trimmed.startswith("{") != trimmed.endswith("}")):
+        raise ValueError(
+            f"the bitbucket forge's identity {trimmed!r} is not an account UUID; write the "
+            "UUID of the account that the token acts as, such as {0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"
+        )
+    return "{" + match.group(1).lower() + "}"
 
 
 def _bbql(value: str) -> str:

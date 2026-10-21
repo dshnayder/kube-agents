@@ -495,6 +495,8 @@ class IdentityTest(DataCenterCase):
         self.assertNotIsInstance(error, IdentityUnknown)
         self.assertEqual(UNAVAILABLE.code, error.fields["code"])
 
+    WRITERS_CAP = next(cls for cls in providers.AVAILABLE if cls.name == "bitbucket-datacenter").WRITERS_CAP
+
     def users(self, answer):
         self.mock.routes[("GET", f"{REST}/users")] = answer
         return self.identity(self.broker(identity="svc"), login="JDoe")["canWrite"]
@@ -505,7 +507,22 @@ class IdentityTest(DataCenterCase):
         self.assertEqual(f"{REST}/users", request["path"])
         # The numbered filter form that Atlassian documents.
         self.assertEqual({"filter": ["JDoe"], "permission.1": ["REPO_WRITE"], "permission.1.projectKey": ["ACME"],
-                          "permission.1.repositorySlug": ["infra"], "limit": ["100"]}, request["query"])
+                          "permission.1.repositorySlug": ["infra"], "start": ["0"], "limit": ["100"]},
+                         request["query"])
+
+    def test_the_search_is_read_past_its_first_page(self):
+        # `filter` matches a part of a name, so 150 other accounts can come
+        # before the user: the user on the second page is still found.
+        others = [{"name": f"jdoe{n}", "type": "NORMAL"} for n in range(150)]
+        self.assertIs(True, self.users(paged(others + [{"name": "jdoe", "type": "NORMAL"}])))
+        self.assertEqual(["0", "100"], [r["query"]["start"][0] for r in self.mock.requests])
+
+    def test_a_user_not_found_in_the_rows_read_is_unknown_not_a_no(self):
+        # More rows than the cap, none of them the user: a "no" would be a
+        # refusal the conversation keeps, so the answer is "not known".
+        others = [{"name": f"jdoe{n}", "type": "NORMAL"} for n in range(self.WRITERS_CAP + 50)]
+        self.assertIsNone(self.users(paged(others)))
+        self.assertIs(False, self.users(paged(others[:150])))
 
     def test_a_service_user_is_no_and_so_is_one_not_listed(self):
         self.assertIs(False, self.users({"values": [{"name": "jdoe", "type": "SERVICE"}]}))

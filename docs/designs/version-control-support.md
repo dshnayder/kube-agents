@@ -3001,7 +3001,8 @@ So the forge names the login (`Forge.whoami`, in [The protocol](#the-protocol)):
 from the `identity` field of its forge entry, or from a lookup of its own. The
 field is for the two Bitbucket providers only; GitHub and GitLab refuse it,
 because their API names the account. The configured value answers first, with
-no call. On Cloud it is the account `uuid` with its braces.
+no call. On Cloud it is the account `uuid`, which the package writes with its
+braces, as Bitbucket writes every author, and any other value is refused.
 Both packages declare `identity_required`. An unknown login is then
 `FORGE_IDENTITY_UNKNOWN`, and the ownership checks refuse. They never fall back
 to "do not compare". Which source each token uses is the one a recorded

@@ -133,6 +133,10 @@ class BitbucketDataCenterForge(Forge):
     #: How many of a pull request's commits `proposal_commits` reads.
     COMMIT_CAP = 250
 
+    #: How many rows of the user search `can_write` reads before it says it
+    #: does not know.
+    WRITERS_CAP = 1000
+
     def __init__(
         self,
         host: str,
@@ -325,34 +329,38 @@ class BitbucketDataCenterForge(Forge):
     ) -> bool | None:
         """Whether `login` may write to `repo`: the user search, filtered on REPO_WRITE.
 
-        A login the filtered search does not return is a definitive no; a
-        service account is a no whatever its permission; a search that
-        failed is not an answer (verify live that a project token may call
-        it).
+        The search's `filter` matches a part of the username, the display name
+        or the e-mail address, so the user is found by an exact `name` in the
+        pages it returns, read up to `WRITERS_CAP` rows. A login that the whole
+        search does not return is a definitive no; one not found in the rows
+        read, with more rows left, is not known (None), because a "no" here is
+        a refusal that the conversation keeps. A service account is a no
+        whatever its permission; a search that failed is not an answer (verify
+        live that a project token may call it).
         """
         if not login or bot:
             return False
         key, slug = repo.split("/", 1)
         try:
-            answer = api(
-                "GET",
+            rows, more = self._pages(
+                api,
                 f"{REST}/users",
                 # The numbered filter form, as Atlassian documents it: an
                 # unnumbered `permission` does not take a repository.
-                params={
+                {
                     "filter": login,
                     "permission.1": "REPO_WRITE",
                     "permission.1.projectKey": key,
                     "permission.1.repositorySlug": slug,
-                    "limit": MAX_PAGE_SIZE,
                 },
-            ) or {}
+                self.WRITERS_CAP,
+            )
         except WorkspaceError:
             return None
-        for node in answer.get("values") or []:
-            if isinstance(node, dict) and str(node.get("name") or "").casefold() == login.casefold():
+        for node in rows:
+            if str(node.get("name") or "").casefold() == login.casefold():
                 return not translate.is_automation(node)
-        return False
+        return None if more else False
 
     # -- shared by several verbs ------------------------------------------
 

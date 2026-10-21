@@ -460,6 +460,9 @@ func (f *ResolvedForge) identityProblem(provider *GitProvider) error {
 	if !forgeIdentityRegex.MatchString(f.Identity) {
 		return fmt.Errorf("identity %q is not one login: letters, digits and . _ @ + - { }, with no space, at most %d characters", f.Identity, MaxForgeIdentityLength)
 	}
+	if provider.IdentityPattern != nil && !provider.IdentityPattern.MatchString(f.Identity) {
+		return fmt.Errorf("identity %q is not an account UUID; a %s forge compares authors by the UUID of the account, such as {0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}", f.Identity, provider.Name)
+	}
 	return nil
 }
 

@@ -9921,9 +9921,9 @@ spec:
                               FORGE_IDENTITY_UNKNOWN.
 
                               It is for bitbucket and bitbucket-datacenter forges only. On Bitbucket
-                              Cloud it is the account UUID with its braces, such as
-                              `{0f3b2c1d-...}`: an access token has a bot account, which the
-                              current-user call refuses. On Bitbucket Data Center it is the username
+                              Cloud it is the account UUID, such as `{0f3b2c1d-...}`, with or without
+                              its braces, and any other value is refused: an access token has a bot
+                              account, which the current-user call refuses. On Bitbucket Data Center it is the username
                               of the account the token acts as. GitHub and GitLab name the account
                               through their own API, so they refuse the field.
                             maxLength: 255

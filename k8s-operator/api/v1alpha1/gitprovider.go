@@ -116,6 +116,12 @@ var gitlabNamespaceRegex = regexp.MustCompile(
 // workspace, and the project is not in the path.
 var bitbucketWorkspaceRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
+// bitbucketAccountUUIDRegex is a Bitbucket Cloud account UUID, with its braces
+// or without them; the broker writes it with braces, as Bitbucket writes every
+// author.
+var bitbucketAccountUUIDRegex = regexp.MustCompile(
+	`^(\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$`)
+
 // bitbucketProjectKeyRegex is a Bitbucket Data Center project key: a letter,
 // then letters, digits and `_`. The broker's
 // providers/bitbucket_datacenter package reads a key with the same rule. A
@@ -190,6 +196,11 @@ type GitProvider struct {
 	// repository declared that way is refused with the form to write instead,
 	// where the depth check would only say it is too deep.
 	LayoutSegments []string
+	// IdentityPattern, when set, is the only form of identity this
+	// provider's broker accepts: its broker refuses any other at start, so
+	// the operator refuses it first. Bitbucket Cloud compares authors by
+	// account UUID.
+	IdentityPattern *regexp.Regexp
 	// AcceptsIdentity is a forge whose broker reads `identity`, the login its
 	// credential acts as, for a token that cannot name its own account. A
 	// provider without it refuses the field: an identity that nothing reads
@@ -268,6 +279,7 @@ var gitProviders = map[string]*GitProvider{
 		// no CA bundle. A Data Center instance is the other provider.
 		NeedsCredentials: true,
 		AcceptsIdentity:  true,
+		IdentityPattern:  bitbucketAccountUUIDRegex,
 		// bitbucket.org and its subdomains, and Atlassian's own domains: a
 		// Bitbucket Data Center forge declared at one would be handed
 		// Atlassian's traffic.
@@ -579,6 +591,12 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 			repository, segments[0])
 	}
 	if len(segments) > 0 && slices.Contains(p.LayoutSegments, lowerASCII(segments[0])) {
+		if p.MaxPathDepth > 0 && len(segments) <= p.MaxPathDepth {
+			// Already KEY/repository, but with a key that the broker reads as
+			// the instance's URL layout (a personal repository for users/).
+			return RepoRef{}, fmt.Errorf("repository %q names the project key %q, which is a word of the %s URL layout (%s); this release does not serve a project with that key",
+				repository, segments[0], p.Name, strings.Join(p.LayoutSegments, ", "))
+		}
 		return RepoRef{}, fmt.Errorf("repository %q is a %s clone or web URL; write it as the project key and the repository slug, KEY/repository",
 			repository, p.Name)
 	}

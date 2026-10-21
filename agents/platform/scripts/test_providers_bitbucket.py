@@ -369,10 +369,10 @@ class ConfigTest(unittest.TestCase):
     def test_other_providers_are_not_built_and_the_fields_reach_the_forge(self):
         self.assertEqual((), tuple(BitbucketCloudForge.for_config({"forges": [{"provider": "gitlab"}]})))
         [built] = BitbucketCloudForge.for_config({"forges": [self.entry(
-            allowed_paths=("acme",), read_token_path="/var/run/forge/read-token", identity=" {abc} ")]})
+            allowed_paths=("acme",), read_token_path="/var/run/forge/read-token", identity=" {9D3E7A10-1111-4222-8333-444455556666} ")]})
         self.assertEqual(("acme",), built.allowed_paths)
         self.assertEqual("/var/run/forge/read-token", built.read_token_path)
-        self.assertEqual("{abc}", built.identity)
+        self.assertEqual("{9d3e7a10-1111-4222-8333-444455556666}", built.identity)
 
     def test_the_broker_refuses_a_config_file_with_a_ca_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -453,8 +453,8 @@ class IdentityTest(CloudCase):
         return broker.identity({"repository": REPO_URL, **payload})["identity"]
 
     def test_a_configured_identity_answers_with_no_call(self):
-        answer = self.identity(self.broker(identity="{configured-account}"))
-        self.assertEqual("{configured-account}", answer["login"])
+        answer = self.identity(self.broker(identity="{9d3e7a10-1111-4222-8333-444455556666}"))
+        self.assertEqual("{9d3e7a10-1111-4222-8333-444455556666}", answer["login"])
         self.assertEqual([], self.mock.requests)
 
     def test_without_one_the_user_route_names_the_account_uuid(self):
@@ -484,8 +484,21 @@ class IdentityTest(CloudCase):
         self.assertNotIsInstance(error, IdentityUnknown)
         self.assertEqual((UNAVAILABLE.status, UNAVAILABLE.code), (error.status, error.fields["code"]))
 
+    def test_a_uuid_without_braces_is_the_braced_login_and_matches_an_author(self):
+        # Bitbucket writes every author's uuid in braces. A UUID copied without
+        # them must still match this install's own proposals.
+        bare = ACCOUNT.strip("{}").upper()
+        answer = self.identity(self.broker(identity=bare))
+        self.assertEqual(ACCOUNT, answer["login"])
+
+    def test_an_identity_that_is_not_a_uuid_stops_the_build(self):
+        for bad in ("jdoe", "{jdoe}", "{" + ACCOUNT.strip("{}"), ACCOUNT.strip("{}") + "}"):
+            with self.subTest(identity=bad), self.assertRaises(ValueError) as caught:
+                BitbucketCloudForge(str(self.token), (), identity=bad)
+            self.assertIn("account UUID", str(caught.exception))
+
     def test_write_access_of_another_account_is_unknown_and_an_automation_is_no(self):
-        broker = self.broker(identity="{me}")
+        broker = self.broker(identity=ACCOUNT)
         self.assertIsNone(self.identity(broker, login="{someone}")["canWrite"])
         self.assertIs(False, self.identity(broker, login="{someone}", bot=True)["canWrite"])
         self.assertEqual([], self.mock.requests)
@@ -650,11 +663,12 @@ class ProposalViewTest(CloudCase):
         self.mock.routes[("GET", f"repositories/acme/infra/commit/{SHORT}")] = {"hash": "f" * 40}
         self.assertEqual(SHORT, self.verb("proposal-view", number=7)["proposal"]["sourceRevision"])
 
-    def test_a_forks_short_hash_is_read_in_the_fork(self):
+    def test_a_forks_short_hash_is_kept_and_no_call_goes_to_the_fork(self):
+        # The fork's workspace is outside allowed_paths, so the token is not
+        # spent there; the fork's revision decides nothing here.
         self.node["source"]["repository"]["full_name"] = "stranger/infra"
-        self.mock.routes[("GET", f"repositories/acme/infra/commit/{SHORT}")] = Status(404)
-        self.mock.routes[("GET", f"repositories/stranger/infra/commit/{SHORT}")] = {"hash": FULL}
-        self.assertEqual(FULL, self.verb("proposal-view", number=7)["proposal"]["sourceRevision"])
+        self.assertEqual(SHORT, self.verb("proposal-view", number=7)["proposal"]["sourceRevision"])
+        self.assertEqual([("GET", self.BASE)], self.mock.calls())
 
     def test_the_diff_is_the_repository_diff_of_the_two_commits_and_never_the_pull_request_route(self):
         answer = self.verb("proposal-view", number=7, diff=True)
@@ -671,12 +685,11 @@ class ProposalViewTest(CloudCase):
         # The fork's commit is not in this repository, so the diff names the
         # repository the commit is in, as Bitbucket's own redirect does.
         self.node["source"]["repository"] = {"full_name": "jdoe/infra"}
-        self.mock.routes[("GET", f"repositories/jdoe/infra/commit/{SHORT}")] = {"hash": FULL}
-        self.mock.routes[("GET", f"repositories/acme/infra/diff/jdoe/infra:{FULL}..{DEST}")] = Text(DIFF)
+        self.mock.routes[("GET", f"repositories/acme/infra/diff/jdoe/infra:{SHORT}..{DEST}")] = Text(DIFF)
         answer = self.verb("proposal-view", number=7, diff=True)
         self.assertEqual(DIFF, answer["diff"])
         diff = [r for r in self.mock.requests if "/diff/" in r["path"]]
-        self.assertEqual(f"repositories/acme/infra/diff/jdoe/infra:{FULL}..{DEST}", diff[0]["path"])
+        self.assertEqual(f"repositories/acme/infra/diff/jdoe/infra:{SHORT}..{DEST}", diff[0]["path"])
 
     def test_the_pull_request_diff_route_is_refused_by_the_transport(self):
         # Why the forge avoids it: the mock answers it as Bitbucket does.
@@ -964,6 +977,35 @@ class GitRefusedTest(CloudCase):
                 self.assertEqual("FORGE_CREDENTIAL_UNAVAILABLE", caught.exception.fields["code"])
                 self.assertNotEqual(GIT_REFUSED_TEXT, str(caught.exception))
                 self.token.write_text(TOKEN + "\n")
+
+    def answering(self, stderr: str):
+        # A runner that does what `check=True` callers need and answers every
+        # `ls-remote` and `push` as git does when the server refuses the token.
+        def git_runner(argv, cwd, check=True, config=()):
+            if any(verb in argv for verb in ("ls-remote", "push")):
+                return subprocess.CompletedProcess(argv, 128, "", stderr)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return git_runner
+
+    def test_the_remote_branch_reads_answer_a_refused_token_the_same_way(self):
+        # branch-view and branch-delete read the remote with check=False, so
+        # git's failure never raises; the refusal is still the forge's text,
+        # with no URL, not a retryable FORGE_CALL_FAILED with git's stderr.
+        stderr = "fatal: Authentication failed for 'https://bitbucket.org/acme/infra.git/'\n"
+        calls = (
+            lambda broker: broker.branch_view({"repository": REPO_URL, "branch": "platform-agent/x"}),
+            lambda broker: broker.branch_delete(
+                {"repository": REPO_URL, "branch": "platform-agent/x", "revision": "a" * 40}),
+        )
+        # branch-delete lists the branch's proposals first: none.
+        self.mock.routes[("GET", "repositories/acme/infra/pullrequests")] = {"values": []}
+        for call in calls:
+            broker = self.broker(git_runner=self.answering(stderr))
+            with self.subTest(call=call), self.assertRaises(WorkspaceError) as caught:
+                call(broker)
+            self.assertEqual("FORGE_UNAUTHENTICATED", caught.exception.fields["code"])
+            self.assertEqual(GIT_REFUSED_TEXT, str(caught.exception))
 
     def test_another_git_failure_keeps_the_generic_failure(self):
         broker = self.broker(git_runner=self.refusing("fatal: unable to access: Could not resolve host\n"))
