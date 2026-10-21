@@ -1,9 +1,11 @@
 """The eval rosters under hack/eval/, read the way hack/ci-eval-pr.sh reads them.
 
-Three files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
+Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
+- ``hack/eval/gitlab-cases.txt`` -- what the GitLab lane runs in
+  its place under ``EVAL_FORGE=gitlab`` (kube-agents#2394), registered cases;
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
@@ -35,6 +37,9 @@ EVAL_DIR = REPO_ROOT / "hack" / "eval"
 PRESUBMIT_CASES_FILE = EVAL_DIR / "presubmit-cases.txt"
 NIGHTLY_CASES_FILE = EVAL_DIR / "nightly-cases.txt"
 BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
+# The GitLab lane's presubmit matrix (kube-agents#2394): what EVAL_FORGE=gitlab
+# runs on a pull request, a subset of presubmit-cases.txt.
+GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -140,6 +145,10 @@ def blocking_roster(path: pathlib.Path = BLOCKING_ROSTER_FILE) -> list[str]:
     return parse_blocking_roster(path.read_text(encoding="utf-8"))
 
 
+def gitlab_cases(path: pathlib.Path = GITLAB_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
 def parse_lane_exclusions(text: str) -> dict[str, str]:
     """Case ids of a lane-exclusion file, each with the reason above it.
 
@@ -170,3 +179,71 @@ def parse_lane_exclusions(text: str) -> dict[str, str]:
 
 def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
+
+
+# The nightly file's last section opens with this line (#3495). Entries above
+# it are frozen in the order they landed; entries below it are kept in case-id
+# order, each with its reason as the comment lines directly above it, so two
+# pull requests that each add a case land on different lines.
+NIGHTLY_SORTED_SECTION_MARKER = "# ── New cases, sorted by case id"
+
+
+def split_nightly(text: str) -> tuple[list[str], list[str], str]:
+    """The nightly file's case ids above and below the sorted-section marker,
+    and the text from the marker on.
+
+    Raises ValueError when the marker is missing or appears twice, because the
+    roster test's two halves (an exact pin above, order and reasons below)
+    only mean something with exactly one boundary.
+    """
+    lines = text.splitlines(keepends=True)
+    at = [i for i, line in enumerate(lines) if line.startswith(NIGHTLY_SORTED_SECTION_MARKER)]
+    if len(at) != 1:
+        raise ValueError(
+            f"expected one {NIGHTLY_SORTED_SECTION_MARKER!r} line in the nightly file, found {len(at)}")
+    head, tail = "".join(lines[:at[0]]), "".join(lines[at[0]:])
+    return case_names(head), case_names(tail), tail
+
+
+def summary(repetitions: int = 3) -> dict[str, int]:
+    """Each roster file's size and the nightly matrix's, computed from the
+    files: the totals the lists' comments used to carry by hand (#3495)."""
+    presubmit, nightly = presubmit_cases(), nightly_cases()
+    return {
+        "presubmit cases": len(presubmit),
+        "blocking roster": len(blocking_roster()),
+        "nightly-only cases": len(nightly),
+        "nightly matrix cases": len(presubmit) + len(nightly),
+        "nightly matrix units": (len(presubmit) + len(nightly)) * repetitions,
+        "presubmit units": len(presubmit) * repetitions,
+        "gitlab lane cases": len(gitlab_cases()),
+        "inject lane exclusions": len(inject_lane_exclusions()),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--summary", action="store_true",
+                        help="print each roster's case count and the matrix sizes")
+    def positive(value: str) -> int:
+        if not value.isdigit() or int(value) < 1:
+            raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+        return int(value)
+
+    parser.add_argument("--repetitions", type=positive, default=3,
+                        help="repetitions a unit count assumes (EVAL_REPETITIONS, default 3). The matrix "
+                             "is the default lane's whole nightly, before inject-lane exclusions or "
+                             "EVAL_NIGHTLY_PART")
+    args = parser.parse_args(argv)
+    if not args.summary:
+        parser.print_help()
+        return 2
+    for name, value in summary(args.repetitions).items():
+        print(f"{name}: {value}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

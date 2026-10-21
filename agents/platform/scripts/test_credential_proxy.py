@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+from dataclasses import replace
 import queue
 import re
 import shutil
@@ -28,6 +29,7 @@ from unittest import mock
 
 import credential_proxy
 import credential_proxy_client
+import feedback_broker
 import gke_endpoint
 import providers
 import vcs_broker
@@ -119,8 +121,23 @@ class AgentAPIProxyTest(unittest.TestCase):
         owner = self
 
         class UpstreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):  # noqa: N802
                 owner.received_authorization = self.headers.get("Authorization", "")
+                if self.path == "/stream":
+                    first = b"event: run.started\ndata: {\"seq\": 1}\n\n"
+                    second = b"event: done\ndata: {}\n\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(f"{len(first):x}\r\n".encode("ascii") + first + b"\r\n")
+                    self.wfile.flush()
+                    owner.second_chunk_released = owner.release_second_chunk.wait(timeout=30)
+                    self.wfile.write(f"{len(second):x}\r\n".encode("ascii") + second + b"\r\n0\r\n\r\n")
+                    self.wfile.flush()
+                    return
                 body = b"proxied"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
@@ -130,6 +147,8 @@ class AgentAPIProxyTest(unittest.TestCase):
             def log_message(self, _message, *_args):
                 return
 
+        self.release_second_chunk = threading.Event()
+        self.second_chunk_released = False
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         AgentAPIProxyHandler.external_key = "external-secret"
         AgentAPIProxyHandler.upstream_key = "internal-sentinel"
@@ -335,6 +354,8 @@ class AgentAPIProxyTest(unittest.TestCase):
                 chunk, self._pending = self._pending, b""
                 return chunk
 
+            read1 = read
+
         class FakeConnection:
             def __init__(self, *_args, **_kwargs):
                 pass
@@ -372,6 +393,19 @@ class AgentAPIProxyTest(unittest.TestCase):
         # ...so nothing injected appears as its own header or in the status line.
         self.assertNotIn(b"\r\nX-Injected:", raw)
         self.assertNotIn(b"\r\nX-Status-Injected:", raw)
+
+    def test_streams_chunked_response_frames_before_upstream_finishes(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/stream",
+            headers={"Authorization": "Bearer external-secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            first_line = response.readline()
+            self.assertEqual(b"event: run.started\n", first_line)
+            self.release_second_chunk.set()
+            rest = response.read()
+        self.assertTrue(self.second_chunk_released)
+        self.assertIn(b"event: done\n", rest)
 
 
 class PolicyTest(unittest.TestCase):
@@ -2208,6 +2242,29 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
 
+    def test_a_refused_kubectl_write_carries_its_verb_and_render_flag(self):
+        status, body = self.post({"argv": ["kubectl", "scale", "deploy/x", "--replicas=3"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual("kubernetes.read-only", body["rule"])
+        self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
+        self.assertFalse(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual(["create"], body["verb"])
+        self.assertTrue(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
+        self.assertEqual(["rollout", "restart"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
+        self.assertEqual(["certificate", "approve"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "rollout", "csr-tenant-b", "deploy/x"], "cwd": "/tmp"})
+        self.assertEqual(["rollout"], body["verb"], "a word after a subcommand verb that is not a subcommand is the caller's")
+        status, body = self.post({"argv": ["kubectl", "cluster-info", "dump"], "cwd": "/tmp"})
+        self.assertEqual(["cluster-info", "dump"], body["verb"])
+        # Every multi-word verb the policy knows is in the vocabulary.
+        policy = credential_proxy.command_policy
+        for head, second in sorted(v for v in policy.KUBECTL_READ_VERBS | policy.KUBECTL_REFUSED_SUBCOMMANDS if len(v) > 1):
+            self.assertIn(second, credential_proxy._KUBECTL_SUBCOMMANDS[head], (head, second))
+
     def test_a_config_flag_comes_back_as_a_policy_block(self):
         # Refused before the lease check, and with its own rule id: an agent
         # that gets "take a lease" back for `git -c` would take a lease and try
@@ -3126,6 +3183,13 @@ class CommandExecutorTest(unittest.TestCase):
                 """\
                 #!/bin/bash
                 set -u
+                # The endpoint decision in front of a fetch runs a help probe
+                # and a describe through this same stub; neither writes a
+                # kubeconfig, as the real gcloud does not.
+                case " $* " in
+                    *" --help "*) echo "  --dns-endpoint  Use the DNS endpoint."; exit 0 ;;
+                    *" describe "*) echo "{}"; exit 0 ;;
+                esac
                 project=""; location=""; cluster=""
                 for arg in "$@"; do
                     case "$arg" in
@@ -3430,7 +3494,11 @@ class CommandExecutorTest(unittest.TestCase):
         original = executor._execute
 
         def record(argv, **kwargs):
-            seen.append(kwargs.get("kubeconfig_path"))
+            # Only the fetch itself: the endpoint decision in front of it runs
+            # a help probe and a describe through the same seam, with no
+            # kubeconfig at all.
+            if "get-credentials" in argv and "--help" not in argv:
+                seen.append(kwargs.get("kubeconfig_path"))
             return original(argv, **kwargs)
 
         with mock.patch.object(executor, "_execute", record):
@@ -3457,7 +3525,11 @@ class CommandExecutorTest(unittest.TestCase):
         original = executor._execute
 
         def record(argv, **kwargs):
-            seen.append(kwargs.get("kubeconfig_path"))
+            # Only the fetch itself: the endpoint decision in front of it runs
+            # a help probe and a describe through the same seam, with no
+            # kubeconfig at all.
+            if "get-credentials" in argv and "--help" not in argv:
+                seen.append(kwargs.get("kubeconfig_path"))
             return original(argv, **kwargs)
 
         with mock.patch.object(executor, "_execute", record):
@@ -3473,6 +3545,23 @@ class CommandExecutorTest(unittest.TestCase):
 
     # ---- Choosing the control-plane endpoint --------------------------------
 
+    @staticmethod
+    def age_marker(executor, target):
+        """Push a provisional marker past its retry window."""
+        marker = executor._provisional_marker(target)
+        old = time.time() - credential_proxy.PROVISIONAL_RETRY_SECONDS - 1
+        os.utime(marker, (old, old))
+
+    @staticmethod
+    def a_decision(flags, provisional=False):
+        """An EndpointDecision carrying `flags`, for patching gke_endpoint."""
+        import gke_endpoint
+
+        kind = {"--dns-endpoint": gke_endpoint.KIND_DNS, "--internal-ip": gke_endpoint.KIND_INTERNAL_IP}.get(
+            flags[0] if flags else "", gke_endpoint.KIND_IP)
+        return gke_endpoint.EndpointDecision(tuple(flags), kind, "203.0.113.10", None, None, "",
+                                             provisional=provisional)
+
     def test_cache_miss_passes_dns_endpoint_when_the_cluster_needs_it(self):
         # The cold path: a restart empties the state dir, so the proxy refetches
         # on its own rather than reusing what the agent's get-credentials filed.
@@ -3486,7 +3575,7 @@ class CommandExecutorTest(unittest.TestCase):
             return original(argv, **kwargs)
 
         with (
-            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--dns-endpoint"]),
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--dns-endpoint"])),
             mock.patch.object(executor, "_execute", record),
         ):
             executor._resolve_kubeconfig(self.CONTEXT)
@@ -3494,6 +3583,430 @@ class CommandExecutorTest(unittest.TestCase):
         fetches = [argv for argv in seen if "get-credentials" in argv]
         self.assertEqual(1, len(fetches))
         self.assertEqual("--dns-endpoint", fetches[0][-1])
+
+    def test_a_callers_unflagged_fetch_gets_the_brokers_endpoint_decision(self):
+        # The broker files whatever a caller's get-credentials produced as the
+        # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
+        # that names no endpoint would otherwise move an internal-ip cluster
+        # back to its public IP for every brokered kubectl after it.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertEqual("--internal-ip", fetches[0][-1])
+        decide.assert_called_once()
+        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+
+    def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
+        # Every spelling a hand-typed command might carry: a global flag with a
+        # detached value ahead of the cluster name, `-z`, and --project before
+        # the verb. None may be read as the cluster name or lose the target.
+        cases = [
+            (["gcloud", "--verbosity", "debug", "container", "clusters", "get-credentials",
+              "cluster-b", "--location=us-central1", "--project=demo-project"],
+             ("demo-project", "cluster-b", "us-central1")),
+            (["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+              "-z", "us-central1-a", "--project", "demo-project"],
+             ("demo-project", "cluster-b", "us-central1-a")),
+            (["gcloud", "--project=demo-project", "container", "clusters", "get-credentials",
+              "cluster-b", "--region", "us-central1"],
+             ("demo-project", "cluster-b", "us-central1")),
+            # A detached value after the verb and ahead of the cluster: only the
+            # arity skip keeps `demo-project` from being read as the cluster.
+            (["gcloud", "container", "clusters", "get-credentials", "--project", "demo-project",
+              "cluster-b", "--location", "us-central1"],
+             ("demo-project", "cluster-b", "us-central1")),
+        ]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                target = credential_proxy._get_credentials_target(argv)
+                self.assertIsNotNone(target, argv)
+                self.assertEqual(expected, (target.project, target.cluster, target.location))
+
+    def test_a_callers_fetch_without_a_project_uses_the_brokers_own(self):
+        # The hand-typed form omits --project; the bootstrap set gcloud's
+        # default project to GKE_PROJECT_ID, so that is what gcloud will use.
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "demo-project"}):
+            target = credential_proxy._get_credentials_target(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"])
+        self.assertIsNotNone(target)
+        self.assertEqual(("demo-project", "cluster-b", "us-central1"),
+                         (target.project, target.cluster, target.location))
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": ""}):
+            self.assertIsNone(credential_proxy._get_credentials_target(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"]))
+
+    def test_a_callers_fetch_that_names_an_endpoint_is_run_as_given(self):
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--zone", "us-central1-a", "--project=demo-project", "--dns-endpoint"],
+            )
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertNotIn("--internal-ip", fetches[0])
+        self.assertEqual("--dns-endpoint", fetches[0][-1])
+        decide.assert_not_called()
+
+    def test_a_callers_fetch_without_a_full_target_is_run_as_given(self):
+        # Without project and location there is nothing to describe; gcloud
+        # falls back to its configured defaults and the broker does not guess.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(["gcloud", "container", "clusters", "get-credentials", "cluster-b"])
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertNotIn("--internal-ip", fetches[0])
+        decide.assert_not_called()
+
+    def test_a_kubeconfig_fetched_on_a_provisional_decision_is_refetched_after_its_window(self):
+        # The decision fell back because the broker's own-cluster describe
+        # failed. The file it produced serves requests inside its window, and
+        # the first request after the window fetches again rather than reusing
+        # it until a restart.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with (
+            mock.patch("gke_endpoint.endpoint_decision",
+                       return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            first = executor._resolve_kubeconfig(self.CONTEXT)
+            second = executor._resolve_kubeconfig(self.CONTEXT)
+        self.age_marker(executor, target)
+        with (
+            mock.patch("gke_endpoint.endpoint_decision",
+                       return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            third = executor._resolve_kubeconfig(self.CONTEXT)
+            fourth = executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(2, len(fetches), "one provisional fetch served inside its window, one settled, then the cache")
+        self.assertEqual("--internal-ip", fetches[1][-1])
+        self.assertTrue(first.is_file() and second.is_file() and third.is_file() and fourth.is_file())
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_callers_fetch_on_a_provisional_decision_is_refetched_by_the_next_read(self):
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.age_marker(executor, credential_proxy.parse_gke_context(self.CONTEXT))
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(2, len(fetches), "the caller's provisional file was not reused past its window")
+        self.assertEqual("--internal-ip", fetches[1][-1])
+
+    def test_a_fresh_provisional_file_is_served_and_an_old_one_is_a_miss(self):
+        # Bounds the cost of an own-cluster describe that keeps failing: the
+        # provisional file is reused inside its retry window and refetched after.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor._resolve_kubeconfig(self.CONTEXT)
+            executor._resolve_kubeconfig(self.CONTEXT)
+            self.assertTrue(executor._provisional_marker(target).exists())
+            self.age_marker(executor, target)
+            executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(2, len(fetches), "one fetch, one reuse inside the window, one refetch after it")
+
+    def test_a_settled_callers_fetch_clears_an_older_marker(self):
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_callers_fetch_with_its_own_flag_clears_an_older_marker(self):
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)) as decide:
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project", "--dns-endpoint"],
+            )
+        decide.assert_not_called()
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_help_probe_that_did_not_answer_leaves_the_fetch_provisional(self):
+        # The mirror of the failed-describe case through the real
+        # endpoint_decision: a support probe that exits non-zero on this one
+        # call is undecided, not "no flag", so the file is marked and refetched.
+        import gke_endpoint
+
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        original_execute = executor._execute
+
+        def failing_help(argv, **kwargs):
+            result = original_execute(argv, **kwargs)
+            if "--help" in argv:
+                return replace(result, exit_code=1, stdout="")
+            return result
+
+        with mock.patch.object(executor, "_execute", failing_help):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        self.assertIsNone(gke_endpoint._support_cache)
+
+    def test_a_fetch_with_no_decision_at_all_is_provisional_too(self):
+        # The target describe failed with nothing cached: gcloud's default is
+        # as unsettled as a fallback made without the own cluster.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+
+    def test_a_callers_fetch_with_no_decision_at_all_is_provisional_too(self):
+        # The broker read the target and tried to decide, and the describe
+        # failed: the caller's result is as unsettled as the broker's own
+        # would be, and must not clear an older mark either.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertTrue(executor._provisional_marker(target).exists())
+
+    def test_a_failed_refetch_past_the_window_serves_the_file_it_has(self):
+        # The mark is set when the GKE API was just failing, so the refetch
+        # runs into the same condition. A working kubeconfig on disk beats a
+        # 400, and the window is pushed out so the next request waits again.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            first = executor._resolve_kubeconfig(self.CONTEXT)
+        self.age_marker(executor, target)
+        original = executor._execute
+
+        def failing_fetch(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                return replace(result, exit_code=1, stderr="ERROR: (gcloud.container.clusters.get-credentials) 503")
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=None),
+            mock.patch.object(executor, "_execute", failing_fetch),
+        ):
+            second = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(first, second)
+        self.assertTrue(second.is_file())
+        marker = executor._provisional_marker(target)
+        self.assertTrue(marker.exists())
+        self.assertTrue(executor._provisional_window_open(marker), "the window was pushed out")
+
+    def test_a_failed_broker_fetch_does_not_mark_a_settled_file_a_caller_filed_meanwhile(self):
+        # A caller's fetch files outside _kubeconfig_lock, so between the
+        # broker's miss and its failed fetch a settled file can land. Serving it
+        # is right; marking it provisional would send it back to the fetch
+        # path a minute later and let an undecided refetch overwrite it.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        original = executor._execute
+
+        def caller_lands_then_fetch_fails(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                managed.parent.mkdir(parents=True, exist_ok=True)
+                managed.write_text(f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n")
+                return replace(result, exit_code=1, stderr="ERROR: 503")
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", caller_lands_then_fetch_fails),
+        ):
+            served = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(managed, served)
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_provisional_broker_fetch_does_not_replace_a_settled_file_a_caller_filed_meanwhile(self):
+        # The succeeding half of the same race: the broker's decision was
+        # undecided, its fetch succeeded, and a caller's settled file landed
+        # in between. An unmarked file present at filing time can only mean a
+        # settled answer arrived since the decision was made; it wins.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        settled = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n# settled by a caller\n"
+        original = executor._execute
+
+        def caller_lands_then_fetch_succeeds(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                managed.parent.mkdir(parents=True, exist_ok=True)
+                managed.write_text(settled)
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", caller_lands_then_fetch_succeeds),
+        ):
+            served = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(managed, served)
+        self.assertEqual(settled, managed.read_text(), "the caller's settled file was kept")
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_callers_undecided_fetch_refreshes_a_settled_file_already_on_disk(self):
+        # An unmarked file is the steady state of every cluster filed settled,
+        # not a race signature. A re-run of the onboarding whose broker-side
+        # decision happens to be undecided must still replace the stale file
+        # (under a mark), or the remedy the tree prescribes does nothing.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        stale = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n# stale, filed long ago\n"
+        managed.write_text(stale)
+        old = time.time() - 3600
+        os.utime(managed, (old, old))
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertNotEqual(stale, managed.read_text(), "gcloud's fresh kubeconfig replaced the stale one")
+        self.assertTrue(executor._provisional_marker(target).exists(), "and it is marked for re-decision")
+
+    def test_the_splice_decides_under_a_tighter_bound_than_a_kubectl(self):
+        # The describes behind a caller's splice run inside the caller's own
+        # fetch bound (30 s for switch_kube_context), so each is bounded well
+        # under a kubectl's 60 s rather than at it.
+        executor = self.fake_gcloud(self.executor())
+        bounds = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            if "describe" in argv or "--help" in argv:
+                bounds.append(kwargs.get("timeout_seconds"))
+            return original(argv, **kwargs)
+
+        import gke_endpoint
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertTrue(bounds, "the splice ran a probe or a describe")
+        for bound in bounds:
+            self.assertEqual(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, bound)
+        self.assertLess(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, executor.kubectl_timeout_seconds)
+
+    def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
+        # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
+        # A scaffold's fetch must not queue behind it to file a credential it
+        # already has; only the marker step is serialised, on its own lock.
+        executor = self.fake_gcloud(self.executor())
+        executor._kubeconfig_lock.acquire()
+        try:
+            done = threading.Event()
+
+            def run():
+                with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
+                done.set()
+
+            threading.Thread(target=run, daemon=True).start()
+            self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
+        finally:
+            executor._kubeconfig_lock.release()
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
@@ -3504,26 +4017,30 @@ class CommandExecutorTest(unittest.TestCase):
         target = credential_proxy.parse_gke_context(self.CONTEXT)
         seen = []
 
-        def fake_args(project, cluster, location, *, run=None, env=None):
+        def fake_decision(project, cluster, location, *, run=None, env=None):
             seen.append(run(["gcloud", "container", "clusters", "describe", cluster]))
-            return []
+            return None
 
-        with mock.patch("gke_endpoint.dns_endpoint_args", fake_args):
-            executor._dns_endpoint_args(resolved, target)
+        with mock.patch("gke_endpoint.endpoint_decision", fake_decision):
+            executor._endpoint_decision(resolved, target)
 
         self.assertEqual(1, len(seen))
-        # The stub exits non-zero without KUBECONFIG set, which is all this needs
-        # to prove: the adapter ran *something*, and it ran it through _execute.
+        # The stub answers a describe with "{}" and exits 0; what this proves is
+        # that the adapter ran *something*, and ran it through _execute.
         self.assertIsInstance(seen[0], tuple)
 
     def test_missing_gke_endpoint_falls_back_instead_of_failing_the_fetch(self):
         # credential_proxy is otherwise stdlib-only. Losing a sibling module must
-        # cost the flag, not the whole credential proxy.
+        # cost the flag, not the whole credential proxy -- and it is a settled
+        # loss: the module will not appear while the pod runs, so the file it
+        # fetches is not provisional, or every cluster would refetch each minute.
         executor = self.fake_gcloud(self.executor())
         target = credential_proxy.parse_gke_context(self.CONTEXT)
 
         with mock.patch.dict(sys.modules, {"gke_endpoint": None}):
-            self.assertEqual([], executor._dns_endpoint_args("gcloud", target))
+            self.assertIsNone(executor._endpoint_decision("gcloud", target))
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertFalse(executor._provisional_marker(target).exists())
 
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
@@ -4124,8 +4641,9 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_a_limit_under_the_floor_disables_the_budget_with_a_warning(self):
         # Autopilot without bursting sets limits equal to requests, so the
-        # proxy's limit there is its 512Mi request; a budget derived from it
-        # would admit one request at a time, worse than slot-only admission.
+        # proxy's limit there is its memory request; at 512Mi, under the
+        # floor, a budget derived from it would admit one request at a time,
+        # worse than slot-only admission.
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
             executor = self.executor(memory_limit_bytes=512 * mib, max_output_bytes=8 * mib)
@@ -5418,7 +5936,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
-        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None))
+        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None), hosts=("gitlab.com",))
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
                 mock.patch.object(credential_proxy, "_provider_forge", return_value=brokered):
             with self.assertRaises(RuntimeError) as raised:
@@ -6034,7 +6552,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
     def test_a_coalesced_refresh_reserves_nothing_and_never_waits(self):
         executor = self._budgeted_executor(admits=1)
-        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        executor._refresh_cache[("github", "github.com")] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
         self._hold_the_budget(executor)
         held = executor.reserved_bytes
         started = time.monotonic()
@@ -6276,7 +6794,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
     def test_a_vcs_verb_with_a_current_cache_returns_without_the_lock(self):
         executor = self._budgeted_executor(admits=1)
-        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        executor._refresh_cache[("github", "github.com")] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
         executor._refresh_lock.acquire()
         self.addCleanup(executor._refresh_lock.release)
         helper = mock.patch.object(executor, "_run_forge_helper", side_effect=AssertionError("ran the helper"))
@@ -9172,6 +9690,7 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     a store recording every git call it makes."""
 
     TOKEN = "glpat-SENTINEL-must-never-appear"
+    READ_TOKEN = "glpat-READ-SENTINEL-must-never-appear"
 
     def setUp(self):
         import content_workspace
@@ -9216,6 +9735,33 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     def _config_of(self, subcommand):
         return [config for argv, config in self.calls if argv[1] == subcommand]
 
+    def _forges_with_read_token(self):
+        """The forges file the operator renders when the forge has credentialsRef:
+        `readTokenPath` set, and the file there only if the Secret has the key."""
+        path = self.base / "forges-read.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(self.base / "token"),
+             "readTokenPath": str(self.base / "read-token"), "allowedPaths": ["acme"]},
+        ]}))
+        return path
+
+    def _with_read_token_path(self):
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            self.registry = credential_proxy.providers.Registry()
+        patcher = mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _store_read_token(self):
+        read = self.base / "read-token"
+        read.write_text(self.READ_TOKEN)
+        return str(read)
+
+    def _helper_file(self, config):
+        """The token file the forge's git helper reads, from one git call's config."""
+        return dict(config)["credential.https://gitlab.com.helper"].split()[1]
+
     def _commit(self, handle):
         self.store.commit(
             handle, "platform-agent/change", "feat: a change",
@@ -9238,6 +9784,87 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
         self.assertEqual([()], self._config_of("clone"))
         self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
         self.assertIn("presents none", "\n".join(logs.output))
+        # This forges file names no readTokenPath, so the warning blames the
+        # operator that rendered it, not the Secret.
+        self.assertIn("names no readTokenPath", "\n".join(logs.output))
+
+    def test_a_context_gitlab_repository_clones_with_the_stored_read_token(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            workspace = self.store.open("gitlab.com/acme/notes")
+        [config] = self._config_of("clone")
+        self.assertEqual("", dict(config)["credential.helper"])
+        self.assertEqual(read, self._helper_file(config))
+        self.assertTrue(workspace.credential.stored_token)
+        dumped = json.dumps(self.calls)
+        self.assertNotIn(self.READ_TOKEN, dumped)
+        self.assertNotIn(self.TOKEN, dumped)
+
+    def test_a_secret_without_the_read_token_key_clones_a_context_repository_with_none(self):
+        # The path is configured, but the Secret lacks the key, so the
+        # operator's optional projection mounts no file: today's behaviour.
+        self._with_read_token_path()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+        self.assertIn(credential_proxy.FORGE_READ_TOKEN_KEY, "\n".join(logs.output))
+        # A key added later is presented on the next open, with no restart.
+        read = self._store_read_token()
+        self.calls.clear()
+        self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[0]))
+
+    def test_the_read_token_never_reaches_a_write_route(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        token = str(self.base / "token")
+        # The content workspace: a managed repository's clone, fetch and push
+        # present the write token's helper, never the read token's.
+        managed = self.store.open("gitlab.com/acme/infra")
+        self._commit(managed.handle)
+        self.store.push(managed.handle, "platform-agent/change")
+        for subcommand in ("clone", "fetch", "push"):
+            with self.subTest(subcommand=subcommand):
+                configs = self._config_of(subcommand)
+                self.assertTrue(configs)
+                for config in configs:
+                    self.assertEqual(token, self._helper_file(config))
+        # A context repository clones with the read token and is never
+        # pushable: the write gate refuses it before any push.
+        context = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[-1]))
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, context.handle)
+        # The API routes and `/v1/vcs/publish`: the broker's transport and git
+        # runner present `forge.credential`, the write token.
+        git_configs = []
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            broker = vcs_broker.VcsBroker(
+                self.base / "vcs",
+                git_runner=lambda argv, cwd, check=True, config=(): git_configs.append(config),
+            )
+        forge, repo = broker.registry.resolve("gitlab.com/acme/infra")
+        self.assertEqual({"PRIVATE-TOKEN": self.TOKEN}, broker._transport(forge, repo)._headers())
+        broker._git_for(forge, repo)(self.base, "push")
+        self.assertEqual(token, self._helper_file(git_configs[0]))
+        # `/v1/forge/refresh` has nothing to make current for a stored token,
+        # read-only or not, and presents neither.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        self.assertNotIn(self.READ_TOKEN, json.dumps(self.calls + replies))
 
     def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
         with self.assertRaises(self.cw.ContentWorkspaceError):
@@ -13610,6 +14237,117 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
             "keyed=1&my_access_token=2&oauth_token_x=3",
             credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
         )
+
+
+class FeedbackRouteTest(_ExecRouteServer):
+    """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
+
+    The verb lives on the broker because the shell sandbox's NetworkPolicy
+    reaches DNS and the broker only; feedback_broker.py owns the wire path and
+    test_feedback_broker.py its behaviour. These tests hold the route: who may
+    call it, how a refusal and an answer travel, and that a malformed body is a
+    400 rather than a traceback.
+    """
+
+    GOOD_PAYLOAD = {
+        "title": "credential proxy dies silently",
+        "kind": "Bug",
+        "happened": "the sidecar crash-loops and nothing surfaces it",
+        "user_confirmed": True,
+    }
+
+    def post_as(self, role, body, raw=False):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:platform-agent-shell", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{feedback_broker.ROUTE}",
+            data=body if raw else json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # The authenticator rather than _authenticated: the route-role gate
+        # (403) runs inside _authenticated, and this class tests that gate.
+        authenticator = mock.Mock()
+        authenticator.authenticate.return_value = principal
+        with mock.patch.object(CredentialProxyHandler, "authenticator", authenticator):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def test_only_the_shell_role_reaches_the_route(self):
+        with mock.patch.object(feedback_broker, "submit") as submit:
+            for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_CHAT):
+                status, _ = self.post_as(role, self.GOOD_PAYLOAD)
+                self.assertEqual(status, 403, role)
+            submit.assert_not_called()
+
+    def test_a_blocked_payload_is_400_with_the_reason_and_links(self):
+        status, body = self.post_as(
+            credential_proxy.CALLER_ROLE_SHELL, {**self.GOOD_PAYLOAD, "user_confirmed": False}
+        )
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("user_confirmed", body["reason"])
+        self.assertEqual(body["fallback"]["form"], feedback_broker.SHORT_LINK)
+
+    def test_a_submission_answers_200_with_the_brokers_object(self):
+        answer = {
+            "status": "SUBMITTED",
+            "issue_url": "https://github.com/gke-labs/kube-agents/issues/1",
+            "fallback": feedback_broker.FALLBACK,
+        }
+        with mock.patch.object(feedback_broker, "submit", return_value=answer) as submit:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body), (200, answer))
+        self.assertEqual(submit.call_args.args[0]["title"], self.GOOD_PAYLOAD["title"])
+
+    def test_an_unreachable_form_is_400_blocked_not_a_traceback(self):
+        with mock.patch.object(
+            feedback_broker, "submit", side_effect=feedback_broker.Blocked("could not reach the feedback form (x)")
+        ):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("could not reach", body["reason"])
+
+    def test_a_full_broker_answers_503_busy_not_a_dropped_connection(self):
+        busy = credential_proxy.CommandSlotUnavailable("every slot is taken")
+        with mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=busy):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+
+    def test_an_unexpected_broker_error_is_400_blocked(self):
+        with mock.patch.object(feedback_broker, "submit", side_effect=IndexError("list index out of range")):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertEqual(body["fallback"], feedback_broker.FALLBACK)
+
+    def test_the_title_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "a" * 36
+        payload = {**self.GOOD_PAYLOAD, "title": token + " leaked in the relay log"}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertTrue(any("feedback submit" in line for line in logs.output))
+
+    def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "b" * 36
+        payload = {**self.GOOD_PAYLOAD, "kind": token}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertNotIn(token, body["reason"])
+
+    def test_a_non_json_body_is_400(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
 
 
 if __name__ == "__main__":

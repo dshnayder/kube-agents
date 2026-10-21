@@ -814,17 +814,25 @@ row is outside the noise the random load-balancing introduces.
 | Personal | `user:<id>`    | automatic capture, and `memory_retain` | that user only |
 | Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
 
-`<id>` is the caller's user identity run through
-`sanitize_user_id`, which produces `<readable>_<digest>`. The readable half
+`<id>` is the user identity run through `sanitize_user_id`, which produces
+`<readable>_<digest>`. Under `spec.mode: today`, the Hermes gateway supplies
+`agent._user_id` directly to `initialize()`. Under `spec.mode: next`, the Hermes
+API server runs `a2a-*` sessions without `user_id` or `chat_type` headers, so
+`hermes-bridge` records `authority.requester.principal` (`hmac:<32-hex>`) and
+`authority.audience.kind` (`dm` or `group`) from the gateway's `.in` task
+submission envelope in `session_kv.db` via `PUT /v1/sessions/a2a-<contextId>/route`,
+and both `kube_agents_memory` and `multiuser_memory` resolve them from
+`session_kv.db` (walking `state.db` `parent_session_id` across compressed
+session continuations). The readable half
 mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
 `-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
 The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
 is lossy while the tag is the entire isolation boundary — identities are
-email-shaped or HMAC-shaped, punctuation is what distinguishes many of them, and
+email-shaped (or `hmac:<32-hex>` pseudonyms under `spec.mode: next`), punctuation is what distinguishes many of them, and
 `alice.smith@corp.example` and `alice+dev@corp.example`-style pairs otherwise
-land on one tag and read each other's private facts. `multiuser_memory` guards
-the same boundary the same way in its filenames. An empty identity produces an
-empty string rather than a hash of nothing, which is what lets both providers fail
+land on one tag and read each other's private facts. `multiuser_memory` guarded
+the same thing the same way in its filenames. An empty or `"default"` identity produces an
+empty string rather than a hash of nothing or a shared `"default"` file, which is what lets both providers fail
 closed on personal memory; see
 [`tests/memory/test_user_tag_isolation.py`](../../tests/memory/test_user_tag_isolation.py).
 Recall asks for `[user:<id>, scope:shared]` with match mode `any_strict`, and
@@ -865,8 +873,8 @@ sequenceDiagram
 
 Four rules govern this path in `spec.mode: next`:
 
-1. **Zero NATS payload or `KV_cap` schema changes.** The `a2a/gateway` already populates `metadata["kube-agents.io/authority"].requester.principal` (`hmac:<32-hex>`) and `metadata["kube-agents.io/authority"].audience.kind` (`"dm"` or `"group"`) on every `.in` task submission ([`a2a/gateway/bridge.go`](../../a2a/gateway/bridge.go)).
-2. **Narrow documented exception for memory scoping.** [`spec-a2a-payloads.md`](spec-a2a-payloads.md) directs workers to read authorization from `KV_cap` rather than the task envelope. On the A2A bus, `a2a/gateway` is the **sole principal with NATS publish permission on `a2a.tasks.*.*.in`** (enforced by [`tests/conformance/test_A_authority.py`](../../tests/conformance/test_A_authority.py)). After `capabilityPermits` succeeds in [`a2a/workers/hermes-bridge/main.go`](../../a2a/workers/hermes-bridge/main.go), `hermes-bridge` reads `authority.requester.principal` and `authority.audience.kind` from the `.in` task metadata solely to scope conversational memory (not to grant tool or cluster capabilities) and includes `user_id` and `chat_type` in its existing `PUT /v1/sessions/a2a-<contextId>/route` request to `session_kv_server.py`.
+1. **Zero NATS payload or `KV_cap` schema changes.** The `a2a/gateway` already populates `metadata["kube-agents.io/authority"].requester.principal` (`hmac:<32-hex>`) and `metadata["kube-agents.io/authority"].audience.kind` (`"dm"` or `"group"`) on every `.in` task submission ([`a2a/gateway/a2adoor.go`](../../a2a/gateway/a2adoor.go)).
+2. **Narrow documented exception for memory scoping.** [`spec-a2a-payloads.md`](spec-a2a-payloads.md) directs workers to read authorization from `KV_cap` rather than the task envelope. On the A2A bus, `a2a/gateway` is the **sole principal with NATS publish permission on `a2a.tasks.*.*.in`** (enforced by [`tests/conformance/test_A_authority.py`](../../tests/conformance/test_A_authority.py)). After `capabilityPermits` succeeds in [`a2a/hermes-bridge/bridge.go`](../../a2a/hermes-bridge/bridge.go), [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go) reads `authority.requester.principal` and `authority.audience.kind` from the `.in` task metadata solely to scope conversational memory (not to grant tool or cluster capabilities) and includes `user_id` and `chat_type` in its existing `PUT /v1/sessions/a2a-<contextId>/route` request to `session_kv_server.py`.
 3. **Zero Hermes source patches.** The Hermes HTTP API server (`run_agent_turn` in `gateway/api_server.py`) calls `memory_manager.initialize(session_id=session_id, ...)` without passing `user_id` or `chat_type`. Rather than patching Hermes source code, both `kube_agents_memory` and `multiuser_memory` query `session_kv.db` (`SESSION_KV_DB_PATH`) when `kwargs.get("user_id")` is empty and `session_id` (or its compression ancestor via `parent_session_id` in `state.db`) starts with `a2a-`.
 4. **Pseudonymous personal tags and one-time mode cutover.** In `spec.mode: next`, `a2a/gateway` hashes the speaker's email with `SESSION_KV_SALT` before publishing to NATS (`hmac:<32-hex>`), keeping plaintext emails off NATS streams and out of `session_kv.db`. Because `a2a/gateway` cannot invert the HMAC and the chat pod does not hold `SESSION_KV_SALT`, switching an existing installation from `spec.mode: today` to `spec.mode: next` performs a one-time cutover of personal memory tags from `user:<sanitized-email>_<sha12>` to `user:hmac-<32-hex>_<sha12>`. Shared memory (`scope:shared`) is unaffected.
 
@@ -1016,7 +1024,7 @@ What the write is _spelled_ varies, because the safe reading of an unqualified
 retain is not the same everywhere. Wherever a person is in the conversation it
 stays `scope="shared"`, explicitly; in an unattended session — cron, the k8s event
 watcher — there is no personal scope to write to and an unqualified retain resolves
-to shared instead of failing. The three cases are in
+to shared instead of failing. The cases are in
 [The tools](#the-tools).
 
 #### What goes in which scope
@@ -1151,14 +1159,23 @@ A write that names no scope is the model declining to state intent, so the defau
 is the safe reading of that silence — which depends on who is in the room, not on
 whether the session happens to hold a user tag:
 
-| Session                                                     | Write default | An unqualified retain                            |
-| ----------------------------------------------------------- | ------------- | ------------------------------------------------ |
-| Attributed DM (`user_id` present, `chat_type == "dm"`)      | `personal`    | filed under that user (`user:<id>`)              |
-| Group space or thread (`SHARED_SESSION_NOTICE`)             | `personal`    | refused, with the reason, and nothing is written |
-| Unattributable interactive (`NO_IDENTITY_NOTICE`)           | `personal`    | refused, with the reason, and nothing is written |
-| Unattended cron / event-watcher (`UNATTENDED_NOTICE`)       | `shared`      | filed under `scope:shared`                       |
+| Session                                              | Write default | An unqualified retain                            |
+| ---------------------------------------------------- | ------------- | ------------------------------------------------ |
+| DM from a known user                                 | `personal`    | filed under that user                            |
+| Group thread (`SHARED_SESSION_NOTICE`)               | `personal`    | refused, with the reason, and nothing is written |
+| Unattributable interactive DM (`NO_IDENTITY_NOTICE`) | `personal`    | refused, with the reason, and nothing is written |
+| Unattended background run (`NO_IDENTITY_NOTICE`)     | `shared`      | filed under `scope:shared`                       |
 
-Separating **Unattributable interactive** from **Unattended** prevents a critical failure mode: if an interactive session loses its `user_id` or `chat_type` (for example, an `a2a-*` session whose route entry is missing), treating it as `_unattended = True` would silently route a human's unqualified `memory_retain` call to `scope:shared` and publish a private fact org-wide. Therefore, `_unattended` is set **only** when the session positively identifies as a background cron or event-watcher turn (never on `a2a-*` chat sessions or interactive sessions with missing metadata). In both shared spaces and unattributable interactive sessions, `get_tool_schemas()` keeps `personal` in the write enum as the default so an unqualified write fails closed and returns an explicit refusal.
+The middle two rows are why the provider carries `_unattended` rather than keying on
+`self._user_tag` being empty: three states have no tag, and only the last one
+(cron and the k8s event watcher) is an empty room. Both a group space and an
+interactive DM or `a2a-*` session whose route or identity is missing have a
+human speaker whose personal facts must not be published org-wide,
+so an unqualified write there must keep failing closed — publishing one
+participant's stated fact org-wide is the outcome the whole scope design exists to
+prevent. `get_tool_schemas` splits the same way: only the unattended variant drops
+`personal` from the write enum, because whenever a human is present that value is the model's only
+way to say "this belongs to one person" and earn the refusal.
 
 Neither read delegates to the stock tool. `memory_reflect` cannot, because
 `hindsight_reflect` drops the tag filter (pinned setting 3). `memory_recall` no

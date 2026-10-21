@@ -1102,9 +1102,12 @@ spec:
                             node's labels for the pod to be scheduled
                           type: object
                         replicas:
-                          description:
-                            Replicas specifies the desired number of pod
-                            replicas. If omitted, defaults to 1.
+                          description: |-
+                            Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+                            The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+                            the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+                            because its leader election has no in-cluster ServiceAccount token to use and the data
+                            volumes an install creates at one replica are ReadWriteOnce.
                           format: int32
                           minimum: 0
                           type: integer
@@ -1186,7 +1189,8 @@ spec:
                             defaults, so the kubelet does not evict the pod at the smaller figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
-                            refuses a memory limit below what admits two commands at once, a request
+                            refuses a memory limit below what admits two commands at once, a limits
+                            entry set alone below the default request it would cross, a request
                             above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
                             pod declares no resourceClaims. A refused override, including an edit of
                             one that was valid, renders the proxy Deployment at the operator's
@@ -9560,6 +9564,70 @@ spec:
                         Omitting it leaves every kubectl call in the sidecar pointed at
                         localhost:8080. See buildCredentialProxyEnv.
                       type: string
+                    stallWatch:
+                      description: |-
+                        StallWatch tunes the controller stall watch — the stall-watch cron job on the
+                        Platform Agent's roster that sweeps the fleet for controllers that stopped
+                        making progress and raises an alert for each new stall. Absent keeps the
+                        watch's built-in behaviour.
+                      properties:
+                        excludeNamespaces:
+                          description: |-
+                            ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+                            in addition to the system namespaces it always skips. Matched exactly. An
+                            open alert in a namespace added here is closed with a note that the
+                            namespace was excluded.
+                          items:
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-type: set
+                        kinds:
+                          description: |-
+                            Kinds replaces the watch's default list of resources to scan (Deployments,
+                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+                            cert-manager Certificates). Each item is a kubectl resource name such as
+                            `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+                            scans every namespaced kind the cluster serves, one read per kind per
+                            namespace, which is slow on a large fleet. Absent or empty keeps the
+                            default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+                            ControllerRevisions and Leases are refused: the scan reports nothing from
+                            them, and a Secret listing would carry every body.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 20
+                          type: array
+                          x-kubernetes-list-type: set
+                          x-kubernetes-validations:
+                            - message: "kinds: all must be the only item"
+                              rule: "!self.exists(k, k == 'all') || self.size() == 1"
+                            - message:
+                                "kinds: secrets, configmaps, events, endpoints,
+                                endpointslices, controllerrevisions and leases are never
+                                scanned"
+                              rule:
+                                "!self.exists(k, k.split('.')[0] in ['secrets',
+                                'secret', 'configmaps', 'configmap', 'cm', 'events',
+                                'event', 'ev', 'endpoints', 'endpoint', 'ep',
+                                'endpointslices', 'endpointslice', 'controllerrevisions',
+                                'controllerrevision', 'leases', 'lease'])"
+                        minStallAgeMinutes:
+                          description: |-
+                            MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+                            lasted at least this long. The age is the longer of what stall_report.py
+                            measures on the object and how long the watch has seen it. A stall that is
+                            younger stays in the watch's ledger and is checked again on each run; an
+                            object that joins a namespace with an open alert is not held. Absent or 0
+                            alerts on the first run that sees the stall.
+                          format: int32
+                          maximum: 1440
+                          minimum: 0
+                          type: integer
+                      type: object
                     tuning:
                       description: |-
                         Tuning sets per-persona execution limits. Unset values keep the defaults
@@ -9690,9 +9758,10 @@ spec:
                             preemption.
 
                             The number lands in three places that deliberately differ. The gateway's
-                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-                            delegation is refused with a chat reply naming the numbers, never queued,
-                            never dropped. The namespace ResourceQuota is rendered a fixed headroom
+                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+                            gateway first evicts the longest-idle session pod (its conversation is
+                            told); only with none idle is a new turn refused with a chat reply naming
+                            the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
                             ABOVE it as the enforcement control: a compromised or buggy gateway
                             ignores its own cap and cannot ignore the quota, and keeping the quota
                             above the cap is what makes users hit the honest refusal rather than an
@@ -9734,9 +9803,10 @@ spec:
 
                             Raising it buys concurrent delegations at the per-pod price plus model
                             concurrency against the shared LiteLLM endpoint; the quota lifts with it.
-                            Lowering it turns busy-hour delegations into refusals sooner - a lower
-                            cap never reaps in-flight sessions, it only blocks new spawns until they
-                            finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+                            Lowering it turns busy-hour delegations into evictions and refusals
+                            sooner - a lower cap never stops a running task: a new spawn at the cap
+                            evicts the session pod idle longest, and is refused only when none is
+                            idle. Setting it to 1 serialises delegated SESSION work; kanban worker
                             concurrency is MaxInProgress above, a different lane.
 
                             The Maximum exists because the quota render adds its headroom to this
@@ -9800,6 +9870,47 @@ spec:
                           A gitlab forge's credentialsRef is required by the API server too, so it
                           holds with the webhook off -- the chart ships it off.
                         properties:
+                          caBundleRef:
+                            description: |-
+                              CABundleRef names a Secret in the PlatformAgent's namespace that holds
+                              the PEM CA certificates that signed this forge's TLS certificate:
+                              a self-managed instance behind a private CA. The broker trusts these
+                              certificates for this forge's host only, beside the system bundle, in
+                              its API client and in git. On a GitHub Enterprise Server forge, the
+                              chart also gives them to the token minter, which trusts them for all of
+                              its outbound calls. It is
+                              for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
+                              is refused when host is empty, gitlab.com or github.com, whose
+                              certificates the public CAs sign.
+
+                              The operator mounts the one key into the credential broker's pod only.
+                              The mount is optional: a missing Secret does not stop the broker, and
+                              calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
+                              broker reads the file on each call, so an update reaches it with no
+                              restart.
+                            properties:
+                              key:
+                                default: ca.crt
+                                description: |-
+                                  Key is the Secret key that holds the PEM certificates. Defaults to
+                                  "ca.crt".
+                                maxLength: 253
+                                pattern: ^[-._a-zA-Z0-9]+$
+                                type: string
+                              name:
+                                description:
+                                  "Name is the Secret's name: a lowercase
+                                  DNS subdomain."
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                            required:
+                              - name
+                            type: object
+                            x-kubernetes-validations:
+                              - message: caBundleRef.key may not be . or start with ..
+                                rule: "!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))"
                           credentialsRef:
                             description: |-
                               CredentialsRef names a Secret in the PlatformAgent's namespace holding
@@ -9812,7 +9923,9 @@ spec:
                               group or project access token, or a dedicated account's personal access
                               token where the tier offers neither. It is mounted into the credential
                               broker's pod only, never the agent's or the sandbox's, and read on every
-                              call, so rotating the token is updating the Secret.
+                              call, so rotating the token is updating the Secret. The Secret may also
+                              hold a read-only token under the key `read-token`; the broker presents it
+                              only to clone the forge's context repositories, never on a write.
                             properties:
                               name:
                                 description:
@@ -9830,10 +9943,17 @@ spec:
                               Host is the forge hostname. Omit it for the provider's default
                               ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
                               provider does not serve is rejected, and an alternative spelling of one
-                              it does serve resolves to the provider's canonical host. For GitLab it may
-                              also be a self-managed instance's hostname, which every repository on the
-                              forge must then name or leave implied; a host another provider serves is
-                              rejected.
+                              it does serve resolves to the provider's canonical host. It may also be a
+                              self-managed instance's hostname: a GitLab instance, or a GitHub
+                              Enterprise Server instance. Every repository on the forge must then name
+                              that host or leave it implied. A host another provider serves is
+                              rejected, and so is a host under a domain where the provider runs its own
+                              services (for GitHub: github.com, githubusercontent.com, ghe.com and
+                              others).
+
+                              An install serves one GitHub host: github.com, or one GitHub Enterprise
+                              Server instance. A second GitHub forge at another host is rejected, and
+                              so is one host declared for two providers.
 
                               The pattern is a DNS name, which every forge's host is; it is here rather
                               than only in the webhook so the API server still refuses whitespace and
@@ -9875,7 +9995,6 @@ spec:
                             pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
                             type: string
                           provider:
-                            default: github
                             description: |-
                               Provider names the forge's kind. It is the discriminator the operator
                               writes into the gitops-state ConfigMap as each repository's `type`, so
@@ -9883,7 +10002,11 @@ spec:
                               URL's text.
 
                               "github" and "gitlab" are registered; the enum grows with each
-                              agent-side provider. Defaults to "github".
+                              agent-side provider. Omitted, it is "github".
+
+                              A forge at a host other than a spelling of github.com must name it, so
+                              a forge written for another instance is never read as a GitHub
+                              Enterprise Server by default.
                             enum:
                               - github
                               - gitlab
@@ -9893,11 +10016,27 @@ spec:
                         type: object
                         x-kubernetes-validations:
                           - message:
+                              "a forge at a host other than github.com names its
+                              provider: github for a GitHub Enterprise Server, gitlab
+                              for a GitLab instance"
+                            rule:
+                              has(self.provider) || !has(self.host) || size(self.host)
+                              == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com',
+                              'ssh.github.com']
+                          - message:
                               "a gitlab forge needs credentialsRef.name: the Secret
                               holding its access token under the key token"
                             rule:
                               "!has(self.provider) || self.provider != 'gitlab'
                               || has(self.credentialsRef)"
+                          - message:
+                              "caBundleRef is for a self-managed host: gitlab.com
+                              and github.com present a certificate the public CAs sign,
+                              and a private CA must never vouch for it"
+                            rule:
+                              "!has(self.caBundleRef) || (has(self.host) && size(self.host)
+                              > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com',
+                              'github.com', 'www.github.com', 'ssh.github.com']))"
                       maxItems: 16
                       type: array
                       x-kubernetes-list-map-keys:
@@ -10453,7 +10592,7 @@ spec:
                       properties:
                         endpoint:
                           description: |-
-                            Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+                            Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
                             the empty alternative in the pattern is required because the API server
                             validates an explicitly-set "", which omitempty does not suppress.
                           maxLength: 45
@@ -10485,6 +10624,11 @@ spec:
                             are unique only within a project and location. This replaces the
                             RECONCILE_EXCLUDE environment variable, which matched bare names across
                             every project.
+                            An excluded cluster gets no Cluster Agent, and fleet answers, the
+                            onboarding sweep and the fleet-audit collectors that list clusters leave
+                            it out. Still covering it: the daily upgrade-readiness watch, the
+                            networking audit's subnet usage, the GCE audit's instance listing, and
+                            the third-party gke MCP server's list_clusters.
                           items:
                             description: ScopeClusterRef identifies one GKE cluster.
                             properties:
@@ -10664,10 +10808,8 @@ spec:
                             chose at creation time or at a public address, and the in-cluster
                             "kubernetes" Service is translated to that address before policy is
                             evaluated. Leaving this empty is allowed and is the stricter choice. It
-                            costs the agent container its API-server connection, which matters at
-                            spec.deployment.replicas above 1, where the container runs
-                            leader_elect.py and holds a Lease, and to any sidecar or plugin you
-                            added that talks to the API. Find the range with
+                            costs the agent container its API-server connection, which matters to
+                            any sidecar or plugin you added that talks to the API. Find the range with
                             `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
                             On a cluster with a public endpoint that command emits a bare address;
                             paste it as-is and it is widened to a single-host prefix.
@@ -10922,22 +11064,19 @@ spec:
                         What the gateway policy already permits, and therefore what this cannot
                         take away:
 
-                          - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-                            metadata addresses — the pre- and post-DNAT forms of a metadata
-                            request (the 988 rule is suppressed when the resolved metadata
-                            daemon IP is empty). So the metadata path stays open. The same
-                            address is also permitted on port 53, where it is the Cloud DNS for
-                            GKE resolver rather than a credential path.
+                          - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+                            GKE resolver rather than a credential path. The gateway policy opens
+                            no metadata credential port: the gateway Pod holds no Google identity
+                            (it runs as its own unannotated ServiceAccount), so there is no
+                            metadata path left for this field to close.
                           - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
                             FQDNNetworkPolicy annotation is set. So every HTTPS destination on
                             the public internet stays open, and with it the exfiltration half of
                             what this control is meant to be.
 
-                        The overlap is deliberate rather than an oversight. Workload Identity
-                        needs the metadata path, and <name>-gateway-netpol still permits it to
-                        the agent Pod. Narrowing that allowance to the broker Pod, which is the
-                        only one that mints a cloud token, is the work that turns this field into
-                        a control.
+                        The overlap is deliberate rather than an oversight. Narrowing
+                        <name>-gateway-netpol's internet rule is the work that turns this field
+                        into a control.
 
                         So what is this for today? Two things, and they are worth having, but
                         neither is enforcement. It renders an auditable statement of the
@@ -10976,21 +11115,18 @@ spec:
 
                         The allowlist covers DNS, the credential broker, LiteLLM, the namespace
                         of the OpenTelemetry collector the agent resolved, the Hindsight memory
-                        API, and whatever egressAllowlist adds. Everything else the agent
-                        container reaches on its own would go away:
+                        API, and whatever egressAllowlist adds. The gke and developer_knowledge
+                        MCP servers go through the broker and are unaffected. Everything else the
+                        agent container reaches on its own would go away:
 
                           - DuckDuckGo web search, which the shared default config turns on for
                             every profile, and the "browser" toolset, which only the Chat Agent
                             disables;
-                          - the gke and developer_knowledge MCP servers, which proxy
-                            container.googleapis.com and developerknowledge.googleapis.com;
                           - github.com reached directly from the sandbox, though not the gh and
                             git wrappers, which go through the broker;
-                          - the metadata lookup in cluster_agent_reconcile.py, which finds that
-                            script's project id. It fails soft after a five-second timeout and
-                            falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-                            pinned empty in the managed .env (a project other than the pod's belongs in
-                            spec.scope.projects, the management project still has to resolve).
+                          - nothing in cluster_agent_reconcile.py, which reads its management
+                            project from GKE_PROJECT_ID (pinned in the managed .env, beside
+                            RECONCILE_PROJECT pinned empty) and asks no metadata server.
 
                         Those would not be accidental casualties. A headless browser with
                         unrestricted egress is the exfiltration path, so the capabilities this
@@ -11314,8 +11450,8 @@ spec:
                       type: boolean
                     metadataDaemonIP:
                       description:
-                        MetadataDaemonIP is the post-NAT daemon IP in rule
-                        3, empty when suppressed.
+                        MetadataDaemonIP is the post-NAT daemon IP in the
+                        LiteLLM policy's metadata rule, empty when suppressed.
                       type: string
                     metadataDaemonIPSource:
                       description:
@@ -11325,7 +11461,7 @@ spec:
                       type: string
                     metadataDaemonPort:
                       description: |-
-                        MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+                        MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
                         DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
                       format: int32
                       type: integer
@@ -11394,6 +11530,25 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    chatMessagesInboundTotal:
+                      description: |-
+                        ChatMessagesInboundTotal is the cumulative count of chat messages that
+                        reached the gateway, from every platform it serves: Google Chat, Slack,
+                        Teams and its own API port alike. Counted at the gateway's dispatch
+                        hook, which Hermes runs after dropping its own internal events and
+                        before it checks the sender against the allowlist, so an unlisted
+                        user's message counts and nothing the gateway never hands to the hook
+                        does. Read every five minutes from the chat_metrics plugin's
+                        kubeagents_chat_messages_inbound_total on the platform-agent container
+                        of the gateway pod that runs Hermes (above one replica, the leader
+                        alone), summed across the pods that have led, and, on a next-mode
+                        install, from the A2A gateway's
+                        kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
+                        ingress is that gateway's there; kept monotonic the same way as
+                        ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+                        brokered command is activity.
+                      format: int64
+                      type: integer
                     clustersMonitored:
                       description: |-
                         ClustersMonitored is how many of ClustersRegistered are delivering
@@ -11442,12 +11597,12 @@ spec:
                     lastActiveTime:
                       description: |-
                         LastActiveTime is the time of the last poll in which a counter above
-                        moved: a brokered command ran, or an event was accepted for triage.
-                        Until SessionsTotal has a source, a chat turn that runs no brokered
-                        command does not move it. Scheduled maintenance jobs that run brokered
-                        commands do move it, though -- the Controller Stall Watch cron runs some
-                        every 30 minutes by default -- so it marks agent activity of any origin,
-                        not human or operator use alone. Advances at most once per five minutes.
+                        moved: a brokered command ran, a proposal was opened or merged, a chat
+                        message reached the gateway, or an event was accepted for triage.
+                        Scheduled maintenance jobs that run brokered commands move it too --
+                        the Controller Stall Watch cron runs some every 30 minutes by default
+                        -- so it marks agent activity of any origin, not human or operator use
+                        alone. Advances at most once per five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:
@@ -11456,16 +11611,48 @@ spec:
                         Nothing writes it yet.
                       format: int64
                       type: integer
+                    remediationsMergedTotal:
+                      description: |-
+                        RemediationsMergedTotal is the cumulative count of proposals this install
+                        opened that the forge reported merged. The agent never merges, so the
+                        credential broker learns of a merge when one of its own reads of the
+                        proposal, proposal-list or proposal-view, shows the merged state; it
+                        counts each such proposal once per broker process, only when its author
+                        is the broker's own login and it merged no earlier than the broker
+                        process started, so a restart cannot count a merge twice, to within the
+                        forge's and the pod's clocks agreeing. Read from the
+                        broker's kubeagents_vcs_proposals_merged_total every five minutes and
+                        kept monotonic the same way as ToolExecutionsTotal. A merge no read of
+                        the broker's ever shows is not counted, and a credential whose login the
+                        broker cannot name counts nothing (the broker logs that once), so this
+                        under-counts rather than over-counts and stays absent on such an
+                        install; it is the forge's word, where RemediationsAppliedTotal is the
+                        install's. Moves LastActiveTime.
+                      format: int64
+                      type: integer
                     remediationsProposedTotal:
                       description: |-
-                        RemediationsProposedTotal is the cumulative count of remediations generated.
-                        Nothing writes it yet.
+                        RemediationsProposedTotal is the cumulative count of proposals the
+                        credential broker's version-control route opened: proposal-create
+                        requests the forge accepted. Read from the broker's
+                        kubeagents_vcs_requests_total under verb proposal-create and status
+                        success every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal; a proposal the forge refused or that failed is not
+                        counted. Moves LastActiveTime.
                       format: int64
                       type: integer
                     sessionsTotal:
                       description: |-
-                        SessionsTotal is the cumulative number of interactive sessions handled.
-                        Nothing writes it yet.
+                        SessionsTotal is the cumulative count of sessions the agent opened: the
+                        triage sessions the event watcher opened for events the daemon
+                        delivered (its k8s_event_watcher_triage_sessions_total; a session
+                        whose inject was filtered, suppressed or failed is not counted) plus
+                        the chat conversations the gateway opened a session for (the session_store
+                        plugin's kubeagents_chat_sessions_total on a today install, the A2A
+                        gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        chat conversation that resumes after the session store's retention
+                        window (seven days by default) counts again. Read every five minutes
+                        and kept monotonic across restarts, like toolExecutionsTotal.
                       format: int64
                       type: integer
                     toolExecutionsTotal:

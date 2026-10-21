@@ -410,10 +410,17 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 	if !strings.Contains(callers, sandboxCaller) {
 		t.Errorf("the broker must serve the sandbox's identity %q, got %q", sandboxCaller, callers)
 	}
-	// And still the agent's: the gateway's chat relays call the same listener.
-	agentCaller := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
-	if !strings.Contains(callers, agentCaller) {
-		t.Errorf("the broker must still serve the agent's identity %q, got %q", agentCaller, callers)
+	// And the gateway's: its chat relays and watchers call the same listener.
+	// Matched as a whole entry, not a substring: the gateway's name extends
+	// the broker's, and the broker's own is not a caller.
+	entries := strings.Split(callers, ",")
+	gatewayCaller := "system:serviceaccount:" + agent.Namespace + ":" + gatewayServiceAccountName(agent)
+	if !slices.Contains(entries, gatewayCaller) {
+		t.Errorf("the broker must serve the gateway's identity %q, got %q", gatewayCaller, callers)
+	}
+	brokerSelf := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
+	if slices.Contains(entries, brokerSelf) {
+		t.Errorf("the broker's own identity %q is not a caller, got %q", brokerSelf, callers)
 	}
 }
 
@@ -650,6 +657,87 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	}
 	if found != "http://test-agent-credential-proxy:8765" {
 		t.Errorf("expected the resolved credential proxy URL in the pod env, got %q", found)
+	}
+}
+
+// The collectors cannot see the scope snapshot from this pod, so the operator
+// tells them whether a boundary exists at all: with one, a run without the
+// fleet_scope tool's flags refuses to list rather than sweeping every project
+// the identity can see.
+func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) string {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envScopeDeclared {
+				return env.Value
+			}
+		}
+		t.Fatalf("%s is not set on the sandbox container; the collectors read it", envScopeDeclared)
+		return ""
+	}
+	if got := read(shellSandboxTestAgent()); got != "false" {
+		t.Errorf("%s = %q without a scope block, want false", envScopeDeclared, got)
+	}
+	declared := shellSandboxTestAgent()
+	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{}
+	if got := read(declared); got != "true" {
+		t.Errorf("%s = %q with a present, empty scope block (the host-only boundary), want true", envScopeDeclared, got)
+	}
+}
+
+// The audits' auto-promotion switch reaches the sandbox pod only when
+// spec.deployment.env carries it, and with the value given: finish runs here,
+// and an operator who set it on the agent would otherwise have set it on a
+// container that never reads it (#3439).
+func TestShellSandboxAuditAutoPromoteEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envAuditAutoPromote {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	if _, ok := read(shellSandboxTestAgent()); ok {
+		t.Errorf("%s is set on the sandbox container with no spec.deployment.env entry; unset means the sweep's default", envAuditAutoPromote)
+	}
+	off := shellSandboxTestAgent()
+	off.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: "OTEL_SDK_DISABLED", Value: "true"},
+		{Name: envAuditAutoPromote, Value: "false"},
+	}}
+	got, ok := read(off)
+	if !ok || got != "false" {
+		t.Errorf("%s = %q, %v with spec.deployment.env setting it to false; want false, true", envAuditAutoPromote, got, ok)
+	}
+	// The pod carries the operator's two words, never the CR's bytes: a quoted
+	// or backslashed literal would stop the sandbox entrypoint before sshd.
+	for value, want := range map[string]string{" FALSE ": "false", "true": "true", "\"false\"": "true", "off": "true"} {
+		odd := shellSandboxTestAgent()
+		odd.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envAuditAutoPromote, Value: value}}}
+		if got, ok := read(odd); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envAuditAutoPromote, got, ok, value, want)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envAuditAutoPromote,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envAuditAutoPromote)
+	}
+	if _, other := func() (string, bool) {
+		sts := buildShellSandboxStatefulSet(off, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "OTEL_SDK_DISABLED" {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}(); other {
+		t.Error("OTEL_SDK_DISABLED reached the sandbox container: only the named switch is forwarded from spec.deployment.env")
 	}
 }
 
@@ -1661,6 +1749,9 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
+		// The watchers' broker token: mounted into the agent container it
+		// would hand the model the broker's watcher role.
+		watcherTokenVolume,
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()

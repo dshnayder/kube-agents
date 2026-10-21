@@ -13,7 +13,7 @@ those scores. Your job between those commands is judgement — scoring, and writ
 nothing else.
 
 This is the last stage before delivery. The file you write is posted to the user **verbatim** by the
-`bootstrap-inventory-delivery` job — no agent edits or reformats it afterward.
+onboarding delivery (the `oobe` job's delivery stage) — no agent edits or reformats it afterward.
 
 The report lists only the most urgent critical findings, up to a limit the install sets, and the
 queue holds all of them, so a finding that does not reach the report is deferred rather than
@@ -338,9 +338,10 @@ A `manual` verification may omit the command; nothing else may.
 
 ### Checks with no owning stream
 
-Three of the checks the sweep emits have no audit stream behind them yet: `probes-startup`,
-`readonly-root-fs`, and `no-resourcequota`. Set `remediation.kind` to `manual` for those even though
-each is a YAML edit — there is no stream to route a pull request through until they get one.
+Five of the checks the sweep emits have no audit stream behind them yet: `probes-startup`,
+`readonly-root-fs`, `no-resourcequota`, `static-sa-key`, and `added-capabilities`. Set `remediation.kind` to `manual` for
+those even though most are a YAML edit — there is no stream to route a pull request through until
+they get one.
 
 The vocabulary the slugs come from is the Cluster Agents' to choose from; it lives in
 [`cluster_inventory_audit_sop.md`](cluster_inventory_audit_sop.md) Step 5 beside the `findings`
@@ -461,5 +462,5 @@ Write clean Markdown that reads well in a chat client. Structure:
 ## Step 7: Silent Exit
 
 Once `/opt/data/INVENTORY.md` is confirmed on disk, return strictly `[SILENT]` without running any
-further commands. Delivery is handled by the `bootstrap-inventory-delivery` job — do not message the
+further commands. Delivery is handled by the `oobe` job's delivery stage — do not message the
 user yourself.

@@ -203,6 +203,91 @@ class ConfigurationTest(unittest.TestCase):
             )
 
 
+class ReadCredentialTest(unittest.TestCase):
+    """The optional read-only token a context repository clones with."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.token = self.dir / "token"
+        self.token.write_text("glpat-write\n")
+        self.read = self.dir / "read-token"
+
+    def built(self, read_token_path=None):
+        path = str(self.read) if read_token_path is None else read_token_path
+        return GitLabForge("gitlab.com", str(self.token), read_token_path=path)
+
+    def test_no_read_token_path_is_no_credential(self):
+        built = GitLabForge("gitlab.com", str(self.token))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_missing_or_empty_file_is_no_credential(self):
+        # The Secret may lack the key: the operator's projection is optional,
+        # so the file is absent and the clone keeps today's behaviour.
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        for empty in ("", "\n", "  \n"):
+            with self.subTest(empty=empty):
+                self.read.write_text(empty)
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_malformed_read_token_is_no_credential(self):
+        # The git helper drops a token that is not one line of printable ASCII
+        # in silence; the forge refuses it first, by the same rule, so the
+        # broker's "presents none" warning names the key.
+        built = self.built()
+        for bad in ("glpat read\n", "\ufeffglpat-read\n", "glpat-read\nsecond-line\n"):
+            with self.subTest(bad=bad):
+                self.read.write_text(bad, encoding="utf-8")
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_bytes("glpat-read".encode("utf-16"))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_stored_read_token_is_presented_as_the_write_token_is_and_never_is_it(self):
+        self.read.write_text("glpat-read\n")
+        built = self.built()
+        first = built.read_credential("acme/notes")
+        self.assertIsInstance(first, providers.StaticFileCredential)
+        self.assertIsNot(first, built.read_credential("acme/notes"), "one object per clone")
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-read"}, first.headers("acme/notes"))
+        config = dict(first.git_config("acme/notes"))
+        self.assertEqual("", config["credential.helper"])
+        helper = config["credential.https://gitlab.com.helper"].split()
+        self.assertEqual([str(self.read), "oauth2"], helper[1:])
+        # The write credential is untouched by the read one existing.
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-write"}, built.credential.headers("acme/infra"))
+        self.assertEqual(
+            str(self.token),
+            dict(built.credential.git_config("acme/infra"))["credential.https://gitlab.com.helper"].split()[1],
+        )
+
+    def test_a_key_added_after_start_is_read_with_no_restart(self):
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_text("glpat-read")
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.StaticFileCredential)
+        self.read.unlink()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_read_token_path_git_may_not_be_handed_stops_the_build(self):
+        for bad in ("relative/read-token", "/t/../read-token", "/t/read token"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.built(bad)
+
+    def test_the_configuration_carries_the_read_token_path(self):
+        [built] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token),
+             "read_token_path": str(self.read), "allowed_paths": ()},
+        ]})
+        self.assertEqual(str(self.read), built.read_token_path)
+        [plain] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token), "allowed_paths": ()},
+        ]})
+        self.assertEqual("", plain.read_token_path)
+
+
 class ProposalTest(unittest.TestCase):
     def test_a_draft_is_a_title_prefix_and_never_doubled(self):
         # The `draft` field is accepted and ignored on create.
@@ -322,6 +407,99 @@ class ProposalTest(unittest.TestCase):
         self.assertIn("did not include the changes to huge.bin", diff)
         capped = Api(mr(), WorkspaceError("not ready", status=502, code="FORGE_UNAVAILABLE"), *([page] * GitLabForge.DIFF_PAGES))
         self.assertIn("diff cut short", forge().proposal_view(capped, "acme/infra", {"number": 1, "diff": True})["diff"])
+
+    def test_gitlab_16_diffs_are_read_without_per_page(self):
+        # Live test on GitLab CE 16.11: no `raw_diffs` (404), and `diffs`
+        # answers 500 to every request that sets `per_page`. The fallback asks
+        # again without it, and pages at the size GitLab chooses.
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(20)]
+        last = [{"old_path": "z", "new_path": "z", "diff": "@@ -1 +1 @@\n"}]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), page, last,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertEqual(
+            [{"per_page": 100, "page": 1}, {"page": 1}, {"page": 2}],
+            [call[2] for call in api.calls[2:]],
+        )
+        self.assertIn("diff --git a/f19 b/f19", diff)
+        self.assertIn("diff --git a/z b/z", diff)
+        self.assertNotIn("cut short", diff)
+
+    def test_a_failure_after_the_first_diff_page_is_not_retried(self):
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(100)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404), page,
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+        )
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+        self.assertEqual(4, len(api.calls))
+
+    def test_the_unsized_fallback_reads_the_same_number_of_pages(self):
+        # Review: up to 50 calls against one broker deadline. The unsized path
+        # reads at most DIFF_PAGES pages, and says how many files it showed.
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(30)]
+        pages = [[dict(item, new_path=f"p{n}-{item['new_path']}") for item in page]
+                 for n in range(GitLabForge.DIFF_PAGES)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), *pages,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertIn(f"only the first {GitLabForge.DIFF_PAGES * 30} files are shown", diff)
+        self.assertEqual(3 + GitLabForge.DIFF_PAGES, len(api.calls))
+
+    def test_the_unsized_fallback_takes_the_page_size_from_gitlab(self):
+        # Review: the page size without `per_page` is GitLab's choice (it
+        # can be 30, not 20). A full first page sets it; a shorter page ends.
+        first = [{"old_path": f"a{i}", "new_path": f"a{i}", "diff": "@@\n"} for i in range(30)]
+        second = [{"old_path": f"b{i}", "new_path": f"b{i}", "diff": "@@\n"} for i in range(29)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), first, second,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertIn("diff --git a/b28 b/b28", diff)
+        self.assertNotIn("cut short", diff)
+        self.assertEqual(5, len(api.calls))
+
+    def test_an_instance_that_ignores_page_gives_no_duplicates(self):
+        page = [{"old_path": f"f{i}", "new_path": f"f{i}", "diff": "@@\n"} for i in range(20)]
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"), page, page,
+        )
+        diff = forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})["diff"]
+        self.assertEqual(1, diff.count("diff --git a/f0 b/f0"))
+        self.assertEqual(5, len(api.calls))
+        # Review: the stop must say that files past the repeat are not shown.
+        self.assertIn("GitLab sent page 1 again when asked for page 2", diff)
+        self.assertIn("files after the first 20, if any, are not shown", diff)
+
+    def test_a_first_diff_page_refused_by_the_broker_is_not_retried(self):
+        # The broker's own refusals (a ceiling, a deadline) are 502 too, but
+        # not FORGE_UNAVAILABLE; asking again would fetch the same answer.
+        for code in ("FORGE_RESPONSE_TOO_LARGE", "FORGE_CALL_FAILED"):
+            with self.subTest(code=code):
+                api = Api(
+                    mr(), WorkspaceError("no route", status=404),
+                    WorkspaceError("refused", status=502, code=code),
+                )
+                with self.assertRaises(WorkspaceError):
+                    forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+                self.assertEqual(3, len(api.calls))
+
+    def test_a_retry_without_per_page_that_fails_is_not_tried_again(self):
+        api = Api(
+            mr(), WorkspaceError("no route", status=404),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+            WorkspaceError("500", status=502, code="FORGE_UNAVAILABLE"),
+        )
+        with self.assertRaises(WorkspaceError):
+            forge().proposal_view(api, "acme/infra", {"number": 1, "diff": True})
+        self.assertEqual(4, len(api.calls))
 
     def test_an_update_that_changes_nothing_reads_instead_of_writing(self):
         # GitLab answers 400 for an update with no parameters.

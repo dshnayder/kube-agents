@@ -167,6 +167,14 @@ NO_REPOS_HEADING = "## No managed repositories configured"
 EXIT_OK = 0
 EXIT_PARTIAL = 1
 EXIT_USAGE = 2
+# The version report marks a `--cluster` run under this key with the specs it
+# was narrowed to (`null` on a full run). Such a file is refused as `--versions`:
+# its lowest control-plane minor is one cluster's, not the fleet's, and a floor
+# read from it drops every removal the clusters it left out still serve.
+REPORT_NARROWED_KEY = "narrowed_to"
+# The remedy names the one change that works: `--current-version` beside
+# `--versions` is refused before the file is opened, so the flag replaces it.
+NARROWED_VERSIONS_FORMAT = "--versions {path}: the report was narrowed by --cluster to {specs}, so its floor is one cluster's and not the fleet's; rerun fleet_upgrade_report.py without --cluster, or replace --versions with --current-version <version>"
 
 
 Version = tuple[int, int]
@@ -752,7 +760,8 @@ def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Ca
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Kubernetes API removals between the fleet's current version and a target, read from GitOps manifests."
+        description="Kubernetes API removals between the fleet's current version and a target, read from GitOps manifests.",
+        allow_abbrev=False,
     )
     parser.add_argument("--target-version", help="Target GKE version, e.g. 1.27.3-gke.100 or 1.27. Defaults to the --versions file's target_version.")
     parser.add_argument("--versions", help="fleet_upgrade_report.py --output JSON; the floor is its lowest control-plane minor.")
@@ -782,6 +791,17 @@ def main(argv: list[str] | None = None) -> int:
                 fleet = json.load(f)
         except (OSError, ValueError) as e:
             sys.stderr.write(f"--versions {args.versions}: {e}\n")
+            return EXIT_USAGE
+        narrowed_to = fleet.get(REPORT_NARROWED_KEY) if isinstance(fleet, dict) else None
+        # The reporter writes a list of specs or null, and `--versions` is any
+        # file the operator points at. Null is a full run; a non-empty list is
+        # the reporter's mark; anything else is not a full run's file either
+        # and is refused the same way, with the value as written rather than
+        # iterated (a bool or a number would raise, a string would be spelled
+        # out letter by letter).
+        if narrowed_to is not None and (not isinstance(narrowed_to, list) or narrowed_to):
+            specs = ", ".join(str(s) for s in narrowed_to) if isinstance(narrowed_to, list) else json.dumps(narrowed_to)
+            sys.stderr.write(NARROWED_VERSIONS_FORMAT.format(path=args.versions, specs=specs) + "\n")
             return EXIT_USAGE
         members = members_from_fleet_json(fleet if isinstance(fleet, dict) else {})
         fleet_target = fleet.get("target_version") if isinstance(fleet, dict) else None

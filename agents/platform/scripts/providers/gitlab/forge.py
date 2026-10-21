@@ -9,7 +9,9 @@ project access token, or, on gitlab.com's Free tier where those do not exist,
 a personal access token of an account that exists for this install. The
 mechanism is the same for all three; what differs is how far the token
 reaches, which is why `allowed_paths` is enforced here before a credential is
-spent and the broker's managed list is enforced before that.
+spent and the broker's managed list is enforced before that. A second,
+read-only token in the same Secret, when there is one, is what a context
+repository clones with (`read_credential`).
 
 What GitLab's API does differently from the shapes every caller expects, and
 where it is absorbed:
@@ -34,7 +36,7 @@ from urllib.parse import quote
 import repo_ref
 
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
-from ..credentials import StaticFileCredential
+from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
@@ -58,6 +60,9 @@ DEVELOPER_ACCESS = 30
 #: The username git is given beside the token. GitLab reads the token and
 #: accepts any non-empty username for an access token over HTTPS.
 GIT_USERNAME = "oauth2"
+
+#: The header GitLab's API reads an access token from.
+TOKEN_HEADER = "PRIVATE-TOKEN"
 
 #: The colour a label is created with when the caller names none. GitLab
 #: requires one; GitHub picks one itself.
@@ -119,18 +124,34 @@ class GitLabForge(Forge):
     )
 
     def __init__(
-        self, host: str, token_path: str, allowed_paths: Iterable[str] = ()
+        self,
+        host: str,
+        token_path: str,
+        allowed_paths: Iterable[str] = (),
+        ca_file: str = "",
+        ca_source: str = "",
+        read_token_path: str = "",
     ) -> None:
         super().__init__()
+        # gitlab.com presents a certificate the public CAs sign, and a private
+        # CA must never vouch for it: the operator refuses caBundleRef there,
+        # and a configuration written another way is refused here too.
+        if ca_file and host in self.default_hosts + ("www.gitlab.com",):
+            raise ValueError(f"the {self.name} forge at {host} names a caFile; only a self-managed host may")
+        self.ca_file = ca_file
+        self.ca_source = ca_source
         # gitlab.com answers on `www.` too, and the operator folds that
         # spelling onto gitlab.com, so a URL written with it resolves here.
         # The canonical host stays first: clone URLs and managed-list keys
         # are built from it.
         self.hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
         self.api_url = f"https://{host}/api/v4"
-        self.credential = StaticFileCredential(
-            token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME
-        )
+        self.credential = self._stored(token_path)
+        self.read_token_path = read_token_path
+        if read_token_path:
+            # Built once here, so a path git may not be handed stops the build
+            # as a bad tokenPath does, and not the first context clone.
+            self._stored(read_token_path)
         prefixes = []
         for path in allowed_paths:
             trimmed = path.strip("/")
@@ -144,6 +165,12 @@ class GitLabForge(Forge):
                 )
             prefixes.append(self._prefix(host, path, trimmed))
         self.allowed_paths = tuple(prefixes)
+
+    def _stored(self, token_path: str) -> StaticFileCredential:
+        """A token file on this host, as git and the API are handed it."""
+        return StaticFileCredential(
+            token_path, self.hosts[0], header=TOKEN_HEADER, username=GIT_USERNAME
+        )
 
     @staticmethod
     def _prefix(host: str, path: str, trimmed: str) -> tuple[str, ...]:
@@ -209,8 +236,37 @@ class GitLabForge(Forge):
                     f"the {cls.name} forge at {entry.get('host')} names no allowedPaths: "
                     "list the namespaces it may reach, or [] for the whole host"
                 )
-            built.append(cls(entry["host"], token_path, allowed))
+            built.append(
+                cls(
+                    entry["host"],
+                    token_path,
+                    allowed,
+                    str(entry.get("ca_file") or ""),
+                    str(entry.get("ca_source") or ""),
+                    str(entry.get("read_token_path") or ""),
+                )
+            )
         return tuple(built)
+
+    def read_credential(self, repo: str) -> Credential:
+        """The read-only token stored beside the write one, for one clone.
+
+        The optional key `read-token` in the forge's credentials Secret, which
+        the operator projects next to `token`. The file is checked on each
+        call: a Secret without the key mounts no file, and a key added later
+        appears with no restart. With no file, an empty one, or one that
+        does not hold a token, there is nothing to present, and a context repository clones with no
+        credential, as it did before the key existed. Never the write token:
+        `credential` is a different file.
+        """
+        if not self.read_token_path:
+            return NoCredential()
+        credential = self._stored(self.read_token_path)
+        # The credential's own rule, the one the git helper applies: a token
+        # with a space, a byte-order mark or a second line is no token.
+        if not credential.holds_token():
+            return NoCredential()
+        return credential
 
     #: How many pages of the token account's projects `reach` reads: enough
     #: for an account that belongs to a thousand projects, which is already the
@@ -511,6 +567,15 @@ class GitLabForge(Forge):
         The fallback is paged, and it says so in the diff when it stops early
         or when GitLab left a file's hunks out: an omission the caller cannot
         see reads as a file the change did not touch.
+
+        On GitLab 16.11, `raw_diffs` answers 404, and `diffs` answers 500 to
+        every request that sets `per_page`. When the first page answers 5xx
+        with `per_page`, the fallback asks again without it. The page size is
+        then GitLab's choice, so the fallback does not assume one. It stops at
+        an empty page, at a page shorter than the first one, or at a page that
+        repeats the previous one. It reads at most `DIFF_PAGES` pages that way,
+        as it does with `per_page`, so the number of calls stays the same, and
+        the diff says so when it stops early.
         """
         try:
             return api("GET", f"{base}/raw_diffs", raw="text/plain")
@@ -523,10 +588,39 @@ class GitLabForge(Forge):
                 raise
         out: list[str] = []
         size = 0
+        shown = 0
+        sized = True
+        page_size = MAX_PAGE_SIZE
+        previous: list[str] = []
         for page in range(1, self.DIFF_PAGES + 1):
-            files = api(
-                "GET", f"{base}/diffs", params={"per_page": MAX_PAGE_SIZE, "page": page}
-            ) or []
+            params = {"per_page": MAX_PAGE_SIZE, "page": page} if sized else {"page": page}
+            try:
+                files = api("GET", f"{base}/diffs", params=params) or []
+            except WorkspaceError as exc:
+                # GitLab 16.11 answers 500 when `per_page` is set. Only on the
+                # first page, and only for GitLab's own 5xx: a later page that
+                # fails is a real failure, and so is a 404.
+                if not (sized and page == 1 and exc.fields.get("code") == FORGE_UNAVAILABLE):
+                    raise
+                sized = False
+                files = api("GET", f"{base}/diffs", params={"page": page}) or []
+                # GitLab chooses the page size, so the first page sets it. A
+                # later page that is shorter, or empty, is the last page. An
+                # empty first page returns below.
+                page_size = len(files)
+            paths = [str(item.get("new_path") or "") for item in files]
+            if not files:
+                return "".join(out)
+            if not sized and paths == previous:
+                # An instance that ignored `page` and sent the same page
+                # again. Files past it, if any, cannot be read, so say so.
+                out.append(
+                    f"# diff may be cut short: GitLab sent page {page - 1} again when asked "
+                    f"for page {page}, so files after the first {shown}, if any, are not shown\n"
+                )
+                return "".join(out)
+            previous = paths
+            shown += len(files)
             for item in files:
                 old, new = item.get("old_path") or "", item.get("new_path") or ""
                 out.append(f"diff --git a/{old} b/{new}\n")
@@ -542,11 +636,9 @@ class GitLabForge(Forge):
                     f"# diff cut short: stopped after {size} characters of changes\n"
                 )
                 return "".join(out)
-            if len(files) < MAX_PAGE_SIZE:
+            if len(files) < page_size:
                 return "".join(out)
-        out.append(
-            f"# diff cut short: only the first {self.DIFF_PAGES * MAX_PAGE_SIZE} files are shown\n"
-        )
+        out.append(f"# diff cut short: only the first {shown} files are shown\n")
         return "".join(out)
 
     def proposal_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:

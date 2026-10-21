@@ -108,6 +108,25 @@ __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
 
+#: The harness's transport switch and its inject value
+#: (``harness.TRANSPORT_INJECT``; not imported, which would drag the harness's
+#: dependencies in here -- ``test_gate.py`` asserts they agree).
+AGENT_TRANSPORT_ENV = "AGENT_TRANSPORT"
+TRANSPORT_INJECT = "inject"
+
+#: Rung 6 off on the inject lane, said on every case it would have compared.
+#: Main's judged record is the today-mode nightly's over the api transport,
+#: filed at a version key that carries neither the mode nor the transport, so
+#: comparing an inject run's judged mean with it measures the transport and
+#: the mode, not the pull request: the next lane redded on rung 6 on four
+#: admitted cases at once on 2026-10-17 with nothing changed on its side.
+#: Back on when the key carries the mode (bench/baselines/README.md).
+JUDGED_OFF_ON_INJECT_NOTE = (
+    "rung 6 not compared on the inject lane: main's judged record is the api "
+    "transport's under spec.mode today, and the version key carries neither, "
+    "so the comparison would measure the lane rather than this change"
+)
+
 #: What ``suite`` exits when the run could not be evaluated (see the module
 #: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
 #: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
@@ -162,6 +181,13 @@ RECORD_CELL_UNKNOWN = "--"
 # the grader's reason; the collector (scripts/eval_dashboard/collect.py)
 # caps at the same figure, so the two never disagree about the cut.
 REPORT_EXCERPT_MAX_CHARS = 300
+# The keys of the `rep N timing:` line. The collector
+# (scripts/eval_dashboard/collect.py, _REP_TIMING_KEYS) parses the same two.
+REP_TIMING_AGENT_KEY = "agent_s"
+REP_TIMING_TURN1_KEY = "turn1_s"
+# The line's precision. A value that rounds to zero at it is left out, as the
+# collector reads `0.0` as unknown.
+REP_TIMING_DECIMALS = 1
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
 # kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
@@ -415,16 +441,21 @@ def _cmd_case(args: argparse.Namespace) -> int:
     # measured on main, which is what the rung asks for.
     evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
     baseline_judged = evidence.judged_means if evidence else None
+    # Main's mean is still reported in the payload below; it only stops
+    # being the comparator (JUDGED_OFF_ON_INJECT_NOTE).
+    judged_off = bool(baseline_judged) and os.environ.get(AGENT_TRANSPORT_ENV, "") == TRANSPORT_INJECT
 
     verdict = grade_case(
         spec,
         list(run_dirs),
         admitted=admitted,
         correctness_floor=args.correctness_floor,
-        baseline_judged=baseline_judged,
+        baseline_judged=None if judged_off else baseline_judged,
         judged_margin=args.judged_margin,
         judged_metrics=_judged_metrics(),
     )
+    if judged_off:
+        verdict.notes.append(JUDGED_OFF_ON_INJECT_NOTE)
 
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
@@ -454,6 +485,16 @@ def _cmd_case(args: argparse.Namespace) -> int:
     for rep in verdict.reps:
         judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
         print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
+        # The agent run's wall clock and its opening chat turn, for the
+        # dashboard's latency rollup. A missing value is left out, and no
+        # line at all when both are. `rep N timing:` does not match `rep N:`.
+        timing = " ".join(
+            f"{key}={value:.{REP_TIMING_DECIMALS}f}"
+            for key, value in ((REP_TIMING_AGENT_KEY, rep.latency), (REP_TIMING_TURN1_KEY, rep.turn1_s))
+            if value is not None and round(value, REP_TIMING_DECIMALS) > 0
+        )
+        if timing:
+            print(f"  rep {rep.index} timing: {timing}")
         # The agent's own words, one line under the grading line of every
         # repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty

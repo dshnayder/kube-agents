@@ -85,7 +85,7 @@ it. An agent should read all of it.
 | [1. Why](#1-why)                                                | the customer requirement, where GitHub is named today, and the shape of the answer — **stop here if that is what you came for** |
 | [2. The concepts](#2-the-concepts)                              | what the systems call things, which words the verbs use, and how a repository is named                                          |
 | [3. The seam](#3-the-seam)                                      | the broker, the bundle transport, the sandbox’s one git, the routes and the error contract                                      |
-| [4. The provider interface](#4-the-provider-interface)          | what a provider supplies, and the decisions a second forge forces                                                               |
+| [4. The provider interface](#4-the-provider-interface)          | what a provider supplies, the decisions a second forge forces, and GitHub Enterprise Server as a declared host                  |
 | [5. Modularity](#5-modularity)                                  | the package layout, and what makes the boundary hold at the third forge                                                         |
 | [6. The declarative surface](#6-the-declarative-surface)        | how an install says which provider it uses                                                                                      |
 | [7. GitLab](#7-gitlab)                                          | the worked example: identity, credential, translation, errors                                                                   |
@@ -108,7 +108,9 @@ question about the tree at the time, not about the design.
 GitLab and Bitbucket are the two required in the short term, and the list being
 open is what shapes the design rather than the two names on it. Self-hosted
 GitLab and Gerrit come up often enough that a design which handles three by
-enumeration and a fourth by rewrite is the wrong design.
+enumeration and a fourth by rewrite is the wrong design. GitHub Enterprise
+Server comes up too. It is not a new forge: it is the `github` provider at a
+host the install declares ([GitHub Enterprise Server](#github-enterprise-server)).
 
 That demand is the whole reason the work exists. It is worth being explicit that
 nothing else is: this is not a response to a deficiency in how repositories are
@@ -238,8 +240,8 @@ reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
 pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
-each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
-the list names, so a repository's name does not change when a second forge is added and the names
+each entry the way the verbs take it. A github.com entry is its bare `owner/name` however many forges
+the list names (an entry on a GitHub Enterprise Server is `<host>/owner/name`, as another forge's is), so a repository's name does not change when a second forge is added and the names
 already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
 canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
@@ -406,7 +408,8 @@ sidecar validates across a trust boundary and must not pull in a module that she
 - `CleanRepoSlugWithOrg` in the operator was the Go one. It is now a deprecated wrapper over the
   GitHub provider's resolution: `repo_ref.go` parses the value with its host kept, and the
   provider refuses any host that is not one of its spellings — `github.com`, `www.github.com`,
-  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
+  `ssh.github.com` — or the forge's declared GitHub Enterprise Server host, before its
+  two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
   the admission path, goes through the same `Resolve`, so it and normalisation are still one
   rule, now a provider's.
 
@@ -972,7 +975,7 @@ Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
-`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED`, `FORGE_TLS_UNTRUSTED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -990,7 +993,11 @@ ones, an unthrottled 403 is `FORGE_FORBIDDEN` and says retrying will not change
 the answer, 404 `FORGE_NOT_FOUND` says that a private repository this install
 cannot see answers the same way so absence is not proven, 422 `FORGE_REJECTED`
 says to fix a field rather than repeat the call, and 5xx is 503
-`FORGE_UNAVAILABLE` and says to retry the same call unchanged. Everything
+`FORGE_UNAVAILABLE` and says to retry the same call unchanged. A TLS
+certificate that does not verify is 502 `FORGE_TLS_UNTRUSTED` and says that no
+retry fixes it; its text names the cause (an untrusted chain, an expired
+certificate, a wrong name, or a CA bundle that is not mounted or not
+loadable). Everything
 unrecognised is still 502 `FORGE_CALL_FAILED`.
 
 The table above is shared, and keying it on the status alone is _nearly_
@@ -1464,10 +1471,11 @@ the cost side:
   property that quietly stops being true when the transport changes.
 
 In exchange the token never enters an argv, an environment variable, or a child
-process at all. That is strictly better than `gh`, and it is worth noting that
-migrating `GitHubForge` onto `HttpTransport` later becomes a small change once
-the App token is available to the broker directly — not proposed here, but the
-shape does not foreclose it.
+process at all. That is strictly better than `gh`. A `GitHubForge` at a GitHub
+Enterprise Server host already uses `HttpTransport`, with the App token minted
+into the broker's memory ([GitHub Enterprise Server](#github-enterprise-server)).
+The github.com forge keeps `gh`; moving it onto `HttpTransport` too is now a
+small change, and it is not proposed here.
 
 ### One package, many hosts
 
@@ -1486,8 +1494,9 @@ def build_forges(config: ForgeConfig) -> tuple[Forge, ...]
 ```
 
 `GitHubForge` yields one instance when no forge configuration is mounted, or
-when the configuration names a `github` forge, and none otherwise; a configured
-host it does not serve is refused. `GitLabForge` yields
+when the configuration names a `github` forge, and none otherwise. Its host is
+github.com, or the one GitHub Enterprise Server host the configuration names; a
+configuration that names two GitHub hosts is refused. `GitLabForge` yields
 one per configured host, and none when none is configured — in which case
 `gitlab.com` resolves to the `StubForge`, so an install that has not set GitLab
 up gets a named refusal rather than a confusing authentication failure. The host
@@ -1511,6 +1520,130 @@ when there are several), and an in-cluster GitLab
 reached as `gitlab` with no scheme is read as a repository named `gitlab` until
 the configured host joins the parser's known set. Registering it there is part
 of wiring the provider up; the misreading is otherwise silent and confusing.
+
+### GitHub Enterprise Server
+
+**Why.** Some customers keep their repositories on GitHub Enterprise Server, a
+GitHub instance they run at their own hostname, often behind a private CA. It
+serves the same REST API as github.com, under `https://<host>/api/v3`, and the
+same GitHub App installation tokens. So it is not a new forge. It is the
+`github` provider at a host the install declares, with the same verbs, the same
+translation and the same recordings in the contract test.
+
+**One GitHub host per install.** An install has one GitHub App and one token
+minter, and the minter mints for one GitHub host. So an install serves
+github.com or one GitHub Enterprise Server, never both. The operator refuses a
+second GitHub forge at another host, and it refuses one host that two providers
+claim. Two GitHub forges at one host are still allowed: they name two
+organisations, as they always could. The first GitHub forge declared decides
+the host. While that forge's host can be read, the forge holds the host even
+when another of its fields is refused: the gitops-state key, the broker's
+configuration and the egress all stay on the host, and a later GitHub forge at
+another host stays refused, so a typo cannot move the install. A change of the
+declaration that moves the host
+writes a `GitHubHostChanged` Warning Event on the PlatformAgent, because the
+repositories registered on the old host are then no longer served.
+
+**The host.** A GitHub forge's `host` may be a GitHub Enterprise Server
+hostname. A spelling of github.com folds to github.com. A host at or under a
+domain where GitHub runs its own services is refused, because it is not an
+instance the customer runs: github.com and its subdomains,
+githubusercontent.com, githubassets.com, githubapp.com, github.io, github.dev,
+and ghe.com (GitHub Enterprise Cloud with data residency, which GitHub runs).
+GitLab refuses the same domains. A repository on the forge names the declared
+host or no host. The operator seeds it into the state ConfigMap by its full URL,
+`https://<host>/owner/name`, and the broker keys it `github:<host>/owner/name`,
+so an entry for github.com never admits a repository on the instance, and the
+reverse. On such an install, the agent and the minter's policy sync both skip a
+GitHub entry that names github.com or no host.
+
+**The provider is named.** A forge at a host other than github.com must name
+its `provider`. The CRD stores no default; an omitted provider reads as github,
+and only at github.com. A forge written for a GitLab instance
+without a provider would otherwise be read as a GitHub Enterprise Server and be
+handed a GitHub token.
+
+**The credential.** The token is a GitHub App installation token, minted by the
+minter as on github.com. What changes is where the broker keeps it:
+
+- On github.com, the token goes into the `gh` CLI's store, and a credential
+  helper that the CLI installs gives it to git (`BrokeredCredential`).
+- On a GitHub Enterprise Server, nothing is installed. The broker runs the
+  minter helper in print mode. The helper prints the token and the repositories
+  it covers, and the broker keeps the token in its memory
+  (`MintedWriteCredential`). The API client sends it as an `Authorization`
+  header. git gets it as `http.https://<host>/.extraheader` on that host only,
+  in the configuration of the one git invocation that spends it, with
+  `credential.helper` cleared. A 401 from the instance, on an API call or a
+  git push, drops the cached token, so a reinstalled App or a revoked token is
+  replaced on the next call. The token is in the environment of the one git
+  process that spends it (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's
+  store or the sandbox, as the read token is. The broker uses one token again for 30 minutes for
+  each repository it covers, and it checks the managed list on every request.
+- A context repository gets a read-only token for each clone, as on github.com.
+
+**The transport.** The forge uses `HttpTransport` at `https://<host>/api/v3`, so
+the broker runs no `gh` for it, and an install with only a GitHub Enterprise
+Server gets no `gh` in the broker's executable allowlist.
+
+**The broker's own login.** The ownership checks (an `advance` onto a branch, a
+`branch-delete`) compare a proposal's author with the credential's own login. An
+installation token cannot read `GET /user`, which answers it with 403, so the
+forge asks GraphQL `viewer { login }` at `https://<host>/api/graphql`, which
+answers an installation with its App's bot login. That is the query `gh auth
+status` makes on github.com. A login that does not come back is a refusal, not
+an empty answer: an empty login would drop the ownership checks.
+
+**Redirects.** Every git invocation a minted token rides on the instance sets
+`http.https://<host>/.followRedirects=false`, with or without a CA bundle, so a
+redirect never carries the token to another host. github.com keeps git's own
+redirect handling, so a repository renamed there still clones.
+
+**A private CA.** A GitHub Enterprise Server behind a private CA names it in
+`caBundleRef`, as a self-managed GitLab does
+([A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca)).
+The broker trusts the CA for that host only, in its API client and in git.
+
+**The minter.** The token minter mints on the instance: the chart reads the
+GitHub forge and sets the minter's `SOURCE_SYSTEM_API_BASE_URL` to
+`https://<host>/api/v3`, the root it composes its App routes under in place of
+`api.github.com`. The minter reaches the instance to mint, so it needs the CA
+too. It is a Go program on the default HTTP transport, which reads the system
+roots: the bundle in its image, and each certificate file in the directories
+`SSL_CERT_DIR` names. So the chart mounts the forge's `caBundleRef` key into
+the minter's pod and points `SSL_CERT_DIR` at it. The minter's client trusts
+the configured CA for all of its outbound calls, beside the image's bundle.
+The CA is one that the customer trusts and installs. No `githubMinter.*` value
+repeats the host or the CA: the forge declaration is the one place both are
+set.
+
+**The agent side.** The managed list names a GitHub Enterprise Server
+repository `<host>/owner/name`, as it names another forge's repository. A bare
+`owner/name` is github.com's everywhere a link or a CLI call is built from it,
+so a name with its host is what keeps the links right. The links that the
+scripts build from a repository use the host in the name: the fleet-audit
+ledger, the audit headline and the opened-pull-request message. The install's
+GitHub host is the `github_host` key of the gitops-state ConfigMap. The
+operator writes the key only for a GitHub Enterprise Server host, so a
+github.com install has no key and reads as github.com. The host is never read
+from a repository entry: the lists are administrator-writable, and one entry
+added by hand must not move the host that every refresh and publish goes to. A
+GitHub entry on any other host is skipped with a warning.
+
+**What it does not include.**
+
+- **github.com and a GitHub Enterprise Server in one install.** There is one
+  minter, so this needs a second minter, which is a second design.
+- **GitHub Enterprise Cloud.** github.com organisations on Enterprise Cloud are
+  github.com. Enterprise Cloud with data residency (`<name>.ghe.com`) is refused
+  as a host; it has its own API host and needs a check of its own.
+- **A port.** The broker reads a forge on the standard HTTPS port only, as for
+  GitLab.
+- **A renamed repository.** GitHub answers a renamed repository with a
+  redirect to its new name. The API client refuses every redirect, and git on
+  a GitHub Enterprise Server host follows none, so an API call on the old name fails
+  with `FORGE_REDIRECTED` and a clone on it fails. Declare the repository by
+  its new name.
 
 ### Where the error contract splits
 
@@ -2416,6 +2549,11 @@ Four endpoints need naming because they are not a rename of GitHub's:
   raw diff as too large or too slow, which would fetch the same diff again; and
   it stops, saying so, once the assembled diff passes the broker's default
   response ceiling, since each page being under it does not bound ten of them.
+  On GitLab 16.11, `/diffs` answers 500 to a request that sets `per_page`. When
+  the first page answers 5xx, the fallback asks once more without `per_page`.
+  GitLab then chooses the page size, so the fallback stops at an empty page, a
+  page shorter than the first, or a page that repeats the previous one, and it
+  reads no more pages than before.
 - **Proposal creation** posts `source_branch`, `target_branch`, `title`,
   `description` to `/merge_requests`. The `draft` field is accepted and ignored
   on creation; a `Draft:` title prefix is what GitLab reads, so a draft proposal
@@ -2434,6 +2572,83 @@ Four endpoints need naming because they are not a rename of GitHub's:
 
 All four are named because getting them wrong is a working-looking module that
 silently drops a field, which is worse than an unimplemented verb.
+
+### A self-managed instance behind a private CA
+
+A self-managed instance often has a TLS certificate that a private CA signed.
+The broker's two clients do not trust that CA by default:
+
+- The client for the forge API uses Python's default trust store, which is the
+  image's system bundle.
+- git in the broker is built on GnuTLS. It ignores `SSL_CERT_FILE`, so a process
+  variable cannot give it the CA.
+
+The forge declaration therefore names the CA: `caBundleRef`, a Secret key in the
+agent's namespace. A CA certificate is public, but its integrity matters: whoever
+can change it chooses which servers the broker presents the forge's token to,
+and the broker relaxes strict X.509 for that host. In a Secret, changing the CA
+needs the same rights as changing the token Secret beside it. A ConfigMap would
+make the token's trust boundary the wider of the two, because many clusters
+grant ConfigMap write more widely than Secret write. The agent's own
+ServiceAccounts can only read ConfigMaps, so this is about people and
+automation, not the agent. The operator mounts the key into the broker's pod
+only, as it mounts the token, and the
+forge's entry in the broker configuration names the file (`caFile`). The
+agent's pod and the shell sandbox get nothing.
+
+A private CA must never vouch for github.com or gitlab.com, so a forge at the
+provider's public host (github.com or gitlab.com in any spelling, or an empty
+host) refuses `caBundleRef`.
+For the other forges, the broker trusts the CA for that forge's host and for no
+other host:
+
+- The API client builds one TLS context for the forge: the system bundle plus the
+  CA file. Other forges keep the default context.
+- git gets `http.https://<host>/.sslCAInfo=<caFile>` in the configuration layer
+  that the broker forces on every git it runs. git matches the key's URL against
+  the remote's URL, so the CA applies to that host only. The pin is in the forced
+  layer, not in the credential's configuration, because a context repository on
+  such a forge is cloned with no credential and still needs the CA. With the
+  broker image's git (libcurl with GnuTLS), the file is trusted beside the
+  system bundle, as the API client's context is, not in place of it.
+- git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
+  file across a redirect, so a redirect would carry the CA to another host.
+  GitLab answers a moved project in the git protocol itself, and its clone URLs
+  end in `.git`, so its git traffic needs no redirect. GitHub Enterprise Server
+  redirects a renamed repository to its new name. That redirect is refused too,
+  so a renamed repository is declared by its new name; the CA and the token
+  never follow a redirect to another host.
+
+Python 3.13 turns on strict X.509 checks in its default context. These checks
+refuse a CA certificate with no Key Usage extension, and a server certificate
+with no Authority Key Identifier. Many private CAs issue such certificates. The
+context for a forge that names its own CA turns the strict checks off, and logs
+this once. The chain and the hostname are still verified, and every other host
+keeps the strict checks. The administrator chose to trust this CA for this host,
+and a refusal of a common CA profile would only make the feature fail.
+
+The mount is optional, as the token's is: a missing Secret does not stop the
+broker. Each call to the forge then fails with `FORGE_TLS_UNTRUSTED`, from both
+clients, and the detail names what to create: "the Secret <name> or its key
+<key> is missing". A wrong key looks the same as a missing Secret, so the
+detail names both. The forge's broker entry carries the two names for this.
+
+A Secret key that holds no usable PEM certificate gets its own answer from
+both clients: the CA file could not be loaded (not PEM, or no certificate in
+it). git words a missing CA file and a malformed one alike, so the broker tells
+the two apart by whether the forge's file exists. A file with no certificate
+in it at all loads as an empty CA list in git, and git then reports an
+untrusted chain.
+
+The broker reads the file on each call, so an update of the Secret reaches
+the broker with no restart.
+
+Both providers accept `caBundleRef` at a self-managed host: a self-managed
+GitLab, or a GitHub Enterprise Server. A provider that reads no CA bundle would
+refuse the field, because a CA that nothing reads would hide a certificate
+problem from the administrator who set it. On a GitHub Enterprise Server the
+token minter reads the same CA too: see
+[GitHub Enterprise Server](#github-enterprise-server).
 
 ### GitLab in the content workspace
 
@@ -2459,14 +2674,21 @@ What a clone presents follows the forge's credential:
   presents nothing, as on GitHub.
 
 **A context repository never receives the write token.** It gets the forge's
-read-only credential when the forge offers one, and GitLab's stored token has no
-read-only variant here, so a GitLab context repository is cloned with no
-credential. That reads a public project and refuses a private one at the clone,
-with a log line saying why. A read-only GitLab token for context repositories
-would lift that: a second Secret and a second `Credential`, with nothing here
-depending on its absence. The write gate is unchanged: `commit` and `push`
-resolve the repository's own forge and refuse anything that forge's managed list
-does not hold.
+read-only credential when the forge offers one. On GitLab that is a second stored
+token, under the optional key `read-token` in the Secret the forge's
+`credentialsRef` already names. There is no new field, and "one forge per host"
+stays. The operator projects the key, when present, beside `token`, and names
+the file to the broker as `readTokenPath`. `read_credential` checks the file on
+each call and returns a `StaticFileCredential` on it, with the same host, header
+and username as the write credential. With no path, no file, an unreadable or empty one,
+or one that does not hold one line of printable ASCII (the rule the git helper applies), it
+returns `NoCredential`, and the clone presents nothing. That reads a public project and
+refuses a private one at the clone, with a log line saying why. The
+recommended token is a project or group access token with the Reporter role and
+only the `read_repository` scope. The write gate is unchanged: `commit`, `push`,
+the API routes and the refresh route resolve the repository's own forge, refuse
+anything that forge's managed list does not hold, and present only the write
+credential.
 
 ### GitLab errors
 
@@ -2483,22 +2705,29 @@ whose fields it validated and refused — is not. Two specifics:
   answers 404, so this does not prove the thing does not exist" — which is the
   clearest evidence that keeping the table forge-neutral was worth it: GitLab
   needs two overrides, for 401 and 400, and not this one.
+- **A certificate that does not verify is not a forge error.** Both clients
+  answer it with `FORGE_TLS_UNTRUSTED` (502), which names the host and the
+  verifier's reason. The shared fallback, `FORGE_CALL_FAILED`, says that one
+  retry is reasonable, and no retry fixes a certificate. The text names the
+  cause, because each one needs a different action: a chain that does not reach
+  a trusted CA (`caBundleRef` for a self-managed forge; for a public host, a
+  TLS-inspecting proxy), an expired or not yet valid certificate (renew it), a
+  certificate for another name (fix the certificate or the host), a CA bundle
+  that is not mounted (create the Secret), and a CA bundle that is not PEM
+  or holds no certificate (correct the Secret). One code serves all five,
+  because the caller does the same in each case: it stops and reports. Lines
+  that git prints from the server (`remote: ...`) are never read as a verdict.
 
 ### What GitLab does not include
 
 Deliberately, and each of these should be a named refusal rather than a
 surprise:
 
-- **Self-managed instances behind a private CA.** The token and the API are the
-  same; what differs is trust of the TLS chain. `HttpTransport` uses the
-  container's CA bundle and nothing mounts a custom one, so a self-signed
-  instance fails to connect — and that failure is the design behaving as
-  specified rather than a gap. Any instance this is exercised against has to
-  carry a certificate the sandbox image already trusts, or have TLS terminated
-  by something that does. The refusal names itself — "the forge's TLS
-  certificate failed verification by this image", followed by the verifier's
-  own reason, such as an unknown issuer, a hostname mismatch or an expired
-  certificate — rather than reading as a call to retry.
+- **A private CA for gitlab.com.** gitlab.com presents a certificate that the
+  public CAs sign, and a private CA must never vouch for it, so its forge
+  refuses `caBundleRef`. A self-managed instance behind a private CA is
+  supported: see
+  [A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca).
 - **GitLab groups as an issue tracker.** Group-level issues and epics are a
   different endpoint namespace. `issue_*` is project-scoped, matching the
   neutral concept.
@@ -2532,9 +2761,9 @@ guardrails in
 **An MCP server in the sandbox would hold a token.** MCP servers are spawned as child processes of
 the agent container. A `GITLAB_TOKEN` in that process's environment is precisely what
 `credential-isolation-design.md` guarantees against. The two remote MCP servers that ship today are
-not a counterexample: they authenticate with a forked `mcp-remote` that mints Google ADC tokens per
-call, and ADC is ambient to the pod rather than injected as a secret. A forge PAT has no ambient
-equivalent.
+not a counterexample: their `mcp-remote` presents the gateway's projected ServiceAccount token to
+the credential proxy, which holds the Google credential, so nothing is injected as a secret. A forge
+PAT has no such broker-held equivalent unless the proxy relays the forge's MCP server the same way.
 
 The second is answered by running the MCP server in the broker's pod rather than the sandbox's,
 with the agent reaching it over the same authenticated Service and the server attaching the token —
@@ -2759,7 +2988,7 @@ been added to it, so until they are, an install approaching its token quota is
 visible in the broker's logs and, by status code alone, as `429`s under
 `endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
 family every forge verb travels (`/v1/forge` reaches only the credential
-refresh, which spends no quota). The refusal is also thinner than it could
+refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status}` names the failing verb, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried
@@ -2828,8 +3057,11 @@ cannot be obtained falls back to the credential-less clone, with the ambient
 helper cleared in that same layer so the write token is never tried in its
 place. On GitHub it is a `contents: read` App installation token minted from the
 repository's own minter policy, which the operator renders per context
-repository; a forge without a read-only credential answers `NoCredential` and
-the clone proceeds as before.
+repository. On GitLab it is the stored `read-token` beside the write token
+(§7, "GitLab in the content workspace"). It is not minted per repository: GitLab
+sets its reach, a project or a group. The broker still presents it only for a
+registered context repository inside the forge's `allowedPaths`. A forge without a read-only
+credential answers `NoCredential` and the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
 by every `/v1/vcs` verb but `capabilities`, by `commit` and `push`, and by the
 refresh route; the verbs' credential-less read path for public repositories

@@ -125,7 +125,9 @@ package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two release
 release two behind reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
-place, and the comment above the target says why.
+place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
+place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
+fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
@@ -160,8 +162,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
-against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
+nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
@@ -544,7 +547,7 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
   presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
@@ -604,28 +607,33 @@ not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
 `/override`, and the command is silently ignored.
 
-**Branch protection is not the gate and reads as though there is none.** `main` requires ten
+**Branch protection is not the gate and reads as though there is none.** `main` requires these
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
-`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`, and
-`Agent instructions cite assets that exist` — and conversation resolution, but **zero** approving
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`,
+`Agent instructions cite assets that exist`, and `Run A2A Module Tests` — and conversation
+resolution, but **zero** approving
 reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
 repository settings for the review requirement therefore finds nothing and concludes wrongly.
 
-The last four joined the set on 2026-09-02; before that, a pull request they had not run on could
-merge without them.
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
+`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
+`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
+could merge without it.
 
-Those ten are not the whole required set either. Tide also requires every Prow presubmit not marked
+Those contexts are not the whole required set either. Tide also requires every Prow presubmit not marked
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
 `pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
 date. The command below therefore answers part of the question, and the two lists together still do
 not answer all of it: they say which contexts must be _present_ and green, but Tide also refuses any
-posted context that is not green, required or not, unless Prow marks it `optional`: Tide always
-reads a cancelled or failed check run as a failing context, and with no Tide context policy for this
-repository an unknown context is not optional. A `classify` run cancelled
-by a superseding event held #1364 unmerged with `lgtm` and `approved` on it, though `classify` is in
-neither list. `tide`'s own status names the offending context; `gh run rerun <run-id> --job <job-id>`
-clears it — by job ID, since `--failed` (below) re-runs failed jobs and a cancelled one is not failed.
+posted context that is not green, required or not, unless Prow marks it `optional`: Tide reads a
+check name whose every check run is cancelled or failed as a failing context (one success under the
+same name clears it; one still running holds it as pending), and with no Tide context policy for this repository
+an unknown context is not optional. A `classify` run cancelled by a superseding event held #1364
+unmerged with `lgtm` and `approved` on it, though `classify` is in neither list. `tide`'s own status
+names the offending context; `/retest` ([below](#re-running-a-check-that-failed)) re-runs such a
+run whole, and with Write access `gh run rerun <run-id> --job <job-id>` clears it by job ID, since
+`--failed` re-runs failed jobs and a cancelled one is not failed.
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \
@@ -688,9 +696,29 @@ reads the key so that such a run is never itself taken for a green. What this tr
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
+Neither carries a verdict across a change to what the job grades. When the blocking job's
+`spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
+repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's
+360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
+then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
+one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
+Then move `main` once, with a docs-only pull request the job skips: Tide also credits a live
+ProwJob at `main`'s head, and a retest that started under the old mode stays credited that way
+until `main` moves. Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
+matrix instead of reusing the old green. The follow-up that drops that lever sets
+`EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
+a green first reported before it, however long its pull request sat.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.
+
+**A pull request on `main` can also carry `Smoke gate` and `Merge labels` statuses.** They
+are the gate checks of a GitHub merge queue that `main` does not use yet, posted by
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml), and each restates something Tide already
+decides: the smoke result (or that the change touches only paths the smoke skips), and the label
+query above. Nothing requires them. Because Tide holds on any posted context
+that is not green, each is posted only when it is green, and a green can go stale until the next
+event. `scripts/merge_gate.py` is the reference for what each one reads.
 
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
@@ -713,10 +741,27 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 ## Re-running a check that failed
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
-re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
-[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
-attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
-on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+re-run. Comment `/retest` on the pull request, as the first thing in the comment: Prow re-runs its
+failed jobs, and [`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub
+Actions runs behind the red checks at the head commit (a cancelled or timed-out run whole, since
+Tide blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
+at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
+comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
+only the pull request's own runs: a head commit that is also a commit on `main` or a release line
+carries that line's push runs too, and a red one of those is named and left alone. It reads the checks as Tide does, the best
+state per check name, so a run a newer success superseded or one cancelled while still queued is
+not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
+was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
+red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
+re-run looks like). A green run whose comment got no reaction at all means GitHub refused the
+reaction; the run's warning and summary say so, and the re-run or the decline reason is still there. A run already on its third attempt is left alone (the
+second attempt is for a run that a lost runner or a superseding event cancelled on the way to the
+one re-run the flake is worth); someone with Write access reads its log and decides, re-running from
+the run's page or with `gh run rerun <run-id> --failed`. Either re-run is also a report.
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
+of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
+commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
 (or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
 step when they name none or name more than a handful, or adds a row to the issue that class already
 has. The tree did not change
@@ -724,8 +769,10 @@ between the attempts, so the code was not the cause; the issue is where the occu
 until someone
 reads them together. It never closes an issue, because every green run of a flaky check looks like a
 fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
-back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
-`Validate PR Title` and `Security Scanning` are left off.
+back. `scripts/notify_flaky_check.py` holds the reasoning and the watched list, and says why
+`Validate PR Title` and `Security Scanning` are left off. The sweep reads runs created in the last
+few days (`SWEEP_WINDOW_DAYS` in the script); a re-run later than that is recorded by dispatching
+the workflow with the run's id and `dry_run` off.
 
 A re-run that fails again records nothing, and neither does a push that happens to go green: only a
 same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke

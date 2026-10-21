@@ -4,8 +4,9 @@
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
 > flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
-> presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
-> rendered and its eval-install half is not started.
+> merge-blocking presubmit sets the flag, so every pull request is graded through the door; the
+> today lane grades `today` after a scripted rollback. Stage 2's operator wiring is rendered and
+> its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;
@@ -58,7 +59,7 @@ every card has settled or
 six full-audit units). The delivered card results are appended to the answer, and the worker's
 report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted; a card still running when the wait ran out is archived first, which stops its worker. A
+deleted; a card still running when the wait ran out is archived first, which stops its worker, and so are the cards its worker fanned out (#3019). A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
@@ -337,7 +338,9 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id; on
+the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
+the harness appends to the trajectory from the workers' sessions instead, present when the
+wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
 as a failure here: on this transport's record the scorer sets every `worker_commands` and
@@ -348,10 +351,10 @@ names, or a trace older than the read that ended the wait), and grades the check
 (a `none`-wrapped check that failed stays graded whatever the loss: the trace shows the call); a
 case with no other objective is not graded on the lane rather than collapsed. A
 marker reporting no loss retires the set-aside for a `tool_called` in its default `router` scope
-— it states the door's capability to show calls, whether or not the run made one — and nothing
+with no `result` pattern — it states the door's capability to show calls, whether or not the run made one — and nothing
 else: a `tool_called` in the `workers` or `all`
 scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
-the worker checks
+the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
@@ -609,7 +612,7 @@ newest `task_runs.summary` of the cards the board shows terminal. No status turn
 none could carry a result back through the door. Only a terminal card reaches the settle step,
 shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
 as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
-returned, and the worker logs are read by those ids for `worker_commands`. A card still running at
+returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
 archived and purged. A door that reports no `contextId`, a session the store does not hold (the
@@ -675,8 +678,10 @@ fan-out the script lists in the job log what the run left on that repository, cl
 With the flag unset both scripts are byte for byte what
 they were, and the presubmit's own tests hold that.
 
-Under the flag the run also checks the rollback path once the suite verdict is computed and
-before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
+Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
+before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,
+since nobody reads the report there and the today lane below proves the same path):
+`hack/rollback-roundtrip.sh` flips the install to `today`
 and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
 and declared again after the second (the lane declares none: the bridge the operator renders
 leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
@@ -685,27 +690,37 @@ afterwards. It is reported, not gated: its own section of the log and two artifa
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
-the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+the eval script's own start plus an allowance for the deploy in front of it. It is also skipped
+on a release-candidate run (`RC_COMMIT_SHA` set): the promotion waits on that job finishing, so
+an hour of report-only round trip would come out of the verdict poller's 330 minutes. The eval's gateway
 log and pod diagnostics are collected before it starts, because the flip replaces the pods
 they come from.
 
-The flag stays off by default for three reasons. Flipping the shared presubmit install changes
-what every pull request measures, and that is the eval crew's decision, not a script default.
-The next stack still has holes independent of any case (images in a private registry, and
-whatever the first runs through the door find), and a default-on flip would red every pull
-request for reasons none of them caused. And the record that earns `next` a place in what every pull request measures is built by
-running it: a scheduled lane on `main` under the flag, with a record of its own, not the
-presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
-of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
-is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit, the periodic on main, and the full-catalog nightly that runs beside a today-mode nightly
-on the same agent model), and refuses it on any other Prow run, so the flag mis-set on the today
-nightly or a postsubmit still stops the deploy before anything is built. The record of its
-own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
-store would be today's once written, and the dashboard has no next lane to file a run under. Until
-both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
-dashboard publisher on the flag alone, whatever its job type; the periodic reads the store, when
-one is armed, and writes nothing shared.
+Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
+mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
+`next` through the door. `today` stays supported as the rollback, so a second lane proves that
+path. The today lane (`pull-kube-agents-smoke-test-today` on demand, and
+the six-hourly periodic `ci-kube-agents-eval-today` on `main`) sets the flag together with
+`EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
+`hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
+leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
+matrix runs over the agent API on that install, with no exclusion list and no lane safeguards,
+and a rollback that fails stops the run red rather than being reported beside it. The deploy
+refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
+
+The flag admits those jobs by name and nothing else without a pull request: section 2b of the
+deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
+listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
+its Tide batch runs, the today lane's periodic, the full-catalog next-mode nightly that runs beside a
+today-mode nightly on the same agent model, the GitLab lane's nightly under next, and the
+release-candidate eval's postsubmit, which grades a candidate in the mode a new install gets), and
+refuses it on any other Prow run, so the flag
+mis-set on the today nightly or another postsubmit still stops the deploy before anything is built. A
+record of `next`'s own does not exist yet: the baseline key has no mode field, so a next-mode
+sample appended to the store would be today's once written, and the dashboard has no next lane to
+file a run under. Until both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the
+baseline recorder and the dashboard publisher on the flag alone, whatever its job type; a flagged
+run reads the store, when one is armed, and writes nothing shared.
 
 ## Open questions
 

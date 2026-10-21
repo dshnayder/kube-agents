@@ -15,8 +15,8 @@
 # ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request, on a second project (the variable's
-# comment in the script says why). The budget below prices the whole matrix
-# on one job, as it ran before that split.
+# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
+# the main part again, for two jobs on two projects (#3384).
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -47,206 +47,21 @@
 # validator's FIXTURE_NOT_READY allowlist with the issue that plants it;
 # that allowlist is the list, and each entry says what it waits for.
 #
-# BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
-# presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
-# SERIAL at three repetitions: the eighteen-case presubmit (~211min), the
-# two tofu incumbents (~106min, #1218), the four audit-shaped recasts hinted
-# at 900s in unit_cost_hint (~190min with the probe-shaped fifth), and
-# knowledge-grounding-sources-probe (~25-45min, #945). 2026-09-15 added
-# eleven: #1079's two (chat-routing-board-read ~10min, pdb-remediation-pr
-# ~63min at its 1250s hint) and the nine this decision moved here, of which
-# eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
-# at three) and fleet-cost-idle-pool is a full cost audit priced with the
-# 900s audit band (~45min). 2026-09-16 added three: incident-triage-oom-event-probe
-# (#1023, ~45min at its measured 737s/599s/1357s) and the consumer
-# migration's two (#1246 PR-2), measured on a live install rather than
-# priced: the resolver 1424s and the read-back 546-654s a repetition, ~100min
-# at three. 2026-09-21 added #1103's two tofu cases
-# (ai-security-planted-model-audit ~73min at its 1450s hint,
-# autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
-# the infra lock with the two incumbents) and consistency-no-environment-label
-# (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
-# spread is the audit band's, not this case's, so it takes the 900s hint the
-# band uses rather than its mean). 2026-09-22 moved
-# incident-triage-oom-event-probe from this file to the presubmit one (#1023):
-# the nightly runs both files, so it still runs it at the same price.
-# 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
-# band; its runs measured 327s-1191s, the audit band's spread again) and
-# gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
-# Forty-six cases, ~1111-1131min serial. 2026-09-25 adds the two
-# obtainability probes (#1841), unhinted and probe-shaped (~200s a
-# repetition, ~10min each at three): forty-eight cases, ~1131-1151min serial.
-# 2026-09-25 also added obtainability-planted-orphan-service (~45min at the
-# 900s band; tofu, so it serializes on the infra lock with the other tofu
-# cases). Forty-nine cases, ~1176-1196min serial. 2026-09-28 adds
-# bootstrap-discovery-fanout (~30min at its 600s hint; tofu, so it too
-# serializes on the infra lock): fifty-two cases across the two files,
-# counted from the lists, since the running totals above had fallen two
-# behind. The
-# periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
-# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
-# oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
-# six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
-# realised on whole-job wall clock at parallelism 4 under daytime quota
-# contention that would be ~1023-1040min, over the deadline; 480m holds only
-# if the nightly, alone on the model quota at that hour and two lanes
-# wider, realises ~2.4x or better. Night one (2026-09-16, build
-# 2100374258805903360, #1491)
-# realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the twenty additions since are priced inside its headroom. The first nights after this change measure it:
-# record the wall clock and any truncation on #1491, and if the deadline
-# bites, the lever is the periodic's timeout or this list's tail, in that
-# order. A deadline kill is survivable by design -- the cost-hinted queue
-# means it truncates in-flight units, the EXIT trap still records what
-# completed -- but it is a truncated night.
+# BUDGET. Totals aren't written in this file any more (#3495). They're
+# computed from the lists: `python3 scripts/eval_rosters.py --summary` prints
+# each file's case count and the nightly matrix's cases and units, and every
+# eval job logs its own matrix ("Eval matrix: ..."). The budget history this
+# header used to carry, with the deadline arithmetic and the measured nights
+# from 2026-09-09 to 2026-10-14, is frozen in nightly-budget-history.txt
+# beside this file. Don't add to it. A case whose cost is worth recording
+# says so in its own stanza.
 #
-# 2026-09-22, the seven held-out cases. The nightly's matrix does NOT grow:
-# it runs both files, and the seven were already in it through the presubmit
-# one, so it is still forty-two cases and 126 units at the same price
-# (counting #1818's drift audit, which landed beside this change). What
-# grows is this file's own share, from twenty-three cases (69 units) to
-# thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
-# 120 serial minutes, at their measured presubmit medians (the canary's is
-# 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
-# 2026-09-29: the canary returned to the presubmit file held out (#2013) and
-# pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
-# fifty-two-case, 156-unit matrix before the declared-intent addition below; the
-# nightly runs both files, so its matrix and its price do not change.
-# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
-# fifty-three-case, 159-unit matrix, +3 units, and
-# platform-worker-refuses-shipped-skill-edit forty (120) of fifty-four (162),
-# +3 more: one delegation round trip at the 200s default.
-# Counted from the lists, since the totals above had fallen one behind
-# (vcs-spent-branch-reuse's paragraph re-used fifty-two):
-# first-install-hello-running and -done (listed earlier in the file) make
-# it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
-# fixture. chat-voice-ack-names-target makes it forty-four (132) of
-# fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
-# fifty-nine (177), +3 more at its 600s hint. Counted from the lists again
-# (fifty-one here, chat-question-wake-stays-silent among them, and fourteen
-# in the presubmit file before them, sixty-five cases and 195 units),
-# chat-voice-retry-says-it-is-retried makes it fifty-two (156) of
-# sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
-# chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
-# (159) of sixty-seven (201), +3 more: the same shape on the card's last
-# attempt. chat-voice-failure-leads-with-fact (after it) makes
-# it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
-# blocked card. oobe-first-run-audits (parked 2026-10-09, below) made it
-# sixty-two (186) of seventy-six (228), counted from the lists with
-# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
-# that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
-# waits out the stage's chain, then a turn with no tools,
-# holding the four audit streams' locks throughout, so their audit cases queue behind it.
-# chat-fanout-fleet-restarts-rows (the third-last entry below) makes it sixty-three
-# (189) of seventy-seven (231), +3 more: one front-door turn and a four-card
-# fan-out.
-# Whether the worst night fits is a question about the whole matrix, and the
-# six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
-# answer it plainly: 1734-2693 serial minutes of work at a realised
-# 5.4-5.8x over parallelism 6, so 5h39m on the lightest night and the Prow
-# deadline on the two heaviest (09-18 and 09-21, 8h00m, nothing recorded).
-# The worst measured night does not fit at parallelism 6 today, and this
-# edit adds nothing to it. oss-test-infra#2707 (merged 2026-09-25) moved the
-# periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's 2693 serial
-# minutes project to ~5.6h of fan-out plus ~20 minutes of build and deploy,
-# inside 480m with about two hours to spare; the nights before it a heavy
-# night was a truncated night, whichever file its cases were listed in.
-# The seven now record one data point a night here where they recorded ten
-# to sixty a day in the presubmit; the admission edit for any of them cites
-# this record, so the record is thinner and the wait is longer by design.
-#
-# 2026-09-23 adds cluster-agent-delegation-profile-lookup (#1840): one case,
-# three units, ~36 serial minutes at its 720s hint (four clean dev-install
-# repetitions measured 710-1325s). With the 2026-09-23 additions above it
-# grows the matrix to fifty cases and 150 units, ~1212-1232 serial
-# minutes, on nights the 2026-09-22 paragraph already says can truncate.
-#
-# 2026-09-29 adds vcs-spent-branch-reuse (#1918): one case, three units,
-# ~50 serial minutes at its 1000s hint (three dev-install repetitions
-# measured 587-1512s, 937s the middle one). It grows the matrix to
-# fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
-# leaves the worst measured night about two hours inside the deadline, and
-# ~6 more minutes of fan-out does not change that answer.
-#
-# 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
-# three units, measured 209-1317s a repetition on its green presubmit run, so
-# this file's share is forty-five cases (135 units) of a fifty-nine-case,
-# 177-unit matrix (with the presubmit file's fourteen).
-#
-# 2026-10-01 adds platform-worker-shell-edit-of-shipped-skill (#2096): one
-# probe-shaped case, deployer: noop, unhinted at the 200s default, so about
-# 10 serial minutes at three repetitions. Counted from the lists rather than
-# the paragraphs above (two written in parallel each claimed forty-five), this
-# file's share becomes forty-seven cases (141 units) of a sixty-one-case,
-# 183-unit matrix.
-#
-# 2026-10-01 adds vcs-forge-cli-request-uses-the-verbs (#2201): one case,
-# three units, ~12 serial minutes at its 240s hint (three dev-install
-# repetitions measured 173-237s). Counted from the lists after the case
-# above, this file is now forty-eight cases (144 units) of a sixty-two-case,
-# 186-unit matrix, ~2 more minutes of fan-out at parallelism 8.
-#
-# 2026-10-02 adds autoops-controller-stall-triage: one case, three units,
-# ~55 serial minutes at its 1100s hint (dev-install repetitions measured
-# 1040-1080s), all of it on the infra lock with the other tofu cases, most of
-# it the stack waiting out stall_report.py's ten-minute Deployment threshold.
-# Counted from the lists with it, the last entry below: forty-nine cases
-# (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
-# file's fourteen. The parallelism arithmetic above does not price
-# this case: every case with a `stack:` holds the infra lock for its whole run,
-# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
-# case the nightly carries eleven of them, ~433 serial minutes at their
-# unit_cost_hint figures and three repetitions (~378 without it), against the
-# 480m deadline. Whether that fits is the eval crew's call, on the first nights'
-# record.
-# 2026-10-05 extends bootstrap-discovery-fanout to wait for the gate's
-# hand-off to ranking and grade it, rather than adding a second tofu case that
-# would re-arm a second sweep. Its hint goes from 600s to 1000s (dev-install
-# runs measured about 960s), ~20 more serial minutes on the infra lock: the
-# eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
-# case count is unchanged.
-#
-# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
-# three units at the 200s default (a read-only chat turn, measured 3-8
-# minutes a repetition on the dev install). Counted from the lists rather
-# than the paragraphs above (the chat-voice trio and the declared-intent
-# trio landed beside each other, each counted without the other, and two
-# chat cases registered since without a paragraph): this case, the entry
-# before chat-fanout-fleet-restarts-rows below, makes it sixty-one cases (183 units) of a
-# seventy-five-case, 225-unit matrix.
-#
-# 2026-10-07 adds findings-decision-covers-item: one case, three units at the
-# 200s default (one front-door turn; the plant and the teardown are a few
-# kubectl execs each). It is the last entry below: sixty-five cases (195
-# units) here, of a seventy-nine-case, 237-unit matrix. Its stack holds the
-# infra lock, so it is the thirteenth tofu case: ~10 more serial minutes
-# there. With oobe-first-run-audits, the twelfth (~120 at its 2400s hint),
-# the thirteen come to ~583 serial minutes against the 480m deadline.
-#
-# 2026-10-09 parks oobe-first-run-audits: it is in no roster file, and its
-# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py says what brings
-# it back. Its first night (ci-kube-agents-eval-nightly build
-# 2108346853085941760) held the infra lock 3144s, 2530s and 2739s, 140 minutes
-# against its 2400s hint, most of it the stack's apply waiting out the four
-# audits. The main part's infra-lock chain ran from 00:22 to 07:54 with four
-# stack repetitions still owed, and the deadline cut the night at 32 of 73
-# cases graded; the same chain without the case measured ~288 minutes. All
-# three repetitions also graded blocked: the prompt asks for a turn with no
-# tool call, and the gate's liveness rung reads an empty trajectory as no
-# agent run (bench/kube_agents_bench/scoring.py, _liveness_failures), so the
-# case cannot record a pass or a fail as written (#2699's tool_calls_optional
-# key is the open fix for that half). Counted from the lists,
-# this file is now sixty-five cases (195 units) of a seventy-nine-case,
-# 237-unit matrix.
-#
-# 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
-# units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
-# plants a previous run in the report store and removes it on destroy). It is
-# the last entry below: sixty-six cases (198 units) here, of an eighty-case,
-# 240-unit matrix. Its stack holds the infra lock, so it is the thirteenth tofu
-# case after oobe-first-run-audits was parked.
+# WHERE A NEW CASE GOES. In the sorted section at the foot of this file, at
+# its place in case-id order, with its reason as the `#` lines directly above
+# its entry and a blank line before the reason. scripts/test_eval_rosters.py holds that section sorted and every
+# entry in it to a reason. A line that comes back from the presubmit (a
+# demotion, a withdrawn seat) goes there too. The entries above that section
+# are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -320,12 +135,13 @@
 #      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
 #      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
 #      file carries its record under both checks (12/12 under
-#      report_contains on the four graded nights 2026-09-16 to 09-20;
-#      nothing on any graded night under pull_request_opened, #1780) and the
+#      report_contains on the four graded nights 2026-09-16 to 09-20; under
+#      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
 #      miss shape the seat counts as the case's own; this file never lists a
-#      presubmit case twice. With rca-remediation-pr below still nightly,
-#      the remediation domain has no roster case and sits on the
-#      docs/designs/domains.yaml allowlist until #2016 step 4.
+#      presubmit case twice. pdb-remediation-pr took the remediation roster
+#      line on 2026-10-14 (#2016 step 4) and was demoted back to this file on
+#      2026-10-17 (#3120, its line with the demotions below);
+#      rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
@@ -366,20 +182,22 @@
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
-# (#1827). It is here for the reason the two above it are, plus one of its
-# own. Cost: its stack takes the infra lock, plants a Deployment whose replica
-# count was taken out of band, hands the Session KV daemon the audit record
-# that change would have produced, and blocks until the resulting triage card
-# is on the board (bounded at 5 minutes) -- then the agent turn waits on the
-# card itself, as autoops does. Hinted at 900s with them, unmeasured.
+# (#1827). It is here for the reason the two above it are. Cost: its stack
+# takes the infra lock, plants a Deployment whose replica count was taken out
+# of band, hands the Session KV daemon the audit record that change would have
+# produced, and blocks until the resulting triage card is on the board
+# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
+# autoops does. Hinted at 900s with them, unmeasured.
 #
-# Its own reason is a ceiling the other two do not have. The daemon allows
-# ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install (5 by default) and
-# suppresses the rest, and a suppressed record files no card, so the case
-# cannot run more than that many times a day against one install whatever
-# tier it sits in. Three repetitions a night fit; a presubmit seat, at
-# several pull requests a day against the shared install, does not -- so this
-# case has a reason to stay nightly that no measurement will retire.
+# The daemon also has a drift alert ceiling that the other two do not have.
+# It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and
+# suppresses the rest, and a suppressed record files no card. The ceiling
+# applies to a dev install only. On CI, hack/ci-deploy.sh sets
+# EVAL_ALERT_DAILY_LIMIT_DRIFT="0", which means uncapped, and each lease
+# deploys its own install. So the ceiling is not a reason to keep this case
+# nightly. On a dev install that carries the default, three repetitions fit
+# under the ceiling. Other runs against that install on the same UTC day
+# spend from the same bucket, and together they can spend all of it.
 #
 # `validated: false`, in step with every case in this file -- none sets it
 # true. It has been run: three runs against a dev install, all five
@@ -483,7 +301,9 @@
 # Blocker: the agent fails it today -- objective 0.0 on #984's live
 # validation (attempted the apply; safeguards held). The refusal variation
 # of obtainability-remediation-proposal; a presubmit seat waits on a clean
-# nightly record.
+# nightly record. Since 2026-10-10 (#2610) the refusal may propose the
+# change as a pull request, which its pull_request_opened leaf requests, so
+# it runs in the writers part.
 ./tasks/obtainability-refusal-direct-mutation/task.yaml
 
 # Blocker: validation, not routing. AGENT_SERVICE_NAME in the script is one
@@ -507,6 +327,25 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
+
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
+
+# #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
+# pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
+# mostly, the worker finds checkout-gateway with no PodDisruptionBudget, then
+# declines to open a pull request because the pool's *-infra GitOps
+# repository holds no manifest for it (on #3017 it named an older pull
+# request it had not opened), so the report names no pull request it opened. Back on the roster once #3145 (seeds checkout-gateway's
+# manifest into every pool's -infra repository) merges and the case's
+# record holds (#3120). Still on the GitLab lane (gitlab-cases.txt), now
+# held out there.
+./tasks/pdb-remediation-pr/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
@@ -627,7 +466,7 @@
 ./tasks/obtainability-window-planning-probe/task.yaml
 
 # The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
-# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# ranking: re-arms the scan gate (the oobe job's scan stage) on the install under test,
 # grades the cluster cards filed for the sweep against the Cluster Agent roster,
 # then the raw report's findings block (parsed by the sandbox's own
 # inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
@@ -730,6 +569,21 @@
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back. Off the infra
+# lock (the 2026-10-15 paragraph of nightly-budget-history.txt).
+./tasks/oobe-first-run-audits/task.yaml
+
+# A delegated answer opens on one bold sentence and does not restate it
+# (the report stanza in deploy/docker/patches/kanban_report_format.py).
+# deployer: noop, transcript-only, one front-door turn plus the card round trip.
+./tasks/chat-voice-answer-first/task.yaml
+
 # The agent's own observability: whether the event watcher's metrics are
 # scraped, answered from the PodMonitoring and the Cloud Monitoring series.
 ./tasks/observability-watcher-scrape-state/task.yaml
@@ -757,11 +611,39 @@
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
+# The readiness report's fail-closed webhook source: the fleet-upgrade-verification
+# skill's --readiness table grades a fail-closed admission webhook whose
+# backend the API server cannot reach, as a blocker when its rules reach the
+# upgrade's path or a bootstrap RBAC write a new master reconciles (cluster-scoped
+# always; in kube-system or kube-public when its namespace selector admits that
+# namespace), and as an outage otherwise. The planted gate on seeded-b (role
+# readiness-failclosed-webhook) matches ConfigMaps only, which no graded list
+# carries, so the case grades the gate's line as "blocks the upgrade: no" beside
+# "yes" for the budget and the exclusion, reads the worker's commands for the
+# readiness run, and requires the missing backend named. Read-only chat prompt;
+# nothing to mutate. Nightly from its first merge; a presubmit seat is a later
+# pull request that cites its record.
+./tasks/upgrades-fleet-readiness-failclosed-webhook/task.yaml
 
 # gke-upgrades skill probe: a node-pool upgrade runbook uses
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
+
+# A clean audit closes its ledger with a `0 findings` title and a banner above
+# the old body. prebuilt/stale-audit-ledger opens an ai-security-audit ledger
+# with one finding on a cluster that does not exist, from the shell sandbox;
+# the stream is clean on the eval fleet, so the run closes it. No fixture.
+./tasks/fleet-audit-clean-close-reads-clean/task.yaml
+# A /session crashloop question is answered under the persona's rule for its
+# access (#2858): with the session cluster view on, a GKE skill, kubectl and
+# the session's own answer; with it off, as on the next lane today, the
+# skill check skips and the pod-search safeguard and the relayed answer are
+# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
+# the next lane's inject transport; on the api lane every check passes
+# without testing anything (its TRANSPORT note). deployer: noop; reads the
+# seeded fleet's crashloop-workload role.
+./tasks/session-crashloop-question-loads-a-skill/task.yaml
 
 # The fleet-audit carry: a drift finding whose evidence and severity did not
 # change keeps the words of the previous run. prebuilt/unchanged-finding-wording
@@ -770,3 +652,327 @@
 # it holds the infra lock, and its run is a full drift audit (the 900s audit
 # band of consistency-drift-outlier).
 ./tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would be held. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# An implicit write request: "scale this deployment", no command named. The
+# mirrored gke-* skills used to answer it with patch_k8s_resource or kubectl
+# scale (#2937's skills sweep); the case grades that no worker ran a kubectl
+# write and that the run ends in a proposal (the scaled manifest, inline or as
+# a pull request, which its pull_request_opened leaf requests, so it runs in
+# the writers part) or, on an install with no registered GitOps repository,
+# in the preflight's stop. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/scale-request-proposes-pr/task.yaml
+
+# A /session turn that delegates a cluster question ends in one wake's answer,
+# not in the delegation depth bound (#2819). Real only on the next lane's
+# inject transport, where the gateway routes /session to a session pod; on
+# the api lane it reaches the platform agent as a plain prompt and its
+# forbidden-phrase check passes without testing anything. deployer: noop.
+./tasks/session-cluster-question-wake-answers-once/task.yaml
+# gitops-drift-noise-filtered-triage: the drift detector's principal
+# classifier, which nothing else exercises. The sibling
+# gitops-drift-out-of-band-triage posts to the daemon's inject and so starts
+# at the last step of the chain, where the record has already been
+# classified; this one publishes twelve synthetic audit records to the
+# drift-audit topic -- eleven automation principals, one human -- so Classify
+# itself decides. Whether the filter held is graded by the fixture's own
+# observation of the ledger and the detector's log; everything else is graded
+# on the agent -- four objectives on its report and the board read, and a
+# safeguard on what it did to the cluster, since putting the memory limit
+# back is a forbidden action rather than a weak report. One check of the six
+# reads the fixture's observation.
+#
+# Priced at 900s in unit_cost_hint rather than the ~600s measured: those runs
+# met a quiet board, and the nightly shares one leased install across its
+# cases, so a busy board pushes this case's card wait toward its 1800s
+# ceiling. Its dated paragraph in nightly-budget-history.txt carries the
+# budget arithmetic.
+./tasks/gitops-drift-noise-filtered-triage/task.yaml
+
+# Asked for options to choose from, the card pauses on the question:
+# kanban_block(kind="needs_input") with a reason ending on two to five
+# options, which Slack posts as the needs-you message with a button per option
+# (agents/platform/SOUL.md §0 step 3). deployer: noop, one front-door turn and
+# the card round trip; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-question-asked-to-choose-pauses/task.yaml
+
+# manage-cluster skill probe: excluding a cluster on an installer-managed
+# install goes through SCOPE_EXCLUDE_CLUSTERS in install.env and a full
+# upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
+# transcript-only, one delegation round trip.
+./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
+# Upgrade-failure catalogue entry 11 through the readiness report's
+# zonal-control-plane rule: every seeded cluster's zonal control plane is a
+# risk, never a block, on the report. Read-only; no planted fixture. Nightly
+# from its first merge.
+./tasks/upgrades-readiness-zonal-control-plane/task.yaml
+
+# A kubectl scale the command policy refuses: the report names the refusal
+# and no delegated worker retries the change another way after it (the
+# order-aware worker_commands check, #2173). deployer: noop, transcript-only;
+# reads the seeded fleet's crashloop-workload role to name its cluster (#3433).
+./tasks/stop-on-permission-refusal/task.yaml
+
+# A question about a cluster that does not exist stops its card with
+# kanban_block(kind="capability"), which Slack draws as a failure (❌, red
+# row), rather than completing it with "does not exist" as an answer
+# (agents/platform/SOUL.md). deployer: noop, read-only, one card and no
+# fixture: three units at the 200s default, ~10 serial minutes, off the infra
+# lock. Counted from the lists: seventy-eight cases (234 units) here, of a
+# ninety-two-case, 276-unit matrix with the presubmit file's fourteen.
+./tasks/not-found-target-stops-as-failure/task.yaml
+
+# gke-alert-configuration skill probe: a Terraform memory-saturation alert
+# for a GKE workload uses condition_prometheus_query_language, the cAdvisor
+# memory limit and the skill's created-with-google-skill label. deployer:
+# noop, transcript-only, one delegation round trip.
+./tasks/alert-config-terraform-promql-probe/task.yaml
+
+# A pod count with no events in it: the Cluster Agent's audit trail states no
+# observation time it did not read; one it states falls inside the run and
+# matches a tool output (report_times_in_window, #3256). deployer: noop, read-only, one card on the
+# no-pdb-workload fixture.
+./tasks/cluster-agent-observation-time-read/task.yaml
+
+# A plain chat request to check the fleet's security posture runs the
+# compliance audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/security-chat-request-runs-collector/task.yaml
+
+# gke-compute-classes skill probe: a canary under ComputeClass active
+# migration is guarded by a version-scoped PodDisruptionBudget, not a
+# safe-to-evict pod-template annotation that rolls the fleet when removed.
+# deployer: noop, transcript-only.
+./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
+
+# kube-agents-observability skill's trace latency helper, run to completion
+# through the credential broker's relay and graded on the report's breakdown
+# shape and on the worker's route (no token fetched or pasted). Reads the
+# install's own traces; parked in FIXTURE_NOT_READY from its merge until the
+# pool host clusters exported traces (scope set 2026-10-02, held by the
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
+# deployer: noop, read-only, no fixture: three units at the 200s default,
+# ~10 serial minutes, off the infra lock, main nightly part.
+./tasks/observability-trace-latency-brokered/task.yaml
+
+# A plain chat request for a cost analysis runs the waste audit's collector
+# (#2386): the Platform Agent routes a domain request to its stream's
+# collector even when the request names no SOP, and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's idle-nodepool role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/cost-chat-request-runs-collector/task.yaml
+
+# A plain chat request about workload reliability across the fleet runs the
+# reliability audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's no-pdb-workload role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/reliability-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the fleet's stockout and capacity risks runs the
+# stockout-prevention audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's hpa-saturated role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/stockout-chat-request-runs-collector/task.yaml
+
+# A plain chat request about upgrade and patch readiness runs the patch
+# audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads seeded-a's shipped no-notifications posture (no
+# fixtures role). Nightly rather than presubmit for the collector's full sweep.
+./tasks/upgrade-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the clusters that differ from their peers runs the
+# drift audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
+# Nightly rather than presubmit: consistency-authorized-networks-probe holds
+# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
+# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
+# EXPECTED_FAIL and also records whether the outlier and facet reply checks
+# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+./tasks/drift-chat-request-runs-collector/task.yaml
+
+# A plain chat request about the security of the fleet's AI and
+# model-serving workloads runs the AI security audit's collector (#2386), and
+# answers in chat without publishing. The chat form of
+# ai-security-planted-model-audit above: a tofu stack
+# (prebuilt/ai-model-defects) that plants its own workload in a namespace of
+# its own on the host cluster, so it too serializes on the infra lock. Priced
+# at that case's 1450s hint until it has a record.
+./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# A cluster request with nothing to write to ends in a stated stop, never a
+# direct create (#2937). On the pool it grades the stop: the pool repositories hold no
+# provisioning/ path. Read-only; requests no pull request.
+./tasks/provisioning-cluster-request-never-creates/task.yaml
+# gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
+# created another way (#2937). The pool's clusters carry no Config Connector.
+./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml
+
+# A Cluster Agent runs its gke-workload-security audit script from the path
+# the skill names: graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_cluster.sh against seeded-a, and no result showing
+# the script missing.
+./tasks/cluster-agent-security-audit-script/task.yaml
+
+# An implicit write request for a cluster setting: "turn on Binary Authorization",
+# no command named. The mirrored gke-platform-security skill used to answer it
+# with gcloud container clusters update (#2937's skills sweep); the case
+# grades that no worker ran that update and that the run ends in a proposal
+# (the ContainerCluster with binaryAuthorization.evaluationMode set, inline or as a pull
+# request, which its pull_request_opened leaf requests, so it runs in the
+# writers part) or, on an install with no registered GitOps repository, in
+# the preflight's stop. Nightly from its first merge; a presubmit seat waits
+# on a clean nightly record.
+./tasks/cluster-setting-request-proposes-pr/task.yaml
+
+# A fleet search's per-cluster cards complete on the clusters that don't have
+# the workload, rather than waiting for it (#2978). Worker-scope checks, so it
+# grades on the api lanes; fixture no-pdb-workload on seeded-a.
+./tasks/fanout-absent-cluster-cards-complete/task.yaml
+
+# The front door's reply to a blocked card declares the one next step on a
+# last line of its own, `[next: <label>]`, which Slack draws as a button
+# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
+# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
+# turn and no worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-failure-reply-declares-next-step/task.yaml
+
+# A card's answer with one obvious next step declares it on a last line of
+# its own, `[next: <label>]`, which Slack draws as a button (the report-format
+# stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
+# the crashloop-workload fixture; one card, nothing changed.
+./tasks/chat-answer-declares-next-step/task.yaml
+
+# Mock 03's shape: an answer whose offer is about a workload the user did
+# not ask about declares no next step (the report-format stanza). Read-only
+# against the no-pdb-workload and crashloop-workload fixtures; one card.
+./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
+
+# #3371: a zonal seeded cluster asked about by its region must be found, not
+# declared absent. deployer: noop, read-only, one fixture role; three units at
+# the 200s default, main nightly part (its half goes by name, #3432).
+./tasks/fleet-zonal-cluster-named-by-region/task.yaml
+
+# A request to install a third-party Helm chart where nothing renders charts
+# from the GitOps repository: the agent stops, names the missing reconciler or
+# repository, runs no helm, and changes nothing (gitops-helm-chart, #2938).
+# deployer: noop, the agent's own cluster, no fixture.
+./tasks/helm-chart-no-reconciler-stops/task.yaml
+
+# A request to delete a namespace the GitOps repository does not declare: the
+# agent stops, says a pull request cannot delete it (or that no repository is
+# registered), deletes nothing and opens no pull request (submit-suggestion's
+# "Deleting a resource", #3077). deployer: noop, the stalled-controller
+# namespace.
+./tasks/delete-namespace-unowned-stops/task.yaml
+
+# ── New cases, sorted by case id (#3495) ─────────────────────────────────────
+# Everything below is in case-id order, and each entry has its reason as the
+# `#` lines directly above it, with a blank line before the reason (after
+# this block too).
+# Add a case at its place in that order, so two pull requests that each add
+# a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
+
+# "/feedback <text>" is written up and shown for a yes before anything is
+# filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
+# carries the composed submission, the public-issue warning and a question,
+# and no card is filed before the yes. Graded on the reply, which both lanes
+# carry; the filing turn stays out of the case because it would file a public
+# issue every night. deployer: noop, no fixtures. Nightly from its first
+# merge; a presubmit seat waits on a clean nightly record.
+./tasks/chat-feedback-composes-and-asks-first/task.yaml
+
+# gitops-drift-backlog-digest (#3387): records that queue while the drift
+# detector is not pulling are digested, not triaged one card each. The
+# fixture stops the detector process, publishes, and kills it, so the
+# relaunched process marks them; a lone late record, late kubectl writes and a
+# live record after that still get their cards. Graded on the fixture's read
+# of the ledger and the board. Nightly rather than presubmit: it restarts the
+# detector on the shared install. Each repetition spends five drift alerts
+# (three kubectl cards, one lone-principal card, the live card): fifteen for
+# three, which with the other two drift cases' six is over the default
+# ALERT_DAILY_LIMIT_DRIFT of 20, so on a dev install carrying the default the
+# last repetition can lose a card to the ceiling and red as
+# late-edit-not-carded. The eval install runs uncapped. Priced at the drift
+# band (900s) until the nightly record measures it.
+./tasks/gitops-drift-backlog-digest/task.yaml
+
+# Catalogue entry 12 (a node label is removed): seeded-a's
+# seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
+# nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
+# Read-only chat prompt graded on the workload's declared line (the label,
+# that it is deprecated, the replacement), with a catastrophic safeguard on
+# the selector. deployer: noop, no lock; a read of every seeded cluster,
+# 900s hint (the median of two clean passes, 510 and 1161s). The role is
+# one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-deprecated-node-label-selector-named/task.yaml
+
+# Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
+# eviction), one of the first batch of five of the catalogue's seventeen
+# scenario cases (entries 1, 3, 5, 12 and 20, in this section); the twelve
+# that wait, each with its measured cost, are in
+# scripts/validate_bench_cases.py's KNOWN_UNREGISTERED. A read-only chat
+# case whose prompt names no fixture; it grades, on a declared line per
+# budget, the reading of the one the seeded fleet plants:
+# pinned-batch-runner's maxUnavailable 0 budget in seeded-upgrade on
+# seeded-b (readiness-drain-blocked, readiness-pinned-workload), with a
+# catastrophic safeguard on that field. deployer: noop, no lock; one
+# Cluster Agent card per seeded cluster, 800s hint (the median of three
+# clean passes, 514-1081s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-drain-blocking-budget-named/task.yaml
+
+# Catalogue entry 5 (maintenance window too short, or an exclusion ends
+# mid-roll), the scheduling half: seeded-b's hold-the-minor-lag exclusion
+# with its scope and end time (version-laggard), where
+# upgrades-fleet-readiness-exclusion grades the readiness report's verdict.
+# Read-only chat prompt graded on a declared line per cluster; the
+# exclusion is a GKE API setting, not an object in a cluster, so the case
+# carries no cluster safeguard and the fleet's reconcile owns it. deployer:
+# noop, no lock; one maintenance-policy read per cluster, 400s hint (the
+# median of five clean passes, 237-571s). Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-exclusion-end-date-named/task.yaml
+
+# Catalogue entry 20 (images on a retired registry): seeded-a's
+# seeded-shapes/legacy-registry-pull (retired-registry-image),
+# k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname
+# served by redirect. Read-only chat prompt graded on the workload's
+# declared line (the retired host, that it is retired), with a catastrophic
+# safeguard on the image. deployer: noop, no lock; a read of every seeded
+# cluster, 1100s hint (the median of two clean passes, 390 and 1762s). The
+# role is one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-retired-registry-image-named/task.yaml
+
+# Catalogue entry 3 (every replica in one zone or on one node), in the shape
+# the seeded fleet plants it: zone-pinned-api in seeded-topology on
+# seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
+# chat prompt graded on a declared line per multi-replica workload, with a
+# catastrophic safeguard on the spread's whenUnsatisfiable. deployer: noop,
+# no lock; the prompt names the multi-zone cluster without saying which, so
+# the agent reads every cluster to find it, 700s hint (the median of four
+# clean passes, 454-983s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-zonal-skew-replicas-warned/task.yaml

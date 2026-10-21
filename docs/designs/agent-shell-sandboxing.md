@@ -37,6 +37,8 @@ smallest thing that has an identity, so the pod is the boundary a credential get
 taking the identity away from the pod the model's shell lands in is what this design is
 for.
 
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
+
 The gateway and the broker still share the annotated ServiceAccount, so the gateway pod
 retains an ambient cloud identity. That is the remaining gap, and it is what
 `spec.security.workloadIdentityFederation` closes: with it configured the broker reads an
@@ -1452,7 +1454,8 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`,
+propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
+the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
 and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
@@ -1791,8 +1794,8 @@ wholesale would put a file named `credential_proxy.py` inside the sandbox, which
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
-`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
-plus the transitive closure of what they import. `inventory_findings.py extract` and `select`
+`stall_report.py`, `audit_cluster.sh` and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
 prioritization SOP answers that exit by going on to `select` and writing the report.
@@ -1814,9 +1817,13 @@ database and is named by its SOP for a hand run. Each gets a stub at its path in
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
-`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
-deleting a profile still has no tool.
+pod. `platform_mcp_server.py` carries the reads of that volume, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee, and `fleet_scope`, which
+hands the fleet audits the reconcile's scope snapshot they cannot read from here; creating and
+deleting a profile still has no tool. What this pod does know about the scope is one bit the operator
+sets on its container, `KUBEAGENTS_SCOPE_DECLARED`: whether the CR carries a block at all, so that a
+collector run here without the tool's flags refuses to enumerate projects rather than sweep past the
+boundary it cannot see.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
@@ -2069,10 +2076,11 @@ the PVC from the moment the card is filed, so the report files it also checks ad
 nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
 which is wrong about the pod and right about the path the worker must write.
 
-The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
-picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
-as though the scan were still running. The report still arrives on the next delivery
-tick.
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin, which
+picks its first greeting by whether `INVENTORY.md` is written. It reads the report across with
+`sandbox_exec.read_bytes`, as delivery does, and greets as though the scan were still running
+when the report is not there yet, or when that read fails or takes longer than
+`REPORT_CHECK_TIMEOUT_SECONDS`. The report still arrives on the next delivery tick either way.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -2127,6 +2135,34 @@ as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be doi
 uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` and
 `/bin/rm` by absolute path, which that file cannot shadow — a bash function name cannot
 contain a slash, and a non-interactive shell does not expand aliases.
+
+The same job takes an inventory of each sandbox profile home (#2989). Hermes cron runs
+started in the sandbox's unwritable login home, so a run's scratch went wherever it could
+write, often the profile home, beside the skills and config on a volume nothing sweeps, and a later session that lists the home cannot tell them
+from what the product put there. Every top-level entry the product doesn't create in that
+kind of home (the mirror's skeleton everywhere; the image-staged trees and database
+placeholders in the platform home; the identity and kubeconfig in a cluster home), checked
+by name and type, goes to `logs/kanban_workspace_gc.log` on the
+agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
+profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
+kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
+the test fleet after cron runs get a working directory of their own. The listing runs as
+`hermes`, the default principal, because its output is believed, under the sandbox's own
+`workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
+name cannot forge a row.
+
+Two shapes are removed rather than inventoried. A cron run's working directory
+(`<home>/cron/runs/<run>`) is pruned after seven days. An override tree, a top-level
+directory named `<something>_override`, is removed the first night (#3551): it is a
+worker's copy of a shipped skill or script, patched to run in place of the original
+(#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
+the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
+off them. That test is a guard on the obvious forms, not a proof; the prune is the
+enforcement. Both
+prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
+to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+`cron/runs` must be real directories for the runs prune, a symlinked home is left alone
+by the override prune, and a symlinked override entry is unlinked rather than followed.
 
 #### The agent pod gives up cluster tooling entirely
 
@@ -2356,8 +2392,8 @@ the script deleted. An operator back-fills a card with no subscription with the 
 `hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
-`hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
-`agents/platform/skills/fleet-audit/SKILL.md:53`. Both spell it
+`hermes cron run <job-id>`, at `agents/platform/AGENTS.md` and
+`agents/platform/skills/fleet-audit/references/on-demand.md`. Both spell it
 `/opt/hermes/.venv/bin/hermes`, which is absent from the sandbox twice over. The other
 matches across `agents/` are either prose mentioning the binary or agent-side processes
 that stay put; `agentplugins/gke-stockout-investigator/scenarios/lib/common.sh:617`
@@ -2548,7 +2584,7 @@ With the proxy gone, the shell in the sandbox, and `automountServiceAccountToken
 already in place, the gateway pod's credential surface is `SESSION_KV_API_KEY` and
 `SESSION_KV_SALT` — and Part A removes those too by putting the Session KV server behind
 its own interface. It keeps the `iam.gke.io/gcp-service-account` annotation on
-`kubeagents-platform-agent`, which is the remaining gap: no process in that pod uses it,
+`kubeagents-platform-agent`, which was the remaining gap (since closed by giving the gateway its own ServiceAccount): no process in that pod uses it,
 but it is still mintable from `169.254.169.254` by anything that gets execution there.
 
 ### Cron jobs that authenticate without a model turn
@@ -2920,6 +2956,8 @@ The broker runs in a pod of its own whether or not `workloadIdentityFederation` 
 configured, and the shell is in the sandbox either way. What federation adds is a credential
 source that is a file in the broker's pod rather than the metadata server answering a
 ServiceAccount two pods share. Without it, two things stay open:
+
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
 
 **The gateway pod keeps a cloud identity.** The gateway and the broker both run as
 `kubeagents-platform-agent`, which carries the `iam.gke.io/gcp-service-account` annotation,

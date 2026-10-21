@@ -40,6 +40,17 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the Compute plant sweep runs as (hack/ci_sweep_compute_plants.py,
+# a Prow periodic on main). Step 1, after the reconciler's grants,
+# creates one custom role on this project with exactly these permissions and
+# grants it, which is the whole reach the identity has here. The reason for
+# each permission is beside COMPUTE_SWEEP_PERMISSIONS in
+# scripts/verify_ci_pool_project.py, whose tests keep the two copies equal.
+readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
+readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
+readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list"
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -302,6 +313,7 @@ gcloud services enable \
   aiplatform.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
+  cloudtrace.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
@@ -416,6 +428,27 @@ for role in \
     --role="${role}" \
     --quiet >/dev/null
 done
+
+# A custom role, not roles/compute.networkAdmin: that role holds almost a
+# thousand permissions, and the sweep needs twelve. `update` on a re-run keeps the
+# role's permissions equal to the list above. On a project already registered,
+# run the commands in docs/ci-pool-projects.md section 5.7 by hand rather than
+# the script (section 8).
+echo "Granting the Compute plant sweeper its custom role on ${PROJECT_ID}..."
+COMPUTE_SWEEP_ROLE_VERB="create"
+if gcloud iam roles describe "${COMPUTE_SWEEP_ROLE_ID}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  COMPUTE_SWEEP_ROLE_VERB="update"
+fi
+gcloud iam roles "${COMPUTE_SWEEP_ROLE_VERB}" "${COMPUTE_SWEEP_ROLE_ID}" \
+  --project="${PROJECT_ID}" \
+  --title="${COMPUTE_SWEEP_ROLE_TITLE}" \
+  --permissions="${COMPUTE_SWEEP_PERMISSIONS}" \
+  --stage="${COMPUTE_SWEEP_ROLE_STAGE}" \
+  --quiet >/dev/null
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="${COMPUTE_SWEEP_SA}" \
+  --role="projects/${PROJECT_ID}/roles/${COMPUTE_SWEEP_ROLE_ID}" \
+  --quiet >/dev/null
 
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
@@ -617,13 +650,15 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # the second engine AGENTS.md forbids. Deliberately not enable_drift_detector,
     # which is the consumer: whether a given lease runs the detector is that
     # lease's helm upgrade to decide, and pinning it true here would be
-    # overwritten by the next one anyway. This reaches projects onboarded from
-    # here on and no project already registered: verify_ci_pool_project.py does
-    # not check the ingress yet, and section 8 of docs/ci-pool-projects.md
-    # forbids re-running this script on a registered project. So a project
-    # provisioned before this line fails a drift case as broken rather than
-    # reporting the gap, which section 3 of that file states rather than
-    # leaving to be discovered.
+    # overwritten by the next one anyway. This line turns the ingress on for a
+    # project this script onboards; it repairs no project already registered,
+    # because verify_ci_pool_project.py does not check the ingress and section
+    # 8 of docs/ci-pool-projects.md forbids re-running this script on one. The registered
+    # projects were repaired out of band rather than by this line, and section
+    # 3 of that page carries the reading, the two mechanisms that did it, and
+    # the projects still without it. A project this line never reached fails a
+    # drift case as broken rather than reporting the gap, and with no verifier
+    # check there is nothing between leases that would say so.
     #
     # drift_pubsub_topic_publishers is the pool's one departure from what an
     # install provisions, and it is confined to the pool for the reason the

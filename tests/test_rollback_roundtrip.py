@@ -12,8 +12,10 @@ one thing about what the simulated operator does and checks the run stops on
 the assertion that names it.
 
 The wiring in hack/ci-eval-pr.sh is pinned at the end: it runs only under
-EVAL_MODE_NEXT=1, after the suite verdict is computed and before it is
-announced, and nothing it does reaches the exit status.
+EVAL_MODE_NEXT=1 on a run that is not a pull request's, after the suite
+verdict is computed and before it is announced, and nothing it does reaches
+the exit status; and the today lane (EVAL_ROLLBACK_LANE=1) runs it before the
+matrix with ROLLBACK_END_MODE=today, where a failure stops the job.
 """
 
 import base64
@@ -34,6 +36,7 @@ import unittest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "hack" / "rollback-roundtrip.sh"
 _CI_EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _OPERATOR = _REPO_ROOT / "k8s-operator"
 _A2A_MANIFESTS = _OPERATOR / "internal" / "controller" / "platformagent_a2a_manifests.go"
 _CONTROLLER = _OPERATOR / "internal" / "controller" / "platformagent_controller.go"
@@ -80,6 +83,7 @@ _FAST_ENV = {
     "ROLLBACK_BUS_UP_TIMEOUT": "30",
     "ROLLBACK_BRIDGE_TIMEOUT": "30",
     "ROLLBACK_SETTLE_TIMEOUT": "30",
+    "ROLLBACK_UNSCHEDULABLE_TIMEOUT": "30",
     "ROLLBACK_TURN_TIMEOUT": "5",
     "ROLLBACK_TURN_ATTEMPTS": "2",
     "ROLLBACK_BUS_TASK_TIMEOUT": "10",
@@ -133,6 +137,22 @@ _PASSING_ORDER = [
     "leg2.bus-task",
     "leg2.nothing-stuck",
     "leg2.not-degraded",
+]
+
+# What ROLLBACK_END_MODE=today adds to a run on an install with no declared
+# sidecars: the preflight read, and leg 3, leg 1's flip and checks again.
+_END_TODAY_PREFLIGHT = "pre.end-mode-today"
+_LEG3_ORDER = [
+    "leg3.mode-today.patched",
+    "leg3.mode-today.reconciled",
+    "leg3.mode-today.agent-rolled",
+    "leg3.mode-today.ready",
+    "leg3.a2a-torn-down",
+    "leg3.pvc-kept",
+    "leg3.creds-kept",
+    "leg3.nothing-stuck",
+    "leg3.not-degraded",
+    "leg3.today-turn",
 ]
 
 # The simulated operator. State is one JSON file; every kubectl call is one
@@ -194,6 +214,9 @@ FAKE_KUBECTL = textwrap.dedent(
         if u is not None and s["tick"] >= u:
             s["unschedulable_until"] = None
             set_ready(s)
+            for pod in s["pods"]:
+                if pod["metadata"]["name"] == AGENT_POD and s.get("unbound_node"):
+                    pod["spec"]["nodeName"] = s.pop("unbound_node")
 
     def set_ready(s, phase="Ready", reason="Reconciled", status="True"):
         cr = s["cr"]
@@ -276,6 +299,44 @@ FAKE_KUBECTL = textwrap.dedent(
 
     PVC = "data-platform-agent-a2a-nats-0"
     CREDS = "platform-agent-a2a-nats-creds"
+    AGENT_POD = "platform-agent-gateway-abc"
+    CAPACITY_MSG = ("Pod %s cannot be scheduled onto any available node: 0/3 nodes are available: "
+                    "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory. "
+                    "no new claims to deallocate, preemption: 0/3 nodes are available: "
+                    "1 Preemption is not helpful for scheduling, 2 No preemption victims found for incoming pod." % AGENT_POD)
+
+    def late_unschedulable(s):
+        # Periodic 2109267671341076480 (#2414 class): the operator's last
+        # pass before the settle check saw the agent pod Pending on capacity
+        # and wrote Degraded/PodUnschedulable. The pod was scheduled seconds
+        # later; the operator watches no Pods, so the status kept the message
+        # until the pass the pod's readiness started (through the owned
+        # Deployment) rewrote it. Fired on the first pod list the settle check
+        # makes once the leg's mode has reconciled, so the settle check itself
+        # passes and the not-degraded check is the first to read it.
+        # late_unschedulable says what follows: "clears" (the pod is not yet
+        # bound; a few calls later it is, and the next pass writes Ready),
+        # "stale" (the pod is already bound and rolled out, and no pass ever
+        # rewrites the status), "persistent" (the pod is not bound and never
+        # is).
+        sc = s["scenario"]
+        leg = sc.get("late_unschedulable_on")
+        if not leg or s["cr"]["spec"].get("mode", "today") != leg or s.get("pending") or s.get("late_fired"):
+            return
+        if leg == "next" and {"spec": {"mode": "next"}} not in s["patches"]:
+            return
+        s["late_fired"] = True
+        reason = sc.get("late_reason", "PodUnschedulable")
+        message = sc.get("late_message", CAPACITY_MSG)
+        set_ready(s, phase="Degraded", reason=reason, status="False")
+        s["cr"]["status"]["conditions"][0]["message"] = message
+        how = sc.get("late_unschedulable", "clears")
+        if how in ("clears", "persistent"):
+            for pod in s["pods"]:
+                if pod["metadata"]["name"] == AGENT_POD:
+                    s["unbound_node"] = pod["spec"].pop("nodeName")
+        if how == "clears":
+            s["unschedulable_until"] = s["tick"] + 6
 
     def job(name, cond):
         conds = [] if cond == "Running" else [{"type": cond, "status": "True"}]
@@ -381,6 +442,7 @@ FAKE_KUBECTL = textwrap.dedent(
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
+                late_unschedulable(s)
             elif kind == "jobs":
                 # A Job that turns Failed after leg 2's provisioning read it
                 # Complete: the second such read under next sees it Failed.
@@ -427,6 +489,14 @@ FAKE_KUBECTL = textwrap.dedent(
 ).lstrip()
 
 
+def capacity_message(pod: str) -> str:
+    """The operator's PodUnschedulable message for a pod short of CPU and memory."""
+    return (
+        f"Pod {pod} cannot be scheduled onto any available node: 0/3 nodes are available: "
+        "1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 Insufficient memory."
+    )
+
+
 def b64(value: str) -> str:
     return base64.b64encode(value.encode()).decode()
 
@@ -466,7 +536,11 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
     if scenario.get("degraded_baseline"):
         cr["status"]["conditions"].append({"type": "Degraded", "status": "True", "reason": scenario["degraded_baseline"], "message": "m"})
     pods = [
-        {"metadata": {"name": "platform-agent-gateway-abc", "labels": {}}, "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]}},
+        {
+            "metadata": {"name": "platform-agent-gateway-abc", "labels": {}},
+            "spec": {"nodeName": "gk3-pool-1-node-a"},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "platform-agent", "state": {"running": {}}}]},
+        },
         {"metadata": {"name": "platform-agent-a2a-nats-0", "labels": {"app.kubernetes.io/part-of": "a2a-next"}}, "status": {"phase": "Running"}},
     ]
     jobs = [
@@ -708,6 +782,70 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("PASS leg2.bus-task", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}])
 
+    def test_ending_at_today_adds_a_third_leg_and_leaves_the_install_rolled_back(self) -> None:
+        # The today lane's shape: the operator renders the bridge, so the CR
+        # declares no sidecars, and the run ends under today.
+        round_trip, _, _ = self.run_sim(healthy_next_state(sidecars=[]))
+        result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = list(passed(round_trip))
+        expected.insert(expected.index("pre.mode-next") + 1, _END_TODAY_PREFLIGHT)
+        self.assertEqual(passed(result), expected + _LEG3_ORDER)
+        self.assertEqual(failed(result), [])
+        self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}, {"spec": {"mode": "today"}}])
+        self.assertEqual(state["cr"]["spec"]["mode"], "today")
+        last = result.stdout.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("ROLLBACK ROUND TRIP PASSED: next -> today -> next -> today on platformagent/platform-agent"), last)
+        self.assertIn("uid pvc-1", last)
+
+    def test_the_default_end_is_next(self) -> None:
+        for value in (None, "next"):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                extra = {} if value is None else {"ROLLBACK_END_MODE": value}
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), **extra)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn(_END_TODAY_PREFLIGHT, passed(result))
+                self.assertFalse([name for name in passed(result) if name.startswith("leg3.")])
+                self.assertEqual(state["cr"]["spec"]["mode"], "next")
+                self.assertIn("ROLLBACK ROUND TRIP PASSED: next -> today -> next on", result.stdout)
+
+    def test_ending_at_today_refuses_declared_sidecars_before_anything_changes(self) -> None:
+        result, state, _ = self.run_sim(healthy_next_state(), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, _END_TODAY_PREFLIGHT, "the CR declares spec.deployment.sidecars (hermes-bridge)")
+        self.assertEqual(state["patches"], [])
+        self.assertEqual(state["cr"]["spec"]["mode"], "next")
+
+    def test_an_end_mode_that_is_neither_fails_before_anything_is_read(self) -> None:
+        for value in ("Today", "rollback", "next "):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE=value)
+                self.assert_fails_at(result, "pre.end-mode", f"ROLLBACK_END_MODE is '{value}'")
+                self.assertEqual(state["patches"], [])
+
+    def test_a_today_turn_that_fails_on_the_third_leg_fails_there(self) -> None:
+        # The door's today turn is the same request on every leg; failing it
+        # once leg 2 has passed shows leg 3 asserts it rather than inheriting
+        # leg 1's pass.
+        state = healthy_next_state(sidecars=[])
+        sim = Sim(state)
+        self.addCleanup(sim.close)
+        proc = subprocess.Popen(
+            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=sim.env(ROLLBACK_END_MODE="today")
+        )
+        out_lines = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_lines.append(line)
+            if line.startswith("PASS leg2.not-degraded"):
+                current = sim.state()
+                current["scenario"]["today_turn_fails"] = True
+                sim.state_path.write_text(json.dumps(current))
+        proc.wait(timeout=180)
+        out = "".join(out_lines)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(re.findall(r"^FAIL (\S+):", out, re.MULTILINE), ["leg3.today-turn"], out)
+        self.assertIn("PASS leg1.today-turn", out)
+
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:
         _, state, _ = self.run_sim(healthy_next_state())
         self.assertTrue(state["calls"])
@@ -738,6 +876,79 @@ class KeptRoundTripTest(RoundTripTest):
         result, _, _ = self.run_sim(healthy_next_state(unschedulable_on="next"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("PodUnschedulable", result.stdout)
+
+    def test_a_capacity_unschedulable_that_clears_is_forgiven_at_not_degraded(self) -> None:
+        # Periodic 2109267671341076480: every other leg-2 check passed, and
+        # leg2.not-degraded read a PodUnschedulable on capacity the operator
+        # wrote while an Autopilot node was coming up. Here the next pass
+        # clears it inside the window; the run passes and says what it forgave.
+        for leg in ("today", "next"):
+            with self.subTest(leg=leg):
+                result, _, _ = self.run_sim(healthy_next_state(late_unschedulable_on=leg, late_unschedulable="clears"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(passed(result), _PASSING_ORDER)
+                check = "leg1.not-degraded" if leg == "today" else "leg2.not-degraded"
+                self.assertIn(f"{check}: Degraded on a pod waiting for CPU or memory", result.stdout)
+                line = next(x for x in result.stdout.splitlines() if x.startswith(f"PASS {check}:"))
+                self.assertIn("forgave a transient PodUnschedulable", line)
+                self.assertIn("cleared after", line)
+
+    def test_a_stale_capacity_unschedulable_on_a_bound_rolled_out_pod_fails_at_the_window(self) -> None:
+        # The pod the condition names is bound and the agent Deployment is
+        # rolled out, but no operator pass rewrites the status. The wait ends
+        # only on the CR's own verdict, so this fails at the bound rather than
+        # passing on pod state while the CR still reads Degraded (a fault on a
+        # pod the operator scans later would hide behind it). The same for a
+        # message about a pod that is not the agent's.
+        for pod in ("platform-agent-gateway-abc", "platform-agent-a2a-gateway-x"):
+            with self.subTest(pod=pod):
+                result, _, _ = self.run_sim(
+                    healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_message=capacity_message(pod)),
+                    ROLLBACK_UNSCHEDULABLE_TIMEOUT="2",
+                )
+                self.assert_fails_at(result, "leg2.not-degraded", "still Degraded after 2s on a pod waiting for CPU or memory")
+                self.assert_fails_at(result, "leg2.not-degraded", f"Pod {pod} cannot be scheduled")
+                self.assertNotIn("PASS leg2.not-degraded", result.stdout)
+
+    def test_a_capacity_unschedulable_that_persists_fails_at_the_window(self) -> None:
+        started = time.monotonic()
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="persistent"), ROLLBACK_UNSCHEDULABLE_TIMEOUT="2"
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/PodUnschedulable")
+        self.assert_fails_at(result, "leg2.not-degraded", "still Degraded after 2s")
+        self.assertIn("leg2.not-degraded: Degraded on a pod waiting for CPU or memory", result.stdout)
+        self.assertLess(time.monotonic() - started, 60)
+
+    def test_an_unschedulable_that_is_not_capacity_fails_at_once(self) -> None:
+        # A taint or a selector only: no scale-up places the pod.
+        result, _, _ = self.run_sim(
+            healthy_next_state(
+                late_unschedulable_on="next",
+                late_unschedulable="stale",
+                late_message="Pod platform-agent-gateway-abc cannot be scheduled onto any available node: 0/3 nodes are available: 3 node(s) had untolerated taint(s).",
+            )
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/PodUnschedulable")
+        self.assertNotIn("waiting for CPU or memory", result.stdout)
+
+    def test_a_degraded_phase_for_another_reason_fails_at_once(self) -> None:
+        # The message is the capacity one, so only the reason tells them apart.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="stale", late_reason="CrashLoopBackOff")
+        )
+        self.assert_fails_at(result, "leg2.not-degraded", "Ready=False/CrashLoopBackOff")
+        self.assertNotIn("waiting for CPU or memory", result.stdout)
+
+    def test_a_capacity_unschedulable_on_another_pod_that_clears_is_forgiven(self) -> None:
+        # The operator scans the A2A pods too; the deploy's gate waits on a
+        # capacity message about any of them, and so does this.
+        result, _, _ = self.run_sim(
+            healthy_next_state(late_unschedulable_on="next", late_unschedulable="clears", late_message=capacity_message("platform-agent-a2a-gateway-x"))
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(x for x in result.stdout.splitlines() if x.startswith("PASS leg2.not-degraded:"))
+        self.assertIn("cleared after", line)
 
     def test_provisioning_slower_than_the_ready_bound_gets_the_bus_up_budget(self) -> None:
         # Under next the CR is not Ready until the provisioning Job is done.
@@ -1245,6 +1456,24 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         sts = sts[: sts.index("\nfunc ")]
         self.assertNotIn("PersistentVolumeClaimRetentionPolicy", sts)
 
+    def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
+        # #2427's gate after the sidecar patch and the not-degraded checks
+        # forgive the same Degraded for the same time: one reason, one
+        # scheduler-message match, and a window of its attempts times its poll.
+        c = self.constants()
+        deploy = {}
+        for line in _CI_DEPLOY.read_text().splitlines():
+            match = re.match(r"""readonly ([A-Z0-9_]+)=["']?([^"']*)["']?$""", line)
+            if match:
+                deploy[match.group(1)] = match.group(2)
+        script = _SCRIPT.read_text()
+        self.assertEqual(c["CR_READY_REASON_POD_UNSCHEDULABLE"], deploy["CR_READY_REASON_POD_UNSCHEDULABLE"])
+        self.assertIn(f"readonly SCHEDULER_CAPACITY_SHORTFALL_RE='{deploy['SCHEDULER_CAPACITY_SHORTFALL_RE']}'", script)
+        window = int(deploy["MODE_NEXT_UNSCHEDULABLE_ATTEMPTS"]) * int(deploy["MODE_NEXT_POLL_SECONDS"])
+        self.assertEqual(int(c["DEFAULT_UNSCHEDULABLE_TIMEOUT"]), window)
+        self.assertIn('reason = "PodUnschedulable"', _CONTROLLER.read_text())
+        self.assertIn("cannot be scheduled onto any available node", _CONTROLLER.read_text())
+
     def test_the_status_words_are_the_operators(self) -> None:
         c = self.constants()
         text = _CONTROLLER.read_text()
@@ -1271,11 +1500,104 @@ def snowflake(epoch_seconds: int) -> int:
     return (epoch_seconds * 1000 - 1288834974657) << 22
 
 
+class CiEvalRollbackLaneTest(unittest.TestCase):
+    """run_rollback_lane in hack/ci-eval-pr.sh, lifted and run: the today
+    lane's round trip, before the matrix, ending under today."""
+
+    def run_lane(self, *, rollback_lane: str | None, mode_next: str | None, script_status: int = 0) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        artifacts = root / "artifacts"
+        (root / "rollback-roundtrip.sh").write_text(
+            'echo "stub ran: $* end=${ROLLBACK_END_MODE:-} context=${ROLLBACK_KUBE_CONTEXT}"\n'
+            "echo 'PASS pre.mode-next: x' >> \"${ROLLBACK_RESULTS_FILE}\"\n"
+            f"exit {script_status}\n"
+        )
+        flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
+        script = textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            {ci_eval_constants()}
+            SCRIPT_DIR={root}
+            export ARTIFACTS={artifacts}
+            TARGET_NAMESPACE=kubeagents-system
+            AGENT_SERVICE_NAME=platform-agent
+            AGENT_CLUSTER_CONTEXT=gke_p_r_c
+            {flag}
+            {lane}
+            profile_begin() {{ echo "PROFILE $*"; }}
+            {ci_eval_function("run_rollback_lane")}
+            run_rollback_lane
+            echo "MATRIX NEXT"
+            """
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, check=False, env=minimal_env())
+        return result, artifacts
+
+    def test_nothing_happens_off_the_lane(self) -> None:
+        for lane in (None, "", "0", "true"):
+            for flag in (None, "1"):
+                with self.subTest(lane=lane, flag=flag):
+                    result, artifacts = self.run_lane(rollback_lane=lane, mode_next=flag)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "MATRIX NEXT\n")
+                    self.assertFalse(artifacts.exists())
+
+    def test_the_lane_without_the_flag_stops_the_job(self) -> None:
+        for flag in (None, "", "0"):
+            with self.subTest(flag=flag):
+                result, _ = self.run_lane(rollback_lane="1", mode_next=flag)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1", result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_a_passing_rollback_ends_at_today_and_the_matrix_follows(self) -> None:
+        result, artifacts = self.run_lane(rollback_lane="1", mode_next="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub ran: kubeagents-system platform-agent end=today context=gke_p_r_c", result.stdout)
+        self.assertIn("Rolled back to today; the matrix runs over the agent API", result.stdout)
+        self.assertLess(result.stdout.index("Rolled back to today"), result.stdout.index("MATRIX NEXT"), result.stdout)
+        self.assertIn("stub ran", (artifacts / "rollback-roundtrip.log").read_text())
+        self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines(), ["PASS pre.mode-next: x"])
+
+    def test_a_failed_rollback_stops_the_job_before_the_matrix(self) -> None:
+        result, _ = self.run_lane(rollback_lane="1", mode_next="1", script_status=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the rollback lane's round trip failed (exit 1)", result.stderr)
+        self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_it_runs_before_the_resets_and_the_audit_pause(self) -> None:
+        lines = _CI_EVAL.read_text().splitlines()
+        call = [i for i, line in enumerate(lines) if line == "run_rollback_lane"]
+        self.assertEqual(len(call), 1, "one call site")
+        watch = lines.index("start_agent_pod_watch")
+        pause = next(i for i, line in enumerate(lines) if line.startswith("scheduled_audits pause"))
+        ledgers = next(i for i, line in enumerate(lines) if line.startswith("# ─── Empty ledgers"))
+        token = next(i for i, line in enumerate(lines) if line.startswith("# 4. Token & Model Configuration"))
+        self.assertLess(watch, call[0])
+        self.assertLess(call[0], ledgers)
+        self.assertLess(call[0], pause)
+        self.assertLess(call[0], token)
+
+
 class CiEvalWiringTest(unittest.TestCase):
     """run_rollback_roundtrip in hack/ci-eval-pr.sh, lifted and run."""
 
     def run_wiring(
-        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False
+        self,
+        *,
+        mode_next: str | None,
+        script_status: int = 0,
+        elapsed: int = 0,
+        job_age: int | None = None,
+        build_id: str | None = None,
+        timeout_on_path: bool = False,
+        job_type: str | None = None,
+        rollback_lane: str | None = None,
+        rc_commit_sha: str | None = None,
     ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
         """`elapsed` is the eval's age (START_TIME), `job_age` this script's
         (EVAL_SCRIPT_STARTED_EPOCH, defaulting to the eval's), `build_id` the
@@ -1292,6 +1614,9 @@ class CiEvalWiringTest(unittest.TestCase):
         )
         flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
         build = "unset BUILD_ID" if build_id is None else f"export BUILD_ID={build_id}"
+        kind = "unset JOB_TYPE" if job_type is None else f"export JOB_TYPE={job_type}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
+        rc = "unset RC_COMMIT_SHA" if rc_commit_sha is None else f"export RC_COMMIT_SHA={rc_commit_sha}"
         age = elapsed if job_age is None else job_age
         script = textwrap.dedent(
             f"""\
@@ -1306,8 +1631,12 @@ class CiEvalWiringTest(unittest.TestCase):
             EVAL_SCRIPT_STARTED_EPOCH=$(($(date +%s) - {age}))
             {flag}
             {build}
+            {kind}
+            {lane}
+            {rc}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
+            collect_credential_proxy_evidence() {{ echo COLLECT_PROXY; }}
             collect_agent_pod_diagnostics() {{
               [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
               AGENT_DIAG_COLLECTED=1
@@ -1336,6 +1665,45 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertNotIn("PROFILE", result.stdout)
                 self.assertNotIn("Rollback round trip", result.stdout)
                 self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_pull_requests_run(self) -> None:
+        # The merge-blocking presubmit grades next, and a Tide batch runs it
+        # too; neither reads a report-only round trip, and the today lane
+        # proves the path on main.
+        for job_type in ("presubmit", "batch"):
+            with self.subTest(job_type=job_type):
+                result, artifacts = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("PROFILE", result.stdout)
+                self.assertIn(f"Rollback round trip skipped: a pull request's run (JOB_TYPE={job_type})", result.stdout)
+                self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_it_runs_on_main_and_off_prow(self) -> None:
+        for job_type in ("periodic", "postsubmit", None):
+            with self.subTest(job_type=job_type):
+                result, _ = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertIn("stub ran", result.stdout)
+
+    def test_skipped_on_the_today_lane_which_ran_it_before_the_matrix(self) -> None:
+        result, artifacts = self.run_wiring(mode_next="1", job_type="periodic", rollback_lane="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("Rollback round trip", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_release_candidate_run(self) -> None:
+        """The RC eval's verdict is read only after its job finishes, inside the
+        promotion poller's 330 minutes; a report-only hour would spend that
+        budget on a check that cannot change the verdict."""
+        result, artifacts = self.run_wiring(mode_next="1", rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("PROFILE", result.stdout)
+        self.assertNotIn("COLLECT_GATEWAY", result.stdout)
+        self.assertIn("Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=b4ee5f3", result.stdout)
+        self.assertIn("returned=0", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_a_failed_round_trip_is_reported_and_changes_nothing(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", script_status=1)
@@ -1472,6 +1840,7 @@ class CiEvalWiringTest(unittest.TestCase):
                 EVAL_MODE_NEXT=1
                 profile_begin() {{ :; }}
                 collect_gateway_log() {{ :; }}
+                collect_credential_proxy_evidence() {{ :; }}
                 collect_agent_pod_diagnostics() {{
                   [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
                   AGENT_DIAG_COLLECTED=1

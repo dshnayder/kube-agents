@@ -59,7 +59,7 @@ revisions go **up** the same way, as a bundle, which is why a branch of five
 commits arrives as five commits. Nothing that came out of the repository is
 ever executed beside the credential.
 
-The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
+The script is `/opt/data/profiles/platform/skills/version-control/scripts/vcs.py` (`scripts/vcs.py` inside the skill directory). Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
 forge that is. On an install that serves more than one forge, `owner/name` is
 refused: name the repository by its URL.
@@ -98,7 +98,7 @@ Verb names are the version-control concept; the spelling you know is an alias.
 One remote call, then local work:
 
 ```bash
-V="$HERMES_HOME"/skills/version-control/scripts/vcs.py
+V=/opt/data/profiles/platform/skills/version-control/scripts/vcs.py
 # Remote: one call, one bundle. Its JSON carries `path` — cd there.
 python3 $V clone https://github.com/acme/infra
 
@@ -242,9 +242,9 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   that with `--advance` and the proposal's base as `--target`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
-  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
-  the same way however many times you repeat the call — report or fix the
-  argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
+  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN`, `FORGE_REJECTED` and
+  `FORGE_TLS_UNTRUSTED` will answer the same way however many times you repeat
+  the call — report or fix the argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
   `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
   this install cannot see answers the same way.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the

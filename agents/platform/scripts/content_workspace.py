@@ -69,7 +69,7 @@ from typing import Callable, Iterable, Mapping
 
 import repo_ref
 import workspace_paths
-from providers import pinned_base
+from providers import pinned_base, tls_refusal as _tls_refusal
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -214,6 +214,19 @@ class Conflict(ContentWorkspaceError):
 class GitFailed(ContentWorkspaceError):
     status = 502
     code = "workspace.git-failed"
+
+
+class TlsUntrusted(ContentWorkspaceError):
+    """git could not verify the forge's TLS certificate, or load its CA.
+
+    Its own code rather than `workspace.git-failed`: no retry fixes it, and the
+    action is an administrator's, which the message names by its cause -- a CA
+    to name in caBundleRef, a certificate to renew or reissue, or a CA
+    Secret to create or correct.
+    """
+
+    status = 502
+    code = "FORGE_TLS_UNTRUSTED"
 
 
 class BaseBranchMissing(ContentWorkspaceError):
@@ -691,6 +704,8 @@ class ContentWorkspaceStore:
         clock: Callable[[], float] = time.monotonic,
         locate: Locate | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], object] | None = None,
+        github_host: Callable[[], str] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -713,6 +728,10 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None. The broker hands its own, which names a forge's CA Secret;
+        # without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or _tls_refusal
         self.base_branch = (
             base_branch.strip()
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
@@ -724,6 +743,9 @@ class ContentWorkspaceStore:
         self.pinned_bases = dict(pinned_bases or {})
         self._credential_for = credential_for
         self._locate = locate
+        # The install's one GitHub host, asked per `open`: github.com, or a
+        # GitHub Enterprise Server host. None is github.com.
+        self._github_host = github_host
         # Monotonic, and injected so a test can drive the idle clock.
         self._clock = clock
         self._workspaces: dict[str, Workspace] = {}
@@ -941,6 +963,10 @@ class ContentWorkspaceStore:
             result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
+            refusal = self._tls_refusal(getattr(result, "stderr", ""))
+            if refusal is not None:
+                detail = getattr(refusal, "fields", {}).get("detail", "")
+                raise TlsUntrusted(f"`git {argv[0]}` failed: {refusal} ({self._redact(detail)})")
             raise GitFailed(
                 f"`git {argv[0]}` failed with exit code {exit_code}: "
                 f"{self._redact(getattr(result, 'stderr', ''))}"
@@ -978,11 +1004,14 @@ class ContentWorkspaceStore:
         Made current again first rather than replayed from the clone: the
         clone-time token may have expired over the workspace's lifetime, and a
         fresh mint is what a fetch on a live token needs. The layer keeps the
-        ambient helper cleared either way, so a repository that was context at
-        `open` and is managed by `commit` is refused a fresh read token and the
-        fetch runs with no credential at all, never on the write token this
-        handle was opened without; reopening the repository is what presents
-        the credential its new role earns.
+        ambient helper cleared either way. A minted read token is not re-asked:
+        a repository that was context at `open` and is managed by `commit` is
+        refused a fresh one, and the fetch runs with no credential at all. A
+        stored token is re-asked on every fetch and push, and the answer
+        follows the repository's current role: a GitLab context repository
+        opened on its stored read token that is managed by `commit` is answered
+        with the write token, which its current role earns. Reopening the
+        repository presents the same credential either way.
         """
         if workspace.credential is None:
             return ()
@@ -1010,14 +1039,21 @@ class ContentWorkspaceStore:
         """`repo`'s canonical name and the URL its clone is made from.
 
         A bare `owner/name` is GitHub's, as it has always been, and its URL is
-        composed here. Anything else is handed to `locate`, which answers for
+        composed here, on the install's GitHub host. On github.com the name
+        stays bare. On a GitHub Enterprise Server host it becomes
+        `<host>/owner/name`, the name every other forge's repository has, so
+        the pins, the managed-repository check and the credential all see the
+        host it was cloned from. Anything else is handed to `locate`, which answers for
         the forges this install serves: the forge parses the name -- nesting,
         allowed paths -- and composes the URL. With no `locate`, or a name no
         served forge owns, the open is refused: the caller names a repository,
         never a host or a URL.
         """
         if isinstance(repo, str) and is_bare_github_name(repo):
-            return repo, f"https://github.com/{repo}.git"
+            host = (self._github_host() if self._github_host else "") or repo_ref.GITHUB_CANONICAL_HOST
+            if host == repo_ref.GITHUB_CANONICAL_HOST:
+                return repo, f"https://github.com/{repo}.git"
+            return f"{host}/{repo}", f"https://{host}/{repo}.git"
         if self._locate is not None and isinstance(repo, str) and repo.strip():
             return self._locate(repo)
         raise ContentWorkspaceError(
@@ -1823,6 +1859,12 @@ class ContentWorkspaceStore:
                 config=self._push_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
+                # Read as `_git` reads a checked failure: a certificate is
+                # answered by its cause, not as "push failed".
+                refusal = self._tls_refusal(getattr(result, "stderr", ""))
+                if refusal is not None:
+                    detail = getattr(refusal, "fields", {}).get("detail", "")
+                    raise TlsUntrusted(f"`git push` failed: {refusal} ({self._redact(detail)})")
                 stderr = (getattr(result, "stderr", "") or "").lower()
                 if "stale info" in stderr or "rejected" in stderr:
                     raise Conflict(

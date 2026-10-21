@@ -556,22 +556,6 @@ class ExclusiveRunTest(unittest.TestCase):
             self.assertIsNone(rec.main())
 
 
-class MetadataTest(unittest.TestCase):
-    def test_response_is_closed(self):
-        # urlopen's response holds a socket; on a cron tick, leaking one per call
-        # leaks one per tick. It must be context-managed.
-        resp = mock.MagicMock()
-        resp.read.return_value = b"  my-project\n"
-        resp.__enter__.return_value = resp
-        with mock.patch.object(rec.urllib.request, "urlopen", return_value=resp):
-            self.assertEqual(rec._metadata("project/project-id"), "my-project")
-        resp.__exit__.assert_called_once()
-
-    def test_unreachable_metadata_returns_none(self):
-        with mock.patch.object(rec.urllib.request, "urlopen", side_effect=OSError("no route")):
-            self.assertIsNone(rec._metadata("project/project-id"))
-
-
 class ListProfilesReservedTest(unittest.TestCase):
     def test_reserved_profiles_excluded(self):
         base = Path(tempfile.mkdtemp()) / "profiles"
@@ -869,6 +853,8 @@ class ScopeTest(HomesMixin):
         snap = self._snapshot()
         self.assertEqual([p["id"] for p in snap["projects"]], sorted([self.MGMT, "team-prod"]))
         self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "mgmt-*"}])
+        self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["legacy", "team-sandbox"],
+                         "the explicit projects an exclude entry dropped are written for the audits' reader")
 
     def test_exclude_clusters_by_triple_skips_create_and_prunes_the_existing_profile(self):
         scope = {"projects": ["other"],
@@ -1047,7 +1033,8 @@ class ScopeTest(HomesMixin):
         declared = {"projects": ["p2"], "exclude": {"projects": ["*-scratch"], "clusters": [
             {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
         (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
-            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared}),
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared,
+             rec.SCOPE_EXCLUDED_KEY: ["team-a"]}),
             encoding="utf-8")
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
         for _ in range(2):
@@ -1056,6 +1043,14 @@ class ScopeTest(HomesMixin):
             self.assertEqual(deleted, [])
             self.assertEqual(self._snapshot()["declared"], rec._normalize_scope(declared))
             self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
+            # The carried tick keeps the boundary: the previous snapshot predates
+            # the key and names p2, so the audits must not widen to the listing.
+            self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "a carried declaration is a boundary in force")
+            self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY])
+            # The carried tick resolves no explicit project, so it drops none
+            # itself; the projects the last readable tick dropped by id or by
+            # number ride on, or the audits' reader would carry them as unresolved.
+            self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["team-a"], "the carried tick repeats the last readable tick's dropped projects")
 
     def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
         # A hand-edited file or snapshot must not abort the run or come apart into characters.
@@ -1121,11 +1116,9 @@ class ScopeTest(HomesMixin):
 
     def test_an_empty_reconcile_project_reads_as_unset(self):
         # The operator pins RECONCILE_PROJECT empty; the empty value must not become the project.
-        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": ""}), \
-             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
-            self.assertEqual(rec._project_source(), ("from-metadata", True))
-        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override"}), \
-             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "", "GKE_PROJECT_ID": "from-harness"}):
+            self.assertEqual(rec._project_source(), ("from-harness", True))
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override", "GKE_PROJECT_ID": "from-harness"}):
             self.assertEqual(rec._project_source(), ("override", True))
 
     def test_an_unreadable_declaration_with_no_previous_snapshot_excludes_nothing(self):
@@ -1133,6 +1126,8 @@ class ScopeTest(HomesMixin):
         report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
         self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
         self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
+        self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY], "no scope block declared this run")
+        self.assertFalse(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "with no previous snapshot nothing is carried: an install that never declared a scope has no boundary on an unreadable tick")
 
     def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
         # The three explicit listings meet at a barrier, so each is held until all three are
@@ -1347,6 +1342,8 @@ class ScopeTest(HomesMixin):
         snap = self._snapshot()
         self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
+        self.assertTrue(snap[rec.SCOPE_PRESENT_KEY], "a declared block is recorded as present, beside what it declares")
+        self.assertTrue(snap[rec.SCOPE_BOUNDARY_KEY], "a read block is a boundary in force")
 
     def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
         # A render from an operator that predates the field carries no key; a value that is
@@ -3057,5 +3054,41 @@ class ScopeTest(HomesMixin):
         self.assertIn(f"`{self.SCOPE}` (denied, 1 project(s))", text)
 
 
+
+class ProjectSourceTest(unittest.TestCase):
+    """The management project comes from the operator before the metadata server.
+
+    The gateway pod reaches no metadata server once its Workload Identity is gone,
+    so the operator's GKE_PROJECT_ID has to answer first, and authoritatively.
+    """
+
+    def test_the_operators_project_answers_and_the_metadata_server_is_gone(self):
+        # The gateway reaches no metadata server, and the script no longer asks one.
+        self.assertFalse(hasattr(rec, "_metadata"))
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": ""}):
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+
+    def test_a_numeric_operator_project_is_resolved_to_its_id(self):
+        # In the gateway the metadata server is closed, so the number is
+        # resolved through the broker; the metadata answer is never reached.
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec, "_project_id_of", return_value=("mgmt-project", rec.OUTCOME_OK)) as resolve:
+            self.assertEqual(rec._project_source(), ("mgmt-project", True))
+        resolve.assert_called_once_with("123456789012")
+
+    def test_a_numeric_operator_project_that_will_not_resolve_is_not_an_answer(self):
+        # Not even through the gcloud config fallback, which the broker was
+        # bootstrapped with from this same number: on a tick with no snapshot
+        # the number would stand as the management project and key every
+        # profile on it. The run is unresolved instead, and the next tick asks.
+        for outcome in (rec.OUTCOME_DENIED, rec.OUTCOME_UNREACHABLE):
+            with self.subTest(outcome=outcome), \
+                    mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                    mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
+                    mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
+                self.assertEqual(rec._project_source(), (None, False))
+
+
 if __name__ == "__main__":
     unittest.main()
+
