@@ -20,8 +20,10 @@
 # second managed repository stays there after the run, and on `main` every
 # other fleet-audit case on the same install would then stop with the same
 # refusal. Run it by hand against such an install, with the gitops
-# repository's `owner/name` substituted for `acme/gitops-repository` and the
-# managed repository's for `acme/managed-repository` at their sites below.
+# repository's path substituted for `acme/gitops-repository` and the managed
+# repository's for `acme/managed-repository` at their sites below: `owner/name`
+# on GitHub, the full project path on GitLab. The URL patterns accept the issue
+# and change URLs of both forges on any host.
 #
 # Domain: fleet-audits.
 # Journey: an operator registers a Terraform repository beside the GitOps
@@ -57,7 +59,7 @@ fixtures:
 verification_spec:
   # The red: on the pre-change harness `start` stops before any check, so no
   # envelope for this run is in the store, unless the agent chose a
-  # repository itself, which the next check fails.
+  # repository itself, which start-chose-the-repository fails.
   - name: the-report-store-holds-this-run
     role: objective
     mode: assert
@@ -65,16 +67,40 @@ verification_spec:
       type: audit_report_stored
       audit: compliance-audit
       required_finding_phrases: ["debug-binding"]
-  # The answer links a ledger issue in the gitops repository, and nothing in
-  # the managed one. Substitute both repositories (see the header).
+  # The change: `start` chose the gitops repository, not the agent. A worker
+  # that passes --repo to `start` or `finish` chose the repository itself
+  # (#2989), and that run fails here also when it chose the right one. This
+  # check reads the commands the worker ran, not the words of its answer.
+  - name: start-chose-the-repository
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: audit_report.py
+          flags: [start]
+          word_patterns: ["^--audit(?:=|$)"]
+      forbidden_runs:
+        - script: audit_report.py
+          flags: [start]
+          word_patterns: ["^--repo(?:=|$)"]
+        - script: audit_report.py
+          flags: [finish]
+          word_patterns: ["^--repo(?:=|$)"]
+  # The answer links a ledger issue in the gitops repository, and no issue,
+  # pull request or merge request in the managed one. The answer can name the
+  # managed repository. Substitute both repositories (see the header).
   - name: the-answer-links-the-gitops-ledger
     role: objective
     mode: assert
     check:
       type: report_contains
       required_patterns:
-        ['(?i)https://github\.com/acme/gitops-repository/issues/\d+']
-      forbidden_patterns: ['(?i)\bacme/managed-repository\b']
+        ['(?i)https://[^/\s]+/acme/gitops-repository/(?:-/)?issues/\d+']
+      forbidden_patterns:
+        [
+          '(?i)https://[^/\s]+/acme/managed-repository/(?:-/)?(?:issues|pull|merge_requests)/\d+',
+        ]
       forbidden_phrases: ["Multiple repositories configured"]
   - name: the-ledger-names-the-binding
     role: objective
