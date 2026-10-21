@@ -6340,7 +6340,8 @@ def _remediation_is_file_backed(remediation: object) -> bool:
 
 
 def _harness_wrote_note(remediation: object) -> bool:
-    """Whether `finish` wrote part of the note in `remediation`."""
+    """Whether `finish` wrote part of the note in `remediation`, other than
+    the route notes (`HARNESS_NOTE_MARKS` has no route note)."""
     if not isinstance(remediation, dict):
         return False
     note = str(remediation.get("note") or "")
@@ -6359,9 +6360,11 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     The other direction is safe and is the one the carry is for: a `gcloud`
     command from the previous run stays when the worker now writes `manual`.
 
-    Not when `finish` wrote part of either note. The pass that wrote it
-    runs again after the carry, so a copied note gets the text two times,
-    or keeps a statement that is not true for this run.
+    Not when `finish` wrote part of either note, other than the route notes,
+    which are stripped and written again (`_strip_route_notes`). The pass
+    that wrote the other parts runs again after the carry, so a copied note
+    gets the text two times, or keeps a statement that is not true for this
+    run.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False

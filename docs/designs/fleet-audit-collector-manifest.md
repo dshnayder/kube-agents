@@ -193,10 +193,10 @@ previous run's stored report (`ledger_document` when the previous run held the o
 `evidence` object and the `severity` are the same, the finding keeps the previous run's `title` and
 `impact`. It also keeps the previous `recommendation` and `remediation` together, but not when
 either side is `manifest` or names a path, not when the previous one is `manual` and this run's is
-not, and not when `finish` wrote part of either note. A carried note loses the route notes of the
-previous run, which `finish` writes again from this run's manifest (the issue-ledger design, §6).
-When the previous run cut the worker's note to give the route notes room, the stored `uncut_note`
-comes back as the note.
+not, and not when `finish` wrote part of either note, other than the route notes, which are stripped
+and written again. A carried note loses the route notes of the previous run, which `finish` writes
+again from this run's manifest (the issue-ledger design, §6). When the previous run cut the worker's
+note to give the route notes room, the stored `uncut_note` comes back as the note.
 The evidence adoption comes first because it
 makes the evidence of an unchanged finding the same on each run. The arm-specific `impact` comes
 after, because it is an observation, and it must replace carried words. The carry runs before the
