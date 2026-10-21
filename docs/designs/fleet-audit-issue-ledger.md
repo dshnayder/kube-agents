@@ -625,19 +625,6 @@ One asymmetry with the real run is deliberate: a dry run **warns** about a `reme
 is missing or fails containment, and does not rewrite the finding to `manual` the way `finish` does.
 Degrading a document it is only previewing would show the reader a body the real run never produces.
 
-### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
-
-The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
-the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
-is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
-
-**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
-`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
-subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
-make `remediate --finding one-id` open up to six pull requests, five of them for findings the
-operator never mentioned and cannot tell apart from the one they did, on the command whose entire
-purpose is to act on a specific request.
-
 Manifest files must already exist under the workspace, but **a missing one is no longer a hard
 error**. That finding degrades to `kind: manual`, keeps its evidence and recommendation, says in the
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
@@ -694,6 +681,19 @@ are left out. The stored document keeps the note from before the cut in the reme
 `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut does not stay on
 a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
+
+### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
+
+The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
+the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
+is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
+
+**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
+`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
+subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
+make `remediate --finding one-id` open up to six pull requests, five of them for findings the
+operator never mentioned and cannot tell apart from the one they did, on the command whose entire
+purpose is to act on a specific request.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
