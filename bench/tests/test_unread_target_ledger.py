@@ -169,7 +169,30 @@ def test_the_seed_opens_one_ledger_with_a_record_finish_trusts(store, monkeypatc
     assert created[0]["labels"] == ["agent:audit", f"audit:{AUDIT}"]
     ids = audit_report.parse_delta_block(body)
     assert len(ids) == 1 and ledger.HELD_OBJECT_NAME in ids[0]
-    assert audit_report.previous_run_memory(AUDIT, 7, GITOPS, body) is not None
+    latest = audit_report.reports_dir_for(AUDIT, GITOPS) / audit_report.REPORT_LATEST_NAME
+    assert latest.is_file()
+    memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
+    assert memory is not None and not memory.get("seeded_from_ledger")
+    assert forge.payloads("issue-close") == []
+
+
+def test_the_seed_fails_and_closes_its_ledger_when_the_store_write_does_nothing(
+    store, monkeypatch
+):
+    # `write_report` never fails the run, and `previous_run_memory` then seeds a
+    # memory from the ledger, so the seed must notice the lost write itself. It
+    # closes the issue it opened: a failed apply runs no destroy.
+    monkeypatch.setattr(audit_report, "write_report", lambda *a, **k: False)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-list": {"issues": []},
+            "issue-create": {"issue": {"number": 7, "url": "https://github.com/acme/fleet/issues/7"}},
+        },
+    )
+    with pytest.raises(SystemExit):
+        ledger.seed(audit_report, PROJECT, LOCATION, HOST, GITOPS, NOW)
+    assert [p["number"] for p in forge.payloads("issue-close")] == [7]
 
 
 def test_the_seed_refuses_over_an_open_ledger(store, monkeypatch):

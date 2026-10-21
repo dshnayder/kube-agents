@@ -30,6 +30,8 @@ not check `label-keys` there. The cluster name is spelled as the drift
 collector spells a target, `<project>/<location>/<name>`. Exits 1 when the
 stream already has an open ledger (the harness reset closes it before the
 run), or when the stored record does not pass the check that `finish` makes.
+In that case it closes the issue it opened first: a failed apply runs no
+destroy, so the destroy cannot close it.
 
 teardown: closes, as not planned, each open drift ledger whose body names the
 invented object. Only this case writes that name.
@@ -59,6 +61,8 @@ SEED_STATUS = "OPENED"
 TEARDOWN_REASON = "not-planned"
 SEED_ARGS = 5
 TEARDOWN_ARGS = 2
+# audit_report's mark on a memory seeded from the ledger, not read from the store.
+SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
 
 
 def target_name(project, location, cluster):
@@ -145,6 +149,23 @@ def seed(audit_report, project, location, cluster, repo, now):
     url = str(opened.get("url") or "")
     if not isinstance(number, int):
         sys.exit(f"ERROR: the forge opened no issue for {AUDIT_ID} in {repo}: {opened}")
+    stored = False
+    try:
+        stored = store_record(audit_report, data, rendered, number, url, repo, now)
+    finally:
+        if not stored:
+            audit_report.forge("issue-close", repo, {"number": number, "reason": TEARDOWN_REASON})
+    if not stored:
+        sys.exit(
+            f"ERROR: the stored record of #{number} was not written or is not one that "
+            "finish trusts, so the run would treat the ledger as a lost memory and carry "
+            f"nothing from it. Closed #{number}."
+        )
+    return url
+
+
+def store_record(audit_report, data, rendered, number, url, repo, now):
+    """Write the stored record of the seeded ledger. True when `finish` trusts it."""
     ids = audit_report.parse_delta_block(rendered.body)
     payload = {
         "status": SEED_STATUS,
@@ -171,12 +192,12 @@ def seed(audit_report, project, location, cluster, repo, now):
         ),
         now,
     )
-    if audit_report.previous_run_memory(AUDIT_ID, number, repo, rendered.body) is None:
-        sys.exit(
-            f"ERROR: the stored record of #{number} is not one that finish trusts, so the "
-            "run would treat the ledger as a lost memory and carry nothing from it."
-        )
-    return url
+    # `write_report` never fails the run, and `previous_run_memory` seeds a
+    # memory from the ledger when the store has no directory. So check that
+    # the file is there and that the memory is the one written here.
+    latest = audit_report.reports_dir_for(AUDIT_ID, repo) / audit_report.REPORT_LATEST_NAME
+    memory = audit_report.previous_run_memory(AUDIT_ID, number, repo, rendered.body)
+    return latest.is_file() and memory is not None and not memory.get(SEEDED_FROM_LEDGER_KEY)
 
 
 def teardown(audit_report, repo):
