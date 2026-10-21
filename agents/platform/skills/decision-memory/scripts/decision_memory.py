@@ -494,9 +494,62 @@ def render_check_markdown(findings: List[Dict[str, Any]], semantic: List[Dict[st
 # Git helpers
 # --------------------------------------------------------------------------
 
+def _git_bin() -> Optional[str]:
+    env_git = os.environ.get("KUBE_AGENTS_LOCAL_GIT")
+    if env_git and os.path.isfile(env_git):
+        return env_git
+    for candidate in ("/opt/vcs/libexec/git", "/opt/vcs/bin/git", "/usr/bin/git"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _ensure_scripts_on_path() -> None:
+    resolved = Path(__file__).resolve()
+    candidates = [Path("/opt/defaults/scripts"), Path("/opt/data/scripts")]
+    if len(resolved.parents) > 3:
+        candidates.insert(0, resolved.parents[3] / "scripts")
+    for candidate in candidates:
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.append(str(candidate))
+
+
+def _resolve_sandbox_git_repo(repo: Path) -> Path:
+    vcs_root = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", DEFAULT_VCS_ROOT))
+    if str(repo).startswith(str(vcs_root)):
+        return repo
+    try:
+        _ensure_scripts_on_path()
+        import sandbox_exec  # type: ignore
+        res = sandbox_exec.run(
+            ["/bin/sh", "-c", f"ls -d {vcs_root}/* 2>/dev/null | head -n 1"],
+            check=False,
+        )
+        cand = (res.stdout or "").strip()
+        if cand:
+            return Path(cand)
+    except Exception:
+        pass
+    return repo
+
+
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
-                          capture_output=True, text=True).stdout
+    local_bin = _git_bin()
+    if local_bin:
+        return subprocess.run(
+            [local_bin, "-c", "safe.directory=*", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    _ensure_scripts_on_path()
+    import sandbox_exec  # type: ignore
+    srepo = _resolve_sandbox_git_repo(repo)
+    res = sandbox_exec.run(
+        ["/opt/vcs/libexec/git", "-c", "safe.directory=*", "-C", str(srepo), *args],
+        check=True,
+    )
+    return res.stdout
 
 
 def changed_files(repo: Path, base: str, head: str = "HEAD") -> Dict[str, Optional[str]]:
@@ -511,11 +564,28 @@ def changed_files(repo: Path, base: str, head: str = "HEAD") -> Dict[str, Option
     return out
 
 
+def _file_exists_on_head(repo: Path, rel_path: str, tracked: Optional[set] = None) -> bool:
+    if (repo / rel_path).exists():
+        return True
+    if tracked is not None:
+        return rel_path in tracked
+    try:
+        return bool(git(repo, "ls-files", "--error-unmatch", rel_path).strip())
+    except subprocess.CalledProcessError:
+        return False
+
+
 def worktree_files(repo: Path, globs: Iterable[str]) -> Dict[str, str]:
     files = {}
     for p in git(repo, "ls-files").splitlines():
         if any(fnmatch.fnmatch(p, g) for g in globs):
-            files[p] = (repo / p).read_text()
+            if (repo / p).exists():
+                files[p] = (repo / p).read_text()
+            else:
+                try:
+                    files[p] = git(repo, "show", f"HEAD:{p}")
+                except subprocess.CalledProcessError:
+                    pass
     return files
 
 
@@ -1229,15 +1299,19 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
         return None
 
     try:
-        old_doc = next((d for d in yaml.safe_load_all(old_raw) if isinstance(d, dict)), None)
-        new_doc = next((d for d in yaml.safe_load_all(new_raw) if isinstance(d, dict)), None)
+        old_docs = [d for d in yaml.safe_load_all(old_raw) if isinstance(d, dict)]
+        new_docs = [d for d in yaml.safe_load_all(new_raw) if isinstance(d, dict)]
     except yaml.YAMLError:
         return None
-    if not old_doc or not new_doc:
+    if not old_docs or not new_docs:
         return None
 
-    old_leaves = _flatten_yaml_leaves(old_doc)
-    new_leaves = _flatten_yaml_leaves(new_doc)
+    old_leaves: Dict[str, Any] = {}
+    new_leaves: Dict[str, Any] = {}
+    for d in old_docs:
+        old_leaves.update(_flatten_yaml_leaves(d))
+    for d in new_docs:
+        new_leaves.update(_flatten_yaml_leaves(d))
 
     # Check if a key was removed in the fix (e.g. limits.cpu removed)
     removed = [k for k in old_leaves if k not in new_leaves and "tolerations" not in k]
@@ -1249,11 +1323,13 @@ def _infer_guard_from_commit(repo: Path, commit_sha: str, target_file: str) -> O
                 "expect": {"file": target_file, "path": rk, "op": "absent", "value": True},
             }
 
-    # Check changed or added leaves
+        # Check changed or added leaves (skip multiline blobs such as ConfigMap data payloads)
     changed = [k for k in new_leaves if old_leaves.get(k) != new_leaves[k]]
     for ck in changed:
         nval = new_leaves[ck]
         oval = old_leaves.get(ck)
+        if isinstance(nval, str) and ("\n" in nval or len(nval) > 200):
+            continue
         nq, oq = quantity(nval), quantity(oval) if oval is not None else None
         if nq is not None and oq is not None:
             op = ">=" if nq > oq else "<="
@@ -1275,7 +1351,7 @@ def _git_commit_index(repo: Path) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, 
     by_pr: Dict[int, Dict[str, Any]] = {}
     by_sha: Dict[str, Dict[str, Any]] = {}
     try:
-        raw = git(repo, "log", "--format=%x1e%H%x1f%s%x1f%b%x1f", "--name-only")
+        raw = git(repo, "log", "-m", "--first-parent", "--format=%x1e%H%x1f%s%x1f%b%x1f", "--name-only")
     except subprocess.CalledProcessError:
         return by_pr, by_sha
     for entry in raw.split("\x1e"):
@@ -1338,13 +1414,7 @@ def _normalize_issue(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _load_vcs_client() -> Any:
-    for candidate in (
-        Path(__file__).resolve().parents[3] / "scripts",
-        Path("/opt/defaults/scripts"),
-        Path("/opt/data/scripts"),
-    ):
-        if candidate.is_dir() and str(candidate) not in sys.path:
-            sys.path.append(str(candidate))
+    _ensure_scripts_on_path()
     import vcs_client  # type: ignore
     return vcs_client
 
@@ -1353,23 +1423,36 @@ def _vcs_fetch_all(repo: Path, repo_spec: str) -> Tuple[List[Dict[str, Any]], Li
     """Fetch proposals and issues across GitHub, GitLab, and Bitbucket via vcs_client."""
     vc = _load_vcs_client()
     prs: List[Dict[str, Any]] = []
+    seen_nums = set()
     page = 1
-    while True:
+    while page <= 20:
         resp = vc.forge("proposal-list", {"state": "all", "limit": 100, "page": page}, repository=repo_spec)
         batch = resp.get("proposals") or []
-        prs.extend(batch)
-        if not resp.get("truncated") or not batch:
+        new_items = [b for b in batch if b.get("number") not in seen_nums]
+        if not new_items:
+            break
+        for b in new_items:
+            seen_nums.add(b.get("number"))
+        prs.extend(new_items)
+        if not resp.get("truncated"):
             break
         page += 1
 
     issues_resp = vc.forge("issue-list", {"state": "all", "limit": 100}, repository=repo_spec)
     issues = [_normalize_issue(i) for i in (issues_resp.get("issues") or [])]
 
+    re_rejected = re.compile(r"rejection of\s+(?:PR|MR|pull request|merge request)?\s*[#!]\s*(\d+)", re.I)
+    referenced_rejected = {
+        int(m.group(1))
+        for raw_pr in prs
+        for m in re_rejected.finditer(str(raw_pr.get("body") or ""))
+    }
+
     by_pr, by_sha = _git_commit_index(repo)
     normalized_prs: List[Dict[str, Any]] = []
     for raw_pr in prs:
         pr = _normalize_proposal(raw_pr, by_pr, by_sha)
-        if not pr.get("merged_at") and pr.get("state") == "closed" and pr.get("title") != "[withdrawn-eval-probe]":
+        if int(pr["number"]) in referenced_rejected and not pr.get("merged_at") and pr.get("state") == "closed":
             try:
                 view = vc.forge(
                     "proposal-view",
@@ -1484,6 +1567,10 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
     triage_counts = {"revert-lesson": 0, "decision": 0, "superseded": 0, "routine": 0}
     llm_synthesized_count = 0
     llm_url, llm_model, llm_key = _resolve_llm_config(a)
+    try:
+        tracked_files = set(git(repo, "ls-files").splitlines())
+    except subprocess.CalledProcessError:
+        tracked_files = set()
     pr_to_record_id: Dict[int, str] = {}
     allocated_ids: Dict[Tuple[str, int], int] = {}
 
@@ -1733,7 +1820,10 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
             continue
 
         # Case 4: High-signal incident fix or governance/convention PR synthesized via LiteLLM
-        live_files = [f for f in files if (repo / f).exists() and not f.startswith("knowledge/")]
+        live_files = [
+            f for f in files
+            if _file_exists_on_head(repo, f, tracked_files) and not f.startswith("knowledge/")
+        ]
         if (
             llm_url
             and merged
