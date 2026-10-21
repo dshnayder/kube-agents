@@ -236,20 +236,19 @@ def test_a_drift_run_that_compares_the_host_does_not_keep_it(store, monkeypatch)
     assert audit_report.unread_held_entries(body, memory, data, exclude=set()) == []
 
 
-def test_teardown_closes_only_the_ledger_this_case_opened(store, monkeypatch):
+def test_teardown_closes_the_ledger_after_a_run_that_dropped_the_seeded_row(store, monkeypatch):
+    """The seed refuses over an open ledger, so each open ledger of the stream is the seeded one.
+
+    A run without the fix writes the body again and the invented object
+    leaves it, so the teardown does not look for the name.
+    """
     forge = forge_with(
         monkeypatch,
-        **{
-            "issue-list": {
-                "issues": [
-                    {"number": 7, "body": f"... {ledger.HELD_OBJECT_NAME} ..."},
-                    {"number": 8, "body": "another drift run's ledger"},
-                ]
-            }
-        },
+        **{"issue-list": {"issues": [{"number": 7, "body": "the run's own body"}]}},
     )
     assert ledger.teardown(audit_report, GITOPS) == [7]
     assert [p["number"] for p in forge.payloads("issue-close")] == [7]
+    assert forge.payloads("issue-list")[0]["labels"] == [f"audit:{AUDIT}"]
 
 
 def test_every_task_variable_is_declared_by_the_stack():

@@ -33,8 +33,11 @@ run), or when the stored record does not pass the check that `finish` makes.
 In that case it closes the issue it opened first: a failed apply runs no
 destroy, so the destroy cannot close it.
 
-teardown: closes, as not planned, each open drift ledger whose body names the
-invented object. Only this case writes that name.
+teardown: closes, as not planned, each open ledger of the stream. The seed
+refuses when the stream has an open ledger, so an open ledger at destroy is
+the one the seed opened. The run under test can write that body again
+without the invented object (a run without the fix does), so the teardown
+does not look for the name.
 """
 
 import json
@@ -201,7 +204,7 @@ def store_record(audit_report, data, rendered, number, url, repo, now):
 
 
 def teardown(audit_report, repo):
-    """Close each open drift ledger that names the invented object."""
+    """Close each open ledger of the stream; the seed opened it."""
     answer = audit_report.forge(
         "issue-list",
         repo,
@@ -209,7 +212,7 @@ def teardown(audit_report, repo):
     )
     closed = []
     for issue in answer.get("issues") or []:
-        if isinstance(issue, dict) and HELD_OBJECT_NAME in str(issue.get("body") or ""):
+        if isinstance(issue, dict) and isinstance(issue.get("number"), int):
             audit_report.forge(
                 "issue-close", repo, {"number": issue["number"], "reason": TEARDOWN_REASON}
             )

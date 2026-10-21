@@ -30,9 +30,10 @@
 # this stack opens.
 #
 # The finding's object is an invented name that only this case uses. The
-# destroy closes each open drift ledger whose body names it. A seed that fails
-# after it opens the issue closes the issue itself, because a failed apply runs
-# no destroy.
+# destroy closes each open drift ledger: the seed refuses when one is open, so
+# an open one at destroy is the one the seed opened, whatever the run wrote in
+# its body. A seed that fails after it opens the issue closes the issue
+# itself, because a failed apply runs no destroy.
 
 terraform {
   required_version = ">= 1.5.0"
