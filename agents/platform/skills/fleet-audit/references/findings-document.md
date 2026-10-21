@@ -250,8 +250,10 @@ field, and publishes nothing:
   cut below keeps that mention. It also names the `reconciler`, whose next sync or upgrade can
   revert a change made by hand. The notes go in a paragraph of their own after your note. It writes
   no note for a candidate without these fields, and none for a fix that `finish` wrote itself, that
-  you declined with `--decline-fix`, or that a pull request already carries. It removes route notes
-  that your note copied from an earlier ledger. It closes a code fence that your note leaves open.
+  you declined with `--decline-fix`, or that an open pull request carries. A fix whose pull request
+  merged while the finding still reproduces, or that a person closed, gets the notes. It removes
+  route notes that your note copied from an earlier ledger. It closes a code fence that your note
+  leaves open.
   When your note and the route notes together are longer than the note cap, it cuts your note and
   ends it with ` …(truncated)`, so that the route notes fit. The cut does not go into the text that
   `finish` adds after your note when the audit did not write your file. A note with a code fence is

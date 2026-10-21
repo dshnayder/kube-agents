@@ -19967,26 +19967,24 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("a", self.unwritten([self.manual(check=check)], self.manifest(check=check)))
 
     def test_each_fix_the_refusal_path_answered_gets_no_route_note(self):
-        """A planned fix, a declined one, one a pull request answers, and one a
-        pull request carries are each skipped on their own; an unwritten fix
-        with none of these, and a decline of no unwritten fix, are not."""
+        """A planned fix, a declined one, and one an open pull request carries
+        are each skipped on their own; an unwritten fix with none of these,
+        and a decline of no unwritten fix, are not."""
         fix = audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)
-        unwritten = {fid: fix for fid in ("planned", "declined", "answered", "open")}
+        unwritten = {fid: fix for fid in ("planned", "declined", "open")}
         skip = audit_report.route_note_skip(
             unwritten,
             {"declined": "why", "stray": "why"},
             {"planned": ("apps/a/pdb.yaml", "# text\n")},
-            {"answered"},
             {"carried"},
         )
-        self.assertEqual(skip, {"planned", "declined", "answered", "carried"})
-        for name in ("planned", "declined", "answered", "carried"):
+        self.assertEqual(skip, {"planned", "declined", "carried"})
+        for name in ("planned", "declined", "carried"):
             with self.subTest(name):
                 left = audit_report.route_note_skip(
                     unwritten,
                     {"declined": "why"} if name != "declined" else {},
                     {"planned": ("p", "t")} if name != "planned" else {},
-                    {"answered"} if name != "answered" else set(),
                     {"carried"} if name != "carried" else set(),
                 )
                 self.assertNotIn(name, left)
@@ -20003,6 +20001,20 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(audit_report.pr_carried_fixes({"a": "apps/a/pdb.yaml"}, [], AUDIT, [on_branch]), set())
         stale = {**naming, "state": "CLOSED", "labels": [{"name": audit_report.STALE_CLOSED_LABEL}]}
         self.assertEqual(audit_report.pr_carried_fixes({}, [], AUDIT, [stale]), set())
+
+    def test_only_an_open_pull_request_carries_a_fix_for_the_route_notes(self):
+        """A merged fix that still reproduces, and a fix that a person closed,
+        leave the manual path to the reader, so the row gets the route notes."""
+        for name, fields in {
+            "merged": {"state": "MERGED", "mergedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            with self.subTest(name):
+                naming = {**fields, "headRefName": "x", "body": audit_report.delta_block(["b"])}
+                on_branch = self.pr_on("apps/a/pdb.yaml", **fields)
+                self.assertEqual(
+                    audit_report.pr_carried_fixes({"a": "apps/a/pdb.yaml"}, ["a"], AUDIT, [on_branch, naming]), set()
+                )
 
     def test_prs_still_open_names_a_pull_request_that_answers_a_manual_finding(self):
         finding = {"id": "a"}
@@ -20627,9 +20639,9 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
         self.assertIn(DECLINE_REASON, body)
         self.assertNotIn(audit_report.DECLARED_NOTE_LEDE, body)
 
-    def test_a_declared_manual_fix_a_pull_request_carries_gets_no_route_note(self):
-        """The pull request is the answer the row shows; a note that sends the
-        reader to the repository would ask for the same change again."""
+    def finish_with_carrying_pr(self, state="OPEN", merged_at=None):
+        """The ledger body of a run whose declared `manual` fix a pull request
+        in `state` carries."""
         self.harness.replies = {"issue-list": issues_view([])}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         check, obj = "unbound-sa-automount", "Deployment/api"
@@ -20645,13 +20657,30 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
                 )
             ]
         )
-        carrying = pr(5, "platform-agent/fix-elsewhere", body=audit_report.delta_block([fid]))
+        carrying = pr(5, "platform-agent/fix-elsewhere", state=state, merged_at=merged_at, body=audit_report.delta_block([fid]))
         self.harness.replies["proposal-list"] = proposals_view([carrying])
         self.assertEqual(self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)]), 0, self.err)
         body = "".join(self.harness.bodies_for("issue-*"))
         self.assertIn("Set the field on the pod template.", body)
+        return body
+
+    def test_a_declared_manual_fix_an_open_pull_request_carries_gets_no_route_note(self):
+        """The pull request is the answer the row shows; a note that sends the
+        reader to the repository would ask for the same change again."""
+        body = self.finish_with_carrying_pr()
         self.assertFalse(audit_report.DECLARED_NOTE_LEDE in body)
         self.assertFalse(audit_report.RECONCILED_NOTE_LEDE in body)
+
+    def test_a_merged_fix_that_still_reproduces_gets_the_route_notes(self):
+        """The merge did not fix it, so the reader makes the change by hand."""
+        body = self.finish_with_carrying_pr(state="MERGED", merged_at="2026-10-01T00:00:00Z")
+        self.assertIn(audit_report.DECLARED_NOTE_LEDE, body)
+        self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
+
+    def test_a_fix_that_a_person_refused_gets_the_route_notes(self):
+        body = self.finish_with_carrying_pr(state="CLOSED")
+        self.assertIn(audit_report.DECLARED_NOTE_LEDE, body)
+        self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
 
     def test_a_degraded_fix_whose_branch_has_a_pull_request_gets_no_route_note(self):
         """The file was never written, but the pull request on the branch its

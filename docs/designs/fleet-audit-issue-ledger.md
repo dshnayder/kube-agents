@@ -669,11 +669,12 @@ whole path is not written, unless the cut below removes that mention. A candidat
 fields gets no note, because a missing `declaration` is not a claim that no file declares the
 object. A route note copied from an earlier ledger is removed before the notes are written again,
 also from a fix that gets no route note and on a run without a manifest. A fix that `finish` wrote, that the worker
-declined, or that a pull request already carries gets no route note, because the row already gives
+declined, or that an open pull request carries gets no route note, because the row already gives
 the answer. A pull request carries the fix when its delta block names the finding, or, for a
-degraded fix, when it is on the branch that the promised path names; a pull request that the
-harness closed as stale does not count. The notes give the location; a worker
-clause that contradicts them stays, and the note beside it is the correction. The worker's note is
+degraded fix, when it is on the branch that the promised path names. Only an open pull request
+counts: when a merged fix still reproduces (`pr-merged-persists`) or a person closed the pull
+request (`refused`), the reader must make the change by hand, so the row gets the route notes.
+The notes give the location; a worker clause that contradicts them stays, and the note beside it is the correction. The worker's note is
 cut first when the total is longer than the note cap, measured after redaction and the escape of a
 comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut
 is never inside a code block: a note with a fence is cut only before the fence, or the route notes
