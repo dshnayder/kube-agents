@@ -677,8 +677,9 @@ clause that contradicts them stays, and the note beside it is the correction. Th
 cut first when the total is longer than the note cap, measured after redaction and the escape of a
 comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut
 is never inside a code block: a note with a fence is cut only before the fence, or the route notes
-are left out. The stored document keeps the note from before the cut in the remediation's
-`uncut_note`, and the carry of an unchanged finding puts that note back, so the cut does not stay on
+are left out. The cut is in the worker's part of the note: the text that the degrade of an
+unwritten file adds at the end stays whole, unless the route notes leave no room for it. The
+stored document keeps the note from before the cut in the remediation's `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut does not stay on
 a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
 

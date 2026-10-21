@@ -20505,6 +20505,43 @@ class TestManualRemediationRoutes(unittest.TestCase):
         data = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
         self.assertNotIn(audit_report.ROUTE_UNCUT_NOTE_FIELD, data["findings"][0]["remediation"])
 
+    def degraded_note(self, reason):
+        return f"Set the probe. {'y' * audit_report.MAX_NOTE_CHARS} _(The audit {reason}. " + (
+            audit_report.DEGRADED_REMEDIATION_TAIL
+        )
+
+    def test_the_cut_keeps_the_note_that_the_degrade_wrote(self):
+        """The degrade note is at the end of the note, and a cut from the end
+        removed it. The stored note then had no harness mark, so the next run
+        carried it and published the degrade text again from the uncut note."""
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"}, reconciler="`flux`")
+        for reason in (
+            "named `apps/a.yaml` as the fix but did not write it, so no pull request can be opened",
+            "named `../x.yaml` as the fix, but that path does not resolve to a real file inside the repository",
+        ):
+            with self.subTest(reason=reason):
+                degraded = self.degraded_note(reason)
+                finding = self.manual(note=degraded)
+                self.disclose(finding, manifest)
+                note = self.note(finding)
+                self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+                self.assertIn("…(truncated) _(The audit " + reason, note)
+                self.assertIn(audit_report.DEGRADED_REMEDIATION_TAIL + "\n\n_(Declared", note)
+                stored = json.loads(json.dumps(audit_report._redact_document(finding)))
+                now = self.manual(note="Other words.")
+                self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [stored]}), [])
+                self.assertEqual(self.note(now), "Other words.")
+
+    def test_a_harness_mark_in_the_uncut_note_stops_the_carry(self):
+        """Also when a cut removed the mark from the note itself."""
+        before = {
+            "kind": "manual",
+            "note": "Set the probe. …(truncated)",
+            audit_report.ROUTE_UNCUT_NOTE_FIELD: self.degraded_note("named `a.yaml` as the fix but did not write it"),
+        }
+        self.assertTrue(audit_report._harness_wrote_note(before))
+        self.assertFalse(audit_report._remediation_may_carry(before, {"kind": "manual", "note": "Other words."}))
+
 class TestManualRemediationRoutesInFinish(HarnessTestCase):
     """The wiring: what reaches the ledger body, in the real run and in the
     preview, and the fix the refusal path handled."""

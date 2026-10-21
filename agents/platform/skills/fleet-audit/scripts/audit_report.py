@@ -1624,8 +1624,9 @@ ROUTE_PARAGRAPH_BREAK = "\n\n"
 CODE_FENCE = "```"
 # What closes a code fence that the worker's note leaves open.
 CODE_FENCE_CLOSE = "\n```"
-# The end of the note `degrade_missing_remediations` writes for a manifest
-# file that the audit did not write.
+# The start and the end of the note `degrade_missing_remediations` writes,
+# after the worker's note, for a manifest file that the audit did not write.
+DEGRADED_REMEDIATION_LEDE = "_(The audit "
 DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run the audit.)_"
 # The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
 # fix that Config Connector reverts.
@@ -6341,11 +6342,16 @@ def _remediation_is_file_backed(remediation: object) -> bool:
 
 def _harness_wrote_note(remediation: object) -> bool:
     """Whether `finish` wrote part of the note in `remediation`, other than
-    the route notes (`HARNESS_NOTE_MARKS` has no route note)."""
+    the route notes (`HARNESS_NOTE_MARKS` has no route note).
+
+    The note before the route-note cut (`ROUTE_UNCUT_NOTE_FIELD`) counts too:
+    `_strip_route_notes` puts it back after a carry, so a mark that the cut
+    removed from the note must stop the carry all the same.
+    """
     if not isinstance(remediation, dict):
         return False
-    note = str(remediation.get("note") or "")
-    return any(mark in note for mark in HARNESS_NOTE_MARKS)
+    notes = (str(remediation.get(field) or "") for field in ("note", ROUTE_UNCUT_NOTE_FIELD))
+    return any(mark in note for note in notes for mark in HARNESS_NOTE_MARKS)
 
 
 def _remediation_may_carry(before: object, now: object) -> bool:
@@ -14902,7 +14908,7 @@ def degrade_missing_remediations(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = (f"{note} " if note else "") + (
-            f"_(The audit {reason}. {DEGRADED_REMEDIATION_TAIL}"
+            f"{DEGRADED_REMEDIATION_LEDE}{reason}. {DEGRADED_REMEDIATION_TAIL}"
         )
         degraded.append(fid)
     return degraded
@@ -15379,15 +15385,31 @@ def _routed_note(found: RouteEvidence, worker_note: str) -> tuple[str, str]:
     return _fit_route_notes(worker_note, NOTE_SEPARATOR.join(notes))
 
 
+def _split_harness_tail(note: str) -> tuple[str, str]:
+    """The worker's part of `note` and the note that `degrade_missing_remediations`
+    wrote at its end, or `(note, "")` when there is no such note."""
+    if not note.endswith(DEGRADED_REMEDIATION_TAIL):
+        return note, ""
+    start = note.rfind(DEGRADED_REMEDIATION_LEDE, 0, len(note) - len(DEGRADED_REMEDIATION_TAIL))
+    if start < 0:
+        return note, ""
+    return note[:start].rstrip(), note[start:]
+
+
 def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
     """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
 
+    The cut is in the worker's part of the note only. The note that
+    `degrade_missing_remediations` wrote at the end stays whole: without it,
+    the stored note has no `HARNESS_NOTE_MARKS` entry. Only when the route
+    notes leave no room for that note does the cut go into it.
+
     A worker note that leaves a code fence open gets the fence closed, so the
-    route notes after it are prose. A cut never goes inside a code block: a
-    worker note with a fence is cut only before its first fence, and when
-    that does not give enough space the route notes are left out. A cut
-    always ends with `ROUTE_NOTE_TRUNCATED`, and route notes that leave no
-    room for it are left out too.
+    text after it is prose. A cut never goes inside a code block: a worker
+    note with a fence is cut only before its first fence, and when that does
+    not give enough space the route notes are left out. A cut always ends with
+    `ROUTE_NOTE_TRUNCATED`, and route notes that leave no room for it are left
+    out too.
 
     The length is measured after `publishable_text`, as the renderer measures
     it: an escaped comment opener and a redaction placeholder make the text
@@ -15395,28 +15417,44 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
     """
     if not added:
         return worker_note, added
-    if worker_note.count(CODE_FENCE) % 2:
-        worker_note += CODE_FENCE_CLOSE
+    body, tail = _split_harness_tail(worker_note)
+    for kept, harness in ((body, tail), (worker_note, "")) if tail else ((worker_note, ""),):
+        fitted = _cut_worker_note(kept, harness, added)
+        if fitted is not None:
+            return fitted, added
+    return worker_note, ""
+
+
+def _cut_worker_note(body: str, tail: str, added: str) -> str | None:
+    """`body` cut so that it, `tail` and the route notes `added` fit
+    `MAX_NOTE_CHARS`, with `tail` after it, or None when no cut fits."""
+    if body.count(CODE_FENCE) % 2:
+        body += CODE_FENCE_CLOSE
+
+    def joined(head: str) -> str:
+        # A fence line with text after it does not close the fence.
+        separator = ROUTE_PARAGRAPH_BREAK if head.endswith(CODE_FENCE) else NOTE_SEPARATOR
+        return separator.join(part for part in (head, tail) if part)
 
     def fits(head: str) -> bool:
-        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (head, added) if part)
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(head), added) if part)
         return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
 
     def cut(room: int) -> str:
-        return (worker_note[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
+        return (body[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
 
-    if fits(worker_note):
-        return worker_note, added
+    if fits(body):
+        return joined(body)
     if not fits(""):
-        return worker_note, ""
-    if CODE_FENCE in worker_note:
-        head = worker_note[: worker_note.index(CODE_FENCE)].rstrip()
+        return None
+    if CODE_FENCE in body:
+        head = body[: body.index(CODE_FENCE)].rstrip()
         if head and fits(head + ROUTE_NOTE_TRUNCATED):
-            return head + ROUTE_NOTE_TRUNCATED, added
-        return worker_note, ""
+            return joined(head + ROUTE_NOTE_TRUNCATED)
+        return None
     # The longest cut that fits. Redaction can depend on the text after a
     # match, so the result is checked again.
-    low, high = 0, len(worker_note) - 1
+    low, high = 0, len(body) - 1
     while low < high:
         middle = (low + high + 1) // 2
         if fits(cut(middle)):
@@ -15426,8 +15464,8 @@ def _fit_route_notes(worker_note: str, added: str) -> tuple[str, str]:
     # The mark stays even when no character of the worker's note fits; route
     # notes that leave no room for the mark are left out.
     if fits(cut(low)):
-        return cut(low), added
-    return worker_note, ""
+        return joined(cut(low))
+    return None
 
 
 def disclose_manual_remediation_routes(
