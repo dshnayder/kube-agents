@@ -1117,6 +1117,11 @@ counts as checked, because the note does not say which findings it could not see
 gap keeps `resolved` at `0` does not change. A finding kept this way counts as published, so it is
 not listed under `unreported_under_gap`.
 
+On the run that rewrites the body, a `/remediate` on an id under _Not re-checked this run_ is
+deferred until a run checks its target, as on the clean run below; this covers the ids inside the
+cap, and an id past the cap is answered as not in the current report, because the ledger stops
+tracking it.
+
 The clean run over a gap renders no rows, because it comments and leaves the body as it was, and it
 keeps the stored `not_rechecked` places. It still uses the ids, all of them with no cap, because the
 body it keeps carries each one: a `/remediate` on one is deferred,
