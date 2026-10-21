@@ -4873,8 +4873,11 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
         if not conversation.startswith(prefix) or len(conversation) == len(prefix):
             raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
     else:
-        if not CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id):
-            raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+        if not (CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id) or chat_type in CONVERSATION_ROUTE_CHAT_TYPES):
+            raise HTTPException(
+                status_code=400,
+                detail="an identity-only route (no platform) needs a user_id of the form hmac:<32-hex> or a chat_type of 'dm' or 'group'",
+            )
         if not conversation:
             raise HTTPException(status_code=400, detail="conversation is required")
     if not context_id:

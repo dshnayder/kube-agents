@@ -303,9 +303,31 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(route["user_id"], hmac_user)
         self.assertEqual(route["chat_type"], "dm")
 
-        # Empty platform without a valid hmac user_id is refused.
-        inject_body["user_id"] = ""
-        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=inject_body).status_code, 400)
+        # An identity-only record with chat_type and no user_id (e.g. console door) is also accepted.
+        console_body = {
+            "platform": "",
+            "conversation": "console:tok-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=console_body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["platform"], "")
+        self.assertNotIn("user_id", route)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # Empty platform without a valid hmac user_id or chat_type is refused with a clear message.
+        bad_id_body = {
+            "platform": "",
+            "conversation": "inject:eval/run-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "",
+        }
+        bad_resp = self.client.put(f"/v1/sessions/{sid}/route", json=bad_id_body)
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertIn("identity-only route", bad_resp.json()["detail"])
 
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe

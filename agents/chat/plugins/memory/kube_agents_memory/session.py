@@ -65,7 +65,9 @@ logger = logging.getLogger(__name__)
 
 A2A_SESSION_PREFIX = "a2a-"
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
-MAX_PARENT_SESSION_HOPS = 16
+MAX_PARENT_SESSION_HOPS = 256
+SQLITE_TIMEOUT_SECONDS = 2.0
+COMPRESSION_END_REASON = "compression"
 INTERACTIVE_PLATFORMS = frozenset({"google_chat", "slack", "discord", "telegram"})
 
 
@@ -84,15 +86,15 @@ def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
     if not state_db.is_file():
         return ""
     try:
-        with closing(sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=2.0)) as conn:
+        with closing(sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
             cur = sid
             seen = {cur}
             for _ in range(MAX_PARENT_SESSION_HOPS):
                 row = conn.execute(
                     "SELECT s.parent_session_id FROM sessions s "
                     "JOIN sessions p ON p.id = s.parent_session_id "
-                    "WHERE s.id = ? AND p.end_reason = 'compression'",
-                    (cur,),
+                    "WHERE s.id = ? AND p.end_reason = ?",
+                    (cur, COMPRESSION_END_REASON),
                 ).fetchone()
                 parent = str(row[0] or "").strip() if row else ""
                 if not parent or parent in seen:
@@ -115,7 +117,7 @@ def _resolve_a2a_session_route(session_id: str, kwargs: Dict[str, Any]) -> Tuple
     if not db_path or not os.path.isfile(db_path):
         return True, "", ""
     try:
-        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
             row = conn.execute(
                 "SELECT metadata FROM session_metadata WHERE session_id = ?", (a2a_sid,)
             ).fetchone()
@@ -234,11 +236,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         # handle_tool_call() is passed no identity — so it fails closed. Shared
         # memory, visible to everyone by design, is unaffected.
         if is_a2a:
-            session_is_shared = bool(
-                chat_type
-                and chat_type != "dm"
-                and not thread_sessions_are_per_user()
-            )
+            session_is_shared = bool(chat_type and chat_type != "dm")
         else:
             session_is_shared = bool(
                 chat_type

@@ -189,6 +189,74 @@ class TestUserTagIsolation(unittest.TestCase):
                 self.assertEqual(p_missing._personal_disabled_reason, NO_IDENTITY_NOTICE)
                 self.assertFalse(p_missing._unattended)
 
+    def test_branched_continuation_does_not_inherit_a2a_parent_route(self):
+        """Only 'compression' parents inherit the originating a2a-* route."""
+        with tempfile.TemporaryDirectory() as tmp:
+            kv_db = os.path.join(tmp, "session_kv.db")
+            state_db = os.path.join(tmp, "state.db")
+            alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+            with closing(sqlite3.connect(kv_db)) as conn, conn:
+                conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (
+                        "a2a-ctx-dm",
+                        json.dumps({
+                            "conversation_route": {
+                                "platform": "google_chat",
+                                "conversation": "gchat:spaces/DM1",
+                                "context_id": "ctx-dm",
+                                "user_id": alice_hmac,
+                                "chat_type": "dm",
+                            }
+                        }),
+                    ),
+                )
+            with closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT)")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('a2a-ctx-dm', NULL, 'branched')")
+                conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason) VALUES ('20261021_branch', 'a2a-ctx-dm', NULL)")
+
+            with patch.dict(os.environ, {"SESSION_KV_DB_PATH": kv_db, "HERMES_HOME": tmp}), \
+                 patch.object(kam_client, "load_hindsight", return_value=None):
+                p_branch = KubeAgentsMemoryProvider()
+                p_branch.initialize("20261021_branch", hermes_home=tmp)
+                self.assertEqual(p_branch._user_tag, "")
+                self.assertEqual(p_branch._personal_disabled_reason, NO_IDENTITY_NOTICE)
+
+    def test_non_a2a_interactive_and_unattended_prongs_and_default_user_id(self):
+        """Verify non-A2A interactive prongs (`chat_type='dm'`, `platform='slack'`),
+        unattended cron/watcher sessions, and `user_id='default'` normalization.
+        """
+        with patch.object(kam_client, "load_hindsight", return_value=None):
+            # Non-A2A interactive DM with missing user_id -> _unattended is False.
+            p_dm = KubeAgentsMemoryProvider()
+            p_dm.initialize("20261021_dm", user_id="", chat_type="dm")
+            self.assertEqual(p_dm._user_tag, "")
+            self.assertEqual(p_dm._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_dm._unattended)
+
+            # Non-A2A interactive platform session with missing user_id -> _unattended is False.
+            p_plat = KubeAgentsMemoryProvider()
+            p_plat.initialize("20261021_slack", user_id="", platform="slack")
+            self.assertEqual(p_plat._user_tag, "")
+            self.assertEqual(p_plat._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_plat._unattended)
+
+            # Non-A2A cron/watcher session with no user_id, chat_type, or platform -> _unattended is True.
+            p_cron = KubeAgentsMemoryProvider()
+            p_cron.initialize("cron-platform-audit-2026-10-21", user_id="")
+            self.assertEqual(p_cron._user_tag, "")
+            self.assertEqual(p_cron._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertTrue(p_cron._unattended)
+
+            # user_id="default" is normalized to empty rather than hashed into a shared tag.
+            p_def = KubeAgentsMemoryProvider()
+            p_def.initialize("a2a-ctx-no-route", user_id="default")
+            self.assertEqual(p_def._user_tag, "")
+            self.assertEqual(p_def._personal_disabled_reason, NO_IDENTITY_NOTICE)
+            self.assertFalse(p_def._unattended)
+
 
 if __name__ == "__main__":
     unittest.main()
