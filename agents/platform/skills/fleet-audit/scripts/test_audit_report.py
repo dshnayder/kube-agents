@@ -16858,6 +16858,19 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         # The baseline is in this scheme now.
         self.assertTrue(self.finish([self.a], scheduled=True)[0]["silent_ok"])
 
+    def test_a_ledger_a_human_closed_is_said_on_the_next_scheduled_run(self):
+        # The last stored run is the scheduled run that listed a. A human then
+        # closed the ledger, so this run has no open ledger and counts `new`
+        # and `resolved` against nothing.
+        self.seed_scheduled([self.a])
+        self.harness.replies = {"issue-list": {"issues": []}}
+        out, text = self.finish([], scheduled=True)
+        self.assertEqual((out["status"], out["resolved"]), ("CLEAN", 0))
+        self.assertFalse(out["silent_ok"])
+        gone = derived_id(obj="Namespace/a")
+        self.assertEqual(out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
+        self.assertIn(f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", text)
+
 
 class TestStandingCoverageGap(HarnessTestCase):
     """A coverage gap that did not change since the stored run is not news.

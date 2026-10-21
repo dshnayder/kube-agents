@@ -1167,8 +1167,9 @@ the last run is zero: a finding that an on-demand run saw first, new or resolved
 the channel. Its `new` and `resolved` then can be 0, so the JSON line also carries
 `since_last_scheduled`, the ids new and resolved since the last scheduled run, and the chat report
 says them on a line of its own ("Changed since the last scheduled run: …"). When no record shows
-the ids, the value is `null` and the line says that the change is not known. The key is absent
-when the last stored run was a scheduled run, because `new` and `resolved` then say the change.
+the ids, or the record was written under another finding id scheme, the value is `null` and the
+line says that the change is not known. The key is absent when the last stored run was a scheduled
+run on the open ledger, because `new` and `resolved` then say the change.
 `new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
 that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
 published and that an on-demand run dropped since then is in `unreported_under_gap` only when it

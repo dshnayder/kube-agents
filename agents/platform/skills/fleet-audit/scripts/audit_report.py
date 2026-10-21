@@ -1323,8 +1323,8 @@ SCHEDULED_REPORTED_UNDER_GAP_KEY = "scheduled_reported_under_gap"
 # last scheduled run, and the ids the last scheduled run published that are
 # gone now (not an id dropped under a coverage gap). It is None when no
 # record shows what the last scheduled run published. The key is absent when
-# the published ids did not move, or when the last stored run was a
-# scheduled run. See `since_last_scheduled`.
+# the published ids did not move, or when `new` and `resolved` counted
+# against the record of the last scheduled run. See `since_last_scheduled`.
 SINCE_SCHEDULED_KEY = "since_last_scheduled"
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
@@ -8067,6 +8067,7 @@ def since_last_scheduled(
     baseline: list[str] | None,
     published: Iterable[str],
     not_resolved: Iterable[str] = (),
+    counted_against_record: bool = True,
 ) -> dict:
     """The `SINCE_SCHEDULED_KEY` entry for the JSON line, or `{}` for none.
 
@@ -8075,15 +8076,22 @@ def since_last_scheduled(
     `baseline` (`scheduled_published_baseline`) was read from, and
     `published` is what this run published. `not_resolved` holds ids that
     left under a coverage gap: they are not resolved, and the report lists
-    them on a line of their own. With no baseline the value is None. When
-    the stored record is a scheduled run's, `new` and `resolved` already
-    count against the last scheduled run, so the entry is left out.
+    them on a line of their own. With no baseline the value is None.
+    `counted_against_record` says that `new` and `resolved` count against
+    `record`. When they do and `record` is a scheduled run's, they already
+    say the change since the last scheduled run, so the entry is left out.
+    With no open ledger they count against no record: every published id is
+    new and none is resolved. Then the entry is left out only when the
+    baseline is empty, because it would say the same.
     """
     if not ids_moved:
         return {}
     if baseline is None:
         return {SINCE_SCHEDULED_KEY: None}
-    if (record or {}).get(RUN_SCHEDULED_KEY) is not False:
+    if counted_against_record:
+        if (record or {}).get(RUN_SCHEDULED_KEY) is not False:
+            return {}
+    elif not baseline:
         return {}
     published = set(published)
     return {
@@ -18263,6 +18271,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         scheduled_ids,
         published_ids,
         not_resolved=reported_under_gap if gaps else (),
+        # With no open ledger, `new` and `resolved` count against no record.
+        counted_against_record=bool(existing_issue),
     )
     for entry in held_entries:
         if carried_without_manifest:
