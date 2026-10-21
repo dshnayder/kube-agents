@@ -15619,7 +15619,9 @@ def disclose_manual_remediation_routes(
     A finding in `skip` gets no route note (`route_note_skip`): a fix that
     `finish` wrote, that the worker declined with a published reason, or that
     an open pull request carries. Only the route notes that its text copied
-    are removed.
+    are removed. The same is true for a remediation that is not `manual`: a
+    worker can copy a route note into its own manifest fix, or into a note
+    that becomes the note of a fix that `finish` writes.
 
     The pass first removes the route notes that the text already carries,
     which a worker that copies the previous ledger brings back, and then
@@ -15637,9 +15639,9 @@ def disclose_manual_remediation_routes(
     for finding in findings:
         fid = str(finding.get("id", ""))
         remediation = finding.get("remediation")
-        if not isinstance(remediation, dict) or remediation.get("kind") != "manual":
+        if not isinstance(remediation, dict):
             continue
-        if fid in skip:
+        if remediation.get("kind") != "manual" or fid in skip:
             before = remediation.get("note")
             _strip_route_notes(remediation)
             if remediation.get("note") != before:
@@ -15676,7 +15678,7 @@ def disclose_manual_routes_and_log(
         if ROUTE_NOTE_PATTERN.search(note):
             log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
         else:
-            log(f"{prefix}{fid}: removed the route notes that its manual remediation copied from an earlier ledger.")
+            log(f"{prefix}{fid}: removed the route notes that its remediation copied from an earlier ledger.")
 
 
 class KccDeclaration(NamedTuple):

@@ -252,7 +252,8 @@ field, and publishes nothing:
   no note for a candidate without these fields, and none for a fix that `finish` wrote itself, that
   you declined with `--decline-fix`, or that an open pull request carries. A fix whose pull request
   merged while the finding still reproduces, or that a person closed, gets the notes. It removes
-  route notes that your note copied from an earlier ledger. It closes a code fence that your note
+  route notes that your note copied from an earlier ledger, from a note of every remediation kind.
+  It closes a code fence that your note
   leaves open. When your note and the route notes together are longer than the note cap, it cuts
   your note and ends it with ` …(truncated)`, so that the route notes fit. The cut does not go into
   the text that `finish` adds after your note when the audit did not write your file, or into the

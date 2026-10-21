@@ -671,7 +671,8 @@ worker's note leaves open is closed first. A note whose path the worker's note a
 whole path is not written, unless the cut below removes that mention. A candidate without these
 fields gets no note, because a missing `declaration` is not a claim that no file declares the
 object. A route note copied from an earlier ledger is removed before the notes are written again,
-also from a fix that gets no route note and on a run without a manifest. A fix that `finish` wrote, that the worker
+also from a fix that gets no route note, from a remediation of every kind (a fix that `finish`
+wrote and a worker's `manifest` fix too), and on a run without a manifest. A fix that `finish` wrote, that the worker
 declined, or that an open pull request carries gets no route note, because the row already gives
 the answer. A pull request carries the fix when its delta block names the finding, or, for a
 degraded fix, when it is on the branch that the promised path names. Only an open pull request

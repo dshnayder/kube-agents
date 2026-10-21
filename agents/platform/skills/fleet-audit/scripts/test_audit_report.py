@@ -20390,6 +20390,32 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertEqual(self.disclose(finding, self.manifest()), ["a"])
         self.assertEqual(self.note(finding), self.WORKER_NOTE)
 
+    def test_a_copied_note_goes_from_every_remediation_kind(self):
+        """A worker that copied a `manual` row's route note into a fix that
+        `finish` then wrote, or into its own manifest fix, kept the note:
+        the pass looked only at `manual` remediations."""
+        stale = audit_report.RECONCILED_NOTE.format(reconciler="`flux`")
+        manifest = self.manifest(declaration={"path": "apps/web/a.yaml"}, reconciler="`flux`")
+        for name, worker in {
+            "generated budget": f"{self.WORKER_NOTE}\n\n{stale}",
+            "worker manifest": f"{self.WORKER_NOTE}\n\n{stale}",
+        }.items():
+            with self.subTest(name):
+                finding = self.manual(note=worker)
+                if name == "generated budget":
+                    with tempfile.TemporaryDirectory() as root, contextlib.redirect_stderr(io.StringIO()):
+                        audit_report.write_generated_fixes(
+                            [finding], {"a": ("apps/web/a-pdb.yaml", "kind: PodDisruptionBudget\n")}, Path(root)
+                        )
+                    skip = {"a"}
+                    expected = f"{audit_report.GENERATED_FIX_NOTE} {self.WORKER_NOTE}"
+                else:
+                    finding["remediation"] = {"kind": "manifest", "path": "apps/web/a.yaml", "note": worker}
+                    skip = frozenset()
+                    expected = self.WORKER_NOTE
+                self.assertEqual(self.disclose(finding, manifest, skip), ["a"])
+                self.assertEqual(self.note(finding), expected)
+
     def test_only_the_whole_path_counts_as_named(self):
         """`apps/web/a.yaml` is not named by `apps/web/a.yaml.bak` or by
         `x/apps/web/a.yaml`; it is named at the end of a sentence."""
