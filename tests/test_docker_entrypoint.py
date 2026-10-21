@@ -1122,8 +1122,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         operator-mounted plugin is a symlink; the loop must leave both as they are.
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         # The two definitions sit above the block's opener. The shipped plugin list runs
         # as it is; the source path is a fixed image path, so the test points it at the
@@ -1213,8 +1213,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
         source = _ENTRYPOINT.read_text(encoding="utf-8")
         plugin_list = next(line for line in source.splitlines() if line.startswith("CLUSTER_IMAGE_PLUGINS="))
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += plugin_list + "\n" + block
         with tempfile.TemporaryDirectory() as tmp:
@@ -1281,8 +1281,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn("CLUSTER_SHARED_PLUGINS", preamble, "the plugin refresh's definitions moved")
         # CLUSTER_TEMPLATE comes from the fixture through the environment, as in the sibling test.
         preamble = "\n".join(line for line in preamble.splitlines() if not line.startswith("CLUSTER_TEMPLATE="))
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += preamble + "\n" + block
         with tempfile.TemporaryDirectory() as tmp:
