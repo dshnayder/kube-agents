@@ -807,30 +807,48 @@ def slug(s: str) -> str:
 
 
 def _resolve_llm_config(a: Any) -> Tuple[Optional[str], str, str]:
-    """Resolve OpenAI-compatible LLM base URL, model, and API key for record synthesis."""
+    """Resolve LiteLLM gateway base URL, model, and API key for OKF synthesis."""
     if getattr(a, "no_llm", False):
         return None, "", ""
     base = (
         getattr(a, "llm_url", None)
         or os.environ.get("DECISION_MEMORY_LLM_URL")
-        or os.environ.get("OPENAI_BASE_URL")
         or os.environ.get("LITELLM_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
         or ""
     ).strip()
-    if not base and os.environ.get("INFERENCE_GATEWAY_SERVICE_HOST"):
-        base = "http://inference-gateway/v1"
     model = (
         getattr(a, "llm_model", None)
         or os.environ.get("DECISION_MEMORY_LLM_MODEL")
+        or os.environ.get("LITELLM_MODEL")
         or os.environ.get("API_SERVER_MODEL_NAME")
-        or DEFAULT_LLM_MODEL
+        or ""
     ).strip()
     api_key = (
         os.environ.get("DECISION_MEMORY_LLM_API_KEY")
+        or os.environ.get("LITELLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
-        or "local"
+        or ""
     ).strip()
-    return (base.rstrip("/") if base else None), model, api_key
+    if not base or not model:
+        for cfg_dir in filter(None, [os.environ.get("HERMES_HOME"), "/opt/data", "/opt/defaults"]):
+            cfg_path = Path(cfg_dir) / "config.yaml"
+            if cfg_path.is_file():
+                try:
+                    cfg = yaml.safe_load(cfg_path.read_text()) or {}
+                    m_cfg = cfg.get("model") or {}
+                    if not base and m_cfg.get("base_url"):
+                        base = str(m_cfg["base_url"]).strip()
+                    if not model and (m_cfg.get("model") or m_cfg.get("default")):
+                        model = str(m_cfg.get("model") or m_cfg.get("default")).strip()
+                    if not api_key and m_cfg.get("api_key"):
+                        api_key = str(m_cfg["api_key"]).strip()
+                    break
+                except Exception:
+                    pass
+    if not base and os.environ.get("INFERENCE_GATEWAY_SERVICE_HOST"):
+        base = "http://inference-gateway/v1"
+    return (base.rstrip("/") if base else None), (model or DEFAULT_LLM_MODEL), (api_key or "none")
 
 
 def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:

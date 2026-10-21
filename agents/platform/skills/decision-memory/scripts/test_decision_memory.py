@@ -731,6 +731,30 @@ class LLMSynthesisTests(unittest.TestCase):
         rec = dm.parse_record((self.r.path / out["path"]).read_text(), out["path"])
         self.assertEqual(rec.guard, {})
 
+    def test_resolve_llm_config_reads_litellm_gateway_from_agent_config_yaml(self):
+        cfg_dir = self.r.path / "agent-home"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "config.yaml").write_text(
+            "model:\n"
+            "  provider: custom\n"
+            "  model: model-default\n"
+            f"  base_url: {self.llm_url}\n"
+            "  api_key: none\n"
+        )
+        old_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(cfg_dir)
+        try:
+            ns = dm.argparse.Namespace(no_llm=False, llm_url=None, llm_model=None)
+            base, model, key = dm._resolve_llm_config(ns)
+            self.assertEqual(base, self.llm_url)
+            self.assertEqual(model, "model-default")
+            self.assertEqual(key, "none")
+        finally:
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
+
 
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")
 class LiveHindsightTests(unittest.TestCase):
