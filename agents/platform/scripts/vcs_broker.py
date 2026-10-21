@@ -242,6 +242,21 @@ def _iso_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+#: What git prints when the server refused the credential it presented. With
+#: prompts off it asks for a username; older paths name the status.
+_GIT_CREDENTIAL_REFUSED = (
+    "could not read Username for 'https://",
+    "returned error: 401",
+    "Authentication failed",
+)
+
+
+def _git_refused_credential(stderr: Any) -> bool:
+    """Whether a failed git call's output says the server refused the credential."""
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr or "")
+    return any(marker in text for marker in _GIT_CREDENTIAL_REFUSED)
+
+
 def _login_key(login: str) -> str:
     """One spelling for two sources that mark an automation differently.
 
@@ -497,7 +512,28 @@ class VcsBroker:
         # than the bind is the one git must present.
         def run(cwd: Path, *args: str, check: bool = True):
             config = tuple(forge.credential.git_config(repo))
-            return self._git_runner(["git", *args], cwd, check, config)
+            try:
+                return self._git_runner(["git", *args], cwd, check, config)
+            except subprocess.CalledProcessError as exc:
+                # A forge whose git refusal means more than "the token is not
+                # valid" says what it means. Only the forge's own text goes
+                # back: git's output can carry the remote URL, so none of it
+                # does. Every other forge keeps the generic git failure.
+                if forge.git_refused and _git_refused_credential(exc.stderr):
+                    # git asks for a username when the helper has no token
+                    # too: a Secret that is not there yet, or an empty file.
+                    # Reading the credential names that case
+                    # (FORGE_CREDENTIAL_UNAVAILABLE), so only a token the
+                    # forge refused gets the forge's text.
+                    forge.credential.headers(repo)
+                    LOGGER.warning(
+                        "git refused the %s credential for a %s call (rc=%s)",
+                        forge.name, args[0] if args else "git", exc.returncode,
+                    )
+                    raise WorkspaceError(
+                        forge.git_refused, status=401, code="FORGE_UNAUTHENTICATED"
+                    ) from exc
+                raise
 
         return run
 
