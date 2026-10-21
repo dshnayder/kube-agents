@@ -14,12 +14,12 @@ All commands output JSON (or Markdown with `--markdown`) and run against a local
 
 ## When to use
 
-| Scenario | Command | Required action |
-| --- | --- | --- |
-| Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic` | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body. |
-| Review a pull request | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR. |
-| Answer "why is X configured this way?" | `why <path>` | Cite matching record IDs. If `records` is empty, state that no decision is recorded, show `history`, and offer to draft a record. Never invent a reason from commit logs. |
-| Record a verified fix or rejected PR | `from-outcome <outcome.json>` | Open a pull request with the drafted lesson record for human review. |
+| Scenario                                                                   | Command                                | Required action                                                                                                                                                                 |
+| -------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic`       | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body. |
+| Review a pull request                                                      | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR.                                                           |
+| Answer "why is X configured this way?"                                     | `why <path>`                           | Cite matching record IDs. If `records` is empty, state that no decision is recorded, show `history`, and offer to draft a record. Never invent a reason from commit logs.       |
+| Record a verified fix or rejected PR                                       | `from-outcome <outcome.json>`          | Open a pull request with the drafted lesson record for human review.                                                                                                            |
 
 ## Verdicts
 
@@ -28,30 +28,30 @@ All commands output JSON (or Markdown with `--markdown`) and run against a local
 - `consistent`: The change satisfies the evaluated guard.
 - `semantic`: The Hindsight index returned similar records outside the explicit file scope. Verify whether they apply.
 
-When `check` returns `no_match`, report *"No recorded decision governs these paths"*.
+When `check` returns `no_match`, report _"No recorded decision governs these paths"_.
 Never claim that no decision exists.
 
 ## Record schema
 
 ```yaml
 ---
-type: lesson            # decision | lesson
-id: LES-2026-001        # DEC-YYYY-NNN | LES-YYYY-NNN
+type: lesson # decision | lesson
+id: LES-2026-001 # DEC-YYYY-NNN | LES-YYYY-NNN
 title: checkout OOM-kills below 256Mi
-status: active          # proposed | active | superseded | retired
+status: active # proposed | active | superseded | retired
 date: 2026-09-10
-scope:                  # include at least one key
+scope: # include at least one key
   paths: ["clusters/*/payments/checkout.yaml"]
   resources: ["Deployment/payments/checkout"]
   clusters: [prod-eu]
   checks: [oom-kill]
-guard:                  # optional machine-checked rule
+guard: # optional machine-checked rule
   rule: Keep checkout memory request at or above 256Mi.
-  severity: block       # block | warn | info
+  severity: block # block | warn | info
   expect:
     file: "clusters/*/payments/checkout.yaml"
     path: "spec.template.spec.containers[name=app].resources.requests.memory"
-    op: ">="            # == != >= > <= < in contains
+    op: ">=" # == != >= > <= < in contains
     value: 256Mi
 evidence:
   pull_request: https://github.com/acme/gitops/pull/31
