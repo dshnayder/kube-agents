@@ -76,9 +76,6 @@ def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
     sid = str(session_id or "").strip()
     if sid.startswith(A2A_SESSION_PREFIX):
         return sid
-    gsk = str(kwargs.get("gateway_session_key") or "").strip()
-    if gsk.startswith(A2A_SESSION_PREFIX):
-        return gsk
     if not sid:
         return ""
     hermes_home_str = kwargs.get("hermes_home") or os.environ.get("HERMES_HOME") or "/opt/data"
@@ -93,7 +90,9 @@ def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
                 row = conn.execute(
                     "SELECT s.parent_session_id FROM sessions s "
                     "JOIN sessions p ON p.id = s.parent_session_id "
-                    "WHERE s.id = ? AND p.end_reason = ?",
+                    "WHERE s.id = ? AND p.end_reason = ? "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL",
                     (cur, COMPRESSION_END_REASON),
                 ).fetchone()
                 parent = str(row[0] or "").strip() if row else ""

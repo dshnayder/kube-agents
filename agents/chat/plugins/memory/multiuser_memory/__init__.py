@@ -273,15 +273,12 @@ def _thread_sessions_are_per_user() -> bool:
 
 
 def _resolve_a2a_session_id(
-    session_id: str, kwargs: Dict[str, Any], hermes_home: Optional[Path]
+    session_id: str, hermes_home: Optional[Path]
 ) -> str:
     """Return the originating ``a2a-*`` session id, walking compression parents if needed."""
     sid = str(session_id or "").strip()
     if sid.startswith(A2A_SESSION_PREFIX):
         return sid
-    gsk = str(kwargs.get("gateway_session_key") or "").strip()
-    if gsk.startswith(A2A_SESSION_PREFIX):
-        return gsk
     if not sid or hermes_home is None:
         return ""
     state_db = hermes_home / "state.db"
@@ -295,7 +292,9 @@ def _resolve_a2a_session_id(
                 row = conn.execute(
                     "SELECT s.parent_session_id FROM sessions s "
                     "JOIN sessions p ON p.id = s.parent_session_id "
-                    "WHERE s.id = ? AND p.end_reason = ?",
+                    "WHERE s.id = ? AND p.end_reason = ? "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL",
                     (cur, COMPRESSION_END_REASON),
                 ).fetchone()
                 parent = str(row[0] or "").strip() if row else ""
@@ -311,10 +310,10 @@ def _resolve_a2a_session_id(
 
 
 def _resolve_a2a_session_route(
-    session_id: str, kwargs: Dict[str, Any], hermes_home: Optional[Path]
+    session_id: str, hermes_home: Optional[Path]
 ) -> Tuple[bool, str, str]:
     """Return ``(is_a2a, user_id, chat_type)`` from ``session_kv.db`` for ``a2a-*`` sessions."""
-    a2a_sid = _resolve_a2a_session_id(session_id, kwargs, hermes_home)
+    a2a_sid = _resolve_a2a_session_id(session_id, hermes_home)
     if not a2a_sid:
         return False, "", ""
     db_path = os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH)
@@ -364,7 +363,7 @@ class MultiUserFileMemoryProvider(MemoryProvider):
         chat_type = str(kwargs.get("chat_type") or "").strip().lower()
 
         is_a2a, a2a_user, a2a_chat_type = _resolve_a2a_session_route(
-            session_id, kwargs, self._hermes_home
+            session_id, self._hermes_home
         )
         if is_a2a:
             if not raw_user and a2a_user:

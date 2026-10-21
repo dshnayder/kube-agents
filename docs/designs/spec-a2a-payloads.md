@@ -257,9 +257,10 @@ before any consumer sees it.
 **What this does not give a consumer.** It does not answer "who is the human" for
 authorization. The capability chain terminates at a request id, not a person;
 `authority.requester` names a pseudonymized principal (`hmac:<32-hex>`) and is advisory for
-access control, though the bridge records `authority.requester.principal` and
-`authority.audience.kind` in `session-kv` on task submission (where the gateway is the sole
-`.in` publisher under rule 2 above) to key per-user memory isolation. It does not expire -
+access control. As an interim exception until the #1884 capability grant carries the
+pseudonymous requester subject directly, the bridge records `authority.requester.principal`
+and `authority.audience.kind` in `session-kv` on task submission (where the gateway is the
+sole `.in` publisher under rule 2 above) to key per-user memory isolation. It does not expire -
 09 §5 is explicit that nothing carries an issue time or a use count, so a resolvable
 reference is resolvable indefinitely, and a consumer MUST NOT read a successful resolution
 as evidence the request is still live.
