@@ -71,8 +71,8 @@ and `document`, this run's validated findings document, whole rather than clippe
 budget. The body's redaction backstop is applied to every string on the way in, so the envelope
 never holds a credential shape the public issue blanked — except a finding's `id`, which the hidden
 block publishes raw, and which a long object name can make look like a token. `current_ids` is
-exactly what the body's hidden block lists: the findings the body rendered, the collector-held ids,
-and the ids under _Not re-checked this run_ ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
+exactly what the body's hidden block lists: the findings the body named, in full or on one line,
+the collector-held ids, and the ids under _Not re-checked this run_ ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 When that last list is not empty, `not_rechecked` gives the title and place of each of its findings,
 because the body may have no row for them and the document does not carry them. A held-open clean
 run copies it from the previous record.
