@@ -7,13 +7,13 @@ An agent that runs an enterprise fleet accumulates two kinds of durable knowledg
 1. **Conversational and organisational facts** — who owns a control, user preferences, and team conventions stated in chat (`kube-agents-memory` and `multiuser_memory`).
 2. **Infrastructure decisions and operational lessons** — why a workload setting or cluster policy exists, which pull request and incident established it, and which machine-checked guard prevents a repeat outage (`knowledge/decisions/*.md`, `knowledge/lessons/*.md`, and `kube-agents-decisions`).
 
-Hermes ships a single-user file-based memory for conversational facts. At fleet scale it does not hold: left unbounded it consumes most of the model's context window on every turn ($110,907$ tokens at $1,414$ records), and bounded to the size Hermes allows ($2,200$ characters) it holds about seven records. Meanwhile, conversational memory alone learns only from chat turns: it ignores the operational loop (`troubleshoot -> PR -> merge -> verified resolution`), paraphrases text during observation consolidation ($11$ of $12$ recall misses strip the record ID), and ranks superseded policies alongside active ones ($0.407$ contamination). And under `spec.mode: next`, `hermes-bridge` previously passed no user identity or conversation kind to Hermes `api_server`, breaking per-user memory isolation.
+Hermes ships a single-user file-based memory for conversational facts. At fleet scale it does not hold: left unbounded it consumes most of the model's context window on every turn ($110,907$ tokens at $1,414$ records), and bounded to the size Hermes allows ($2,200$ characters) it holds about seven records. Meanwhile, conversational memory alone learns only from chat turns: it ignores the operational loop (`troubleshoot -> PR -> merge -> verified resolution`), paraphrases text during observation consolidation ($11$ of $12$ recall misses strip the record ID), and ranks superseded policies alongside active ones ($0.407$ contamination). In addition, `hermes-bridge` invokes the Hermes HTTP API server (`POST /v1/chat/completions`) with `session_id = "a2a-<contextId>"`, where `memory_manager.initialize()` receives no in-process `user_id` or `chat_type`, so both memory providers must resolve caller identity and audience kind from the session route store.
 
-This document specifies the unified long-term memory architecture across both `spec.mode: today` and `spec.mode: next`:
+This document specifies the unified long-term memory architecture:
 
 - **Layer 1 — Conversational Memory (`kube-agents-memory` and `multiuser_memory`):**
   - Retrieval-backed memory on Hindsight (`kube-agents-memory`) decouples context cost from corpus size ($4,264$ tokens vs $110,907$ tokens at $1,414$ records).
-  - In `spec.mode: next`, `hermes-bridge` reads the gateway-verified `authority.requester.principal` (`hmac:<32-hex>`) and `authority.audience.kind` (`"dm"` | `"group"`) from the task's `.in` submission envelope after capability verification and records them on the session route in `session_kv_server.py`. Both memory providers resolve `user_id` and `chat_type` from `session_kv.db` with zero Hermes source patches.
+  - `hermes-bridge` reads the gateway-verified `authority.requester.principal` (`hmac:<32-hex>`) and `authority.audience.kind` (`"dm"` | `"group"`) from the task's `.in` submission envelope after capability verification and records them on the session route in `session_kv_server.py`. Both memory providers resolve `user_id` and `chat_type` from `session_kv.db` with zero Hermes source patches.
   - Five explicit session attribution states (`attributed-dm`, `unattributable-shared`, `unattributable-interactive`, `unattended`, and `read-only`) ensure that missing identity on a human turn fails closed, refuses unqualified writes, and never leaks across users or into `scope:shared`.
 - **Layer 2 — Decision and Lesson Memory (`knowledge/` + `kube-agents-decisions` + `decision_memory.py`):**
   - Git is the source of truth: decisions (`knowledge/decisions/DEC-*.md`) and lessons (`knowledge/lessons/LES-*.md`) live in the GitOps repository as Operational Knowledge Format (OKF) files with `scope`, `evidence`, `supersedes`, and optional machine-checked `guard.expect` blocks.
@@ -27,7 +27,7 @@ This document specifies the unified long-term memory architecture across both `s
 | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The Hindsight chat provider         | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                               |
 | The lighter file alternative        | [`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)                                                                   |
-| The `mode: next` route store        | [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go), [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) |
+| The session route store             | [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go), [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) |
 | The decision memory CLI & skill     | [`agents/platform/skills/decision-memory/`](../../agents/platform/skills/decision-memory/SKILL.md) (`scripts/decision_memory.py`)                                      |
 | The pre-PR submission gate          | [`agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py`](../../agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py)                 |
 | Which chat provider an install gets | `install.sh --memory=`, carried as `spec.harness.memory.provider` — see [Choosing a provider](#choosing-a-provider)                                                    |
@@ -50,13 +50,13 @@ points there.
 Each section goes a level deeper than the one before it, so a human reader can
 stop as soon as they have what they came for. An agent should read all of it.
 
-| Section                           | Audience                                              | What it gives you                                                                                                      |
-| --------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| [Why](#why)                       | Engineering leads, product managers, senior engineers | Enterprise adopter expectations, operational capabilities unlocked, and why pre-analyzed memory beats live scan        |
-| [Background](#background)         | Engineers familiar with `kube-agents`                 | What Hermes ships, why external providers were filtered to Hindsight, and where chat-only memory falls short           |
-| [The decision](#the-decision)     | Architects and tech leads                             | The scale argument for Hindsight and the two-layer split between conversational memory and Git-backed decisions        |
-| [The design](#the-design)         | Implementers and AI agents                            | Conversational scoping, `mode: next` identity & 5 session states, OKF decision/lesson memory, and `decision_memory.py` |
-| [The experiment](#the-experiment) | Evaluators and operators                              | Part 1: 1,664-record retrieval ladder; Part 2: 500-cluster 3-arm A/B evaluation of Decision Memory                     |
+| Section                           | Audience                                              | What it gives you                                                                                               |
+| --------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| [Why](#why)                       | Engineering leads, product managers, senior engineers | Enterprise adopter expectations, operational capabilities unlocked, and why pre-analyzed memory beats live scan |
+| [Background](#background)         | Engineers familiar with `kube-agents`                 | What Hermes ships, why external providers were filtered to Hindsight, and where chat-only memory falls short    |
+| [The decision](#the-decision)     | Architects and tech leads                             | The scale argument for Hindsight and the two-layer split between conversational memory and Git-backed decisions |
+| [The design](#the-design)         | Implementers and AI agents                            | Conversational scoping, session route identity & 5 session states, OKF decision/lesson memory, and CLI          |
+| [The experiment](#the-experiment) | Evaluators and operators                              | Part 1: 1,664-record retrieval ladder; Part 2: 500-cluster 3-arm A/B evaluation of Decision Memory              |
 
 ---
 
@@ -66,7 +66,7 @@ stop as soon as they have what they came for. An agent should read all of it.
 
 Enterprise platform teams managing tens of mega-clusters and thousands of workloads report three recurring memory failures:
 
-1. **Per-user context is lost or cross-contaminated across chat modes.** Engineers expect the agent to remember their personal preferences in direct messages, refuse personal memory in shared group spaces, and maintain strict per-user isolation under both `spec.mode: today` and `spec.mode: next`.
+1. **Per-user context is lost or cross-contaminated across sessions.** Engineers expect the agent to remember their personal preferences in direct messages, refuse personal memory in shared group spaces, and maintain strict per-user isolation across sessions.
 2. **Engineers or agents undo a protective fix.** An engineer or agent changes a memory limit, `PodDisruptionBudget`, resource quota, or node pool setting to reduce cost. Because no record links that setting to the outage it fixed, the outage returns.
 3. **Engineers or agents repeat a failed fix.** A team or agent proposes a change that reviewers previously rejected or that failed in production. Without a record of the negative outcome, the organization repeats the failed change.
 
@@ -74,7 +74,7 @@ From these pain points, enterprise adopters defined seven requirements for long-
 
 | Adopter expectation                     | Operational requirement                                                                                                                                         |
 | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Isolate personal vs. shared memory**  | Keep personal preferences strictly private per user in DMs across `today` and `next`, and fail closed when speaker identity cannot be attributed.               |
+| **Isolate personal vs. shared memory**  | Keep personal preferences strictly private per user in DMs, and fail closed when speaker identity cannot be attributed.                                         |
 | **Explain past rationale**              | Answer _"Why is X configured this way?"_ with the exact decision ID, the pull request URL, and the approver.                                                    |
 | **Day-one "first two hours" bootstrap** | Scan the past 2 years of repository pull requests within 2 hours of onboarding and produce a baseline "state of being" for the environment.                     |
 | **Triage history at scale**             | Scan years of past pull requests, `/docs` folders, and external wikis incrementally. Separate active rules from superseded, rejected, or anachronistic changes. |
@@ -84,14 +84,14 @@ From these pain points, enterprise adopters defined seven requirements for long-
 
 ### Operational impact: what the agent can do that it could not do before
 
-| Capability                                        | Without unified memory                                                                                                                                   | With unified memory (`kube-agents-memory` + `decision-memory`)                                                                                      | Measurable eval / operational impact                                                                               |
-| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| **1. Isolate personal memory in `mode: next`**    | `hermes-bridge` drops user identity; `multiuser_memory` shares one `"default"` file across all users, and `kube_agents_memory` treats DMs as unattended. | `hermes-bridge` records gateway-attested `user_id` (`hmac:<32-hex>`) and `chat_type` in `session_kv`; providers enforce 5 explicit session states.  | $0$ cross-user memory leaks; $0$ silent drops on human `"Remember: ..."` requests in `mode: next`.                 |
-| **2. Learn from yesterday's trajectories**        | Every run starts stateless. On task `b-0011`, the agent proposed the same invalid quota increase in 4 separate runs.                                     | Verified outcomes (`resolved-merged`, `pr-merged-persists`, `refused`) produce scoped `LES` records with deterministic guards.                      | Two-trajectory eval: run 2 achieves $0$ repeat bad fixes after run 1's fix is refused or fails verification.       |
-| **3. Block regressions on human and agent PRs**   | Neither CI nor the agent checks diffs against past incident fixes. Engineers accidentally revert protective settings during cost tuning.                 | `decision_memory.py check` runs in the submission tool path and in pull request CI, blocking any change that violates an active guard.              | $100\%$ of guarded regressions are intercepted before merge with the exact historical PR citation.                 |
-| **4. Onboard a 2-year repo in 2 hours**           | A newly installed agent has zero historical context until humans manually state facts in chat.                                                           | `decision_memory.py bootstrap --since 2y` triages 2 years of PRs and docs in under 2 hours into a `STATE_OF_BEING.md` baseline and initial records. | Day-one agent answers rationale queries across 2 years of GCP and Kubernetes history immediately after onboarding. |
-| **5. Answer "why" with verifiable provenance**    | Observation consolidation paraphrases text and drops record IDs in $11$ of $12$ recall misses (`id_stripped`).                                           | Records live in git and index as verbatim chunks (`enable_observations: false`), preserving every ID, quantity, and PR URL.                         | $0$ `id_stripped` citation misses; every rationale answer links to the approving PR and commit.                    |
-| **6. Detect silent drift and graduate to policy** | Superseded rules stay in memory ($0.407$ contamination), and out-of-band edits silently break past decisions.                                            | Nightly `dream` runs flag `at_risk` records the morning after a breaking change and propose `policy/` admission rules for recurring lessons.        | $0.000$ superseded contamination on active recall; recurring failure classes graduate to API-server enforcement.   |
+| Capability                                        | Without unified memory                                                                                                                                               | With unified memory (`kube-agents-memory` + `decision-memory`)                                                                                      | Measurable eval / operational impact                                                                               |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **1. Isolate personal memory per user**           | `POST /v1/chat/completions` omits user identity; `multiuser_memory` shares one `"default"` file across all users, and `kube_agents_memory` treats DMs as unattended. | `hermes-bridge` records gateway-attested `user_id` (`hmac:<32-hex>`) and `chat_type` in `session_kv`; providers enforce 5 explicit session states.  | $0$ cross-user memory leaks; $0$ silent drops on human `"Remember: ..."` requests.                                 |
+| **2. Learn from yesterday's trajectories**        | Every run starts stateless. On task `b-0011`, the agent proposed the same invalid quota increase in 4 separate runs.                                                 | Verified outcomes (`resolved-merged`, `pr-merged-persists`, `refused`) produce scoped `LES` records with deterministic guards.                      | Two-trajectory eval: run 2 achieves $0$ repeat bad fixes after run 1's fix is refused or fails verification.       |
+| **3. Block regressions on human and agent PRs**   | Neither CI nor the agent checks diffs against past incident fixes. Engineers accidentally revert protective settings during cost tuning.                             | `decision_memory.py check` runs in the submission tool path and in pull request CI, blocking any change that violates an active guard.              | $100\%$ of guarded regressions are intercepted before merge with the exact historical PR citation.                 |
+| **4. Onboard a 2-year repo in 2 hours**           | A newly installed agent has zero historical context until humans manually state facts in chat.                                                                       | `decision_memory.py bootstrap --since 2y` triages 2 years of PRs and docs in under 2 hours into a `STATE_OF_BEING.md` baseline and initial records. | Day-one agent answers rationale queries across 2 years of GCP and Kubernetes history immediately after onboarding. |
+| **5. Answer "why" with verifiable provenance**    | Observation consolidation paraphrases text and drops record IDs in $11$ of $12$ recall misses (`id_stripped`).                                                       | Records live in git and index as verbatim chunks (`enable_observations: false`), preserving every ID, quantity, and PR URL.                         | $0$ `id_stripped` citation misses; every rationale answer links to the approving PR and commit.                    |
+| **6. Detect silent drift and graduate to policy** | Superseded rules stay in memory ($0.407$ contamination), and out-of-band edits silently break past decisions.                                                        | Nightly `dream` runs flag `at_risk` records the morning after a breaking change and propose `policy/` admission rules for recurring lessons.        | $0.000$ superseded contamination on active recall; recurring failure classes graduate to API-server enforcement.   |
 
 ### Why remember decisions in long-term memory instead of rescanning the repository each time?
 
@@ -815,20 +815,19 @@ row is outside the noise the random load-balancing introduces.
 | Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
 
 `<id>` is the user identity run through `sanitize_user_id`, which produces
-`<readable>_<digest>`. Under `spec.mode: today`, the Hermes gateway supplies
-`agent._user_id` directly to `initialize()`. Under `spec.mode: next`, the Hermes
-API server runs `a2a-*` sessions without `user_id` or `chat_type` headers, so
-`hermes-bridge` records `authority.requester.principal` (`hmac:<32-hex>`) and
-`authority.audience.kind` (`dm` or `group`) from the gateway's `.in` task
-submission envelope in `session_kv.db` via `PUT /v1/sessions/a2a-<contextId>/route`,
-and both `kube_agents_memory` and `multiuser_memory` resolve them from
-`session_kv.db` (walking `state.db` `parent_session_id` across compressed
-session continuations). The readable half
-mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
-`-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
-The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
-is lossy while the tag is the entire isolation boundary — identities are
-email-shaped (or `hmac:<32-hex>` pseudonyms under `spec.mode: next`), punctuation is what distinguishes many of them, and
+`<readable>_<digest>`. Because the Hermes HTTP API server runs `a2a-*` sessions
+without in-process `user_id` or `chat_type` headers, `hermes-bridge` records
+`authority.requester.principal` (`hmac:<32-hex>`) and `authority.audience.kind`
+(`dm` or `group`) from the gateway's `.in` task submission envelope in
+`session_kv.db` via `PUT /v1/sessions/a2a-<contextId>/route`, and both
+`kube_agents_memory` and `multiuser_memory` resolve them from `session_kv.db`
+(walking `state.db` `parent_session_id` across compressed session continuations).
+The readable half mirrors Hindsight's own `_sanitize_bank_segment`:
+non-alphanumerics collapse to `-`, runs of `-` collapse to one, and leading or
+trailing `-`/`_` are stripped. The digest is `sha256(raw)[:12]`, and it is there
+because the readable half alone is lossy while the tag is the entire isolation
+boundary — identities are `hmac:<32-hex>` pseudonyms (or email-shaped strings in
+direct tests), punctuation is what distinguishes many of them, and
 `alice.smith@corp.example` and `alice+dev@corp.example`-style pairs otherwise
 land on one tag and read each other's private facts. `multiuser_memory` guarded
 the same thing the same way in its filenames. An empty or `"default"` identity produces an
@@ -843,14 +842,9 @@ shared knowledge either impossible or duplicated, and each bank carries its own
 mission, config and consolidation state to keep in sync. Tags do the same job in
 one place.
 
-#### Identity propagation in `spec.mode: today` and `spec.mode: next`
+#### Identity propagation through `hermes-bridge` and `session_kv`
 
-Both `kube_agents_memory` and `multiuser_memory` must receive the caller's user identity (`user_id`) and conversation audience (`chat_type`: `"dm"` or `"group"`) at `initialize(session_id, **kwargs)` across both runtime modes:
-
-| Runtime mode       | How chat turns enter Hermes                                                                 | How `user_id` and `chat_type` reach `initialize()`                                                                                                                                                                                               | Personal tag / file prefix (`sanitize_user_id(user_id)`)                  |
-| ------------------ | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
-| `spec.mode: today` | In-process Hermes platform adapter (`gateway/run.py`)                                       | Passed directly in `initialize(..., user_id=agent._user_id, chat_type=...)`.                                                                                                                                                                     | `<sanitized-email>_<sha12>`                                               |
-| `spec.mode: next`  | `a2a/gateway` $\to$ NATS `a2a.tasks.chat.general.in` $\to$ `hermes-bridge` $\to$ HTTP `/v1` | `hermes-bridge` writes `user_id` and `chat_type` to `PUT /v1/sessions/a2a-<contextId>/route` on [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py); `initialize()` resolves them from `session_kv.db` by `session_id`. | `hmac-<32-hex>_<sha12>` (derived by `a2a/gateway` with `SESSION_KV_SALT`) |
+Both `kube_agents_memory` and `multiuser_memory` resolve the caller's user identity (`user_id`) and conversation audience (`chat_type`: `"dm"` or `"group"`) at `initialize(session_id, **kwargs)` from the session route recorded by `hermes-bridge` (falling back to explicit `kwargs` in direct unit tests):
 
 ```mermaid
 sequenceDiagram
@@ -871,12 +865,12 @@ sequenceDiagram
   M->>KV: Read user_id & chat_type from session_kv.db (walking parent_session_id in state.db if compressed)
 ```
 
-Four rules govern this path in `spec.mode: next`:
+Four rules govern this path:
 
-1. **Zero NATS payload or `KV_cap` schema changes.** The `a2a/gateway` already populates `metadata["kube-agents.io/authority"].requester.principal` (`hmac:<32-hex>`) and `metadata["kube-agents.io/authority"].audience.kind` (`"dm"` or `"group"`) on every `.in` task submission ([`a2a/gateway/a2adoor.go`](../../a2a/gateway/a2adoor.go)).
-2. **Narrow documented exception for memory scoping.** [`spec-a2a-payloads.md`](spec-a2a-payloads.md) directs workers to read authorization from `KV_cap` rather than the task envelope. On the A2A bus, `a2a/gateway` is the **sole principal with NATS publish permission on `a2a.tasks.*.*.in`** (enforced by [`tests/conformance/test_A_authority.py`](../../tests/conformance/test_A_authority.py)). After `capabilityPermits` succeeds in [`a2a/hermes-bridge/bridge.go`](../../a2a/hermes-bridge/bridge.go), [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go) reads `authority.requester.principal` and `authority.audience.kind` from the `.in` task metadata solely to scope conversational memory (not to grant tool or cluster capabilities) and includes `user_id` and `chat_type` in its existing `PUT /v1/sessions/a2a-<contextId>/route` request to `session_kv_server.py`.
+1. **Zero NATS payload or `KV_cap` schema changes.** The `a2a/gateway` populates `metadata["kube-agents.io/authority"].requester.principal` (`hmac:<32-hex>`) and `metadata["kube-agents.io/authority"].audience.kind` (`"dm"` or `"group"`) on every `.in` task submission ([`a2a/gateway/a2adoor.go`](../../a2a/gateway/a2adoor.go)).
+2. **Narrow documented exception for memory scoping.** [`spec-a2a-payloads.md`](spec-a2a-payloads.md) directs workers to read authorization from `KV_cap` rather than the task envelope. On the A2A bus, `a2a/gateway` is the **sole principal with NATS publish permission on `a2a.tasks.*.*.in`** (enforced by [`tests/conformance/test_A_authority.py`](../../tests/conformance/test_A_authority.py)). After `capabilityPermits` succeeds in [`a2a/hermes-bridge/bridge.go`](../../a2a/hermes-bridge/bridge.go), [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go) reads `authority.requester.principal` and `authority.audience.kind` from the `.in` task metadata solely to scope conversational memory (not to grant tool or cluster capabilities) and includes `user_id` and `chat_type` in its `PUT /v1/sessions/a2a-<contextId>/route` request to `session_kv_server.py`. Shared-credential doors (`console:` and `verified_by == "nats-grant"`) clear `user_id` so multiple operators do not share one personal memory store.
 3. **Zero Hermes source patches.** The Hermes HTTP API server (`run_agent_turn` in `gateway/api_server.py`) calls `memory_manager.initialize(session_id=session_id, ...)` without passing `user_id` or `chat_type`. Rather than patching Hermes source code, both `kube_agents_memory` and `multiuser_memory` query `session_kv.db` (`SESSION_KV_DB_PATH`) when `kwargs.get("user_id")` is empty and `session_id` (or its compression ancestor via `parent_session_id` in `state.db`) starts with `a2a-`.
-4. **Pseudonymous personal tags and one-time mode cutover.** In `spec.mode: next`, `a2a/gateway` hashes the speaker's email with `SESSION_KV_SALT` before publishing to NATS (`hmac:<32-hex>`), keeping plaintext emails off NATS streams and out of `session_kv.db`. Because `a2a/gateway` cannot invert the HMAC and the chat pod does not hold `SESSION_KV_SALT`, switching an existing installation from `spec.mode: today` to `spec.mode: next` performs a one-time cutover of personal memory tags from `user:<sanitized-email>_<sha12>` to `user:hmac-<32-hex>_<sha12>`. Shared memory (`scope:shared`) is unaffected.
+4. **Pseudonymous personal tags.** `a2a/gateway` hashes the speaker's email with `SESSION_KV_SALT` before publishing to NATS (`hmac:<32-hex>`), keeping plaintext emails off NATS streams and out of `session_kv.db` (`user:hmac-<32-hex>_<sha12>`). Shared memory (`scope:shared`) is unaffected.
 
 ### Why a wrapper rather than configuration
 
@@ -1464,8 +1458,8 @@ resolve the session into one of five attribution states at `initialize()`:
 
 Three implementation invariants enforce this table across both memory providers:
 
-1. **No `"default"` user fallback in `multiuser_memory` ([#3596](https://github.com/gke-labs/kube-agents/issues/3596)).** Previously, `multiuser_memory` fell back to `raw_user = kwargs.get("user_id") or "default"`, which placed every unattributed `spec.mode: next` user into a single shared `default_<sha12>.md` file labelled `"private to the current user"`. `multiuser_memory` now treats `"default"` and empty `user_id` identically: personal memory is disabled (`self._user_path = None`), `UsersMdBlock` is omitted from the system prompt, and `memory(..., target="user")` returns an explicit error refusal.
-2. **Group audience detection without `thread_id`.** In `spec.mode: today`, group threads always carry `thread_id`. In `spec.mode: next`, `authority.audience.kind` is `"group"` while `thread_id` in `initialize()` is empty. Both providers classify a session as shared whenever `chat_type == "group"` or (`chat_type` is non-empty, not `"dm"`, and `thread_id` is present).
+1. **No `"default"` user fallback in `multiuser_memory` ([#3596](https://github.com/gke-labs/kube-agents/issues/3596)).** Previously, `multiuser_memory` fell back to `raw_user = kwargs.get("user_id") or "default"`, which placed every unattributed user into a single shared `default_<sha12>.md` file labelled `"private to the current user"`. `multiuser_memory` now treats `"default"` and empty `user_id` identically: personal memory is disabled (`self._user_id = ""`), `UsersMdBlock` is omitted from the system prompt, and `multiuser_memory(..., target="user")` returns an explicit error refusal.
+2. **Group audience detection without `thread_id`.** On `a2a-*` sessions, `authority.audience.kind` is `"group"` while `thread_id` in `initialize()` is empty. Both providers classify a session as shared whenever `chat_type != "dm"` on an `a2a-*` session (or when `chat_type != "dm"` and `thread_id` is present in direct non-A2A invocations).
 3. **Explicit refusal instructions in the system prompt.** When personal memory is disabled in an interactive session (`unattributable-shared` or `unattributable-interactive`), the system prompt block explicitly instructs the model: if the user asks to remember a personal preference or private fact (for example, `"Remember: my test cluster is ..."`), do **not** silently drop the write or claim to have saved it — explain why personal memory is unavailable in this session and offer `scope="shared"` only if the fact is genuinely team-wide.
 
 Both cases put an explanation into the system prompt, so the agent tells the user
@@ -1474,10 +1468,7 @@ DM-only by design.
 
 #### Why a space stays on one session
 
-In `spec.mode: today`, `thread_sessions_per_user` would restore attribution, and
-with it personal memory, by giving each participant their own session. It is
-deliberately left off (and in `spec.mode: next`, the A2A gateway always assigns one
-`context_id` per group thread regardless of `thread_sessions_per_user`): a space's
+The A2A gateway assigns one `context_id` per group thread (and `thread_sessions_per_user` is deliberately left off): a space's
 value is the shared thread, and with per-user sessions Bob's follow-up lands in a
 session that never saw Alice ask the question.
 
@@ -1831,7 +1822,7 @@ Agents retrieve decision memory on demand when they answer rationale questions, 
 
 #### Surface A — Deterministic and hybrid CLI (`decision_memory.py`)
 
-Both `spec.mode: today` and `spec.mode: next` workers load the [`decision-memory`](../../agents/platform/skills/decision-memory/SKILL.md) skill and call `decision_memory.py`:
+Platform workers load the [`decision-memory`](../../agents/platform/skills/decision-memory/SKILL.md) skill and call `decision_memory.py`:
 
 | Command      | Input parameters                                                                     | What it retrieves and returns                                                                                                                                                                                                                                                                                                                      |
 | ------------ | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2291,5 +2282,5 @@ Decision memory ships disabled by default. Enabling it by default requires passi
 - [`gitops-fix-cycle.md`](gitops-fix-cycle.md) — post-merge verification predicates and the `b-0011` repeated quota-raise analysis.
 - [`pr-comment-conversation.md`](pr-comment-conversation.md) — pull request sweep and idempotent comment markers.
 - [`capability-delivery-vehicle.md`](capability-delivery-vehicle.md) — self-learning safety boundaries (`apply` vs `propose`).
-- [`spec-mode-switch.md`](spec-mode-switch.md) — `spec.mode: next` runtime architecture.
+- [`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md) — `hermes-bridge` session route and HTTP dispatch architecture.
 - [Architecture 02 §2.3](../architecture/02-agent-personas.md) and [06 §5](../architecture/06-api-and-data-contracts.md) — Operational Knowledge Format (OKF) specification.
