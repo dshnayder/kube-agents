@@ -15483,6 +15483,12 @@ def _split_kustomize_head(note: str) -> KustomizeNoteHead:
     return KustomizeNoteHead("", None, True, note)
 
 
+def _is_kcc_reverted_note(note: str) -> bool:
+    """Whether `note` is the note of `degrade_reverted_gcloud_remediations`:
+    its prose in the first paragraph, then the worker's command in a fence."""
+    return KCC_REVERTED_NOTE_MARK in note.split(ROUTE_PARAGRAPH_BREAK, 1)[0]
+
+
 def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
 
@@ -15504,6 +15510,10 @@ def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     (`_sized_manifest_block`) to make room for the reconciler note, and its
     fences stay closed.
 
+    The note of `degrade_reverted_gcloud_remediations` is not cut at all: its
+    fenced command is the only pasteable copy of the end state. The route
+    notes that do not fit after it are left out.
+
     A worker note that leaves a code fence open gets the fence closed, so the
     text after it is prose. A cut never goes inside a code block: a worker
     note with a fence loses its first code block and all the text after it,
@@ -15518,7 +15528,11 @@ def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     notes = [note for note in notes if note]
     if not notes:
         return worker_note, ""
-    head = _split_kustomize_head(worker_note)
+    if _is_kcc_reverted_note(worker_note):
+        # All of it is text that `finish` wrote, so nothing in it is cut.
+        head = KustomizeNoteHead(worker_note, None, True, "")
+    else:
+        head = _split_kustomize_head(worker_note)
     block = ""
     if head.lines is not None:
         block = _manifest_block_text(head.lines if head.whole else [*head.lines, MANUAL_NOTE_TRUNCATED])

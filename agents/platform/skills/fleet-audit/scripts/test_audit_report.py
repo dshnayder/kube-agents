@@ -20363,6 +20363,31 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertEqual(note.count("```") % 2, 0)
         self.assertTrue(note.startswith("Run this. …(truncated)\n\n_(Reconciled by"), note[:80])
 
+    def test_the_route_notes_keep_the_kcc_command(self):
+        """`degrade_reverted_gcloud_remediations` writes the whole note: its
+        prose, then the worker's `gcloud` command in a fence. The command is
+        the only pasteable copy of the end state, so the route notes do not
+        cut it. A route note that does not fit is left out."""
+        prose = (
+            "This object is declared in the GitOps repository at `gcp/c1.yaml`, whose spec sets "
+            f"`masterAuthorizedNetworksConfig`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command "
+            "below is reverted on the next reconcile and this finding returns on the next run. "
+            "Make the change in that file instead."
+        )
+        manifest = self.manifest(namespace_directory={"path": "clusters/c1", "source": "cluster"})
+        for name, size in {"long command": 1500, "short command": 200}.items():
+            with self.subTest(name):
+                command = "gcloud container clusters update c1 " + "x" * size
+                kcc = f"{prose}\n\n```bash\n{command}\n```"
+                finding = self.manual(note=kcc)
+                self.disclose(finding, manifest)
+                note = self.note(finding)
+                self.assertTrue(note.startswith(kcc), note[:300])
+                self.assertLessEqual(len(audit_report.publishable_text(note)), audit_report.MAX_NOTE_CHARS)
+                self.assertNotIn(audit_report.ROUTE_NOTE_TRUNCATED, note)
+                if name == "short command":
+                    self.assertIn("`clusters/c1`", note.removeprefix(kcc))
+
     def test_the_reconciler_note_is_published_when_a_fenced_note_leaves_little_room(self):
         """The SOP tells the worker to leave the reconciler to `finish`, so a
         reconciled object must not publish without the note. The code block
