@@ -3159,8 +3159,9 @@ STATE_DIR="$(mktemp -d)"
 #                 holds infra while waiting for it.
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
-#                 consistency-no-environment-label, and
-#                 fleet-audit-unchanged-finding-keeps-wording write the
+#                 consistency-no-environment-label,
+#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
 #                 whichever unit opened it. Without this, one lane's ledger
