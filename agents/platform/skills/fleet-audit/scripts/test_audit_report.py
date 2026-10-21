@@ -20513,6 +20513,43 @@ class TestManualRemediationRoutes(unittest.TestCase):
         self.assertIn(f"`{path}`", note)
         self.assertIn(name, note)
 
+    def test_a_value_that_redaction_changes_does_not_pile_up_route_notes(self):
+        """`sk-` inside `task-` and 32 more characters is a token shape. The
+        stored document is redacted, so the stored route note no longer
+        matched `ROUTE_NOTE_PATTERN`, and each run that copied the ledger added
+        one more note."""
+        path = "apps/task-scheduler-worker-pool-production/a.yaml"
+        name = "task-scheduler-worker-pool-production"
+        cases = {
+            "path": (self.manifest(declaration={"path": path}), "_(Declared"),
+            "reconciler": (self.manifest(reconciler=f"the Argo CD Application `{name}`"), "_(Reconciled by"),
+        }
+        for label, (manifest, lede) in cases.items():
+            with self.subTest(label):
+                self.assertNotEqual(audit_report.redact_secrets(path), path)
+                note = self.WORKER_NOTE
+                for _ in range(4):
+                    finding = self.manual(note=note)
+                    self.disclose(finding, manifest)
+                    stored = json.loads(json.dumps(audit_report._redact_document(finding)))
+                    note = stored["remediation"]["note"]
+                self.assertLessEqual(note.count(lede), 1, note)
+                self.assertNotIn(audit_report.REDACTED, note)
+                self.assertTrue(note.startswith(self.WORKER_NOTE), note)
+
+    def test_a_stored_route_note_with_a_redacted_value_is_removed(self):
+        """A ledger written before the check holds such a note already."""
+        redacted = audit_report.REDACTED
+        for stale in (
+            audit_report.DECLARED_NOTE.format(path=f"apps/ta{redacted}/a.yaml"),
+            audit_report.RECONCILED_NOTE.format(reconciler=f"the Argo CD Application `ta{redacted}`"),
+            audit_report.RECONCILED_NOTE.format(reconciler=f"`{redacted}`"),
+        ):
+            with self.subTest(stale):
+                finding = self.manual(note=self.WORKER_NOTE + "\n\n" + stale)
+                self.disclose(finding, self.manifest())
+                self.assertEqual(self.note(finding), self.WORKER_NOTE)
+
     def test_a_carried_cut_note_is_whole_again_when_there_is_room(self):
         """The carry copies the stored note. A cut made only to give the route
         notes room must not stay on the note after the route notes are gone."""

@@ -1495,11 +1495,15 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
+# What `redact_secrets` writes in place of a credential. The route notes
+# below use it too, so it is declared before them.
+REDACTED = "[redacted by audit_report.py]"
 # The notes `disclose_manual_remediation_routes` adds to a `manual` remediation
 # from the collector's candidate fields. Each value in a note is a path or a
-# name that `ROUTE_PATH_PATTERN` or `RECONCILER_PATTERN` accepts, so the pass
-# can find and remove the whole note that an earlier copy of the text carries
-# (`ROUTE_NOTE_PATTERN`) before it writes the note again.
+# name that `ROUTE_PATH_PATTERN` or `RECONCILER_PATTERN` accepts, and that
+# `redact_secrets` does not change, so the pass can find and remove the whole
+# note that an earlier copy of the text carries (`ROUTE_NOTE_PATTERN`) before
+# it writes the note again.
 DECLARED_NOTE_LEDE = "_(Declared in this repository at "
 DECLARED_NOTE = (
     DECLARED_NOTE_LEDE + "`{path}`. Make the change in the repository, not on the live object.)_"
@@ -1561,11 +1565,12 @@ ROUTE_NAMESPACE_TEXT = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 # does not import the collector. A reconciler that is not exactly one of
 # them is shown as `RECONCILER_UNNAMED`: the note then still says that a
 # change by hand can be reverted, and it shows nothing from the annotation.
-RECONCILER_TEXT = (
-    rf"the Helm release `{ROUTE_NAME_TEXT}`(?: in {ROUTE_NAMESPACE_TEXT})?"
-    rf"|the Argo CD Application `{ROUTE_NAME_TEXT}`"
-    rf"|`{ROUTE_NAME_TEXT}`"
+RECONCILER_TEMPLATE = (
+    "the Helm release `{name}`(?: in {namespace})?"
+    "|the Argo CD Application `{name}`"
+    "|`{name}`"
 )
+RECONCILER_TEXT = RECONCILER_TEMPLATE.format(name=ROUTE_NAME_TEXT, namespace=ROUTE_NAMESPACE_TEXT)
 RECONCILER_PATTERN = re.compile(RECONCILER_TEXT)
 RECONCILER_UNNAMED = "a controller whose name the audit does not show"
 # The `renderer` values `collect.release_declarations` writes, copied because
@@ -1577,6 +1582,15 @@ RELEASE_RENDERER_NOUNS = {
     "kustomize": "the Kustomize overlay",
 }
 RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+# A value in an earlier route note, also after `redact_secrets` changed it.
+# A note that an older run wrote can hold a value that redaction changed, and
+# a note that the pattern does not find is written again on each run.
+ROUTE_REDACTED_TEXT = re.escape(REDACTED)
+ROUTE_STORED_PATH_TEXT = rf"(?:[A-Za-z0-9_./-]|{ROUTE_REDACTED_TEXT})+"
+ROUTE_STORED_RECONCILER_TEXT = RECONCILER_TEMPLATE.format(
+    name=rf"(?:[A-Za-z0-9_.-]|{ROUTE_REDACTED_TEXT})+",
+    namespace=rf"(?:[a-z0-9-]|{ROUTE_REDACTED_TEXT})+",
+)
 # One earlier route note, exactly as a template above writes it. A value can
 # hold no character of the text around it, so a match is always one whole
 # note, and a removal never leaves part of a note behind.
@@ -1587,9 +1601,9 @@ ROUTE_NOTE_PATTERN = re.compile(
     "|".join(
         "(?:"
         + re.escape(template)
-        .replace(re.escape("{path}"), ROUTE_PATH_TEXT)
+        .replace(re.escape("{path}"), ROUTE_STORED_PATH_TEXT)
         .replace(re.escape("{noun}"), f"(?:{ROUTE_NOUN_TEXT})")
-        .replace(re.escape("{reconciler}"), f"(?:{RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
+        .replace(re.escape("{reconciler}"), f"(?:{ROUTE_STORED_RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
         + ")"
         for template in (
             DECLARED_NOTE,
@@ -2026,8 +2040,6 @@ def normalise_newlines(text: str | None) -> str:
         return ""
     return str(text).replace("\r\n", "\n").replace("\r", "\n")
 
-
-REDACTED = "[redacted by audit_report.py]"
 
 # Every hidden marker this harness reads — the delta block, the id scheme, the
 # finding markers, the held-section brackets — is an HTML comment, so a `<!--`
@@ -15311,11 +15323,14 @@ def _field_path(candidate: dict, field: str) -> str:
     `""` also when the path has a character that `ROUTE_PATH_PATTERN` does not
     accept: no location note is better than a note that a file name can
     change into a link or a mention. And `""` when the path is longer than
-    `ROUTE_PATH_MAX_CHARS`, so that the route notes cannot fill the note.
+    `ROUTE_PATH_MAX_CHARS`, so that the route notes cannot fill the note, or
+    when `redact_secrets` changes it: the stored note would then show a path
+    that is not in the repository.
     """
     value = candidate.get(field)
     path = str(value.get("path") or "").strip() if isinstance(value, dict) else ""
-    return path if len(path) <= ROUTE_PATH_MAX_CHARS and ROUTE_PATH_PATTERN.fullmatch(path) else ""
+    shown = len(path) <= ROUTE_PATH_MAX_CHARS and ROUTE_PATH_PATTERN.fullmatch(path)
+    return path if shown and redact_secrets(path) == path else ""
 
 
 def _shown_reconciler(candidate: dict) -> str:
@@ -15323,13 +15338,14 @@ def _shown_reconciler(candidate: dict) -> str:
 
     The phrase comes from annotations on the live object. When it is not
     exactly one of the phrases `collect.reconciler_of` writes, with safe
-    names, or is longer than `ROUTE_RECONCILER_MAX_CHARS`, the note shows
-    `RECONCILER_UNNAMED` in its place.
+    names, is longer than `ROUTE_RECONCILER_MAX_CHARS`, or is changed by
+    `redact_secrets`, the note shows `RECONCILER_UNNAMED` in its place.
     """
     reconciler = str(candidate.get("reconciler") or "").strip()
     if not reconciler:
         return reconciler
-    if len(reconciler) <= ROUTE_RECONCILER_MAX_CHARS and RECONCILER_PATTERN.fullmatch(reconciler):
+    shown = len(reconciler) <= ROUTE_RECONCILER_MAX_CHARS and RECONCILER_PATTERN.fullmatch(reconciler)
+    if shown and redact_secrets(reconciler) == reconciler:
         return reconciler
     return RECONCILER_UNNAMED
 
