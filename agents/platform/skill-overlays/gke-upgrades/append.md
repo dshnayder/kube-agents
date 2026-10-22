@@ -9,8 +9,8 @@ control plane or a node pool is the laggard, run the
 table rather than reasoning from memory:
 
 ```bash
-./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
-  --output /opt/data/scratch/fleet_versions.json
+/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and
@@ -27,7 +27,7 @@ the maintenance window at a given instant (`--at`, default now), and node-pool v
 against the target control plane. It also grades a fourth thing the checklist's admission-webhook
 item points at: a fail-closed webhook whose backend is unreachable and whose rules reach the
 upgrade's path (the writes a node drain and a node join make, as `UPGRADE_PATH_TARGETS` in
-`./skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
+`/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
 a drain that will not finish, or whose rules reach the bootstrap RBAC writes a new master reconciles
 (ClusterRoles and ClusterRoleBindings always; Roles and RoleBindings in `kube-system` or
 `kube-public` when its namespace selector admits that namespace), which is a cause of a master that
@@ -44,4 +44,5 @@ When the checklist's deprecated-API item comes up, the same skill's `api_depreca
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output` from a full run, since it refuses a `--cluster` run's file as one cluster's floor. It
-reads Git only: point at GKE Deprecation Insights for live client usage.
+reads Git only; live client usage of removed and deprecated APIs is what `--readiness` reads from
+the audit log, with GKE Deprecation Insights as the thirty-day cross-check.

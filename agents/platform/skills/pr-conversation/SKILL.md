@@ -24,12 +24,12 @@ posting, and recording that a request has been handled — belongs to
 `"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py`. Your role is
 reasoning: understanding what was asked and producing the answer or the change.
 
-Every command below spells that path out in full. Most skills here are written
-`./skills/…`, which works because a cron turn starts in the profile directory —
-but a card dispatch starts you in the task's kanban workspace
-(`…/kanban/workspaces/<task-id>`), where the relative form is
-`No such file or directory`. `$HERMES_HOME` is the profile directory in both
-contexts, so it is the form that works from either.
+Every command below spells that path out in full. A relative `./skills/…` path
+resolves in neither place you start from: a cron turn starts in a directory of its
+own (`<profile>/cron/runs/<job>_<run>`), and a card dispatch starts you in the task's
+kanban workspace (`…/kanban/workspaces/<task-id>`), where the relative form is
+`No such file or directory`. `$HERMES_HOME` is the profile
+directory in both contexts, so it is the form that works from either.
 
 ## Vocabulary
 
@@ -261,4 +261,4 @@ has no cron caller. The card is the channel.
   own branch. Anything wider is a new `submit-suggestion` run, proposed in the
   reply and not performed.
 - **Never merge, close, or approve.** Human review gates every resolution.
-- **Never modify a pull request labelled `agent:ignore`.**
+- **Never modify a pull request labelled `agent:ignore`**, or, on a forge with no labels, one with `agent:ignore` on a line of its own in the description.
