@@ -28675,12 +28675,38 @@ class TestStoreLedger(HarnessTestCase):
     REPO = "acme/fleet"
     NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
 
+    # The payload fields that ask a forge for a label.
+    LABEL_FIELDS = ("labels", "labelsAdd", "labelsRemove")
+
     def setUp(self):
         super().setUp()
         self.forge_is(NO_ISSUES_NO_LABELS)
         self.harness.replies["proposal-create"] = created(
             "proposal", "https://forge.invalid/acme/fleet/pull-requests/8"
         )
+        # A forge that says `labels: false` refuses every label call by name,
+        # as a broker does, so a label call cannot pass unseen.
+        self.label_refusals = []
+        forge = patch.object(vcs_client, "forge", self.labelless_forge)
+        forge.start()
+        self.addCleanup(forge.stop)
+
+    def labelless_forge(self, verb, payload, repository=None):
+        capabilities = self.harness.replies.get("capabilities")
+        if (
+            isinstance(capabilities, dict)
+            and capabilities.get("labels") is False
+            and (verb == "label-ensure" or any(k in (payload or {}) for k in self.LABEL_FIELDS))
+        ):
+            self.label_refusals.append((verb, payload))
+            raise vcs_client.VcsError("this forge has no labels", code="LABELS_UNSUPPORTED")
+        return self.forge_through_recorder(verb, payload, repository)
+
+    def new_process(self):
+        """Forget what an earlier subcommand learnt: each runs in its own process."""
+        audit_report._CAPABILITIES.clear()
+        audit_report._LABELS.clear()
+        audit_report._LAST_REFUSAL.clear()
 
     def forge_is(self, capabilities):
         self.harness.replies["capabilities"] = capabilities
@@ -28697,6 +28723,7 @@ class TestStoreLedger(HarnessTestCase):
         path = audit_report.findings_path_for(AUDIT)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        self.new_process()
         code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
         return code
 
@@ -28902,6 +28929,15 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(carried["cluster"], "prod-us-east")
 
     # -- finish --------------------------------------------------------------------
+
+    def test_no_subcommand_sends_a_label_call_to_a_forge_with_no_labels(self):
+        """Review finding: `start` and `finish` shared one process here, so
+        `finish` could send label calls and no test saw it."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        self.run_once(make_doc(findings=[]))
+        self.assertEqual(self.label_refusals, [])
 
     def test_finish_keeps_the_ledger_in_the_store_and_opens_a_fix(self):
         self.touch(self.NETPOL)
@@ -29146,6 +29182,7 @@ class TestStoreLedger(HarnessTestCase):
         validated = audit_report.load_findings(path, AUDIT)
         fid = validated["findings"][0]["id"]
         Path(path).write_text(json.dumps(validated), encoding="utf-8")
+        self.new_process()
         code = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid])
         self.assertEqual(code, 0, self.err)
         out = self.stdout_json()
@@ -29359,6 +29396,7 @@ class TestStoreLedger(HarnessTestCase):
         self.start()
         path = audit_report.findings_path_for(AUDIT)
         Path(path).write_text(json.dumps(make_doc(findings=[self.two_findings()[1]])), encoding="utf-8")
+        self.new_process()
         code = self.run_main(
             ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
         )
@@ -29382,6 +29420,7 @@ class TestStoreLedger(HarnessTestCase):
         self.start()
         path = audit_report.findings_path_for(AUDIT)
         Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        self.new_process()
         code = self.run_main(
             ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
         )
