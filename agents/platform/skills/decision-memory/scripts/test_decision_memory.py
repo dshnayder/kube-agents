@@ -287,6 +287,17 @@ class WhyAndOutcomeTests(unittest.TestCase):
         self.assertEqual(out["status"], "found")
         self.assertEqual(sorted(x["id"] for x in out["records"]), ["DEC-2026-001", "LES-2026-001"])
         self.assertEqual(len(out["results"]), 2)
+        self.assertEqual(len(out["citations"]), 2)
+
+    def test_why_works_on_content_directory_without_git(self):
+        import shutil
+        shutil.rmtree(self.r.path / ".git")
+        rc, out = self.r.run("why", "clusters/prod-eu/payments/checkout.yaml")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["status"], "found")
+        self.assertEqual([x["id"] for x in out["records"]], ["LES-2026-001"])
+        self.assertEqual(out["history"], [])
+        self.assertTrue(any("LES-2026-001" in c for c in out["citations"]))
 
     def test_bootstrap_records_rejected_proposal_on_cited_records(self):
         prs = [

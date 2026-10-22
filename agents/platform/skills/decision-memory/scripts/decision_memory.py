@@ -580,16 +580,29 @@ def _file_exists_on_head(repo: Path, rel_path: str, tracked: Optional[set] = Non
         return False
 
 
+def _list_repo_files(repo: Path) -> List[str]:
+    if (repo / ".git").exists():
+        try:
+            return git(repo, "ls-files").splitlines()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    return [
+        p.relative_to(repo).as_posix()
+        for p in sorted(repo.rglob("*"))
+        if p.is_file() and ".git" not in p.parts
+    ]
+
+
 def worktree_files(repo: Path, globs: Iterable[str]) -> Dict[str, str]:
     files = {}
-    for p in git(repo, "ls-files").splitlines():
+    for p in _list_repo_files(repo):
         if any(fnmatch.fnmatch(p, g) for g in globs):
             if (repo / p).exists():
                 files[p] = (repo / p).read_text()
-            else:
+            elif (repo / ".git").exists():
                 try:
                     files[p] = git(repo, "show", f"HEAD:{p}")
-                except subprocess.CalledProcessError:
+                except (subprocess.CalledProcessError, FileNotFoundError):
                     pass
     return files
 
@@ -611,8 +624,13 @@ def _match_pr_num(text: str) -> Optional[str]:
 
 
 def history(repo: Path, path: str, limit: int = 10) -> List[Dict[str, Any]]:
+    if not (repo / ".git").exists():
+        return []
     fmt = "%H%x1f%an%x1f%aI%x1f%s%x1f%b%x1e"
-    raw = git(repo, "log", f"-n{limit}", f"--format={fmt}", "--", path)
+    try:
+        raw = git(repo, "log", f"-n{limit}", f"--format={fmt}", "--", path)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
     out = []
     for entry in raw.split("\x1e"):
         entry = entry.strip("\n")
@@ -849,6 +867,16 @@ def cmd_check(a) -> Dict[str, Any]:
             "markdown": render_check_markdown(findings, semantic)}
 
 
+def _format_citation(rec_summary: Dict[str, Any]) -> str:
+    parts = [f"{rec_summary['id']} ({rec_summary.get('path', '')})"]
+    if rec_summary.get("pull_request"):
+        parts.append(f"PR: {rec_summary['pull_request']}")
+    if rec_summary.get("rejected_proposals"):
+        rej = ", ".join(str(x) for x in rec_summary["rejected_proposals"])
+        parts.append(f"rejected PRs: {rej}")
+    return " — ".join(parts)
+
+
 def _why_single_path(repo: Path, target: str, records: List[Record], limit: int) -> Dict[str, Any]:
     content = (repo / target).read_text() if (repo / target).exists() else None
     resources = _resources_in(content) if content else []
@@ -864,9 +892,11 @@ def _why_single_path(repo: Path, target: str, records: List[Record], limit: int)
         bool(re.search(rf"(?:[#!/]|^){re.escape(h['pull_request'])}(?:\b|\)|$)", str(g.get("pull_request") or "")))
         for g in governing)]
     return {"status": "found" if governing else "no_match",
-            "path": target, "resources": resources, "records": governing, "history": hist,
+            "path": target, "resources": resources,
+            "citations": [_format_citation(g) for g in governing],
+            "records": governing, "history": hist,
             "history_without_record": uncovered,
-            "note": ("Recorded rationale exists; cite the record ids." if governing else
+            "note": ("Recorded rationale exists; you MUST cite the record IDs (e.g. LES-..., DEC-...) and their PR / rejected_proposals links in your answer and kanban_complete result." if governing else
                      "No recorded decision governs this path. The history is evidence of what changed, "
                      "not of why — say so, and offer to draft a decision record from it.")}
 
@@ -895,10 +925,11 @@ def cmd_why(a) -> Dict[str, Any]:
     return {
         "status": "found" if any_found else "no_match",
         "paths": targets,
+        "citations": [_format_citation(g) for g in combined_records],
         "records": combined_records,
         "results": per_path,
         "note": (
-            "Recorded rationale exists; cite the record ids."
+            "Recorded rationale exists; you MUST cite the record IDs (e.g. LES-..., DEC-...) and their PR / rejected_proposals links in your answer and kanban_complete result."
             if any_found
             else "No recorded decision governs these paths."
         ),
@@ -1156,7 +1187,7 @@ def cmd_dream(a) -> Dict[str, Any]:
     repo = Path(a.repo)
     records = load_records(repo)
     by_id = {r.id: r for r in records}
-    all_files = git(repo, "ls-files").splitlines()
+    all_files = _list_repo_files(repo)
     report: Dict[str, Any] = {"date": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
                               "verified": [], "at_risk": [], "obsolete": [], "reverted": [],
                               "supersession": [], "conflicts": [], "recurring": [], "uncovered_changes": [],
