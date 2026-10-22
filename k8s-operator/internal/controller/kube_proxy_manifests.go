@@ -5,8 +5,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -45,6 +47,17 @@ const (
 	kubeProxyMemoryRequest          = "256Mi"
 	kubeProxyCPULimit               = "1"
 	kubeProxyMemoryLimit            = "512Mi"
+	kubeProxyTLSHashAnnotation      = "kubeagents.x-k8s.io/tls-cert-hash"
+	kubeProxyTLSClockSkew           = 5 * time.Minute
+	kubeProxyTLSValidity            = 10 * 365 * 24 * time.Hour
+	kubeProxySecretDefaultMode      = int32(0440)
+	kubeAPITokenExpirationSeconds   = int64(3600)
+	kubeAPITokenVolumeName          = "event-watcher-ksa-token"
+	kubeRootCAConfigMapName         = "kube-root-ca.crt"
+	kubeProxyProbeInitialDelay      = int32(2)
+	kubeProxyProbePeriod            = int32(10)
+	kubeProxyProbeTimeout           = int32(5)
+	kubeProxyProbeFailureThreshold  = int32(3)
 )
 
 func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {
@@ -116,11 +129,18 @@ func kubeProxyOTelEnvVars(agent *agentv1alpha1.PlatformAgent, endpoint string, d
 	return envs
 }
 
-func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) *appsv1.Deployment {
+func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
 	for k, v := range kubeProxySelector(agent) {
 		podLabels[k] = v
+	}
+
+	var podAnnotations map[string]string
+	if tlsCertHash != "" {
+		podAnnotations = map[string]string{
+			kubeProxyTLSHashAnnotation: tlsCertHash,
+		}
 	}
 
 	var affinity *corev1.Affinity
@@ -159,7 +179,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
-		{Name: "event-watcher-ksa-token", MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+		{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
 	}
 
 	volumes := []corev1.Volume{
@@ -168,25 +188,25 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  kubeProxyTLSSecretName(agent),
-					DefaultMode: ptr.To(int32(0440)),
+					DefaultMode: ptr.To(kubeProxySecretDefaultMode),
 				},
 			},
 		},
 		{
-			Name: "event-watcher-ksa-token",
+			Name: kubeAPITokenVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				Projected: &corev1.ProjectedVolumeSource{
-					DefaultMode: ptr.To(int32(0440)),
+					DefaultMode: ptr.To(kubeProxySecretDefaultMode),
 					Sources: []corev1.VolumeProjection{
 						{
 							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-								ExpirationSeconds: ptr.To(int64(3600)),
+								ExpirationSeconds: ptr.To(kubeAPITokenExpirationSeconds),
 								Path:              "token",
 							},
 						},
 						{
 							ConfigMap: &corev1.ConfigMapProjection{
-								LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+								LocalObjectReference: corev1.LocalObjectReference{Name: kubeRootCAConfigMapName},
 								Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
 							},
 						},
@@ -229,10 +249,10 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 					Scheme: corev1.URISchemeHTTPS,
 				},
 			},
-			InitialDelaySeconds: 2,
-			PeriodSeconds:       10,
-			TimeoutSeconds:      5,
-			FailureThreshold:    3,
+			InitialDelaySeconds: kubeProxyProbeInitialDelay,
+			PeriodSeconds:       kubeProxyProbePeriod,
+			TimeoutSeconds:      kubeProxyProbeTimeout,
+			FailureThreshold:    kubeProxyProbeFailureThreshold,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -260,7 +280,8 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 			Selector: &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: podLabels,
+					Labels:      podLabels,
+					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
@@ -327,8 +348,8 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 }
 
 func generateKubeProxyTLSBundle(serviceName, namespace string) (caPEM, certPEM, keyPEM []byte, err error) {
-	now := time.Now().Add(-5 * time.Minute)
-	notAfter := now.Add(10 * 365 * 24 * time.Hour)
+	now := time.Now().Add(-kubeProxyTLSClockSkew)
+	notAfter := now.Add(kubeProxyTLSValidity)
 
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -386,22 +407,42 @@ func generateKubeProxyTLSBundle(serviceName, namespace string) (caPEM, certPEM, 
 	return caPEM, certPEM, keyPEM, nil
 }
 
-func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func kubeProxyTLSSecretHash(data map[string][]byte) string {
+	sum := sha256.New()
+	sum.Write(data["ca.crt"])
+	sum.Write([]byte{0})
+	sum.Write(data["tls.crt"])
+	sum.Write([]byte{0})
+	sum.Write(data["tls.key"])
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	secretName := kubeProxyTLSSecretName(agent)
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, client.ObjectKey{Name: secretName, Namespace: agent.Namespace}, existing)
 	if err == nil {
+		if !metav1.IsControlledBy(existing, agent) {
+			return "", fmt.Errorf("kube-proxy TLS Secret %s/%s already exists and is not owned by PlatformAgent %s", agent.Namespace, secretName, agent.Name)
+		}
 		if len(existing.Data["ca.crt"]) > 0 && len(existing.Data["tls.crt"]) > 0 && len(existing.Data["tls.key"]) > 0 {
-			return nil
+			return kubeProxyTLSSecretHash(existing.Data), nil
 		}
 	} else if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to get kube-proxy TLS Secret %s/%s: %w", agent.Namespace, secretName, err)
+		return "", fmt.Errorf("failed to get kube-proxy TLS Secret %s/%s: %w", agent.Namespace, secretName, err)
 	}
 
 	caPEM, certPEM, keyPEM, genErr := generateKubeProxyTLSBundle(kubeProxyName(agent), agent.Namespace)
 	if genErr != nil {
-		return fmt.Errorf("failed to generate kube-proxy TLS bundle: %w", genErr)
+		return "", fmt.Errorf("failed to generate kube-proxy TLS bundle: %w", genErr)
 	}
+
+	bundleData := map[string][]byte{
+		"ca.crt":  caPEM,
+		"tls.crt": certPEM,
+		"tls.key": keyPEM,
+	}
+	bundleHash := kubeProxyTLSSecretHash(bundleData)
 
 	if errors.IsNotFound(err) {
 		secret := &corev1.Secret{
@@ -411,34 +452,27 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 				Labels:    commonLabels(agent),
 			},
 			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{
-				"ca.crt":  caPEM,
-				"tls.crt": certPEM,
-				"tls.key": keyPEM,
-			},
+			Data: bundleData,
 		}
 		if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-			return err
+			return "", err
 		}
-		return r.Create(ctx, secret)
+		return bundleHash, r.Create(ctx, secret)
 	}
 
-	existing.Data = map[string][]byte{
-		"ca.crt":  caPEM,
-		"tls.crt": certPEM,
-		"tls.key": keyPEM,
-	}
-	return r.Update(ctx, existing)
+	existing.Data = bundleData
+	return bundleHash, r.Update(ctx, existing)
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
-	if err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
+	if err != nil {
 		return err
 	}
 
 	objs := []client.Object{
 		buildKubeProxyService(agent),
-		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled),
+		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled, tlsHash),
 		buildKubeProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {

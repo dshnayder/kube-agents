@@ -86,6 +86,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	opts := renderOptions{imageVolumeSupported: true}
 	gatewayDeployment := buildDeployment(agent, "c", "f", "s", "p", nil, opts)
 	credentialProxy := buildCredentialProxyDeployment(agent, "p")
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "t")
 	a2aGateway := buildA2AGatewayDeployment(agent)
 	a2aCallout := buildA2ACalloutDeployment(agent)
 	a2aVerifier := buildA2AVerifierDeployment(agent)
@@ -98,6 +99,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	pods := []renderedPodTemplate{
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
 		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
+		{"buildKubeProxyDeployment", kubeProxy.Name, kubeProxy.Spec.Template.Spec},
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
 		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AVerifierDeployment", a2aVerifier.Name, a2aVerifier.Spec.Template.Spec},

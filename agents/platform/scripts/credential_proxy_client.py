@@ -73,6 +73,12 @@ API_RELAY_PREFIX = "/v1/gcp/"
 # one that convention spells as `${HERMES_HOME:-/opt/data}`.
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
+DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+SANDBOX_HERMES_UID = 1001
+SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
+SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
 # What a workspace `open` labels itself with, so the broker's log can say who
 # holds a slot when the store is full: the kanban card first, the session
 # otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
@@ -640,10 +646,6 @@ def implicit_kubectl_context(argv: list[str]) -> str:
     return shell_context() or ""
 
 
-DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
-DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/broker-token/token"
-
-
 def build_kube_proxy_kubeconfig(
     context: str,
     proxy_url: str | None = None,
@@ -678,7 +680,7 @@ def build_kube_proxy_kubeconfig(
         ],
         "users": [
             {
-                "name": "kube-proxy-caller",
+                "name": KUBE_PROXY_USER_NAME,
                 "user": {
                     "tokenFile": resolved_token,
                 },
@@ -689,7 +691,7 @@ def build_kube_proxy_kubeconfig(
                 "name": context,
                 "context": {
                     "cluster": context,
-                    "user": "kube-proxy-caller",
+                    "user": KUBE_PROXY_USER_NAME,
                 },
             }
         ],
@@ -700,9 +702,14 @@ def build_kube_proxy_kubeconfig(
 
 def _caller_default_kubeconfig_path() -> Path:
     """Return the default kubeconfig path for the active sandbox user."""
-    if os.geteuid() == 1001:
-        return Path("/home/hermes/.kube/config")
-    return Path("/opt/data/.kubeconfig")
+    if os.geteuid() == SANDBOX_HERMES_UID:
+        return SANDBOX_HERMES_KUBECONFIG_PATH
+    return SANDBOX_SHARED_KUBECONFIG_PATH
+
+
+def _default_kubeconfig_candidates() -> list[Path]:
+    """Return the default kubeconfig files to update when a cluster context is registered."""
+    return [_caller_default_kubeconfig_path(), SANDBOX_SHARED_KUBECONFIG_PATH]
 
 
 def _merge_context_into_kubeconfig_file(
@@ -736,11 +743,11 @@ def _merge_context_into_kubeconfig_file(
     doc["clusters"] = clusters
     users = list(doc.get("users") or [])
     users = [
-        u for u in users if isinstance(u, dict) and u.get("name") != "kube-proxy-caller"
+        u for u in users if isinstance(u, dict) and u.get("name") != KUBE_PROXY_USER_NAME
     ]
     users.append(
         {
-            "name": "kube-proxy-caller",
+            "name": KUBE_PROXY_USER_NAME,
             "user": {"tokenFile": token_file},
         }
     )
@@ -752,7 +759,7 @@ def _merge_context_into_kubeconfig_file(
             "name": context,
             "context": {
                 "cluster": context,
-                "user": "kube-proxy-caller",
+                "user": KUBE_PROXY_USER_NAME,
             },
         }
     )
@@ -775,9 +782,8 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
         or DEFAULT_KUBE_PROXY_TOKEN_FILE
     ).strip()
-    candidates = [_caller_default_kubeconfig_path(), Path("/opt/data/.kubeconfig")]
     seen: set[Path] = set()
-    for path in candidates:
+    for path in _default_kubeconfig_candidates():
         if path in seen:
             continue
         seen.add(path)

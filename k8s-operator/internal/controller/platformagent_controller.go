@@ -2279,7 +2279,7 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
-	if err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+	if _, err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
 		return err
 	}
 

@@ -1767,7 +1767,7 @@ func TestShellSandboxCarriesTheEventWatcherSwitch(t *testing.T) {
 
 func TestKubeProxyObservabilityManifests(t *testing.T) {
 	agent := shellSandboxTestAgent()
-	dep := buildKubeProxyDeployment(agent, "http://otel-collector.observability.svc:4318", false)
+	dep := buildKubeProxyDeployment(agent, "http://otel-collector.observability.svc:4318", false, "tls-hash")
 	c := dep.Spec.Template.Spec.Containers[0]
 
 	envs := make(map[string]string, len(c.Env))
@@ -1794,7 +1794,7 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 		t.Errorf("expected container port %s=%d on kube-proxy container, got %#v", kubeProxyMetricsPortName, kubeProxyMetricsPort, c.Ports)
 	}
 
-	disabledDep := buildKubeProxyDeployment(agent, "", true)
+	disabledDep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
 	disabledEnvs := make(map[string]string)
 	for _, e := range disabledDep.Spec.Template.Spec.Containers[0].Env {
 		disabledEnvs[e.Name] = e.Value

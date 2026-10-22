@@ -14136,14 +14136,21 @@ class KubeProxyClientTest(unittest.TestCase):
 
     def test_rewrite_kubeconfig_for_kube_proxy(self):
         raw = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
-        with mock.patch.dict(
-            os.environ,
-            {
-                "KUBE_PROXY_URL": "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443",
-                "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
-                "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/broker-token/token",
-            },
-            clear=False,
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "KUBE_PROXY_URL": "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443",
+                    "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+                    "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                credential_proxy_client,
+                "_default_kubeconfig_candidates",
+                return_value=[],
+            ),
         ):
             rewritten = credential_proxy_client.rewrite_kubeconfig_for_kube_proxy(raw)
 
@@ -14156,7 +14163,7 @@ class KubeProxyClientTest(unittest.TestCase):
             rewritten,
         )
         self.assertIn(
-            "tokenFile: /var/run/secrets/kubeagents/broker-token/token",
+            "tokenFile: /var/run/secrets/kubeagents/credential-proxy/token",
             rewritten,
         )
         self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(rewritten))
@@ -14168,7 +14175,7 @@ class KubeProxyClientTest(unittest.TestCase):
                 "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
                 "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
                 "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
-                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/broker-token/token\n",
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/credential-proxy/token\n",
                 encoding="utf-8",
             )
             with (
@@ -14181,8 +14188,8 @@ class KubeProxyClientTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     credential_proxy_client,
-                    "_caller_default_kubeconfig_path",
-                    return_value=kc,
+                    "_default_kubeconfig_candidates",
+                    return_value=[kc],
                 ),
             ):
                 credential_proxy_client.merge_context_into_default_kubeconfig(self.CONTEXT)

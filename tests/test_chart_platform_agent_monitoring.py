@@ -95,6 +95,13 @@ _SCRAPES = (
         "port_name": "a2a-metrics",
         "selector_keys": ("app",),
     },
+    {
+        "suffix": "-kube-proxy-monitoring",
+        "deployment": "platformagent-kube-proxy",
+        "container": "kube-proxy",
+        "port_name": "kube-metrics",
+        "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
+    },
 )
 
 
