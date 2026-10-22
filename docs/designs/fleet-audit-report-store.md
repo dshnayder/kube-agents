@@ -68,8 +68,9 @@ under that repository's own directory, with `unreachable_repo` (`repo`, `reason`
 install with several managed repositories and no `role: gitops` repository writes under
 `no_forge/local`, with `no_repository_chosen` (`reason`). Both are reported to chat on every run, and
 their new and resolved counts are unknown. No reader takes a marked envelope as a memory: the
-no-forge path does not use one as its baseline, and the forge path reads its memory from the newest
-envelope in the ring that is not marked. A directory that holds only marked envelopes is a store
+no-forge path does not use one as its baseline, the forge path reads its memory from the newest
+envelope in the ring that is not marked, and a run with no open ledger does not read the scheduled
+baseline from one. A directory that holds only marked envelopes is a store
 that no published run wrote, so the next run that reaches the repository seeds its memory once from
 the open ledger, as in §4.
 

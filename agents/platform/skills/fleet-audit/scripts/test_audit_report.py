@@ -29122,6 +29122,50 @@ class TestUnreachableRepository(BaseTestCase):
         )
         self.assertIsNone(audit_report.previous_no_forge_record(AUDIT))
 
+    def test_a_forge_run_with_no_ledger_does_not_read_a_marked_envelope_as_its_baseline(self):
+        """A run that could not reach the repository published nothing there, so
+        the scheduled baseline of the next run with no open ledger comes from
+        the newest run that published to it."""
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        (directory / "runs").mkdir(parents=True)
+        published = {
+            "repo": "acme/gitops",
+            "id_scheme": audit_report.ID_SCHEME,
+            "current_ids": [],
+            audit_report.RUN_SCHEDULED_KEY: True,
+            audit_report.SCHEDULED_PUBLISHED_IDS_KEY: [],
+        }
+        diverted = dict(
+            published,
+            current_ids=["a.b.c"],
+            **{
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: ["a.b.c"],
+                audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/gitops", "reason": "gone"},
+            },
+        )
+        (directory / "runs" / "20261020T000000Z.json").write_text(json.dumps(published), encoding="utf-8")
+        (directory / "runs" / "20261021T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
+        (directory / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
+        record = audit_report.newest_stored_record(AUDIT, "acme/gitops")
+        self.assertEqual(audit_report.scheduled_published_baseline(record), [])
+
+    def test_a_store_with_only_marked_envelopes_has_no_known_scheduled_baseline(self):
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        directory.mkdir(parents=True)
+        (directory / "latest.json").write_text(
+            json.dumps({
+                "repo": "acme/gitops",
+                "id_scheme": audit_report.ID_SCHEME,
+                "current_ids": ["a.b.c"],
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: ["a.b.c"],
+                audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/gitops", "reason": "gone"},
+            }),
+            encoding="utf-8",
+        )
+        record = audit_report.newest_stored_record(AUDIT, "acme/gitops")
+        self.assertIsNone(audit_report.scheduled_published_baseline(record))
+
     def test_a_failed_store_write_keeps_the_published_memory(self):
         """The diverted run wrote nothing to the ledger, so the record of the
         last published run still describes it exactly."""

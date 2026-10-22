@@ -8206,13 +8206,20 @@ def newest_stored_record(audit_id: str, repo: str) -> dict | None:
     newest record is the record of the ledger that a run closed, or of a
     clean run that had no ledger, and the channel last heard of the stream
     from the scheduled baseline in it.
+
+    A run that could not reach `repo` stores its envelope here too, marked
+    (`is_diverted`). It published nothing to `repo`, so it is never read:
+    when the store holds only marked envelopes, the answer is None.
     """
     try:
         directory = reports_dir_for(audit_id, repo)
     except ValueError:
         return None
     key = _ledger_key(repo)
-    return first_stored_record(directory, lambda envelope: _ledger_key(envelope.get("repo")) == key)
+    return first_stored_record(
+        directory,
+        lambda envelope: _ledger_key(envelope.get("repo")) == key and not is_diverted(envelope),
+    )
 
 
 def scheduled_reported_baseline(memory: dict | None) -> set[str]:

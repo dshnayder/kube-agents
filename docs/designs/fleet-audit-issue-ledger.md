@@ -1240,7 +1240,10 @@ run published anything, so the baseline is empty.
 
 The stored memory belongs to the open ledger. With no open ledger, a scheduled run reads the
 baseline from the newest record that the stream stored for the repository, which is the record of
-the ledger that a run closed. So a scheduled run after an on-demand run that closed the ledger
+the ledger that a run closed. A marked envelope from a run that could not reach the repository is
+not read, because that run published nothing there ([report store](fleet-audit-report-store.md)
+§2). When the store holds only marked envelopes, no baseline is known and the run speaks. So a
+scheduled run after an on-demand run that closed the ledger
 speaks once, and the channel hears that the stream is clean. When a person closed the ledger, the
 newest record is the record of its last run, and it still lists that run's ids. A scheduled run
 with a gap does not call those ids resolved, because no run checked them. It lists them under
