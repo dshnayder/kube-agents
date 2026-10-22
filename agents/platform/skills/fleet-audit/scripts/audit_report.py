@@ -19041,6 +19041,18 @@ def _finish_store_ledger(
     else:
         ledger_body = ""
 
+    # The document the held ledger renders, for the next run's titles, as the
+    # forge path keeps it: the one the memory carries when the memory was
+    # itself held open, else the memory's own document. A held run's own
+    # document is its empty set, not what the ledger renders.
+    ledger_document = None
+    if held_open:
+        carried = (memory or {}).get("ledger_document")
+        if not isinstance(carried, dict) and not (memory or {}).get("ledger_held_open"):
+            carried = (memory or {}).get("document")
+        if isinstance(carried, dict):
+            ledger_document = carried
+
     reported_new = len(new_ids)
     reported_resolved = len(resolved_ids)
     payload = {
@@ -19093,7 +19105,7 @@ def _finish_store_ledger(
         new_ids=new_ids,
         resolved_ids=resolved_ids,
         rendered_ids=stored_ids,
-        ledger_document=(memory or {}).get("document") if held_open else None,
+        ledger_document=ledger_document,
         ledger_held_open=held_open,
         delta_known=delta_known,
         reported_under_gap=reported_under_gap,

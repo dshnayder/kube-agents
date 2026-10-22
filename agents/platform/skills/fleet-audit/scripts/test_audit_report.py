@@ -28950,6 +28950,25 @@ class TestStoreLedger(HarnessTestCase):
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertEqual(self.latest()["current_ids"], [validated["findings"][0]["id"]])
 
+    def test_a_second_held_run_keeps_the_document_the_ledger_renders(self):
+        """Review finding: the second held-open run in a row stored the first
+        held run's own empty document as the ledger's document."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.run_once(make_doc(findings=[]))
+        self.assertTrue(self.latest()["ledger_held_open"])
+        self.run_once(make_doc(findings=[]))
+        latest = self.latest()
+        self.assertTrue(latest["ledger_held_open"])
+        self.assertEqual(
+            [f["id"] for f in latest["ledger_document"]["findings"]],
+            [validated["findings"][0]["id"]],
+        )
+
     def test_a_clean_run_over_a_lost_memory_leaves_the_next_run_lost_too(self):
         """Review finding: a clean run that could not trust the store stored an
         empty ledger as trusted memory, and the next clean run closed the fix."""
