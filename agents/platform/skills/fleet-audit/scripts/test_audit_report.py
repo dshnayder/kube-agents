@@ -28950,6 +28950,38 @@ class TestStoreLedger(HarnessTestCase):
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertEqual(self.latest()["current_ids"], [validated["findings"][0]["id"]])
 
+    def test_a_clean_run_over_a_lost_memory_leaves_the_next_run_lost_too(self):
+        """Review finding: a clean run that could not trust the store stored an
+        empty ledger as trusted memory, and the next clean run closed the fix."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": proposal["body"]}}
+        # The stored ledger ages out of the ring: diverted runs fill it.
+        directory = self.store_dir()
+        shutil.rmtree(directory)
+        runs = directory / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True)
+        for day in range(1, 15):
+            (runs / f"202609{day:02d}T000000Z.json").write_text(json.dumps({
+                "status": audit_report.NO_FORGE_STATUS, "repo": self.REPO,
+                "id_scheme": audit_report.ID_SCHEME, "current_ids": [],
+                audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
+            }), encoding="utf-8")
+        second = self.run_once(make_doc(findings=[]))
+        self.assertEqual(second["prs_closed"], [])
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, second["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, second["coverage_gaps"])
+        third = self.run_once(make_doc(findings=[]))
+        self.assertEqual(third["prs_closed"], [])
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, third["coverage_gaps"])
+        self.assertFalse(third["silent_ok"])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+        self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
+
     def test_the_automatic_sweep_keeps_its_cap(self):
         self.patch_attr("AUTO_PROMOTION_CAP", 1)
         findings = [

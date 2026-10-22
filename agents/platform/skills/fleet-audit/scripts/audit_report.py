@@ -1919,7 +1919,25 @@ LOST_MEMORY_UNGUARDED_GAP = (
     "until a run that reports findings rewrites it, or a human who has checked "
     "them closes it"
 )
-LOST_MEMORY_GAPS = (LOST_MEMORY_GAP, LOST_MEMORY_UNGUARDED_GAP)
+# The same two gaps on a run that keeps its ledger in the report store
+# (`_finish_store_ledger`). There is no ledger issue to hold open or for a
+# person to close, so the gap says what the run holds back: the stale closes.
+STORE_LOST_MEMORY_GAP = (
+    "the report store holds no trusted record of the stored ledger, so the "
+    "findings it carries are unknown, and the collector still flags something "
+    "this run did not report; no remediation fix is closed over it"
+)
+STORE_LOST_MEMORY_UNGUARDED_GAP = (
+    "the report store holds no trusted record of the stored ledger, so nothing "
+    "shows whether the findings it carries were fixed; no remediation fix is "
+    "closed until a run that reports findings stores the ledger again"
+)
+LOST_MEMORY_GAPS = (
+    LOST_MEMORY_GAP,
+    LOST_MEMORY_UNGUARDED_GAP,
+    STORE_LOST_MEMORY_GAP,
+    STORE_LOST_MEMORY_UNGUARDED_GAP,
+)
 # What a clean run says about a lost memory where a coverage gap would say
 # "did not see the whole fleet": the fleet may have been seen whole, and the
 # way out is a findings run or a maintainer, not better coverage.
@@ -18412,9 +18430,21 @@ def previous_store_ledger(audit_id: str, repo: str) -> tuple[dict | None, bool]:
     that a no-forge run diverted here, or that a forge run wrote, is not this
     memory.
     """
-    return _previous_store_envelope(
+    envelope, known = _previous_store_envelope(
         audit_id, repo, STORE_LEDGER_STATUS, "a run that keeps its ledger in the store"
     )
+    if isinstance(envelope, dict) and envelope.get("ledger_held_open") and (
+        envelope.get("delta_known") is False
+    ):
+        # A clean run over a lost memory held a ledger it could not read. Its
+        # envelope carries no ledger, so the memory stays lost: trusting its
+        # empty ledger would let the next clean run close every fix.
+        log(
+            f"WARNING: the newest record for {audit_id} was stored over a lost memory "
+            f"and carries no ledger; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    return envelope, known
 
 def render_no_forge_summary(
     audit_id: str,
@@ -18839,7 +18869,11 @@ def _finish_store_ledger(
     # Over a lost memory a clean run cannot tell what the stored ledger
     # carried, so it closes no fix, as the forge path's lost-memory gap says.
     if not delta_known and not findings:
-        gap = LOST_MEMORY_GAP if (still_flagged - held_exclude) else LOST_MEMORY_UNGUARDED_GAP
+        gap = (
+            STORE_LOST_MEMORY_GAP
+            if (still_flagged - held_exclude)
+            else STORE_LOST_MEMORY_UNGUARDED_GAP
+        )
         gaps = [*gaps, gap]
         log(f"COVERAGE GAP: {gap}")
     coverage_moved = coverage_changed(gaps, memory)
@@ -18859,8 +18893,13 @@ def _finish_store_ledger(
             "neither reported nor in resolved_because; no fix is closed over it."
         )
     # A clean run that did not account for the stored ledger leaves it as it
-    # was, as the forge path leaves an issue it holds open.
-    held_open = not findings and bool(gaps or unaccounted or held) and delta_known and bool(memory)
+    # was, as the forge path leaves an issue it holds open. Over a lost memory
+    # it holds a ledger it cannot read: the envelope then carries no ledger
+    # and says so (`delta_known` False), and `previous_store_ledger` reads it
+    # as a lost memory again, as the forge path stores no issue number.
+    held_open = not findings and bool(gaps or unaccounted or held) and (
+        bool(memory) or not delta_known
+    )
     stored_ids = sorted(set(previous_ids) if held_open else set(current_ids) | set(held))
     new_ids = sorted(set(current_ids) - set(previous_ids)) if delta_known else []
     # Over a coverage gap an absence means "not checked", not fixed.
