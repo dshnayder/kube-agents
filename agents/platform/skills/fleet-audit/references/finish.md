@@ -168,7 +168,8 @@ An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (an
 no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
 does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
 repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
-check is one issue listing that `start` makes through the broker, and `finish` follows its result.
+check is one issue listing that `start` makes through the broker (one pull request listing on a
+forge with no issue tracker), and `finish` follows its result.
 The run does not choose another repository, and it is never silent (`silent_ok: false`). A run for
 which several repositories are managed and none can be chosen (none has `role: gitops`) is the same
 too: its note gives the reason and the fix, and the JSON line carries it under
@@ -221,6 +222,10 @@ follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
   explained under `resolved_because`, as with a ledger issue.
 - `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
   run with nothing new is silent. A run the store does not hold is never silent.
+- If the store lost the previous ledger, a clean run closes no pull request, and its
+  `coverage_gaps` says why. It stores a record that the next run also reads as lost, so each clean
+  run after it closes nothing until a run that reports findings stores the ledger again. Such a
+  run is never silent.
 - A `/remediate` cannot be commented on a ledger. A person asks in chat, and you run `remediate` for
   the ids they name ([remediation.md](remediation.md)).
 

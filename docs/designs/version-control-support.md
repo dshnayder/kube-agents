@@ -2956,13 +2956,17 @@ class LedgerDecision(NamedTuple):
     ledger: Literal["forge", "store"]
     remediation: bool
     reason: str | None
+    probe: str = "issue-list"
 ```
 
 `start` makes the decision and writes it into the run record, `ledger` and
 `remediation` included, and `finish` follows the record. If `finish` decided
 again, a forge that changed between the two steps would split one run across
-two ledgers. The "store, remediation on" row is new behaviour for the store
-path: it opens, finds and closes remediation proposals as the forge path does
+two ledgers. `probe` is the listing that found a repository unreachable: the
+note gives its advice from the record, with no broker call, so a broker that
+is lost at `finish` cannot stop the run after its store write. In the "store,
+remediation on" row the store path opens, finds and closes remediation
+proposals as the forge path does
 (`open_remediation_pr`, `list_remediation_prs`, `close_stale_remediation_prs`),
 and it puts their links in the chat summary and in the stored report. The
 stored report is the ledger: it holds the body that the forge path would post,

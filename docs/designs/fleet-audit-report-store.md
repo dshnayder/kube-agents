@@ -83,7 +83,9 @@ trusts it on its own, as the no-forge run trusts its own (its `status`, `repo` a
 the ring), takes the delta from its `current_ids`, and reads the locations of the findings it
 carries from its `ledger_body`, so the clean-close guard of §4 has the same input as on the forge
 path. A clean run that does not close keeps the previous body and ids, with `ledger_held_open`
-true. The no-forge path and the forge path do not read it as a memory: its `status` is not
+true. A clean run over a lost memory has no body to keep: it stores `ledger_held_open` true and
+`delta_known` false, and the next run reads that envelope as a lost memory, not as an empty ledger.
+The no-forge path and the forge path do not read it as a memory: its `status` is not
 `NO_FORGE`, and it names no issue.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
@@ -300,8 +302,9 @@ ledger drops from its body with a notice pointing at the stored report. The read
 because skill selection runs off the description, and `fleet-audit`'s describes publishing; a
 question about a past run should not pull the publish procedure into context.
 
-A `STORE_LEDGER` envelope is read like any other: `streams`, `show` and the status view show its
-`status` and its PR URLs, and the agent gives those links where it would give the ledger URL.
+A `STORE_LEDGER` envelope is read like any other. `streams` rows show its `status` and no PR URL;
+`show` carries the PR URLs (`prs_opened`, `prs_still_open`, `prs_closed`); the status view lists
+only the PRs opened. The agent gives those links where it would give the ledger URL.
 
 **The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and

@@ -543,13 +543,17 @@ other forge call, and any other refusal leaves the run on its forge path.
 Before that listing, `start` asks the forge's `capabilities` where the ledger goes
 ([`version-control-support.md`](version-control-support.md#the-ledger-without-issues) §8). A forge
 with no issue verbs, or with issues and no labels, keeps the ledger in the report store, and its
-remediation pull requests still open on the forge. `start` then clones the repository, ensures no
-label, looks up no ledger issue, prints `"ledger": "store"` and a note with the reason, reads
-`carried` from the ledger body the previous such run stored, and lists one open pull request instead
-of one open issue. An answer that cannot be read keeps the forge path, so a transient fault never
-moves a ledger. The run record carries the decision as `ledger`, `remediation` and `reason`; a
-record without them reads as the forge path for a repository, and as the no-forge path for
-`no_forge/local` or an `unreachable` pair.
+remediation pull requests still open on the forge. `start` then clones the repository, looks up no
+ledger issue, prints `"ledger": "store"` and a note with the reason, reads `carried` from the ledger
+body the previous such run stored, and lists one open pull request instead of one open issue. On a
+forge with no labels it creates no label; on a forge with labels and no issues it ensures the labels
+as the forge path does, because the remediation pull requests carry them. An answer that cannot be
+read keeps the forge path, so a transient fault never moves a ledger. The run record carries the
+decision as `ledger`, `remediation` and `reason`; a record without them reads as the forge path for
+a repository, and as the no-forge path for `no_forge/local` or an `unreachable` pair. For an
+`unreachable` pair the record also keeps `probe`, the listing that found the repository unreachable,
+and the note follows it with no broker call: only a refused issue listing tells the operator to
+enable issues. A record without `probe` reads as the issue listing.
 
 `finish` on such a run applies every guard the forge path applies before it publishes (the
 declaration, missing-file, Config Connector and Kustomize passes, and the unwritten-fix refusal),
@@ -557,7 +561,11 @@ then opens, syncs and stale-closes the remediation pull requests as steps 2, 7 a
 with the same cap and switch, through the label-free paths on a forge with no labels. It writes no
 ledger and reads no `/remediate` comment: a person asks in chat, and `remediate` opens the fix with
 no ledger link. A clean run closes a stale pull request only over complete coverage and with every
-finding of the stored ledger accounted for, as step 5 requires. Its status is
+finding of the stored ledger accounted for, as step 5 requires. A clean run over a store that lost
+the previous ledger closes nothing, holds the ledger open, and stores an envelope with
+`ledger_held_open` true and `delta_known` false; the next run reads that envelope as a lost memory
+again, as the forge path's next run does when the envelope names no issue, until a run that reports
+findings stores the ledger again. Its status is
 `STORE_LEDGER`; the report store holds the ledger
 ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2), and the chat summary names the
 findings, the pull request links and the reason. `silent_ok` follows §7.5: nothing is wrong with

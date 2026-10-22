@@ -123,7 +123,7 @@ the SOP and these references.
 | `on-demand.md`         | for a request to trigger a cron job or run several audits; for the in-flight guard  |
 | `lifecycle.md`         | for what each `start` field means, the workspace modes, content-mode reads, `draft` |
 | `findings-document.md` | before you write the findings document                                              |
-| `finish.md`            | before `finish`, and to read its output, an exit 2, `partial` or `NO_FORGE`         |
+| `finish.md`            | before `finish`; for its output, exit 2, `partial`, `NO_FORGE`, `STORE_LEDGER`      |
 | `clean-run.md`         | for a run with zero findings, a `HELD` ledger, or `silent_ok`                       |
 | `remediation.md`       | for a `manifest` fix, a `/remediate` comment, or a direct ask to fix a finding      |
 | `ledger.md`            | for what a finding's ledger state means, and the ledger's size limits               |
