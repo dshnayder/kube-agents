@@ -132,4 +132,20 @@ func TestTransportGKEAndInCluster(t *testing.T) {
 			t.Errorf("path = %q, want /api/v1/namespaces/default/pods", got["path"])
 		}
 	})
+
+	t.Run("canceled caller context does not evict cached GKE cluster transport", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req, _ := http.NewRequest(http.MethodGet, "https://placeholder/api/v1/namespaces/default/pods", nil)
+		_, err := tr.RoundTripCluster(ctx, "gke_proj-1_us-central1_clu-1", req)
+		if err == nil {
+			t.Fatalf("expected error on canceled context")
+		}
+		tr.mu.RLock()
+		_, cached := tr.clusters["gke_proj-1_us-central1_clu-1"]
+		tr.mu.RUnlock()
+		if !cached {
+			t.Errorf("expected cached transport for gke_proj-1_us-central1_clu-1 to remain after caller context cancellation")
+		}
+	})
 }

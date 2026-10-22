@@ -73,11 +73,11 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	// The whole list, by name, rather than a count: every volume here is a way to
 	// put bytes into the pod the agent can run arbitrary commands in, so adding one
-	// should be a decision someone makes on purpose. Exactly five are allowed —
+	// should be a decision someone makes on purpose. Exactly six are allowed —
 	// the authorized-keys Secret, the SETTINGS.md ConfigMap, the token the shell
-	// presents to the credential runtime, the empty mount over ~/.hermes, and the
-	// GitOps state ConfigMap. Anything else fails here and gets argued about in
-	// review.
+	// presents to the credential runtime, the empty mount over ~/.hermes, the
+	// GitOps state ConfigMap, and the kube-proxy public CA certificate. Anything
+	// else fails here and gets argued about in review.
 	//
 	// The third one is a credential, unlike the others, and it is here because
 	// the alternative is not "the sandbox holds nothing" but "the sandbox cannot
@@ -120,6 +120,17 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	if len(secret.Items) != 1 || secret.Items[0].Key != "authorized_keys" {
 		t.Errorf("expected only the authorized_keys item from the Secret, got %#v", secret.Items)
+	}
+	// The kube-proxy CA volume projects only the public ca.crt item from the TLS Secret, never tls.key.
+	proxyCA, ok := byName[kubeProxyCAVolumeName]
+	if !ok {
+		t.Fatalf("expected the %q volume, got %#v", kubeProxyCAVolumeName, pod.Volumes)
+	}
+	if proxyCA.Secret == nil || proxyCA.Secret.SecretName != kubeProxyTLSSecretName(agent) {
+		t.Fatalf("expected %q Secret volume from %q, got %#v", kubeProxyCAVolumeName, kubeProxyTLSSecretName(agent), proxyCA.VolumeSource)
+	}
+	if len(proxyCA.Secret.Items) != 1 || proxyCA.Secret.Items[0].Key != "ca.crt" {
+		t.Errorf("expected only the ca.crt item from the kube-proxy TLS Secret, got %#v", proxyCA.Secret.Items)
 	}
 	// The other one is a ConfigMap, which is the part that matters: a Secret named
 	// here would be a credential arriving by the same route.
@@ -1869,5 +1880,9 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 	np := buildKubeProxyNetworkPolicy(agent)
 	if len(np.Spec.Ingress) != 2 {
 		t.Fatalf("expected 2 ingress rules on kube-proxy NetworkPolicy (callers + gmp-system), got %d", len(np.Spec.Ingress))
+	}
+	if len(np.Spec.Ingress[0].From) != 1 || np.Spec.Ingress[0].From[0].PodSelector == nil ||
+		np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != shellSandboxName(agent) {
+		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
 	}
 }

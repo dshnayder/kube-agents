@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -31,6 +32,12 @@ type cachedClusterTransport struct {
 	expiresAt time.Time
 }
 
+type discoveryCall struct {
+	done  chan struct{}
+	entry cachedClusterTransport
+	err   error
+}
+
 // Transport implements k8sapiproxy.UpstreamTransport over HTTPS for in-cluster and GKE control planes.
 type Transport struct {
 	hostClusterID      string
@@ -45,6 +52,7 @@ type Transport struct {
 
 	mu       sync.RWMutex
 	clusters map[string]cachedClusterTransport
+	inflight map[string]*discoveryCall
 }
 
 // NewTransport constructs an HTTPS UpstreamTransport.
@@ -109,6 +117,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 		discoveryClient:     discoveryClient,
 		cacheTTL:            cacheTTL,
 		clusters:            make(map[string]cachedClusterTransport),
+		inflight:            make(map[string]*discoveryCall),
 	}, nil
 }
 
@@ -169,9 +178,16 @@ func (t *Transport) roundTripGKECluster(ctx context.Context, clusterID string, r
 
 	resp, err := entry.rt.RoundTrip(outReq)
 	if err != nil {
-		t.mu.Lock()
-		delete(t.clusters, clusterID)
-		t.mu.Unlock()
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.mu.Lock()
+			if current, ok := t.clusters[clusterID]; ok && current.rt == entry.rt {
+				delete(t.clusters, clusterID)
+				if ht, ok := current.rt.(*http.Transport); ok {
+					ht.CloseIdleConnections()
+				}
+			}
+			t.mu.Unlock()
+		}
 		return nil, err
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -190,6 +206,45 @@ func (t *Transport) getOrDiscoverCluster(ctx context.Context, clusterID string, 
 	}
 	t.mu.RUnlock()
 
+	t.mu.Lock()
+	if entry, ok := t.clusters[clusterID]; ok && time.Now().Before(entry.expiresAt) {
+		t.mu.Unlock()
+		return entry, nil
+	}
+	if call, ok := t.inflight[clusterID]; ok {
+		t.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.entry, call.err
+		case <-ctx.Done():
+			return cachedClusterTransport{}, ctx.Err()
+		}
+	}
+	call := &discoveryCall{done: make(chan struct{})}
+	t.inflight[clusterID] = call
+	t.mu.Unlock()
+
+	entry, err := t.discoverClusterTransport(ctx, clusterID, coords)
+
+	t.mu.Lock()
+	delete(t.inflight, clusterID)
+	if err == nil {
+		if prev, hadPrev := t.clusters[clusterID]; hadPrev && prev.rt != entry.rt {
+			if ht, ok := prev.rt.(*http.Transport); ok {
+				ht.CloseIdleConnections()
+			}
+		}
+		t.clusters[clusterID] = entry
+	}
+	call.entry = entry
+	call.err = err
+	close(call.done)
+	t.mu.Unlock()
+
+	return entry, err
+}
+
+func (t *Transport) discoverClusterTransport(ctx context.Context, clusterID string, coords *GKEClusterCoordinates) (cachedClusterTransport, error) {
 	resolved, err := DiscoverGKEEndpoint(ctx, t.discoveryClient, t.containerAPIBaseURL, t.tokenProvider, coords)
 	if err != nil {
 		return cachedClusterTransport{}, err
@@ -217,16 +272,11 @@ func (t *Transport) getOrDiscoverCluster(ctx context.Context, clusterID string, 
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
-	entry := cachedClusterTransport{
+	return cachedClusterTransport{
 		serverURL: parsedURL,
 		rt:        rt,
-		expiresAt: now.Add(t.cacheTTL),
-	}
-
-	t.mu.Lock()
-	t.clusters[clusterID] = entry
-	t.mu.Unlock()
-	return entry, nil
+		expiresAt: time.Now().Add(t.cacheTTL),
+	}, nil
 }
 
 func rewriteRequestTarget(req *http.Request, target *url.URL) {

@@ -590,9 +590,6 @@ SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin
 # nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
 # because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
-if [ -n "${KUBE_PROXY_URL:-}" ]; then
-  setenv_args="$setenv_args KUBECONFIG=\"$DATA/.kubeconfig\""
-fi
 # CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
 # projected volume, and forwarding the name is what lets the client read it. It
 # has to cross with the URL rather than after it, because the broker authenticates

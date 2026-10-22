@@ -277,6 +277,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -311,12 +312,6 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 	tcp := corev1.ProtocolTCP
 	callers := []networkingv1.NetworkPolicyPeer{
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
-		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
-	}
-	if a2aSessionClusterViewEnabled(agent) {
-		callers = append(callers, networkingv1.NetworkPolicyPeer{
-			PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()},
-		})
 	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},

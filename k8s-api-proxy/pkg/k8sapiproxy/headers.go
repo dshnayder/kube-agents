@@ -25,42 +25,23 @@ func SanitizeRequestHeaders(h http.Header) {
 	SanitizeRequestHeadersWithOptions(h, false)
 }
 
-// SanitizeRequestHeadersWithOptions removes caller credentials and Kubernetes impersonation headers from h,
-// and removes Upgrade / Connection: upgrade unless preserveUpgrade is true.
+// SanitizeRequestHeadersWithOptions removes caller credentials, hop-by-hop Connection tokens, and Kubernetes impersonation headers from h,
+// and removes Upgrade unless preserveUpgrade is true.
 func SanitizeRequestHeadersWithOptions(h http.Header, preserveUpgrade bool) {
 	h.Del("Authorization")
 	h.Del("Proxy-Authorization")
 	h.Del("Cookie")
+	h.Del("Connection")
 	if !preserveUpgrade {
 		h.Del("Upgrade")
-		stripConnectionUpgradeToken(h)
+	} else if strings.TrimSpace(h.Get("Upgrade")) != "" {
+		h.Set("Connection", "Upgrade")
 	}
 	for key := range h {
 		lower := strings.ToLower(key)
 		if strings.HasPrefix(lower, "impersonate-") || strings.HasPrefix(lower, "x-remote-") {
 			h.Del(key)
 		}
-	}
-}
-
-func stripConnectionUpgradeToken(h http.Header) {
-	values := h.Values("Connection")
-	if len(values) == 0 {
-		return
-	}
-	var kept []string
-	for _, connVal := range values {
-		for _, token := range strings.Split(connVal, ",") {
-			trimmed := strings.TrimSpace(token)
-			if trimmed != "" && !strings.EqualFold(trimmed, "upgrade") {
-				kept = append(kept, trimmed)
-			}
-		}
-	}
-	if len(kept) == 0 {
-		h.Del("Connection")
-	} else {
-		h.Set("Connection", strings.Join(kept, ", "))
 	}
 }
 

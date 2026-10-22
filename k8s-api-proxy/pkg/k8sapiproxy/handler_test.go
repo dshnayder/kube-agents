@@ -1,15 +1,27 @@
 package k8sapiproxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c1, c2 := net.Pipe()
+	_ = c2.Close()
+	return c1, bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1)), nil
+}
 
 type recordingTransport struct {
 	lastClusterID string
@@ -96,9 +108,13 @@ func TestHandlerEndToEnd(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/clusters/gke_my-proj_us-central1_clu/api/v1/namespaces/kube-system/pods", nil)
 		req.Header.Set("Authorization", "Bearer sandbox-jwt")
+		req.Header.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
+		req.Header.Set("Cookie", "session=secret")
 		req.Header.Set("Impersonate-User", "cluster-admin")
 		req.Header.Set("Impersonate-Group", "system:masters")
 		req.Header.Set("X-Remote-User", "admin")
+		req.Header.Set("Connection", "User-Agent, Accept")
+		req.Header.Set("User-Agent", "kubectl/v1.31.0")
 
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -117,6 +133,39 @@ func TestHandlerEndToEnd(t *testing.T) {
 		}
 		if gotUA := upstream.lastReq.Header.Get("User-Agent"); !strings.Contains(gotUA, "kproxy/system:serviceaccount:ns:shell") {
 			t.Errorf("expected User-Agent to include kproxy/<caller>, got %q", gotUA)
+		}
+	})
+
+	t.Run("strips Connection: Accept on Secret requests so PartialObjectMetadata is preserved upstream", func(t *testing.T) {
+		upstream := &recordingTransport{
+			respBody: `{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":{"name":"my-sec"}}`,
+		}
+		h, _ := NewHandler(Config{
+			Authenticator:    &StaticAuthenticator{Identity: CallerIdentity{Username: "system:serviceaccount:ns:shell"}},
+			Upstream:         upstream,
+			DefaultClusterID: "in-cluster",
+			Mode:             ModeReadOnlyWithDryRun,
+			RedactSecrets:    true,
+		})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/my-sec", nil)
+		req.Header.Set("Connection", "Accept, User-Agent")
+		req.Header.Set("Accept", "application/json")
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("Code = %d, want 200", rec.Code)
+		}
+		if gotAccept := upstream.lastReq.Header.Get("Accept"); gotAccept != partialObjectMetadataAccept {
+			t.Errorf("upstream Accept = %q, want %q", gotAccept, partialObjectMetadataAccept)
+		}
+	})
+
+	t.Run("statusRecorder.Unwrap exposes underlying http.Hijacker for protocol upgrades", func(t *testing.T) {
+		rec := &statusRecorder{ResponseWriter: &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}, statusCode: http.StatusOK}
+		rc := http.NewResponseController(rec)
+		if _, _, err := rc.Hijack(); err != nil {
+			t.Fatalf("expected ResponseController.Hijack() to succeed through statusRecorder.Unwrap(), got: %v", err)
 		}
 	})
 

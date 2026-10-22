@@ -712,6 +712,11 @@ def _default_kubeconfig_candidates() -> list[Path]:
     return [_caller_default_kubeconfig_path(), SANDBOX_SHARED_KUBECONFIG_PATH]
 
 
+def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
+    """Return True when `path` is one of the sandbox default multi-context kubeconfigs."""
+    return Path(path) in _default_kubeconfig_candidates()
+
+
 def _merge_context_into_kubeconfig_file(
     path: Path,
     context: str,
@@ -899,7 +904,12 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
         stripped.append(argument)
         index += 1
     if destination is None:
-        destination = os.environ.get("KUBECONFIG", "").strip() or None
+        env_kc = os.environ.get("KUBECONFIG", "").strip()
+        if env_kc and not (
+            os.environ.get("KUBE_PROXY_URL", "").strip()
+            and _is_default_sandbox_kubeconfig(env_kc)
+        ):
+            destination = env_kc
     return stripped, Path(destination) if destination else None
 
 
@@ -935,7 +945,10 @@ def execute(
             flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
             kubeconfig = os.environ.get("KUBECONFIG", "").strip()
-            if kubeconfig:
+            if kubeconfig and not (
+                os.environ.get("KUBE_PROXY_URL", "").strip()
+                and _is_default_sandbox_kubeconfig(kubeconfig)
+            ):
                 context = kubeconfig_context(kubeconfig)
             elif argv[0] == "kubectl" and not flag_pinned:
                 context = implicit_kubectl_context(argv)

@@ -182,6 +182,29 @@ func TestScrubSecretResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("fails closed with 502 when upstream Secret payload exceeds 64 MiB limit", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets", nil)
+		info, _ := factory.NewRequestInfo(req)
+		oversized := io.MultiReader(
+			strings.NewReader(`{"apiVersion":"v1","kind":"SecretList","items":[{"metadata":{"name":"big"},"data":{"blob":"`),
+			io.LimitReader(zeroReader{}, maxSecretResponseBytes+10),
+			strings.NewReader(`"}}]}`),
+		)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(oversized),
+		}
+		ScrubSecretResponse(resp, info, false)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(bodyBytes), "exceeds 64 MiB limit") {
+			t.Errorf("expected 64 MiB limit error message, got %s", string(bodyBytes))
+		}
+	})
+
 	t.Run("scrubs streaming watch events", func(t *testing.T) {
 		watchStream := `{"type":"ADDED","object":{"apiVersion":"v1","kind":"Secret","metadata":{"name":"s1"},"data":{"k":"dmFs"}}}` + "\n"
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets?watch=true", nil)
@@ -227,4 +250,13 @@ func TestScrubSecretResponse(t *testing.T) {
 			t.Fatalf("gzip secret response leaked secret value: %s", string(out))
 		}
 	})
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
 }

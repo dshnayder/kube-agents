@@ -103,9 +103,10 @@ func TestTokenReviewAuthenticator(t *testing.T) {
 		defer apiServer.Close()
 
 		auth, err := NewTokenReviewAuthenticator(TokenReviewConfig{
-			APIServerURL: apiServer.URL,
-			TokenFile:    tokenFile,
-			HTTPClient:   apiServer.Client(),
+			APIServerURL:   apiServer.URL,
+			TokenFile:      tokenFile,
+			AllowedCallers: []string{"system:serviceaccount:ns:shell"},
+			HTTPClient:     apiServer.Client(),
 		})
 		if err != nil {
 			t.Fatalf("NewTokenReviewAuthenticator failed: %v", err)
@@ -119,6 +120,17 @@ func TestTokenReviewAuthenticator(t *testing.T) {
 		}
 		if got := req.Header.Get("Authorization"); got != "" {
 			t.Errorf("expected Authorization header to be deleted on failure, got %q", got)
+		}
+	})
+
+	t.Run("rejects empty AllowedCallers configuration", func(t *testing.T) {
+		_, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+			APIServerURL:   "https://kubernetes.default.svc",
+			TokenFile:      tokenFile,
+			AllowedCallers: []string{"", "   "},
+		})
+		if err == nil {
+			t.Fatalf("expected NewTokenReviewAuthenticator to fail when AllowedCallers is empty")
 		}
 	})
 }

@@ -74,19 +74,29 @@ type TokenReviewAuthenticator struct {
 	cache map[string]cachedIdentity
 }
 
+const (
+	defaultAPIServerURL         = "https://kubernetes.default.svc"
+	defaultServiceAccountCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	defaultServiceAccountToken  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	defaultTokenReviewTimeout   = 10 * time.Second
+	defaultTokenReviewCacheTTL  = 60 * time.Second
+	maxTokenReviewResponseBytes = 1 << 20
+	tokenReviewAPIPath          = "/apis/authentication.k8s.io/v1/tokenreviews"
+)
+
 // NewTokenReviewAuthenticator constructs a TokenReviewAuthenticator.
 func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (*TokenReviewAuthenticator, error) {
 	apiServerURL := strings.TrimRight(strings.TrimSpace(cfg.APIServerURL), "/")
 	if apiServerURL == "" {
-		apiServerURL = "https://kubernetes.default.svc"
+		apiServerURL = defaultAPIServerURL
 	}
 	tokenFile := strings.TrimSpace(cfg.TokenFile)
 	if tokenFile == "" {
-		tokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+		tokenFile = defaultServiceAccountToken
 	}
 	caFile := strings.TrimSpace(cfg.CAFile)
 	if caFile == "" {
-		caFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+		caFile = defaultServiceAccountCAFile
 	}
 
 	client := cfg.HTTPClient
@@ -100,7 +110,7 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (*TokenReviewAuthenticat
 			tlsCfg.RootCAs = pool
 		}
 		client = &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: defaultTokenReviewTimeout,
 			Transport: &http.Transport{
 				TLSClientConfig: tlsCfg,
 			},
@@ -114,10 +124,13 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (*TokenReviewAuthenticat
 			allowed[trimmed] = struct{}{}
 		}
 	}
+	if len(allowed) == 0 {
+		return nil, errors.New("TokenReviewAuthenticator requires at least one allowed caller ServiceAccount")
+	}
 
 	ttl := cfg.CacheTTL
 	if ttl <= 0 {
-		ttl = 60 * time.Second
+		ttl = defaultTokenReviewCacheTTL
 	}
 
 	return &TokenReviewAuthenticator{
@@ -212,7 +225,7 @@ func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 		return nil, fmt.Errorf("failed to encode TokenReview request: %w", err)
 	}
 
-	reviewURL := a.apiServerURL + "/apis/authentication.k8s.io/v1/tokenreviews"
+	reviewURL := a.apiServerURL + tokenReviewAPIPath
 	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, reviewURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TokenReview request: %w", err)
@@ -227,7 +240,7 @@ func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenReviewResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read TokenReview response: %w", err)
 	}
@@ -251,10 +264,11 @@ func (a *TokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 		return nil, errors.New("TokenReview returned an empty username")
 	}
 
-	if len(a.allowedCallers) > 0 {
-		if _, ok := a.allowedCallers[username]; !ok {
-			return nil, fmt.Errorf("caller %q is not in the allowed callers list", username)
-		}
+	if len(a.allowedCallers) == 0 {
+		return nil, errors.New("no allowed callers configured")
+	}
+	if _, ok := a.allowedCallers[username]; !ok {
+		return nil, fmt.Errorf("caller %q is not in the allowed callers list", username)
 	}
 
 	identity := CallerIdentity{

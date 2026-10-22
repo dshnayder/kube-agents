@@ -348,8 +348,6 @@ RUN useradd --no-create-home --home-dir /home/agent --shell /bin/bash --uid 1000
     usermod -p '*' agent && \
     install -d -m 0755 -o root -g root /home/agent && \
     install -d -m 0755 -o root -g root /home/agent/.ssh && \
-    install -d -m 0755 -o root -g root /home/agent/.kube && \
-    ln -sf /opt/data/.kubeconfig /home/agent/.kube/config && \
     install -d -m 0555 -o root -g root /home/agent/.hermes && \
     install -d -m 0755 /run/sshd && \
     install -d -m 0755 -o agent -g agent /opt/data && \

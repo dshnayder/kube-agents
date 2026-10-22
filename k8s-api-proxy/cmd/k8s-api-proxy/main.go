@@ -117,6 +117,9 @@ func main() {
 			callers = append(callers, trimmed)
 		}
 	}
+	if len(callers) == 0 {
+		log.Fatalf("--allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS) is required and must name at least one caller ServiceAccount")
+	}
 
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
 		APIServerURL:   *kubeAPIServer,

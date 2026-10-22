@@ -164,6 +164,26 @@ var allowedDiscoveryPaths = map[string]struct{}{
 	"/readyz":     {},
 }
 
+var discoverySegmentPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?\z`)
+
+func isAllowedDiscoveryPath(p string) bool {
+	if _, ok := allowedDiscoveryPaths[p]; ok {
+		return true
+	}
+	if strings.HasPrefix(p, "/openapi/v3/") && len(p) > len("/openapi/v3/") {
+		return true
+	}
+	trimmed := strings.TrimPrefix(p, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) == 2 && (parts[0] == "api" || parts[0] == "apis") && discoverySegmentPattern.MatchString(parts[1]) {
+		return true
+	}
+	if len(parts) == 3 && parts[0] == "apis" && discoverySegmentPattern.MatchString(parts[1]) && discoverySegmentPattern.MatchString(parts[2]) {
+		return true
+	}
+	return false
+}
+
 var upgradeSubresources = map[string]struct{}{
 	"exec":        {},
 	"attach":      {},
@@ -245,10 +265,7 @@ func EvaluatePolicyWithOptions(mode Mode, redactSecrets bool, allowUpgradeSubres
 				Message:         fmt.Sprintf("kube-proxy policy blocked HTTP method %q on non-resource path %q: only GET and HEAD are permitted on discovery paths. This is a permission boundary, not an error to work around.", r.Method, info.Path),
 			}
 		}
-		if _, ok := allowedDiscoveryPaths[info.Path]; ok {
-			return nil
-		}
-		if strings.HasPrefix(info.Path, "/openapi/v3/") {
+		if isAllowedDiscoveryPath(info.Path) {
 			return nil
 		}
 		return &PolicyError{
@@ -395,6 +412,7 @@ func evaluateSubresourceByMode(mode Mode, r *http.Request, info *request.Request
 			return nil
 		}
 		if (mode == "" || mode == ModeReadOnlyWithDryRun) && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") && HasStrictDryRunAll(r) {
+			enforceDryRunQuery(r)
 			return nil
 		}
 		if mode == ModeReadWrite && (info.Verb == "create" || info.Verb == "update" || info.Verb == "patch") {

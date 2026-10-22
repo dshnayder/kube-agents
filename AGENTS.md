@@ -21,14 +21,14 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
   - `site/`: The published site (Astro + Starlight), the canonical home for user-facing docs.
   - `architecture/`: The end-state specification (`01`–`09`): the target, not what ships today.
   - `designs/`: Per-feature design documents.
-- `k8s-api-proxy/`: Go Kubernetes API reverse proxy (`kube-proxy`).
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` resources.
-- `scripts/`: Repository tooling: `installer/` (shared by front doors), `dev/`, `release/`.
+- `scripts/`: Repository tooling: `installer/` (shared by the front doors), `dev/`, `release/`.
 - `examples/`: LiteLLM provider configs, vLLM serving, inference replay.
 - `bench/`: Evaluation harness running [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent.
 - `images.json`: Inventory of every container image an install pulls, with its upstream reference
-  and pin; read by `make mirror-images`, kustomize deploy targets, and the docs generator.
-- `INSTALL.md` / `README.md`: Installation guide and project overview.
+  and pin; read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
+- `INSTALL.md`: Installation guide.
+- `README.md`: Project overview.
 
 ## Where Tests Go
 
@@ -56,7 +56,7 @@ A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makef
 ## Agent Setup & Integration
 
 This repository is mostly configuration and documentation for AI agents, plus the Go modules in
-`k8s-operator/`, `k8s-api-proxy/`, and `a2a/`. Follow [INSTALL.md](INSTALL.md) to set up and register the Platform
+`k8s-operator/` and `a2a/`. Follow [INSTALL.md](INSTALL.md) to set up and register the Platform
 Agent; [docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts,
 and operational guides.
 
@@ -216,7 +216,7 @@ user" clauses here. Agents with a user in the loop follow this file.
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
   `--platform linux/amd64` Docker build (plus `scripts/check_image_layers.py` for a new `RUN`/`COPY`
-  in `deploy/docker/Dockerfile`), `go build` in `k8s-operator/`, `k8s-api-proxy/`, or `a2a/`, `make terraform-test` on
+  in `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on
   Terraform modules. Commands:
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 

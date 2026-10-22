@@ -21,6 +21,7 @@ const (
 	redactedSecretValue         = "REDACTED"
 	redactedAnnotationKey       = "kubeagents.x-k8s.io/redacted"
 	redactedAnnotationValue     = "true (secret data values are redacted by kube-proxy)"
+	maxSecretResponseBytes      = 64 << 20
 )
 
 // RewriteSecretRequestHeaders rewrites Accept and Accept-Encoding headers on core/v1 Secret requests
@@ -84,9 +85,13 @@ func ScrubSecretResponse(resp *http.Response, info *request.RequestInfo, callerW
 	}
 
 	defer bodyReader.Close()
-	raw, err := io.ReadAll(io.LimitReader(bodyReader, 64<<20))
+	raw, err := io.ReadAll(io.LimitReader(bodyReader, maxSecretResponseBytes+1))
 	if err != nil {
 		replaceWithBadGateway(resp, "kube-proxy failed to read Secret response body from upstream")
+		return
+	}
+	if len(raw) > maxSecretResponseBytes {
+		replaceWithBadGateway(resp, "kube-proxy refused Secret response: upstream Secret payload exceeds 64 MiB limit")
 		return
 	}
 

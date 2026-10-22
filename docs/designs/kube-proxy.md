@@ -347,7 +347,7 @@ When `Config.RedactSecrets` is enabled (the default) and `RequestInfo` matches c
    - On every response for a `secrets` request (including `PartialObjectMetadata`, `Table`, `watch` streams, or `dryRun=All`), `kube-proxy` decompresses any residual `Content-Encoding: gzip` stream, inspects the JSON payload, and scrubs sensitive payloads while preserving `Secret` key names:
      - Top-level and `items[*]` `.data` and `.stringData` keys are collected (along with any key names recorded in `metadata.managedFields[*].fieldsV1["f:data"]` and `["f:stringData"]`), `.stringData` is removed, and `.data` is populated with `"REDACTED"` values for each key so `kubectl get secret -o yaml` and `kubectl describe secret` display the key names without exposing secret bytes.
      - Annotation `kubectl.kubernetes.io/last-applied-configuration` in `metadata.annotations` (which otherwise contains the plaintext JSON of a `Secret` applied with `kubectl apply`) is deleted, and `kubeagents.x-k8s.io/redacted: "true (secret data values are redacted by kube-proxy)"` is added so `kubectl describe secret` explicitly indicates redaction.
-   - If a `secrets` response cannot be parsed as valid JSON, `kube-proxy` fails closed and returns `502 Bad Gateway` rather than forwarding unverified bytes.
+   - If a `secrets` response exceeds the 64 MiB payload cap or cannot be parsed as valid JSON, `kube-proxy` fails closed and returns `502 Bad Gateway` rather than forwarding unverified bytes.
 
 ### 8. Header sanitization and streaming (`pkg/k8sapiproxy/headers.go`)
 
@@ -356,7 +356,7 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `Authorization`, `Proxy-Authorization`, and `Cookie` (consumed or dropped at ingress and never forwarded)
 - `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid`, and any header matching `^Impersonate-Extra-` (case-insensitive)
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
-- `Upgrade` and `Connection: upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled)
+- `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
 
 It also appends `kproxy/<caller-username>` to the outbound `User-Agent` header so `kube-apiserver` audit logs record the originating sandbox identity alongside `kubectl`'s own `User-Agent`.
 
@@ -367,7 +367,7 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 `pkg/transport/gkehttps` (`gke-https`) implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
 
 1. **`in-cluster` (or host cluster matching `KUBE_CONTEXT_NAME`)**:
-   - Uses `https://kubernetes.default.svc` with the mounted CA certificate (`CREDENTIAL_PROXY_KUBE_CA_FILE`, `/var/run/secrets/kubeagents/kube-api/ca.crt`) and the proxy pod's projected Kubernetes API `ServiceAccount` token (`CREDENTIAL_PROXY_KUBE_TOKEN_FILE`, `/var/run/secrets/kubeagents/kube-api/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
+   - Uses `https://kubernetes.default.svc` with the mounted CA certificate (`CREDENTIAL_PROXY_KUBE_CA_FILE`, `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`) and the proxy pod's projected Kubernetes API `ServiceAccount` token (`CREDENTIAL_PROXY_KUBE_TOKEN_FILE`, `/var/run/secrets/kubeagents/kube-api/token`), avoiding external round trips to `container.googleapis.com` for the host cluster.
 2. **Fleet GKE clusters (`gke_<project>_<location>_<cluster>`)**:
    - Validates `<project>`, `<location>`, and `<cluster>` against `^[a-z0-9][a-z0-9-]*\z`.
    - Calls `GET https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}` using the proxy pod's `GCPTokenSource` (Workload Identity Federation via `CREDENTIAL_PROXY_WIF_AUDIENCE`, `CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT`, and `CREDENTIAL_PROXY_WIF_TOKEN_FILE`, or the GCE metadata server).
@@ -399,10 +399,10 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 
 The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and ClusterIP Service** alongside `<agent>-credential-proxy` ([`k8s-operator/internal/controller/kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)):
 
-- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` and `<agent>-gateway` pods, and admits `gmp-system` on port `8444`.
-- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, and `<agent>-kube-proxy.<namespace>.svc`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
-- **Upstream identity**: `<agent>-kube-proxy` uses the same Workload Identity / Workload Identity Federation configuration as `<agent>-credential-proxy` to authenticate upstream to `kube-apiserver` and `container.googleapis.com`.
-- **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765`. `<agent>-shell` receives `KUBE_PROXY_URL=https://<agent>-kube-proxy:8443` and routes all `kubectl` operations through `<agent>-kube-proxy`.
+- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment (`Recreate` strategy) and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod, and admits `gmp-system` on port `8444`.
+- **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
+- **Upstream identity**: `<agent>-kube-proxy` uses the same Workload Identity / Workload Identity Federation configuration as `<agent>-credential-proxy` to authenticate upstream to `kube-apiserver` and `container.googleapis.com`, and binds its ServiceAccount via a `ClusterRoleBinding` (`<namespace>-<agent>-kube-proxy-tokenreview` -> `ClusterRole/system:auth-delegator` and `<namespace>-<agent>-kube-proxy-reader` -> `ClusterRole/<namespace>-<agent>-cluster-reader`).
+- **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765`. `<agent>-shell` receives `KUBE_PROXY_URL=https://<agent>-kube-proxy.<namespace>.svc.cluster.local:8443` and routes all `kubectl` operations through `<agent>-kube-proxy`.
 
 ### 12. Integration with generic agent sandboxes (NVIDIA OpenShell)
 
