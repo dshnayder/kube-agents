@@ -1159,7 +1159,9 @@ Every tier writes the ids of these findings in a second renderer-owned list insi
 body tell these ids from findings that the body cut for space. An id with no known place is not kept, and the run log
 names it, because a row held by id alone would never get a place back and would stay for as long as
 any gap stands. On the findings run the rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how
-many it did not show, in every tier except the id-only one. The id stays in the marker, so the next complete run
+many it did not show, in every tier except the id-only one. An id past the cap leaves the body and the marker, but
+the run still did not check its target: its pull request stays open in the stale-close pass, a `/remediate` on it is
+deferred, and the run log names it. A kept id stays in the marker, so the next complete run
 joins against it, and it is not in `resolved` and not stale for the stale-close pass. It is not in
 the held-id list that a run without a manifest carries (collector design §3.3), so the row goes away
 on the first run that checks its target. A finding on a target that the run read and checked is not

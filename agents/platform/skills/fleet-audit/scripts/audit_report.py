@@ -9262,10 +9262,12 @@ def unread_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     The sibling of `collector_hold_reason` for a row under _Not re-checked
     this run_ (`unread_held_entries`): the finding is on the ledger, but this
     run did not check its target, so there is no finding in the document to
-    act on and no reason to call the id a typo.
+    act on and no reason to call the id a typo. Also for a finding past
+    `MAX_HELD_IDS`, which has no row, so the reply does not say the ledger
+    shows it.
     """
     return (
-        f"`{target}` stays on this ledger because this run did not read or did not "
+        f"`{target}` is held because this run did not read or did not "
         "check its target, so the run cannot tell if the finding is still there. "
         f"There is no finding in the document to open a {noun} from. The request "
         "stands: the first run whose document carries the finding acts on it, and "
@@ -11243,10 +11245,10 @@ def _render_collector_held(
         )
     if unread:
         out += _render_unread_held(unread, detail=detail, under_flagged=bool(flagged))
-    return out + _render_unread_overflow(unread_overflow) + _held_span_close(held)
+    return out + _render_unread_overflow(unread_overflow, noun) + _held_span_close(held)
 
 
-def _render_unread_overflow(overflow: int) -> list[str]:
+def _render_unread_overflow(overflow: int, noun: str = DEFAULT_PROPOSAL_NOUN) -> list[str]:
     """The line a held section ends with when `MAX_HELD_IDS` left unread held findings out."""
     if not overflow:
         return []
@@ -11254,7 +11256,8 @@ def _render_unread_overflow(overflow: int) -> list[str]:
         "",
         f"_{overflow} more previous finding(s) are on a target that this run did not "
         f"check, and are not shown: the ledger holds at most {MAX_HELD_IDS} at once. "
-        "The ledger stops tracking them._",
+        f"Their {noun}s stay open, and a `/remediate` on one waits for a run "
+        "that checks its target._",
     ]
 
 
@@ -11427,7 +11430,7 @@ def _render_held_note(
         if unread
         else []
     )
-    unread_lines += _render_unread_overflow(unread_overflow)
+    unread_lines += _render_unread_overflow(unread_overflow, noun)
     if not held:
         return ["", HELD_SECTION_BEGIN] + unread_lines + _held_span_close(unread)
     if carried:
@@ -19365,6 +19368,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             unread_entries, unread_dropped = unread_entries[:room], unread_entries[room:]
     unread_overflow = len(unread_dropped)
     unread_ids = {entry["id"] for entry in unread_entries}
+    # Every previous finding on a target this run did not check, the ones past
+    # the cap too. The body carries only `unread_ids`, but the stale-close pass
+    # and `/remediate` use this set: a finding the cap left out is still not
+    # re-checked, so its pull request stays open and a `/remediate` on it waits,
+    # as for a collector-held finding past the cap.
+    unchecked_ids = unread_ids | {entry["id"] for entry in unread_dropped}
     for entry in unread_entries:
         log(
             f"HELD: {entry['id']} is on the ledger and this run did not check it "
@@ -20069,7 +20078,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         log(
             f"WARNING: the ledger stops tracking {unread_overflow} previous "
             "finding(s) on a target this run did not check — it holds at most "
-            f"{MAX_HELD_IDS} at once: "
+            f"{MAX_HELD_IDS} at once. Their pull requests stay open, and a "
+            "`/remediate` on one waits for a run that checks its target: "
             + ", ".join(entry["id"] for entry in unread_dropped)
         )
 
@@ -20086,7 +20096,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         collector_held=held_ids,
         collector_flagged=candidate_only,
         noun=noun,
-        unread_held=unread_ids,
+        unread_held=unchecked_ids,
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:
@@ -20301,8 +20311,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # never had room for. Its pull request is not stale while the
             # condition is still observed, whatever the document left out.
             # And every finding held because this run did not check its
-            # target: absence there is not evidence of a fix.
-            set(current_ids) | still_flagged | unread_ids,
+            # target: absence there is not evidence of a fix. That includes
+            # the ones past `MAX_HELD_IDS`, which left the body but not the gap.
+            set(current_ids) | still_flagged | unchecked_ids,
             previous_titles,
             {},
             now,
