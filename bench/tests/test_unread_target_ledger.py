@@ -174,6 +174,7 @@ def test_the_seed_opens_one_ledger_with_a_record_finish_trusts(store, monkeypatc
     memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
     assert memory is not None and not memory.get("seeded_from_ledger")
     assert forge.payloads("issue-close") == []
+    assert ledger.recorded_seeded_issue(audit_report, GITOPS) == 7
 
 
 def test_the_seed_fails_and_closes_its_ledger_when_the_store_write_does_nothing(
@@ -240,7 +241,8 @@ def test_teardown_closes_the_ledger_after_a_run_that_dropped_the_seeded_row(stor
     """The seed refuses over an open ledger, so each open ledger of the stream is the seeded one.
 
     A run without the fix writes the body again and the invented object
-    leaves it, so the teardown does not look for the name.
+    leaves it, so the teardown does not look for the name. With no recorded
+    number, the list is the fallback.
     """
     forge = forge_with(
         monkeypatch,
@@ -249,6 +251,71 @@ def test_teardown_closes_the_ledger_after_a_run_that_dropped_the_seeded_row(stor
     assert ledger.teardown(audit_report, GITOPS) == [7]
     assert [p["number"] for p in forge.payloads("issue-close")] == [7]
     assert forge.payloads("issue-list")[0]["labels"] == [f"audit:{AUDIT}"]
+
+
+def test_teardown_closes_the_recorded_issue_that_the_listing_omits(store, monkeypatch):
+    """On GitHub the label-filtered list can omit an open issue that got its label a short time before.
+
+    The seed records the number it opened, so the teardown closes that issue
+    after `issue-view` says it is open, also when the list is empty. Then it
+    removes the record.
+    """
+    seeded_body(monkeypatch)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-view": {"issue": {"number": 7, "state": "open"}},
+            "issue-list": {"issues": []},
+        },
+    )
+    assert ledger.teardown(audit_report, GITOPS) == [7]
+    assert [p["number"] for p in forge.payloads("issue-view")] == [7]
+    assert [p["number"] for p in forge.payloads("issue-close")] == [7]
+    assert ledger.recorded_seeded_issue(audit_report, GITOPS) is None
+
+
+def test_teardown_closes_the_recorded_issue_once_and_other_listed_ledgers(store, monkeypatch):
+    """The recorded issue is not closed again from the list; another open ledger is closed."""
+    seeded_body(monkeypatch)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-view": {"issue": {"number": 7, "state": "open"}},
+            "issue-list": {"issues": [{"number": 7}, {"number": 9}]},
+        },
+    )
+    assert ledger.teardown(audit_report, GITOPS) == [7, 9]
+    assert [p["number"] for p in forge.payloads("issue-close")] == [7, 9]
+
+
+def test_teardown_does_not_close_a_recorded_issue_that_is_closed(store, monkeypatch):
+    seeded_body(monkeypatch)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-view": {"issue": {"number": 7, "state": "closed"}},
+            "issue-list": {"issues": []},
+        },
+    )
+    assert ledger.teardown(audit_report, GITOPS) == []
+    assert forge.payloads("issue-close") == []
+
+
+def test_teardown_ignores_a_record_for_another_repository(store, monkeypatch):
+    seeded_body(monkeypatch)
+    path = ledger.seeded_issue_path(audit_report, GITOPS)
+    path.write_text('{"repo": "acme/other", "number": 7}\n', encoding="utf-8")
+    forge = forge_with(monkeypatch, **{"issue-list": {"issues": []}})
+    assert ledger.teardown(audit_report, GITOPS) == []
+    assert forge.payloads("issue-view") == []
+
+
+def test_the_seed_does_not_make_the_report_store_directory(store, monkeypatch):
+    """The stored record makes the directory; the record of the number does not."""
+    assert not store.exists()
+    ledger.record_seeded_issue(audit_report, GITOPS, 7)
+    assert not store.exists()
+    assert ledger.recorded_seeded_issue(audit_report, GITOPS) is None
 
 
 def test_every_task_variable_is_declared_by_the_stack():

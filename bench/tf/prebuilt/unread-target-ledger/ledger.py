@@ -24,7 +24,8 @@ stored record is one that `finish` trusts.
 
 seed: opens one fleet-consistency-drift ledger with one finding on the host
 cluster, under the `label-keys` facet, and writes the stored record of that
-ledger. The host cluster carries no environment label, so the drift collector
+ledger. It also writes the issue number to `SEEDED_ISSUE_NAME` in the stream's
+report store directory, which the stored record has made. The host cluster carries no environment label, so the drift collector
 compares it on no facet: the next run has a coverage gap on the host and does
 not check `label-keys` there. The cluster name is spelled as the drift
 collector spells a target, `<project>/<location>/<name>`. Exits 1 when the
@@ -33,11 +34,15 @@ run), or when the stored record does not pass the check that `finish` makes.
 In that case it closes the issue it opened first: a failed apply runs no
 destroy, so the destroy cannot close it.
 
-teardown: closes, as not planned, each open ledger of the stream. The seed
-refuses when the stream has an open ledger, so an open ledger at destroy is
-the one the seed opened. The run under test can write that body again
-without the invented object (a run without the fix does), so the teardown
-does not look for the name.
+teardown: closes, as not planned, the issue whose number the seed wrote, if
+`issue-view` says it is open. Then it closes each other open ledger of the
+stream that the label-filtered issue list gives. The number comes first
+because on GitHub that list can omit an open issue that got its label a short
+time before: the teardown then closed nothing, and the `finish` of the next
+repetition opened a second ledger. The seed refuses when the stream has an
+open ledger, so an open ledger at destroy is the one the seed opened. The run
+under test can write that body again without the invented object (a run
+without the fix does), so the teardown does not look for the name.
 """
 
 import json
@@ -66,6 +71,11 @@ SEED_ARGS = 5
 TEARDOWN_ARGS = 2
 # audit_report's mark on a memory seeded from the ledger, not read from the store.
 SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
+# The file in the stream's report store directory that holds the seeded issue
+# number. Not a `.json` under `runs/`, so the store's readers and its prune
+# do not see it.
+SEEDED_ISSUE_NAME = "eval-unread-target-issue.json"
+OPEN_STATE = "open"
 
 
 def target_name(project, location, cluster):
@@ -164,7 +174,46 @@ def seed(audit_report, project, location, cluster, repo, now):
             "finish trusts, so the run would treat the ledger as a lost memory and carry "
             f"nothing from it. Closed #{number}."
         )
+    record_seeded_issue(audit_report, repo, number)
     return url
+
+
+def seeded_issue_path(audit_report, repo):
+    return audit_report.reports_dir_for(AUDIT_ID, repo) / SEEDED_ISSUE_NAME
+
+
+def record_seeded_issue(audit_report, repo, number):
+    """Write the seeded issue number where the teardown reads it.
+
+    Only into a directory that is there: the stored record makes it, and this
+    script does not make the report store. A number that is not written
+    leaves the teardown with the issue list alone, so the failure is a warning.
+    """
+    path = seeded_issue_path(audit_report, repo)
+    if not path.parent.is_dir():
+        print(
+            f"WARNING: no report store directory {path.parent}; #{number} is not recorded.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        path.write_text(
+            json.dumps({"repo": repo, "number": number}) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"WARNING: could not record #{number} in {path}: {exc}", file=sys.stderr)
+
+
+def recorded_seeded_issue(audit_report, repo):
+    """The issue number the seed wrote for `repo`, or None."""
+    try:
+        record = json.loads(seeded_issue_path(audit_report, repo).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("repo") != repo:
+        return None
+    number = record.get("number")
+    return number if isinstance(number, int) and not isinstance(number, bool) else None
 
 
 def store_record(audit_report, data, rendered, number, url, repo, now):
@@ -204,19 +253,32 @@ def store_record(audit_report, data, rendered, number, url, repo, now):
 
 
 def teardown(audit_report, repo):
-    """Close each open ledger of the stream; the seed opened it."""
+    """Close the seeded ledger by its recorded number, then each other open ledger of the stream."""
+    closed = []
+    recorded = recorded_seeded_issue(audit_report, repo)
+    if recorded is not None:
+        issue = audit_report.forge("issue-view", repo, {"number": recorded}).get("issue") or {}
+        if issue.get("state") == OPEN_STATE:
+            audit_report.forge("issue-close", repo, {"number": recorded, "reason": TEARDOWN_REASON})
+            closed.append(recorded)
     answer = audit_report.forge(
         "issue-list",
         repo,
-        {"labels": [f"audit:{AUDIT_ID}"], "state": "open", "limit": audit_report.MAX_PAGE},
+        {"labels": [f"audit:{AUDIT_ID}"], "state": OPEN_STATE, "limit": audit_report.MAX_PAGE},
     )
-    closed = []
     for issue in answer.get("issues") or []:
-        if isinstance(issue, dict) and isinstance(issue.get("number"), int):
-            audit_report.forge(
-                "issue-close", repo, {"number": issue["number"], "reason": TEARDOWN_REASON}
-            )
-            closed.append(issue["number"])
+        if not isinstance(issue, dict) or not isinstance(issue.get("number"), int):
+            continue
+        if issue["number"] in closed:
+            continue
+        audit_report.forge(
+            "issue-close", repo, {"number": issue["number"], "reason": TEARDOWN_REASON}
+        )
+        closed.append(issue["number"])
+    try:
+        seeded_issue_path(audit_report, repo).unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"WARNING: could not remove the seeded issue record: {exc}", file=sys.stderr)
     return closed
 
 
