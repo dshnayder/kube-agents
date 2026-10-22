@@ -467,40 +467,54 @@ Each frontmatter field serves a specific operational purpose:
 | `guard` (`severity`, `expect`)     | Turns a written lesson into a deterministic check (`>= 256Mi`, `absent`, `regex`, etc.) enforced before a pull request is opened. |
 | `evidence` (`pull_request`, ...)   | Links the record to the exact pull requests, incident issues, and commits so the agent can cite verifiable provenance.            |
 
-#### 1. How decision and lesson memory is populated
+#### 1. How the agent learns across three core operational scenarios
 
-No agent or background job ever writes directly to the default branch or directly to the Hindsight index. Every write path opens a pull request against `knowledge/`. Only after a human merges that pull request does `decision_memory.py index` update the Hindsight bank.
+No agent or background job ever writes directly to the default branch or directly to the `kube-agents-decisions` Hindsight bank. Every Layer 2 write path opens a pull request against `knowledge/`. Only after a human merges that pull request does the Curator update the `kube-agents-decisions` bank and broadcast the update on NATS.
 
-##### Path W1 — Learn automatically from verified pull request outcomes
+The table below summarizes how the agent learns across the three primary operational scenarios:
+
+| Scenario | Example trigger | What happens immediately | How it becomes a durable, enforced rule |
+| :--- | :--- | :--- | :--- |
+| **Scenario 1: Learning from chat** (e.g., in a group space someone says _"Let's not submit any infrastructure PRs on Friday"_) | An engineer states a team-wide convention, freeze, or ownership rule in a group chat or DM. | **Layer 1 (`kube-agents-memory`)**: The Chat Agent calls `memory_retain(scope="shared")` to store the rule under `scope:shared` and confirms in chat. Every subsequent chat turn and scheduled run recalls this rule immediately via `prefetch_all`. | **Layer 2 (`knowledge/decisions/DEC-*.md`)**: Because the rule governs GitOps pull requests, the Chat Agent also publishes a decision candidate to NATS (`a2a.topics.agent.chat.outcomes`) or offers to open a PR adding `DEC-YYYY-NNN.md` (for example, blocking Friday PR submissions on `clusters/**` and `infrastructure/**`). Once merged, `submit-suggestion` enforces the rule deterministically before `git push`. |
+| **Scenario 2: Learning from troubleshooting & monitoring** (e.g., a Cluster Agent detects an outage and submits a fix PR to the infra repo) | An event watcher, fleet audit check, or troubleshooting run diagnoses a cluster failure and opens a remediation PR. | The remediation PR includes a `Lesson draft` (`LES-YYYY-NNN.md`, `status: proposed`) scoping the affected workload and YAML path. After the PR merges (or is closed), post-merge verification checks Argo CD/Flux health, 24-hour event silence, and the fleet-audit ledger. | The Cluster Agent publishes the verified outcome (`resolved-merged`, `pr-merged-persists`, or `refused`) to NATS (`a2a.topics.agent.<profile>.outcomes`). The Go Curator synthesizes a verified `LES-*` record (or promotes a recurring multi-cluster pattern into a fleet-wide `DEC-*` rule), opens a `knowledge/` PR, indexes the merged record into Hindsight, and publishes `a2a.topics.shared.decisions`. |
+| **Scenario 3: Learning on Day-0 installation** (scanning an existing GitOps repo when the agent is first installed) | A GitOps repository is registered on a new installation and `knowledge/STATE_OF_BEING.md` does not yet exist. | The Go Curator automatically launches `bootstrap --since 2y --budget-minutes 120`. Stage 1 scans 2 years of commits, merged/closed PRs, review comments, and issues in $0\text{–}15\text{ min}$ with zero LLM calls, and Stage 2 prunes deleted workloads (`anachronistic`) and noise against `HEAD`. | Stage 3 uses concurrent goroutines to diff YAML/HCL ASTs, calls LiteLLM (`POST /v1/chat/completions`) to write OKF sections with exact PR/issue links, and verifies every candidate guard against `HEAD`. Stage 4 opens one onboarding PR (`STATE_OF_BEING.md` + `DEC-*`/`LES-*` files) and indexes the corpus into Hindsight within 2 hours of installation. |
+
+##### Path W1 — Learn automatically from troubleshooting, monitoring, and pull request outcomes
 
 ```mermaid
 sequenceDiagram
-  participant A as Platform / Cluster Agent
+  participant A as Cluster / Platform Agent
   participant G as GitOps Repository
-  participant OR as Outcome Recorder
-  participant V as Verification Signals
-  A->>G: Open fix PR (with proposed lesson draft)
+  participant V as Verification Signals (Audit / Events / Argo CD)
+  participant N as NATS JetStream (TOPICS-JOURNAL & TOPICS-STATE)
+  participant C as Go Curator / Dreamer (a2a/cmd/curator)
+  participant H as Hindsight (kube-agents-decisions)
+
+  A->>G: Open remediation PR (with proposed lesson draft)
   Note over G: Human merges or closes PR
-  OR->>G: Sweep closed/merged platform-agent/* PRs
-  OR->>V: Check post-merge verification signals
-  V-->>OR: resolved-merged | pr-merged-persists | refused
-  OR->>OR: Run decision_memory.py from-outcome
-  OR->>G: Open PR to activate positive lesson or record negative lesson
+  V-->>A: Verify outcome (resolved-merged | pr-merged-persists | refused)
+  A->>N: Publish outcome to a2a.topics.agent.<profile>.outcomes
+  N->>C: Deliver outcome event
+  C->>C: Synthesize OKF via LiteLLM + verify guard against HEAD + check multi-cluster recurrence
+  C->>G: Open PR for LES-YYYY-NNN.md (or promoted fleet-wide DEC-YYYY-NNN.md)
+  Note over G: Human merges knowledge/ PR
+  C->>H: Upsert verbatim chunk (document_id = okf:<repo>:<path>)
+  C->>N: Publish updated digest to a2a.topics.shared.decisions
 ```
 
-1. **Propose a lesson alongside the fix**: When an agent opens a remediation pull request, it includes a `Lesson draft` section in the PR description (or commits `knowledge/lessons/LES-YYYY-NNN.md` with `status: proposed`) so the human reviewer approves both the manifest fix and the lesson in one review.
+1. **Propose a lesson alongside the fix**: When a Cluster Agent or Platform Agent diagnoses an issue from monitoring alerts or fleet-audit findings and opens a remediation pull request, it includes a `Lesson draft` section in the PR description (or commits `knowledge/lessons/LES-YYYY-NNN.md` with `status: proposed`) so the human reviewer can approve both the manifest fix and the lesson in one review.
 2. **Verify post-merge resolution (`resolved-merged`)**: After a fix PR merges, the outcome recorder checks four deterministic signals (from strongest to weakest):
    - **Fleet audit verification**: `audit_report.py finish` confirms that the next complete audit run no longer reproduces the finding ([`fleet-audit-issue-ledger.md` §4](fleet-audit-issue-ledger.md#4-finding-lifecycle)).
    - **Cluster event silence**: `intercepted_events` records zero occurrences of the workload failure reason for $24\text{ hours}$ after merge.
    - **GitOps sync and health**: Argo CD or Flux reports `Synced` at or after the merge commit SHA and `Healthy`.
    - **Findings queue closure**: `findings_queue.py` confirms `pr_state=merged` and verifies that the finding has cleared.
 3. **Learn from failed or rejected fixes (`pr-merged-persists` and `refused`)**:
-   - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), `decision_memory.py from-outcome` drafts a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
-   - When the LiteLLM inference gateway is available (`LITELLM_BASE_URL`, `model.base_url` in `config.yaml`, or `--llm-url`, defaulting to `http://inference-gateway.<namespace>.svc.cluster.local/v1` with model `model-default`), `from-outcome` synthesizes clean OKF sections (`What happened`, `What fixed it`, `How we know it worked`, `Prevent it next time`) and a candidate `guard` from unstructured PR descriptions and review comments, then deterministically verifies that the proposed guard passes against `HEAD` before writing the file.
+   - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), the Curator drafts a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
+   - When the LiteLLM inference gateway is available (`LITELLM_BASE_URL`, `model.base_url` in `config.yaml`, or `--llm-url`, defaulting to `http://inference-gateway.<namespace>.svc.cluster.local/v1` with model `model-default`), `from-outcome` makes a single-shot OpenAI-compatible completion call to synthesize clean OKF sections (`What happened`, `What fixed it`, `How we know it worked`, `Prevent it next time`) and a candidate `guard` from unstructured PR descriptions and review comments, then deterministically verifies that the proposed guard passes against `HEAD` before writing the file.
 
-##### Path W2 — Bounded history bootstrap ("midterm" vs. multi-year) and incremental harvesting
+##### Path W2 — Day-0 repository onboarding: bounded history bootstrap ("midterm" vs. multi-year)
 
-Enterprise Infrastructure-as-Code repositories often span four to five years of commits, where much of the oldest history refers to retired clusters or superseded architectures. Teams can choose a history window (`--since 90d`, `180d`, or `2y`) and wall-clock budget (`--budget-minutes`) when running `decision_memory.py bootstrap`:
+Enterprise Infrastructure-as-Code repositories often span four to five years of commits, where much of the oldest history refers to retired clusters or superseded architectures. When `kube-agents` is first installed and a GitOps repository has no `knowledge/STATE_OF_BEING.md`, the onboarding job automatically runs a bounded bootstrap (`--since 2y --budget-minutes 120`, configurable to `--since 90d` or `180d`):
 
 | History window                                 | Typical PRs & issues scanned | Processing time & compute cost                                            | Harvested records (`DEC` + `LES`) | Storage footprint (Git + Hindsight `pgvector`)             | When to choose                                                                                                     |
 | ---------------------------------------------- | ---------------------------: | ------------------------------------------------------------------------- | --------------------------------: | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -508,20 +522,28 @@ Enterprise Infrastructure-as-Code repositories often span four to five years of 
 | **6 months (`--since 180d`)**                  |             $400\text{–}900$ | $5\text{–}12\text{ min}$                                                  |                    $30\text{–}70$ | $\approx 120\text{ KB}$ in Git; $\approx 250\text{ KB}$ DB | Balanced onboarding covering two quarterly release cycles and seasonal traffic patterns.                           |
 | **2 years (`--since 2y`, default ceiling)**    |         $1,500\text{–}4,000$ | $30\text{–}120\text{ min}$ (bounded by `--budget-minutes 120`)            |                  $100\text{–}250$ | $\approx 450\text{ KB}$ in Git; $< 1\text{ MB}$ in DB      | Full historical backfill for mature fleets ($< 0.02\%$ of the default $8\text{ GiB}$ Hindsight PostgreSQL volume). |
 
-Running `decision_memory.py bootstrap --since 2y --budget-minutes 120` executes four stages:
+Running `bootstrap --since 2y --budget-minutes 120` executes four stages:
 
 | Stage                                  | Time window                | What happens                                                                                                                                                                                                                                                                                                         | Output                                                                        |
 | -------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | **1. Fast Git & PR metadata scan**     | $0\text{–}15\text{ min}$   | Scans commit history and closed/merged PR and issue metadata within the `--since` window without LLM calls. Identifies revert chains, closed unmerged PRs on governed files, and high-churn resource fields.                                                                                                         | Ranked list of $50\text{–}150$ high-signal pull requests out of thousands.    |
 | **2. Five-way deterministic triage**   | $15\text{–}30\text{ min}$  | Compares each candidate's diff against the current `HEAD` tree and classifies it into `current`, `superseded`, `rejected`, `anachronistic` (deleted cluster/workload), or `noise` (formatting/version bumps).                                                                                                        | Filtered set of `current`, `superseded`, and `rejected` candidates at `HEAD`. |
-| **3. Hybrid guard & record synthesis** | $30\text{–}90\text{ min}$  | Diffs pre-revert and post-revert YAML/HCL ASTs to infer `guard.expect` rules, calls the LiteLLM inference gateway to synthesize clean OKF descriptions and fallback guards from unstructured PR/issue text, verifies every candidate guard against `HEAD`, and writes `DEC-YYYY-NNN.md` and `LES-YYYY-NNN.md` files. | Scoped decision and lesson files with verifiable PR and issue links.          |
+| **3. Hybrid guard & record synthesis** | $30\text{–}90\text{ min}$  | Diffs pre-revert and post-revert YAML/HCL ASTs to infer `guard.expect` rules, calls the LiteLLM inference gateway concurrently to synthesize clean OKF descriptions and fallback guards from unstructured PR/issue text, verifies every candidate guard against `HEAD`, and writes `DEC-YYYY-NNN.md` and `LES-YYYY-NNN.md` files. | Scoped decision and lesson files with verifiable PR and issue links.          |
 | **4. Baseline "State of Being" PR**    | $90\text{–}120\text{ min}$ | Opens a single onboarding pull request containing `knowledge/STATE_OF_BEING.md` (fleet summary, active guards, superseded policies, and uncovered areas) plus the initial `knowledge/decisions/` and `lessons/` files.                                                                                               | Day-one institutional memory ready for team review within 2 hours.            |
 
-For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. When a GitOps repository is registered for the first time and `knowledge/STATE_OF_BEING.md` does not yet exist, the onboarding workflow triggers `decision_memory.py bootstrap --since 2y --budget-minutes 120` automatically so the team gets historical coverage within 2 hours of installation. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
+For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
 
-##### Path W3 — Capture explicit architectural decisions from chat
+##### Path W3 — Learn from chat: team conventions (`scope:shared`) and Git-governed decisions (`DEC-*`)
 
-When an engineer states an architectural rule in chat, the Chat Agent offers to open a pull request adding `knowledge/decisions/DEC-YYYY-NNN.md` rather than only storing a conversational note. Following `SOUL.md` §1.6, the agent shows the exact record text in chat before opening the pull request.
+When an engineer states an operational rule in chat—for example, saying _"Let's not submit any infrastructure PRs on Friday"_ in a group channel—`kube-agents` captures the rule across both memory layers according to its scope:
+
+1. **Immediate shared conversational memory (`Layer 1`, `kube-agents-memory`)**:
+   - In a group space, the session runs in state `unattributable-shared` (personal memory disabled, shared memory enabled).
+   - Following [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6, the Chat Agent recognizes the statement as a team-wide operational convention, calls `memory_retain(content="Change-freeze policy: do not submit or open infrastructure pull requests on Fridays.", scope="shared")`, and confirms in chat what it saved.
+   - Because every interactive session and unattended job prefetches `scope:shared` on every turn, all agents immediately recall this convention in conversation.
+2. **Deterministic GitOps enforcement (`Layer 2`, `knowledge/decisions/DEC-YYYY-NNN.md`)**:
+   - Prompt recall alone is advisory; to guarantee that no agent profile or automated job opens an infrastructure pull request on a Friday (or violates an architectural constraint stated in chat), the Chat Agent also offers to open a pull request adding `knowledge/decisions/DEC-YYYY-NNN.md` (or publishes a decision candidate to `a2a.topics.agent.chat.outcomes` for the Curator).
+   - Following `SOUL.md` §1.6, the agent displays the proposed `DEC-YYYY-NNN.md` record in chat before opening the pull request. Once merged, `submit-suggestion` and CI enforce the rule deterministically before `git push`.
 
 ##### Path W4 — Synchronize Git records into the Hindsight `kube-agents-decisions` bank
 
@@ -583,13 +605,25 @@ A scheduled job runs `decision_memory.py dream` nightly (and after merges to `kn
 | **7. Summary refresh**      | Refreshes tag-scoped Hindsight summary views (`[scope:shared, kind:decision, area:<name>]`).                                                                            | Yes       | Keeps human-readable area overviews up to date.                                  |
 | **8. Dream report**         | Posts a summary to the platform chat space only when `at_risk`, `conflicts`, `obsolete`, `recurrences`, or `uncovered_changes` are non-empty (`silent: true` if clean). | No        | Zero chat noise on clean nights; immediate alert when drift occurs.              |
 
-##### Cross-cluster federated learning and NATS bus curation (`spec.mode: next`)
+##### Cross-cluster federated learning and the Go Curator/Dreamer on NATS (`spec.mode: next`)
 
-In a multi-cluster fleet running `spec.mode: next`, Cluster Agent profiles operate in parallel across clusters and communicate over the NATS bus without depending on Kanban or Hermes:
+In a multi-cluster fleet running `spec.mode: next`, Cluster Agent profiles operate in parallel across clusters and communicate over the NATS JetStream bus ([`a2a/lib/topics.go`](../../a2a/lib/topics.go)) without depending on Kanban or Hermes.
 
-1. **Publish candidate lessons and skills to NATS**: When a Cluster Agent resolves a cluster-specific incident or discovers a reusable diagnostic pattern, it publishes a structured outcome event (`resolved-merged`, `pr-merged-persists`, or `refused`) and any candidate skill update onto the NATS bus.
-2. **Central curation and fleet-wide graduation**: The Dreamer/Curator profile consumes outcome events across all clusters and runs Phase 5 policy graduation (`decision_memory.py dream`). When two or more clusters report the same failure signature or guarded YAML path (for example, an Autopilot resource floor or a CoreDNS `ndots` regression), the curator promotes the cluster-scoped `LES-*` records into a single fleet-wide `DEC-*` rule (`clusters: ["*"]`) or consolidates the best diagnostic steps into one shared skill, and opens one fleet-wide pull request.
-3. **Broadcast back to all profiles**: Once the curated record or skill merges and `decision_memory.py index` updates Hindsight, the curator publishes a memory-refresh event on NATS so every Cluster Agent and Platform Agent profile immediately enforces the lesson without rediscovering the issue on the remaining clusters.
+Rather than running an open-ended LLM agent loop for background curation, the **Curator/Dreamer (`a2a/cmd/curator` + `a2a/memory`)** is a compiled **Go service and CLI** (`~15\text{–}25\text{ MiB}` RSS, $< 5\text{ ms}$ CLI startup) that combines deterministic Go code with targeted single-shot LiteLLM calls (`POST /v1/chat/completions`):
+
+| Responsibility in `a2a/cmd/curator` | Execution engine | Why Go + single-shot LiteLLM |
+| :--- | :--- | :--- |
+| **1. NATS JetStream topic consumption & publishing** | **100% Go** (`github.com/nats-io/nats.go/jetstream`, `a2a/lib/topics.go`) | Consumes `a2a.topics.agent.<profile>.outcomes` on `TOPICS-JOURNAL` and publishes `a2a.topics.shared.decisions` on `TOPICS-STATE` with durable consumer acks. |
+| **2. YAML AST walking, K8s quantity math & `HEAD` guard checks** | **100% Go** (`gopkg.in/yaml.v3`, `k8s.io/apimachinery/pkg/api/resource`) | Evaluates 35,000+ OKF guards across a 30,000-cluster Git tree in parallel goroutines (`errgroup`) without Python GIL overhead. |
+| **3. Cross-cluster recurrence detection** ($\ge 2$ clusters) | **100% Go** | Groups active `LES-*` records by `(check_id, kind, yaml_path, op)` across clusters deterministically. |
+| **4. Synthesizing OKF prose & candidate guards from PR diffs** | **1-shot LiteLLM call** + **Go `HEAD` verification** | Requests a strict JSON object from LiteLLM (with prompt-JSON fallback for Claude proxies), then deterministically verifies that the candidate guard holds at `HEAD`. |
+| **5. Consolidating multi-cluster lessons & candidate skills** | **1-shot LiteLLM call** + **Go PR creation** | Merges $N$ verified cluster lessons or candidate skill diffs into one fleet-wide `DEC-YYYY-NNN.md` (`clusters: ["*"]`) or shared `SKILL.md` and opens a single pull request. |
+
+The federated learning loop runs in three steps over NATS:
+
+1. **Publish candidate lessons and skills to `TOPICS-JOURNAL` (`a2a.topics.agent.<profile>.outcomes`)**: When a Cluster Agent resolves a cluster-specific incident (`resolved-merged`), sees a fix fail post-merge (`pr-merged-persists`), has a PR rejected (`refused`), or discovers a reusable diagnostic pattern, it publishes a structured outcome artifact on its NATS outcome topic.
+2. **Central curation and fleet-wide graduation (`a2a/cmd/curator`)**: The Go Curator consumes outcome events across all clusters and runs Phase 5 policy graduation (`dream`). When two or more clusters report the same failure signature or guarded YAML path (for example, an Autopilot resource floor or a CoreDNS `ndots` regression), the Curator promotes the cluster-scoped `LES-*` records into a single fleet-wide `DEC-*` rule (`clusters: ["*"]`, `supersedes: [LES-...]`), consolidates the best diagnostic steps into one shared skill, and opens one fleet-wide pull request.
+3. **Index and broadcast to `TOPICS-STATE` (`a2a.topics.shared.decisions`)**: Once the curated record or skill merges, the Curator upserts the verbatim chunk into Hindsight (`kube-agents-decisions`) and publishes an updated catalog digest to `a2a.topics.shared.decisions` so every Cluster Agent and Platform Agent profile can read the latest fleet rules via `ReadTopicLatest` and enforce them immediately without rediscovering the issue on the remaining clusters.
 
 #### 5. Reference implementation: how `decision_memory.py` works
 
