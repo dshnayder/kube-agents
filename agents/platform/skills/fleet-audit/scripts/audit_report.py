@@ -19029,8 +19029,27 @@ def _finish_store_ledger(
         if not findings and delta_known and not gaps
         else []
     )
+    # And, as the forge path's clean branch does, every held finding: the
+    # collector still flags it whatever `resolved_because` says, so the close,
+    # the pull-request retirement and the `resolved` count all stop. A
+    # findings run does not fold them: there `still_flagged` keeps their fixes.
+    held_ids = {entry["id"] for entry in held_entries}
+    if not findings:
+        already_held = {entry["id"] for entry in unaccounted}
+        unaccounted = sorted(
+            unaccounted + [e for e in held_entries if e["id"] not in already_held],
+            key=lambda entry: entry["id"],
+        )
+        for fid in sorted(held_ids):
+            log(
+                f"STILL FLAGGED: {fid} is on the stored ledger and the collector still "
+                "flags it, so it is not resolved whatever the document says; no fix is "
+                "closed over it."
+            )
     unaccounted_ids = [entry["id"] for entry in unaccounted]
     for entry in unaccounted:
+        if entry["id"] in held_ids:
+            continue
         log(
             f"UNACCOUNTED: {entry['id']} ({entry['object']} in {entry['cluster']}) is on the "
             f"stored ledger and this run says `{entry['check']}` ran there again, but it is "

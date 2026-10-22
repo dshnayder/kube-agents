@@ -29308,5 +29308,49 @@ class TestStoreLedger(HarnessTestCase):
         started = self.start()
         self.assertIn(held_id, [entry["id"] for entry in started[audit_report.CARRIED_KEY]])
 
+    NETPOL_CANDIDATE = {
+        "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+        "object": "Namespace/no-network-policy", "severity": "major",
+        "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
+    }
+
+    def finish_with_manifest(self, doc, candidates):
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(_full_manifest(candidates=candidates)), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_a_clean_run_over_a_still_flagged_finding_closes_no_other_fix(self):
+        """Review finding: a clean run whose document explains A and B while
+        the collector still flags A held the ledger open over A and closed B's
+        fix as stale. The forge path folds A into `unaccounted` and closes
+        nothing."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.touch(self.B_PATH)
+        self.run_once(make_doc(findings=self.two_findings()))
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        a, b = validated["findings"]
+        pr_a = self.open_proposal(8, {"findings": [a]})
+        pr_b = self.open_proposal(9, {"findings": [b]})
+        self.harness.replies["proposal-list"] = {"proposals": [pr_a, pr_b], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": pr_b["body"]}}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [self.resolved_entry(a), self.resolved_entry(b)]
+        out = self.finish_with_manifest(clean, [self.NETPOL_CANDIDATE])
+        self.assertEqual(out["prs_closed"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+        self.assertEqual(out[audit_report.UNACCOUNTED_KEY], [a["id"]])
+        self.assertEqual(out["resolved"], 0)
+        self.assertFalse(out["silent_ok"])
+        self.assertTrue(self.latest()["ledger_held_open"])
+        self.assertEqual(sorted(self.latest()["current_ids"]), sorted([a["id"], b["id"]]))
+
 if __name__ == "__main__":
     unittest.main()
