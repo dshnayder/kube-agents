@@ -25129,7 +25129,11 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     The reachability check is recorded the same way: before it publishes,
     `finish` lists one open issue in the repository (`unreachable_reason`).
     That adds one `forge issue-list` call, and its trace line, at the start
-    of every transcript that publishes.
+    of every transcript that publishes. Before that read, `finish` asks
+    `capabilities` where the ledger goes (`store_ledger_reason`), once a run:
+    the clean transcripts gain that call and its trace line at the start, and
+    in the findings transcript the `capabilities` read for `fileUrl` moves
+    there, because both read the one answer.
     Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
@@ -26968,9 +26972,11 @@ class TestManifestRemediationLinks(HarnessTestCase):
             created_body,
         )
 
-        # When `capabilities` omits `fileUrl`, the bare path link stands.
+        # When `capabilities` omits `fileUrl`, the bare path link stands. A new
+        # command is a new process, which asks `capabilities` again.
         self.harness.calls.clear()
         self.harness.payloads.clear()
+        audit_report._CAPABILITIES.clear()
         self.harness.replies = {
             "capabilities": {},
             "issue-create": created("issue", "https://github.com/acme/fleet/issues/43"),
@@ -28173,6 +28179,16 @@ class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
         self.assertNotIn("body", update)
 
 
+def forge_decision(repo):
+    """The decision for a repository whose ledger stays on its forge."""
+    return audit_report.LedgerDecision(repo, audit_report.LEDGER_FORGE, True, None)
+
+
+def repo_and_pair(decision):
+    """The repository a decision publishes to, and its no-forge pair."""
+    return decision.publish_repo, decision.unreachable
+
+
 def _repo_entries(*urls, kind="github"):
     """A `managed_repos` value: one `{type, url}` entry per URL."""
     return json.dumps([{"type": kind, "url": url} for url in urls])
@@ -28319,13 +28335,13 @@ class TestLedgerRepositoryChoice(BaseTestCase):
         self.claim()
         self.lease("acme/terraform")
         audit_report.write_run_record(AUDIT, "acme/terraform", [])
-        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/terraform", None))
-        self.assertEqual(audit_report.finish_target(AUDIT, "acme/terraform"), ("acme/terraform", None))
+        self.assertEqual(audit_report.finish_target(AUDIT, None), forge_decision("acme/terraform"))
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/terraform"), forge_decision("acme/terraform"))
         # It follows the decision; it does not probe again.
         self.assertEqual(recorder.calls, [])
         # A record from an earlier run is not this run's.
         audit_report.release_in_flight(AUDIT)
-        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
+        self.assertEqual(audit_report.finish_target(AUDIT, None), forge_decision("acme/gitops"))
 
     def test_finish_with_another_repo_than_start_resolves_and_probes_it(self):
         self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
@@ -28335,11 +28351,12 @@ class TestLedgerRepositoryChoice(BaseTestCase):
         self.claim()
         self.lease("acme/terraform")
         audit_report.write_run_record(AUDIT, "acme/terraform", [])
-        self.assertEqual(audit_report.finish_target(AUDIT, "acme/gitops"), ("acme/gitops", None))
-        # It probes the repository it names, and only that one.
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/gitops"), forge_decision("acme/gitops"))
+        # It asks where the ledger goes and probes the repository it names,
+        # and only that one.
         self.assertEqual(
             [(call, payload.get("repository")) for call, payload in zip(recorder.calls, recorder.payloads)],
-            [(["forge", "issue-list"], "acme/gitops")],
+            [(["forge", "capabilities"], "acme/gitops"), (["forge", "issue-list"], "acme/gitops")],
         )
 
     def test_one_repository_needs_no_gitops_role(self):
@@ -28417,17 +28434,18 @@ class TestUnreachableRepository(BaseTestCase):
         self.assertEqual(latest[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
         self.assertFalse(self.store().exists())
         # No in-flight note here (claim_in_flight is stubbed), so `finish` has
-        # no record of this run and probes on its own: one probe for each
-        # command, to the gitops repository, and nothing else.
+        # no record of this run and decides on its own: for each command, one
+        # `capabilities` question and one probe, to the gitops repository, and
+        # nothing else.
         self.assertEqual(
             [(call, payload.get("repository")) for call, payload in zip(self.recorder.calls, self.recorder.payloads)],
-            [(["forge", "issue-list"], "acme/gitops")] * 2,
+            [(["forge", "capabilities"], "acme/gitops"), (["forge", "issue-list"], "acme/gitops")] * 2,
         )
 
     def test_a_refusal_that_is_not_about_the_repository_does_not_divert(self):
         self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_RATE_LIMITED"))
         self.assertIsNone(audit_report.unreachable_reason("acme/gitops"))
-        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
+        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), forge_decision("acme/gitops"))
 
     def test_each_repository_code_diverts(self):
         self.assertEqual(
@@ -28437,7 +28455,7 @@ class TestUnreachableRepository(BaseTestCase):
         for code in sorted(audit_report.unreachable_repo_codes()):
             with self.subTest(code=code):
                 self.patch_attr("run_cmd", _UnreachableRecorder(code))
-                repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+                repo, unreachable = repo_and_pair(audit_report.resolve_reachable_repo(AUDIT))
                 self.assertEqual(repo, audit_report.NO_FORGE_REPO)
                 self.assertEqual(unreachable[0], "acme/gitops")
                 self.assertIn(code, unreachable[1])
@@ -28456,7 +28474,7 @@ class TestUnreachableRepository(BaseTestCase):
 
     def test_a_reachable_repository_keeps_the_forge_path(self):
         self.patch_attr("run_cmd", Recorder())
-        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
+        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), forge_decision("acme/gitops"))
 
     def claim_for_real(self):
         self.patch_attr("claim_in_flight", self.real_claim_in_flight)
@@ -28507,17 +28525,17 @@ class TestUnreachableRepository(BaseTestCase):
         self.real_claim_in_flight(AUDIT)
         self.addCleanup(audit_report.release_in_flight, AUDIT)
         audit_report.write_run_record(AUDIT, "acme/gitops", [])
-        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
+        self.assertEqual(audit_report.finish_target(AUDIT, None), forge_decision("acme/gitops"))
         self.assertEqual(self.recorder.calls, [])
 
     def test_a_repository_the_broker_does_not_manage_says_to_register_it(self):
         self.patch_attr("run_cmd", _UnreachableRecorder("REPOSITORY_NOT_MANAGED"))
-        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        _repo, unreachable = repo_and_pair(audit_report.resolve_reachable_repo(AUDIT))
         note = audit_report.unreachable_note(unreachable)
         self.assertIn("Register the repository", note)
         self.assertNotIn("Make sure that the repository exists", note)
         self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_NOT_FOUND"))
-        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        _repo, unreachable = repo_and_pair(audit_report.resolve_reachable_repo(AUDIT))
         self.assertIn("Make sure that the repository exists", audit_report.unreachable_note(unreachable))
 
 
@@ -28580,7 +28598,7 @@ class TestUnreachableRepository(BaseTestCase):
 
     def test_a_refused_listing_says_issues_must_be_enabled(self):
         self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_FORBIDDEN"))
-        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        _repo, unreachable = repo_and_pair(audit_report.resolve_reachable_repo(AUDIT))
         self.assertIn("issues enabled", audit_report.unreachable_note(unreachable))
 
 
@@ -28643,6 +28661,396 @@ class TestNoRepositoryChosen(BaseTestCase):
         self.assertIn("not in the managed repositories list", self.err)
         self.assertEqual(self.out, "")
 
+
+class TestStoreLedger(HarnessTestCase):
+    """A forge with no issue tracker, or no labels: the ledger is in the store,
+    and remediation pull requests still open (version-control-support.md §8).
+
+    The decision is made at `start` from `capabilities`, written into the run
+    record, and followed by `finish`. The findings go to the report store and
+    to chat, as on the no-forge path; the fixes go to the forge through the
+    label-free paths.
+    """
+
+    REPO = "acme/fleet"
+    NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def setUp(self):
+        super().setUp()
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.harness.replies["proposal-create"] = created(
+            "proposal", "https://forge.invalid/acme/fleet/pull-requests/8"
+        )
+
+    def forge_is(self, capabilities):
+        self.harness.replies["capabilities"] = capabilities
+
+    def claim(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def start(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
+        return code
+
+    def run_once(self, doc):
+        self.start()
+        self.assertEqual(self.finish(doc), 0, self.err)
+        return self.stdout_json()
+
+    def latest(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def chat_text(self):
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        return "\n".join(str(part.get("text") or "") for part in record["parts"])
+
+    def open_proposal(self, number, doc, body_ids=None, state="open"):
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        ids = body_ids if body_ids is not None else [
+            audit_report.derive_finding_id(dict(f)) for f in doc["findings"]
+        ]
+        return {
+            "number": number,
+            "source": branch,
+            "sourceRepo": self.REPO,
+            "target": "main",
+            "state": state,
+            "author": Recorder.VIEWER.removesuffix("[bot]"),
+            "url": f"https://forge.invalid/acme/fleet/pull-requests/{number}",
+            "labels": [],
+            "body": audit_report.delta_block(ids) + "\n" + audit_report.remediation_stream_marker(AUDIT),
+        }
+
+    # -- the decision ----------------------------------------------------------
+
+    def test_a_forge_without_issue_verbs_keeps_the_ledger_in_the_store_and_opens_fixes(self):
+        decision = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertEqual(decision.repo, self.REPO)
+        self.assertEqual(decision.ledger, audit_report.LEDGER_STORE)
+        self.assertTrue(decision.remediation)
+        self.assertIn("no issue tracker", decision.reason)
+        self.assertIsNone(decision.unreachable)
+        self.assertEqual(decision.publish_repo, self.REPO)
+        # The probe is a proposal listing: an issue listing proves nothing here.
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+        self.assertEqual(1, len(self.harness.forge_calls("proposal-list")))
+
+    def test_a_forge_with_issues_and_no_labels_also_keeps_the_ledger_in_the_store(self):
+        self.forge_is({**GITHUB_LIKE, "forge": "stub", "labels": False})
+        decision = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertEqual((decision.ledger, decision.remediation), (audit_report.LEDGER_STORE, True))
+        self.assertIn("no labels", decision.reason)
+
+    def test_github_and_gitlab_keep_the_ledger_on_the_forge(self):
+        for answer in (GITHUB_LIKE, GITLAB_LIKE):
+            with self.subTest(forge=answer["forge"]):
+                audit_report._CAPABILITIES.clear()
+                audit_report._LABELS.clear()
+                self.forge_is(answer)
+                self.assertEqual(
+                    audit_report.resolve_reachable_repo(AUDIT),
+                    audit_report.LedgerDecision(self.REPO, audit_report.LEDGER_FORGE, True, None),
+                )
+
+    def test_an_unreadable_capabilities_answer_keeps_the_forge_path(self):
+        self.harness.failures["capabilities"] = 1
+        decision = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertEqual(decision.ledger, audit_report.LEDGER_FORGE)
+
+    def test_an_unreachable_repository_on_such_a_forge_opens_nothing(self):
+        def refuse(verb, payload, repository=None):
+            if verb == "proposal-list":
+                raise vcs_client.VcsError("no such repository", code="FORGE_NOT_FOUND")
+            return self.forge_through_recorder(verb, payload, repository)
+
+        with patch.object(vcs_client, "forge", refuse):
+            decision = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertEqual((decision.ledger, decision.remediation), (audit_report.LEDGER_STORE, False))
+        self.assertEqual(decision.publish_repo, audit_report.NO_FORGE_REPO)
+        self.assertEqual(decision.unreachable[0], self.REPO)
+        self.assertIn("FORGE_NOT_FOUND", decision.unreachable[1])
+        # A forge with no issue tracker is not told to turn its issues on.
+        self.assertNotIn("issues enabled", audit_report.unreachable_note(decision.unreachable))
+
+    # -- the run record ----------------------------------------------------------
+
+    def test_start_records_the_decision_and_finish_follows_it(self):
+        self.claim()
+        started = self.start()
+        record = json.loads(Path(audit_report.run_record_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(record[audit_report.RUN_RECORD_LEDGER_KEY], audit_report.LEDGER_STORE)
+        self.assertIs(record[audit_report.RUN_RECORD_REMEDIATION_KEY], True)
+        self.assertIn("no issue tracker", record[audit_report.RUN_RECORD_REASON_KEY])
+        self.assertEqual(record["repo"], self.REPO)
+        self.assertEqual(started["ledger"], audit_report.LEDGER_STORE)
+        # The forge gains an issue tracker between the two steps; the run stays
+        # on the decision `start` made, so one run never has two ledgers.
+        self.forge_is(GITHUB_LIKE)
+        audit_report._CAPABILITIES.clear()
+        audit_report._LABELS.clear()
+        decision = audit_report.finish_target(AUDIT, None)
+        self.assertEqual(decision.ledger, audit_report.LEDGER_STORE)
+        self.assertTrue(decision.remediation)
+
+    def test_a_run_record_from_the_old_code_reads_with_the_old_meaning(self):
+        self.claim()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.claim_in_flight(AUDIT)
+        # The record without a decision is the one the code before it wrote.
+        path = Path(audit_report.write_run_record(AUDIT, self.REPO, []))
+        old = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn(audit_report.RUN_RECORD_LEDGER_KEY, old)
+        self.assertEqual(
+            audit_report.this_runs_decision(AUDIT),
+            audit_report.LedgerDecision(self.REPO, audit_report.LEDGER_FORGE, True, None),
+        )
+        unreachable = {
+            **old,
+            "repo": audit_report.NO_FORGE_REPO,
+            audit_report.RUN_RECORD_UNREACHABLE_KEY: {"repo": self.REPO, "reason": "gone"},
+        }
+        path.write_text(json.dumps(unreachable), encoding="utf-8")
+        decision = audit_report.this_runs_decision(AUDIT)
+        self.assertEqual((decision.ledger, decision.remediation), (audit_report.LEDGER_STORE, False))
+        self.assertEqual(decision.unreachable, (self.REPO, "gone"))
+        path.write_text(json.dumps({**old, "repo": audit_report.NO_FORGE_REPO}), encoding="utf-8")
+        self.assertEqual(
+            audit_report.this_runs_decision(AUDIT),
+            audit_report.LedgerDecision(audit_report.NO_FORGE_REPO, audit_report.LEDGER_STORE, False, None),
+        )
+
+    # -- start -------------------------------------------------------------------
+
+    def test_start_clones_the_repository_and_reads_no_ledger_issue(self):
+        started = self.start()
+        self.assertIsNone(started["issue"])
+        self.assertEqual(started["repo"], self.REPO)
+        self.assertEqual(started["mode"], "directory")
+        self.assertEqual(started["ledger"], audit_report.LEDGER_STORE)
+        self.assertIn("no issue tracker", started[audit_report.LEDGER_NOTE_KEY])
+        self.assertNotIn("no_forge", started)
+        self.assertEqual(started["pending_remediation_requests"], [])
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+        self.assertEqual([], self.harness.forge_calls("label-ensure"))
+
+    def test_start_names_the_findings_the_stored_ledger_carries(self):
+        self.touch(self.NETPOL)
+        first = self.run_once(make_doc())
+        self.assertEqual(first["status"], audit_report.STORE_LEDGER_STATUS)
+        started = self.start()
+        [carried] = started[audit_report.CARRIED_KEY]
+        self.assertEqual(carried["check"], "netpol-missing")
+        self.assertEqual(carried["cluster"], "prod-us-east")
+
+    # -- finish --------------------------------------------------------------------
+
+    def test_finish_keeps_the_ledger_in_the_store_and_opens_a_fix(self):
+        self.touch(self.NETPOL)
+        out = self.run_once(make_doc())
+        url = "https://forge.invalid/acme/fleet/pull-requests/8"
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertIsNone(out["issue_url"])
+        self.assertEqual(out["prs_opened"], [url])
+        self.assertEqual(out["ledger"], audit_report.LEDGER_STORE)
+        self.assertIn("no issue tracker", out[audit_report.LEDGER_NOTE_KEY])
+        # No issue and no label on the forge; the fix carries the stream marker.
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+        self.assertEqual([], self.harness.forge_calls("label-ensure"))
+        [create] = self.harness.forge_calls("proposal-create")
+        self.assertIn(audit_report.remediation_stream_marker(AUDIT), create["body"])
+        self.assertNotIn("labels", create)
+        # Chat: the summary with the fix's link and the reason line.
+        self.assertIn(url, out["summary"])
+        self.assertEqual(out["summary"].splitlines()[-1], out[audit_report.LEDGER_NOTE_KEY])
+        self.assertIn(out["summary"], self.chat_text())
+        # The store: real published memory, with the link, not a marked envelope.
+        latest = self.latest()
+        self.assertEqual(latest["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual(latest["prs_opened"], [url])
+        self.assertEqual(latest["ledger"], audit_report.LEDGER_STORE)
+        self.assertFalse(audit_report.is_diverted(latest))
+        self.assertFalse((self.reports_dir / AUDIT / "no_forge").exists())
+
+    def test_a_forge_with_issues_and_no_labels_runs_without_its_ledger_lookup(self):
+        # The lookup refuses on such a forge, so a run that reached it would
+        # stop at `start`; the decision keeps it off that path.
+        self.forge_is({**GITHUB_LIKE, "forge": "stub", "labels": False})
+        self.touch(self.NETPOL)
+        out = self.run_once(make_doc())
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertIn("no labels", out[audit_report.LEDGER_NOTE_KEY])
+        self.assertEqual(len(out["prs_opened"]), 1)
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+        self.assertEqual([], self.harness.forge_calls("label-ensure"))
+
+    def test_a_second_run_with_nothing_new_is_silent_and_names_the_waiting_fix(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        first = self.run_once(doc)
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(first["new"], 1)
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        self.harness.replies["proposal-list"] = {
+            "proposals": [self.open_proposal(8, validated)], "truncated": False,
+        }
+        second = self.run_once(doc)
+        self.assertEqual((second["new"], second["resolved"]), (0, 0))
+        self.assertEqual(second["prs_opened"], [])
+        self.assertEqual(second["prs_still_open"], ["https://forge.invalid/acme/fleet/pull-requests/8"])
+        self.assertTrue(second["silent_ok"])
+        self.assertEqual(1, len(self.harness.forge_calls("proposal-create")))
+
+    def test_a_clean_run_closes_the_stale_fix_by_its_description_marker(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        self.run_once(doc)
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": proposal["body"]}}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [
+            {**{k: validated["findings"][0][k] for k in ("check", "cluster", "namespace", "object")},
+             "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+        ]
+        out = self.run_once(clean)
+        self.assertEqual(out["prs_closed"], [proposal["url"]])
+        self.assertEqual(out["resolved"], 1)
+        self.assertFalse(out["silent_ok"])
+        [update] = self.harness.forge_calls("proposal-update")
+        self.assertIn(audit_report.STALE_CLOSED_BODY_MARKER, update["body"])
+        self.assertNotIn("labelsAdd", update)
+        self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
+        self.assertIn(proposal["url"], out["summary"])
+
+    def test_a_clean_run_over_an_unexplained_finding_closes_nothing(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        self.run_once(doc)
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        out = self.run_once(make_doc(findings=[]))
+        self.assertEqual(out["prs_closed"], [])
+        self.assertEqual(len(out[audit_report.UNACCOUNTED_KEY]), 1)
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+        # The ledger the store holds still carries the finding for the next run.
+        self.assertTrue(self.latest()["ledger_held_open"])
+        self.assertEqual(self.latest()["current_ids"], [validated["findings"][0]["id"]])
+
+    def test_the_automatic_sweep_keeps_its_cap(self):
+        self.patch_attr("AUTO_PROMOTION_CAP", 1)
+        findings = [
+            make_finding(fid="a", remediation={"kind": "manifest", "path": "clusters/a.yaml", "note": "a"}),
+            make_finding(fid="b", remediation={"kind": "manifest", "path": "clusters/b.yaml", "note": "b"}),
+        ]
+        self.touch("clusters/a.yaml")
+        self.touch("clusters/b.yaml")
+        out = self.run_once(make_doc(findings=findings))
+        self.assertEqual(len(out["prs_opened"]), 1)
+        self.assertEqual(1, len(self.harness.forge_calls("proposal-create")))
+
+    def test_the_switch_off_opens_nothing(self):
+        self.touch(self.NETPOL)
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: audit_report.AUTO_PROMOTE_OFF}):
+            out = self.run_once(make_doc())
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-create"))
+
+    def test_an_unwritten_fix_is_refused_as_on_the_forge_path(self):
+        # No file at the promised path: the same refusal the forge path gives.
+        self.start()
+        self.assertEqual(self.finish(make_doc()), 2)
+        self.assertIn("payments-netpol.yaml", self.err)
+        self.assertEqual([], self.harness.forge_calls("proposal-create"))
+
+    def test_an_unlisted_kustomize_addition_publishes_as_manual(self):
+        (self.workspace / "clusters" / "prod-us-east").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "clusters" / "prod-us-east" / "kustomization.yaml").write_text(
+            "resources:\n- other.yaml\n", encoding="utf-8"
+        )
+        self.touch(self.NETPOL)
+        self.patch_attr(
+            "degrade_unlisted_kustomize_additions",
+            lambda findings, probe, noun: [
+                f["id"] for f in findings
+                if f.update(remediation={"kind": "manual", "note": "add it to resources"}) is None
+            ],
+        )
+        out = self.run_once(make_doc())
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-create"))
+
+    # -- memory --------------------------------------------------------------------
+
+    def test_the_next_run_reads_the_stored_ledger_as_its_memory(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
+        self.assertTrue(known)
+        self.assertEqual(envelope["status"], audit_report.STORE_LEDGER_STATUS)
+        # The forge memory never reads it: it names no issue.
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 7, self.REPO))
+        # The wording carry reads it like any published run.
+        self.assertIsNotNone(audit_report.previous_run_document(AUDIT, self.REPO))
+        # A true no-forge run does not use it as its baseline.
+        self.assertEqual(audit_report.previous_no_forge_ids(AUDIT), [])
+
+    def test_a_marked_envelope_is_not_store_ledger_memory(self):
+        directory = self.store_dir()
+        directory.mkdir(parents=True)
+        (directory / "latest.json").write_text(json.dumps({
+            "status": audit_report.NO_FORGE_STATUS, "repo": self.REPO, "id_scheme": audit_report.ID_SCHEME,
+            "current_ids": ["x"], audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
+        }), encoding="utf-8")
+        self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
+
+    def test_report_query_shows_the_stored_ledger(self):
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        reports_scripts = Path(__file__).resolve().parents[2] / "fleet-audit-reports" / "scripts"
+        sys.path.insert(0, str(reports_scripts))
+        self.addCleanup(sys.path.remove, str(reports_scripts))
+        import report_query
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = report_query.main(["show", AUDIT, "--root", str(self.reports_dir)])
+        self.assertEqual(code, 0, out.getvalue())
+        answer = json.loads(out.getvalue())
+        self.assertEqual(answer["repo"], self.REPO)
+        self.assertEqual(answer["envelope"]["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual(answer["envelope"]["prs_opened"], ["https://forge.invalid/acme/fleet/pull-requests/8"])
+
+    # -- /remediate through chat -------------------------------------------------
+
+    def test_a_direct_ask_opens_the_fix_with_no_ledger_lookup(self):
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        path = self.write_findings(doc)
+        validated = audit_report.load_findings(path, AUDIT)
+        fid = validated["findings"][0]["id"]
+        Path(path).write_text(json.dumps(validated), encoding="utf-8")
+        code = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid])
+        self.assertEqual(code, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["prs_opened"], ["https://forge.invalid/acme/fleet/pull-requests/8"])
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+        [create] = self.harness.forge_calls("proposal-create")
+        self.assertNotIn("Part of #", create["body"])
 
 if __name__ == "__main__":
     unittest.main()
