@@ -906,6 +906,12 @@
 # autoops-warning-event-triage).
 ./tasks/autoops-warning-event-no-action-triage/task.yaml
 
+# #3090: the first onboarding report opens with the scan counts and the line
+# `inventory_findings.py select` prints, graded by equality. The
+# bootstrap-ranking stack with a planted report that has no critical finding;
+# the onboarding lock, like bootstrap-inventory-ranking-delivery.
+./tasks/bootstrap-inventory-posture-scope/task.yaml
+
 # "/feedback <text>" is written up and shown for a yes before anything is
 # filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
 # carries the composed submission, the public-issue warning and a question,
@@ -987,6 +993,13 @@
 # carries no `expected_fail` marker because #3116, which owned that red, is
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
+
+# A general fleet health question ("check if my clusters are all healthy") runs
+# fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
+# fleet the per-cluster fan-out queued behind the board's five user slots for
+# over thirty minutes. Reads the crashloop-workload role; read-only; requests
+# no pull request. Nightly from its first merge.
+./tasks/health-chat-request-runs-collector/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
