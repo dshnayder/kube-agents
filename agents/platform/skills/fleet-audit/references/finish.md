@@ -219,11 +219,14 @@ follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
   previous such run, `prs_opened`, `prs_still_open`, `prs_closed`, `unaccounted`, `findings`,
   `critical`, `"ledger": "store"`, the `ledger_note`, and `summary`. A clean run closes a stale pull
   request only when coverage is complete and every finding the stored ledger carries is reported or
-  explained under `resolved_because`, as with a ledger issue.
+  explained under `resolved_because`, as with a ledger issue. A previous finding the collector
+  still flags is held on the stored ledger, and the next `start` lists it in `carried`.
 - `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
   run with nothing new is silent. A run the store does not hold is never silent.
 - If the store lost the previous ledger, a clean run closes no pull request, and its
-  `coverage_gaps` says why. It stores a record that the next run also reads as lost, so each clean
+  `coverage_gaps` says why. The store loses it when its last write failed, when its record cannot
+  be read, or when it holds only records of runs that could not reach the repository. A new
+  identity scheme does not lose it. It stores a record that the next run also reads as lost, so each clean
   run after it closes nothing until a run that reports findings stores the ledger again. Such a
   run is never silent.
 - A `/remediate` cannot be commented on a ledger. A person asks in chat, and you run `remediate` for

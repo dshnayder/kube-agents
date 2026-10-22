@@ -18930,8 +18930,9 @@ def _finish_store_ledger(
 
     - The memory is the previous run's envelope (`previous_store_ledger`): its
       ids give the delta, and its `ledger_body`, the ledger this path renders
-      and stores but never posts, gives the locations `start` prints and the
-      clean-run join reads (`unaccounted_previous_findings`).
+      and stores but never posts, gives the held set, the locations `start`
+      prints and the clean-run join reads (`unaccounted_previous_findings`),
+      as the stored body of the issue gives them on the forge path.
     - The remediation proposals are found, opened and closed as on the forge
       path, through the label-free paths on a forge with no labels: the
       automatic sweep with its cap and switch, the label or marker sync, the
