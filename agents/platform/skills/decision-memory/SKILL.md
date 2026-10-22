@@ -14,12 +14,12 @@ The helper script does not import any agent harness packages.
 
 ## Workflow
 
-| Scenario                                                                   | Command                                | Required action                                                                                                                                                                 |
-| -------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic`       | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body. |
-| Review a pull request                                                      | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR.                                                           |
-| Answer "why is X configured this way?"                                     | `why <path>`                           | Cite matching record IDs. If `records` is empty, state that no decision is recorded, show `history`, and offer to draft a record. Never invent a reason from commit logs.       |
-| Record a verified fix or rejected PR                                       | `from-outcome <outcome.json>`          | Open a pull request with the drafted lesson record for human review.                                                                                                            |
+| Scenario                                                                   | Command                                | Required action                                                                                                                                                                                                 |
+| -------------------------------------------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Propose a change (`submit-suggestion`, `fleet-audit`, manifest generation) | `check --base <base> --semantic`       | Stop on any `violates` finding with `severity: block`. Revise the change or ask the user. Include the `--markdown` output under **Prior decisions and lessons** in the PR body.                                 |
+| Review a pull request                                                      | `check --base <base> --head <pr-head>` | Post a comment for each `violates` finding with the record ID and its evidence PR URL. Never approve or merge the PR.                                                                                           |
+| Answer "why is X configured this way?"                                     | `why <path> [<path2> ...]`             | Cite every matching record ID (`DEC-YYYY-NNN`, `LES-YYYY-NNN`), its evidence PR link, and any `rejected_proposals` directly in your answer. If `records` is empty, state that no decision is recorded.           |
+| Record a verified fix or rejected PR                                       | `from-outcome <outcome.json>`          | Open a pull request with the drafted lesson record for human review.                                                                                                                                            |
 
 ## Verdicts
 
@@ -70,10 +70,12 @@ Escape literal dots inside YAML keys with a backslash: `spec.hard.requests\.memo
 
 ## Commands
 
+Pass `--repo <owner>/<repo>` (which resolves or clones `/opt/data/scratch/vcs/github__<owner>__<repo>__main` automatically) or `--repo <local-clone-path>`:
+
 ```bash
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <owner>/<repo> why clusters/prod-eu/payments/quota.yaml
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> validate
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
-python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why clusters/prod-eu/payments/quota.yaml
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> from-outcome outcome.json
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> dream
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write

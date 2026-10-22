@@ -788,8 +788,49 @@ def repo_identity(repo: Path) -> str:
     return resolved.name
 
 
+def _has_knowledge_dir(p: Path) -> bool:
+    return p.is_dir() and any((p / d).is_dir() for d in RECORD_DIRS)
+
+
+def _resolve_repo_dir(repo_arg: str) -> Path:
+    cand = Path(repo_arg)
+    if _has_knowledge_dir(cand):
+        return cand
+    vcs_root = Path(os.environ.get("KUBE_AGENTS_VCS_ROOT", "/opt/data/scratch/vcs"))
+    ident = _parse_remote_url_identity(repo_arg)
+    if not ident and cand.is_dir() and (cand / ".git").exists():
+        try:
+            ident = _parse_remote_url_identity(git(cand, "remote", "get-url", "origin").strip())
+        except Exception:
+            ident = None
+    if ident and "/" in ident and vcs_root.is_dir():
+        owner, name = ident.split("/", 1)
+        for match in sorted(vcs_root.glob(f"*__{owner}__{name}__*")):
+            if _has_knowledge_dir(match):
+                return match
+    vcs_script = Path("/opt/data/profiles/platform/skills/version-control/scripts/vcs.py")
+    if ident and "/" in ident and vcs_script.is_file():
+        try:
+            res = subprocess.run(
+                [sys.executable, str(vcs_script), "clone", f"https://github.com/{ident}", "--force"],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if res.returncode == 0:
+                data = json.loads(res.stdout)
+                cloned = Path(data.get("path", ""))
+                if _has_knowledge_dir(cloned):
+                    return cloned
+        except Exception:
+            pass
+    if vcs_root.is_dir() and (not cand.is_dir() or repo_arg in (".", "/opt/data")):
+        for match in sorted(vcs_root.glob("*__*__*__*")):
+            if _has_knowledge_dir(match):
+                return match
+    return cand
+
+
 def cmd_validate(a) -> Dict[str, Any]:
-    repo = Path(a.repo)
+    repo = _resolve_repo_dir(a.repo)
     problems, ids = {}, {}
     records = load_records(repo)
     for rec in records:
@@ -808,7 +849,7 @@ def cmd_validate(a) -> Dict[str, Any]:
 
 
 def cmd_index(a) -> Dict[str, Any]:
-    repo = Path(a.repo)
+    repo = _resolve_repo_dir(a.repo)
     repo_id = a.repo_id or repo_identity(repo)
     hs = Hindsight(a.hindsight_url, a.bank)
     hs.ensure_bank()
@@ -847,9 +888,9 @@ def _load_changed(a, repo: Path) -> Dict[str, Optional[str]]:
 
 
 def cmd_check(a) -> Dict[str, Any]:
-    repo = Path(a.knowledge_repo or a.repo)
+    repo = _resolve_repo_dir(a.knowledge_repo or a.repo)
     records = [r for r in load_records(repo) if not validate_record(r)]
-    changed = _load_changed(a, Path(a.repo))
+    changed = _load_changed(a, _resolve_repo_dir(a.repo))
     findings = match_change(records, changed)
     semantic: List[Dict[str, Any]] = []
     if a.hindsight_url and a.semantic:
@@ -902,7 +943,7 @@ def _why_single_path(repo: Path, target: str, records: List[Record], limit: int)
 
 
 def cmd_why(a) -> Dict[str, Any]:
-    repo = Path(a.repo)
+    repo = _resolve_repo_dir(a.repo)
     raw_paths = list(getattr(a, "path", None) or []) + list(getattr(a, "flag_paths", None) or [])
     if isinstance(raw_paths, str):
         raw_paths = [raw_paths]

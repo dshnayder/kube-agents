@@ -299,6 +299,28 @@ class WhyAndOutcomeTests(unittest.TestCase):
         self.assertEqual(out["history"], [])
         self.assertTrue(any("LES-2026-001" in c for c in out["citations"]))
 
+    def test_why_resolves_repo_slug_via_vcs_root(self):
+        import shutil
+        vcs_root = self.r.path.parent / "vcs_root"
+        checkout = vcs_root / "github__acme__gitops__main"
+        shutil.copytree(self.r.path, checkout)
+        old_env = os.environ.get("KUBE_AGENTS_VCS_ROOT")
+        os.environ["KUBE_AGENTS_VCS_ROOT"] = str(vcs_root)
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = dm.main(["--repo", "acme/gitops", "why", "clusters/prod-eu/payments/checkout.yaml"])
+            out = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0)
+            self.assertEqual(out["status"], "found")
+            self.assertEqual([x["id"] for x in out["records"]], ["LES-2026-001"])
+        finally:
+            if old_env is None:
+                os.environ.pop("KUBE_AGENTS_VCS_ROOT", None)
+            else:
+                os.environ["KUBE_AGENTS_VCS_ROOT"] = old_env
+            shutil.rmtree(vcs_root, ignore_errors=True)
+
     def test_bootstrap_records_rejected_proposal_on_cited_records(self):
         prs = [
             {
