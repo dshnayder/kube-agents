@@ -561,13 +561,16 @@ then opens, syncs and stale-closes the remediation pull requests as steps 2, 7 a
 with the same cap and switch, through the label-free paths on a forge with no labels. It writes no
 ledger and reads no `/remediate` comment: a person asks in chat, and `remediate` opens the fix with
 no ledger link. A clean run closes a stale pull request only over complete coverage and with every
-finding of the stored ledger accounted for, as step 5 requires. The previous ledger is read as the
+finding of the stored ledger accounted for, as step 5 requires: a finding that the collector still
+flags is not accounted for, whatever `resolved_because` says. The previous ledger is read as the
 forge path reads the stored body of the issue, with no issue to check it against
 ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2): the held set and the carried held
 rows come from its body, a body from an earlier identity scheme is re-spelled and withholds
 `resolved` on a findings run, and the held findings render on the stored body. A store whose last
-write failed, whose record cannot be read, or that holds only records of runs that could not reach
-the repository has lost the previous ledger. A clean run over a store that lost
+write failed or whose record cannot be read has lost the previous ledger. A store that does not
+exist, or that holds only records of runs that could not reach the repository in a ring that is not
+full, has no previous ledger when no remediation pull request of the stream is open, and the run is
+first; with one open, it has lost the previous ledger, because the store is its only copy. A clean run over a store that lost
 the previous ledger closes nothing, holds the ledger open, and stores an envelope with
 `ledger_held_open` true and `delta_known` false; the next run reads that envelope as a lost memory
 again, as the forge path's next run does when the envelope names no issue, until a run that reports

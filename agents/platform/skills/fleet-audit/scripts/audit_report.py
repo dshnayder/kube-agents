@@ -18447,24 +18447,35 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
     return [str(fid) for fid in (envelope or {}).get("current_ids") or []]
 
 
-def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]:
+def _store_ledger_envelope(
+    audit_id: str, repo: str, *, open_fix: bool = True
+) -> tuple[dict | None, bool]:
     """The envelope the previous store-ledger run of `repo` wrote, and whether it is knowable.
 
     Read as `read_report_memory` reads the memory of a ledger issue, with the
-    one difference that this ledger has no issue to vouch for it:
+    one difference that this ledger has no issue to vouch for it. `open_fix`
+    says whether a remediation proposal of this stream may be open: True when
+    the listing found one, and when the caller did not list them.
 
-    - No store directory for `repo` is (None, True): the run is first. The
-      forge path's first run is the one with no open issue.
+    - No store directory for `repo` is (None, True) when no fix of this stream
+      is open: the run is first, as the forge path's first run is the one with
+      no open issue. With an open fix it is a lost memory (None, False): the
+      store went with its volume or its key, and the store is the only copy
+      of this ledger, where the forge path seeds from the issue.
     - An absent or unreadable `latest.json` in a directory that exists is a
       lost memory (None, False). `write_report` drops `latest.json` when its
       write fails, so the newest envelope in `runs/` may be the run before the
       one that failed; trusting it would miss what the failed run published.
     - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
       `runs/` that is not diverted (`_newest_published_envelope`). When there
-      is none the memory stays lost. The forge path seeds once from the issue
-      body there (`seed_memory_from_ledger`); this ledger has no other copy,
-      and a run that kept its ledger here may have aged out of the ring, so it
-      is unavoidably lost until a findings run stores a new ledger.
+      is none, and the ring is shorter than `REPORT_HISTORY` and no fix of
+      this stream is open, no run ever stored a ledger here and nothing can
+      close: the run is first, as when a run that could not reach the
+      repository created the directory. Otherwise the memory stays lost: a
+      full ring may have aged a stored ledger out, and an open fix may come
+      from a ledger whose store write failed. The forge path seeds once from
+      the issue body there (`seed_memory_from_ledger`); this ledger has no
+      other copy, so it is lost until a findings run stores a new ledger.
     - The envelope is trusted when a run that kept its ledger in the store
       (`STORE_LEDGER_STATUS`) wrote it for this repository and it has a
       readable ledger. Anything else is a lost memory, as a store written for
@@ -18479,7 +18490,13 @@ def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
     if not directory.exists():
-        return None, True
+        if not open_fix:
+            return None, True
+        log(
+            f"No stored ledger for {audit_id} in {repo}, but a remediation proposal of this "
+            f"stream is open; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
     path = directory / REPORT_LATEST_NAME
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -18496,7 +18513,15 @@ def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]
         )
         return None, False
     if is_diverted(envelope):
-        envelope = _newest_published_envelope(directory / REPORT_RUNS_DIR)
+        runs = directory / REPORT_RUNS_DIR
+        envelope = _newest_published_envelope(runs)
+        if envelope is None and not open_fix:
+            try:
+                ring = len(list(runs.glob("*.json")))
+            except OSError:
+                ring = REPORT_HISTORY
+            if ring < REPORT_HISTORY:
+                return None, True
         if envelope is None:
             log(
                 f"Stored reports for {audit_id} in {repo} are all from runs that could not "
@@ -18518,7 +18543,9 @@ def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]
     return envelope, True
 
 
-def previous_store_ledger(audit_id: str, repo: str) -> tuple[dict | None, bool]:
+def previous_store_ledger(
+    audit_id: str, repo: str, *, open_fix: bool = True
+) -> tuple[dict | None, bool]:
     """The ledger that the previous store-ledger run of `repo` stored, and whether it is knowable.
 
     The memory of a run whose forge has no issue tracker (`STORE_LEDGER_STATUS`):
@@ -18528,7 +18555,7 @@ def previous_store_ledger(audit_id: str, repo: str) -> tuple[dict | None, bool]:
     that a no-forge run diverted here, or that a forge run wrote, is not this
     memory.
     """
-    envelope, known = _store_ledger_envelope(audit_id, repo)
+    envelope, known = _store_ledger_envelope(audit_id, repo, open_fix=open_fix)
     if isinstance(envelope, dict) and envelope.get("ledger_held_open") and (
         envelope.get("delta_known") is False
     ):
@@ -18954,7 +18981,13 @@ def _finish_store_ledger(
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
 
-    memory, delta_known = previous_store_ledger(audit_id, repo)
+    # The store is the only copy of this ledger, so an absent one is a first
+    # run only when no fix of this stream is open (`_store_ledger_envelope`).
+    memory, delta_known = previous_store_ledger(
+        audit_id,
+        repo,
+        open_fix=any(str(pr.get("state") or "").upper() == "OPEN" for pr in remediation_prs),
+    )
     previous_ids = [str(fid) for fid in (memory or {}).get("current_ids") or []]
     previous_body = str((memory or {}).get("ledger_body") or "")
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}

@@ -2973,7 +2973,10 @@ stored report is the ledger: it holds the body that the forge path would post,
 with the status `STORE_LEDGER`, and nothing posts it. The next run of the
 repository reads it as its memory, so the delta, the findings that `start`
 names, and the guard that stops a clean run from closing a fix over a finding
-that it did not account for read the same input as on the forge path. The
+that it did not account for read it as the forge path reads the stored body of
+the issue. One input differs: the forge path seeds a lost memory from the
+issue, and this ledger has no other copy, so a store with no ledger in it is a
+lost memory while a remediation proposal of the stream is open. The
 envelope is not marked as a diverted run's is, and the no-forge path and the
 forge path do not read it. An
 install can use a forge with no issues only where `start` makes this decision:

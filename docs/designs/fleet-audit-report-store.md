@@ -84,14 +84,18 @@ it against. It trusts `latest.json` when its `status` is `STORE_LEDGER`, its `re
 repository, and it has `current_ids` and a `ledger_body`. The identity scheme is not a trust
 condition: a body from an earlier scheme is re-spelled and `resolved` is withheld on a findings run,
 as in §4. A diverted `latest.json` defers to the newest envelope in the ring that is not marked. No
-store directory is a first run. An absent or unreadable `latest.json` in a directory that exists is
+store directory is a first run when no remediation proposal of the stream is open; with one open it
+is a lost memory, because the store is the only copy of this ledger. An absent or unreadable `latest.json` in a directory that exists is
 a lost memory, and so is an envelope that fails the checks: the ring is not searched for an older
 one, because a failed write drops `latest.json`, and the newest ring entry can then be the run
-before the one that failed. A directory that holds only marked envelopes stays a lost memory too.
-The forge path seeds once from the issue there; this ledger has no other copy, so a findings run,
-which stores a new ledger, is the exit. The run takes the delta from `current_ids`, and the held
+before the one that failed. A directory that holds only marked envelopes, in a ring shorter than
+`REPORT_HISTORY`, is a first run on the same condition: no run stored a ledger there, and no fix can
+close. With a full ring, which can have aged a stored ledger out, or with an open proposal, it is a
+lost memory. The forge path seeds once from the issue there; this ledger has no other copy, so a
+findings run, which stores a new ledger, is the exit. The run takes the delta from `current_ids`, and the held
 set, the carried held rows and the locations of the findings from `ledger_body`, so the
-clean-close guard of §4 has the same input as on the forge path. Held findings render on the stored
+clean-close guard of §4 reads them as on the forge path. A previous finding the collector still
+flags holds the clean close as on the forge path. Held findings render on the stored
 body as on the issue. A clean run that does not close keeps the previous body and ids, with
 `ledger_held_open` true. A clean run over a lost memory has no body to keep: it stores
 `ledger_held_open` true and `delta_known` false, and the next run reads that envelope as a lost

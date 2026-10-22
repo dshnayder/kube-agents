@@ -29238,12 +29238,7 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(out["resolved"], 0)
         self.assertNotIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
 
-    def test_only_diverted_envelopes_stay_lost_until_a_findings_run(self):
-        """The store path has no ledger issue to seed from, so a store that
-        holds only diverted envelopes stays a lost memory, and a findings run
-        is the exit."""
-        self.claim()
-        self.touch(self.NETPOL)
+    def plant_diverted_store(self, count=1):
         directory = self.store_dir()
         runs = directory / audit_report.REPORT_RUNS_DIR
         runs.mkdir(parents=True)
@@ -29252,16 +29247,83 @@ class TestStoreLedger(HarnessTestCase):
             "id_scheme": audit_report.ID_SCHEME, "current_ids": [],
             audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
         }
-        (runs / "20260901T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
+        for day in range(1, count + 1):
+            (runs / f"202609{day:02d}T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
         (directory / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
-        self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
+
+    def test_only_diverted_envelopes_with_no_open_fix_are_a_first_run(self):
+        """Review finding: a first morning that could not reach the repository
+        left only a diverted envelope, and every clean run after it reported
+        a lost memory. No ledger was ever stored here and no fix of this
+        stream is open, so nothing can close: the run is first."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.plant_diverted_store()
+        clean = self.run_once(make_doc(findings=[]))
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_GAP, clean["coverage_gaps"])
+        envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
+        self.assertTrue(known)
+        self.assertFalse(envelope["ledger_held_open"])
+        second = self.run_once(make_doc(findings=[]))
+        self.assertTrue(second["silent_ok"])
+
+    def test_only_diverted_envelopes_with_an_open_fix_stay_lost_until_a_findings_run(self):
+        """A fix of this stream is open, so a ledger may have been stored and
+        lost (a failed store write, then a diverted run): the memory stays
+        lost, the clean run closes nothing, and a findings run is the exit."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.plant_diverted_store()
+        proposal = self.open_proposal(8, make_doc())
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": proposal["body"]}}
         clean = self.run_once(make_doc(findings=[]))
         self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
+        self.assertEqual(clean["prs_closed"], [])
         self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
         self.run_once(make_doc())
         envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
         self.assertTrue(known)
         self.assertEqual(len(envelope["current_ids"]), 1)
+
+    def test_a_full_ring_of_diverted_envelopes_stays_lost(self):
+        """A full ring may have aged a stored ledger out, so it is no first run."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.plant_diverted_store(audit_report.REPORT_HISTORY)
+        clean = self.run_once(make_doc(findings=[]))
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
+
+    def test_a_lost_store_directory_with_an_open_fix_is_a_lost_memory(self):
+        """Review finding: a store directory lost with its volume read as a
+        first run, and the next clean run closed a live fix. The store is the
+        only copy of this ledger, so an open fix of the stream makes it lost."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": proposal["body"]}}
+        shutil.rmtree(self.store_dir())
+        clean = self.run_once(make_doc(findings=[]))
+        self.assertEqual(clean["prs_closed"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
+        self.assertFalse(clean["silent_ok"])
+
+    def test_a_lost_store_directory_with_only_closed_fixes_is_a_first_run(self):
+        """No open fix of the stream, so nothing can close: the run is first."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        proposal = self.open_proposal(8, validated, state="merged")
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        shutil.rmtree(self.store_dir())
+        clean = self.run_once(make_doc(findings=[]))
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
 
     def test_a_diverted_latest_reads_the_newest_published_run(self):
         """As `read_report_memory`: a diverted `latest.json` defers to the
