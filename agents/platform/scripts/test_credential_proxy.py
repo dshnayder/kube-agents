@@ -182,6 +182,46 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
 
+    def test_refuses_bridge_a2a_session_paths_and_headers(self):
+        for path, extra_headers in (
+            ("/api/sessions/a2a-ctx-victim/chat", {}),
+            ("/api/sessions/a2a-ctx-victim/chat/stream", {}),
+            ("/api/sessions/a2a-ctx-victim", {}),
+            ("/api/sessions/%612a-ctx-victim/chat", {}),
+            ("/p/default/api/sessions/a2a-ctx-victim/chat", {}),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "a2a-ctx-victim"}),
+            ("/v1/responses", {"X-Hermes-Session-Key": "a2a-ctx-victim"}),
+        ):
+            with self.subTest(path=path, headers=extra_headers):
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=b"{}",
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+                self.assertEqual("", self.received_authorization)
+
+    def test_allows_non_a2a_session_paths_and_headers(self):
+        for path, extra_headers in (
+            ("/api/sessions?limit=1", {}),
+            ("/api/sessions/k8s-evt-123/chat", {}),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "sess-123"}),
+        ):
+            with self.subTest(path=path, headers=extra_headers):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
+
     def test_rejection_reaches_a_client_that_sent_a_body(self):
         # Raw socket rather than urllib: the defect is at the transport, and a
         # library that retries or re-raises would hide which of the two happened.

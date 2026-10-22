@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import queue
 import re
 import select
@@ -2329,6 +2330,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self._targets_bridge_session(self.path, self.headers):
+            self._drain_request_body()
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         # The three refusals below cannot drain -- see _drain_request_body -- so a
         # caller that sent a body may read the close before the response. They are
         # answers to a malformed or oversized request, where the framing is already
@@ -2404,6 +2409,41 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     def _drain_request_body(self) -> None:
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
+
+    @staticmethod
+    def _targets_bridge_session(path: str, headers: Any) -> bool:
+        """Return True when an external request names an `a2a-*` bridge session.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths and
+        session headers on the external proxy stops a holder of
+        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
+        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
+        """
+        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
+            )
+            for raw_val in raw_values:
+                val = str(raw_val or "").strip()
+                while (unquoted := urllib.parse.unquote(val)) != val:
+                    val = unquoted
+                if val.strip().lower().startswith("a2a-"):
+                    return True
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        segments = [seg.lower() for seg in normalized.split("/") if seg]
+        for idx, seg in enumerate(segments):
+            if seg.startswith("a2a-"):
+                return True
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(segments) and segments[idx + 1].startswith("a2a-"):
+                    return True
+        return False
 
     @staticmethod
     def _sanitize_header(value: str) -> str:
