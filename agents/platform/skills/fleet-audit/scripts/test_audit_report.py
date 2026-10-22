@@ -29206,6 +29206,79 @@ class TestStoreLedger(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
 
+    def test_an_id_scheme_bump_is_not_a_lost_memory(self):
+        """Review finding: an envelope from the previous id scheme was not
+        trusted, so every clean stream stayed lost and closed no fixed PR."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        self.patch_attr("ID_SCHEME", audit_report.ID_SCHEME + 1)
+        # The pull request's own marker is under the new scheme: one under the
+        # old scheme is not joinable on either path (`close_stale_remediation_prs`).
+        proposal = self.open_proposal(8, validated)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": proposal["body"]}}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [self.resolved_entry(validated["findings"][0])]
+        out = self.run_once(clean)
+        self.assertEqual(out["prs_closed"], [proposal["url"]])
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_GAP, out["coverage_gaps"])
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
+        self.assertEqual(out["resolved"], 1)
+
+    def test_a_findings_run_after_an_id_scheme_bump_withholds_resolved(self):
+        """The forge path's stale-scheme rule: a rename is not a fix."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.touch(self.B_PATH)
+        self.run_once(make_doc())
+        self.patch_attr("ID_SCHEME", audit_report.ID_SCHEME + 1)
+        out = self.run_once(make_doc(findings=[self.two_findings()[1]]))
+        self.assertEqual(out["resolved"], 0)
+        self.assertNotIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
+
+    def test_only_diverted_envelopes_stay_lost_until_a_findings_run(self):
+        """The store path has no ledger issue to seed from, so a store that
+        holds only diverted envelopes stays a lost memory, and a findings run
+        is the exit."""
+        self.claim()
+        self.touch(self.NETPOL)
+        directory = self.store_dir()
+        runs = directory / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True)
+        diverted = {
+            "status": audit_report.NO_FORGE_STATUS, "repo": self.REPO,
+            "id_scheme": audit_report.ID_SCHEME, "current_ids": [],
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
+        }
+        (runs / "20260901T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
+        (directory / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
+        self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
+        clean = self.run_once(make_doc(findings=[]))
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, clean["coverage_gaps"])
+        self.assertEqual(audit_report.previous_store_ledger(AUDIT, self.REPO), (None, False))
+        self.run_once(make_doc())
+        envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
+        self.assertTrue(known)
+        self.assertEqual(len(envelope["current_ids"]), 1)
+
+    def test_a_diverted_latest_reads_the_newest_published_run(self):
+        """As `read_report_memory`: a diverted `latest.json` defers to the
+        newest envelope in the ring that a run which published here wrote."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc())
+        published = self.latest()
+        (self.store_dir() / "latest.json").write_text(json.dumps({
+            "status": audit_report.NO_FORGE_STATUS, "repo": self.REPO,
+            "id_scheme": audit_report.ID_SCHEME, "current_ids": [],
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
+        }), encoding="utf-8")
+        envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
+        self.assertTrue(known)
+        self.assertEqual(envelope["current_ids"], published["current_ids"])
+
     def test_a_held_finding_stays_on_the_stored_ledger_and_in_the_next_start(self):
         """Review finding: the held finding was in `current_ids` but not in
         `ledger_body`, so the next `start` did not carry it."""

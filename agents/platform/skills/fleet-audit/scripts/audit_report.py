@@ -18469,6 +18469,9 @@ def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]
       (`STORE_LEDGER_STATUS`) wrote it for this repository and it has a
       readable ledger. Anything else is a lost memory, as a store written for
       another issue is on the forge path; the ring is not searched past it.
+      The identity scheme is not a trust condition, as in `read_report_memory`:
+      `_finish_store_ledger` re-spells and withholds as `finish` does over a
+      stored body of another scheme.
     """
     try:
         directory = reports_dir_for(audit_id, repo)
@@ -18506,12 +18509,10 @@ def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]
         and _ledger_key(envelope.get("repo")) == _ledger_key(repo)
         and isinstance(envelope.get("current_ids"), list)
         and isinstance(envelope.get("ledger_body"), str)
-        and envelope.get("id_scheme") == ID_SCHEME
     ):
         log(
             f"WARNING: the stored ledger for {audit_id} in {repo} was not written by a run "
-            f"that keeps its ledger in the store under id scheme {ID_SCHEME}; "
-            f"{MEMORY_UNKNOWABLE}"
+            f"that keeps its ledger in the store; {MEMORY_UNKNOWABLE}"
         )
         return None, False
     return envelope, True
@@ -18957,6 +18958,27 @@ def _finish_store_ledger(
     previous_body = str((memory or {}).get("ledger_body") or "")
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
     finding_places = report_finding_places(memory, data)
+    # The forge path's stale-scheme rule: ids stored under another identity
+    # scheme are spelled differently, so `resolved` and the ids no longer
+    # reported under a gap are withheld on a findings run, and no finding is
+    # marked new against them. The held set re-spells the stored rows
+    # (`collector_held_entries`, `carried_held_entries`). A clean run closes as
+    # the forge path's clean branch does, with no stale-scheme guard.
+    previous_scheme = parse_id_scheme(previous_body)
+    stale_scheme = bool(previous_ids) and previous_scheme != ID_SCHEME
+    if stale_scheme:
+        log(
+            f"Previous stored ledger's {len(previous_ids)} finding id(s) were written "
+            f"under identity scheme {previous_scheme} and this run uses {ID_SCHEME}; "
+            "withholding 'resolved' this run rather than reporting a rename as a fix."
+        )
+        _, residual = previous_marker_ids(previous_body)
+        if residual:
+            log(
+                f"WARNING: {residual} id(s) in the previous marker had no rendered row "
+                f"to re-derive under identity scheme {ID_SCHEME}; they leave the stored "
+                "ledger unheld with this rewrite, which is the cost of the scheme bump."
+            )
     current_ids = finding_ids(findings)
     withheld_ids = set(finding_ids(withheld))
     held_exclude = set(current_ids) | withheld_ids
@@ -19025,14 +19047,18 @@ def _finish_store_ledger(
     new_ids = sorted(set(current_ids) - set(previous_ids)) if delta_known else []
     # Over a coverage gap an absence means "not checked", not fixed.
     resolved_ids = (
-        sorted(set(previous_ids) - set(stored_ids)) if delta_known and not gaps else []
+        sorted(set(previous_ids) - set(stored_ids))
+        if delta_known and not gaps and not (stale_scheme and findings)
+        else []
     )
     published_ids = held_exclude | set(held)
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
     } - published_ids
     unreported_under_gap = (
-        sorted(set(previous_ids) - published_ids - already_reported) if gaps else []
+        sorted(set(previous_ids) - published_ids - already_reported)
+        if gaps and not stale_scheme
+        else []
     )
     reported_under_gap = sorted(already_reported | set(unreported_under_gap))
 
@@ -19155,7 +19181,7 @@ def _finish_store_ledger(
             held=held_entries,
             held_overflow=len(held_dropped),
             held_carried=carried_without_manifest,
-            new_ids=set(new_ids) if delta_known and memory else None,
+            new_ids=set(new_ids) if delta_known and memory and not stale_scheme else None,
             blocked_by=blocking_prs(pr_by_finding, claimed),
             file_url=fix_plan.file_url,
             file_ref=fix_plan.file_ref,
