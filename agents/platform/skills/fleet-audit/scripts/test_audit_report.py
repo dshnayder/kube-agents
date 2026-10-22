@@ -28780,6 +28780,57 @@ class TestStoreLedger(HarnessTestCase):
         # A forge with no issue tracker is not told to turn its issues on.
         self.assertNotIn("issues enabled", audit_report.unreachable_note(decision.unreachable))
 
+    def refuse_proposal_list(self, verb, payload, repository=None):
+        if verb == "proposal-list":
+            raise vcs_client.VcsError("forbidden", code=audit_report.FORGE_FORBIDDEN_CODE)
+        return self.forge_through_recorder(verb, payload, repository)
+
+    def test_a_refused_proposal_listing_does_not_ask_for_issues(self):
+        """Review finding: a forge with issues and no labels is probed with the
+        proposal listing, and a refusal of it is not about issues."""
+        self.forge_is({**GITHUB_LIKE, "forge": "stub", "labels": False})
+        with patch.object(vcs_client, "forge", self.refuse_proposal_list):
+            decision = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertEqual(decision.unreachable[0], self.REPO)
+        self.assertEqual(decision.probe, audit_report.STORE_REACHABILITY_PROBE_VERB)
+        note = audit_report.unreachable_note(decision.unreachable, probe=decision.probe)
+        self.assertNotIn("issues enabled", note)
+        self.assertIn(audit_report.UNREACHABLE_FORGE_REMEDY, note)
+
+    def test_the_no_forge_note_asks_the_broker_nothing(self):
+        """Review finding: the note asked `capabilities`, and a lost broker
+        then stopped `finish` after the store write, with no line and no chat."""
+        lost = mock.Mock(side_effect=audit_report.BrokerUnavailable("broker down"))
+        reason = f"[{audit_report.FORGE_FORBIDDEN_CODE}] forbidden"
+        with patch.object(audit_report, "capabilities_answer", lost):
+            note = audit_report.unreachable_note((self.REPO, reason))
+            store_note = audit_report.unreachable_note(
+                (self.REPO, reason), probe=audit_report.STORE_REACHABILITY_PROBE_VERB
+            )
+        lost.assert_not_called()
+        # The probe that `main` used, and its advice.
+        self.assertIn(audit_report.UNREACHABLE_FORBIDDEN_REMEDY, note)
+        self.assertIn(audit_report.UNREACHABLE_FORGE_REMEDY, store_note)
+
+    def test_finish_follows_the_probe_start_recorded_with_a_lost_broker(self):
+        self.claim()
+        self.forge_is({**GITHUB_LIKE, "forge": "stub", "labels": False})
+        with patch.object(vcs_client, "forge", self.refuse_proposal_list):
+            started = self.start()
+        self.assertNotIn("issues enabled", started["no_forge"])
+        record = json.loads(Path(audit_report.run_record_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(record[audit_report.RUN_RECORD_PROBE_KEY], audit_report.STORE_REACHABILITY_PROBE_VERB)
+        # `finish` runs in another process: nothing is cached, and the broker is gone.
+        audit_report._CAPABILITIES.clear()
+        audit_report._LABELS.clear()
+        lost = mock.Mock(side_effect=audit_report.BrokerUnavailable("broker down"))
+        with patch.object(audit_report, "capabilities_answer", lost):
+            self.assertEqual(self.finish(make_doc(findings=[])), 0, self.err)
+        lost.assert_not_called()
+        out = self.stdout_json()
+        self.assertNotIn("issues enabled", out["no_forge"])
+        self.assertIn(audit_report.UNREACHABLE_FORGE_REMEDY, out["no_forge"])
+
     # -- the run record ----------------------------------------------------------
 
     def test_start_records_the_decision_and_finish_follows_it(self):

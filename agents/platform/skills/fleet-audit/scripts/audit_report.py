@@ -951,6 +951,11 @@ NO_REPOSITORY_CHOSEN_KEY = "no_repository_chosen"
 # The run record's key for a run that took the no-forge path because its
 # repository could not be reached: `{"repo", "reason"}`. `finish` follows it.
 RUN_RECORD_UNREACHABLE_KEY = "unreachable"
+# The run record's key for the read that found that repository unreachable
+# (`REACHABILITY_PROBE_VERB` or `STORE_REACHABILITY_PROBE_VERB`). The note's
+# advice follows it, so `finish` asks the broker nothing to give it. A record
+# without it was written when the probe was always the issue listing.
+RUN_RECORD_PROBE_KEY = "probe"
 # The JSON line's key for the repository that could not be reached, and why.
 UNREACHABLE_REPO_KEY = "unreachable_repo"
 
@@ -13199,6 +13204,8 @@ class LedgerDecision(NamedTuple):
     ledger: Literal["forge", "store"]
     remediation: bool
     reason: str | None
+    # The read that found `repo` unreachable, for the note's advice.
+    probe: str = REACHABILITY_PROBE_VERB
 
     @property
     def publish_repo(self) -> str:
@@ -13285,7 +13292,7 @@ def resolve_reachable_repo(audit_id: str, repo: str | None = None) -> LedgerDeci
     reason = unreachable_reason(resolved, probe)
     if reason is not None:
         log(f"UNREACHABLE: {resolved}: {reason}; the run keeps its findings in the report store")
-        return no_forge_decision((resolved, reason))
+        return no_forge_decision((resolved, reason))._replace(probe=probe)
     if store_reason is not None:
         log(
             f"LEDGER IN STORE: {store_reason}; the ledger goes to the report store and chat, "
@@ -13295,13 +13302,22 @@ def resolve_reachable_repo(audit_id: str, repo: str | None = None) -> LedgerDeci
     return LedgerDecision(resolved, LEDGER_FORGE, True, None)
 
 
-def unreachable_note(unreachable: tuple[str, str] | None, *, stored: bool = True) -> str:
+def unreachable_note(
+    unreachable: tuple[str, str] | None,
+    *,
+    stored: bool = True,
+    probe: str = REACHABILITY_PROBE_VERB,
+) -> str:
     """The no-forge note: why the run has no repository to publish to.
 
     `unreachable` is the decision's pair (`LedgerDecision.unreachable`), or
     None for an install that registers no repository. A pair with no
     repository is a run for which several repositories are managed and none
-    could be chosen.
+    could be chosen. `probe` is the read that found the repository
+    unreachable (`LedgerDecision.probe`): a refused issue listing can mean
+    that the issues are off, and a refused proposal listing cannot. The note
+    asks the broker nothing, so a lost broker cannot stop the run after its
+    store write.
     """
     if unreachable is None:
         return NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
@@ -13314,8 +13330,7 @@ def unreachable_note(unreachable: tuple[str, str] | None, *, stored: bool = True
     template = UNREACHABLE_NOTE if stored else UNREACHABLE_UNSTORED_NOTE
     if gitops_preflight.NOT_MANAGED_CODE in reason:
         remedy = UNREACHABLE_NOT_MANAGED_REMEDY
-    elif FORGE_FORBIDDEN_CODE in reason and forge_has_issue_verbs(repo):
-        # The probe listed issues only where the forge has them.
+    elif FORGE_FORBIDDEN_CODE in reason and probe == REACHABILITY_PROBE_VERB:
         remedy = UNREACHABLE_FORBIDDEN_REMEDY
     else:
         remedy = UNREACHABLE_FORGE_REMEDY
@@ -13352,6 +13367,9 @@ def _recorded_decision(data: dict) -> LedgerDecision | None:
     )
     if pair is not None or repo == NO_FORGE_REPO:
         old = no_forge_decision(pair)
+        probe = data.get(RUN_RECORD_PROBE_KEY)
+        if pair is not None and probe in (REACHABILITY_PROBE_VERB, STORE_REACHABILITY_PROBE_VERB):
+            old = old._replace(probe=probe)
     else:
         old = LedgerDecision(repo, LEDGER_FORGE, True, None)
     if RUN_RECORD_LEDGER_KEY not in data:
@@ -14976,7 +14994,10 @@ def write_run_record(
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
                 RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
                 **(
-                    {RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]}}
+                    {
+                        RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]},
+                        RUN_RECORD_PROBE_KEY: decision.probe,
+                    }
                     if unreachable
                     else {}
                 ),
@@ -17164,7 +17185,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
-        log(f"NO FORGE: {unreachable_note(unreachable)}")
+        log(f"NO FORGE: {unreachable_note(unreachable, probe=decision.probe)}")
         root = no_forge_workspace(audit_id)
         existing_issue, pending, carried = None, [], []
     elif decision.store_ledger:
@@ -17220,7 +17241,11 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                 # a mode switch. `none` is an install with no forge: nothing
                 # publishes the fixes, and the workspace is empty.
                 "mode": NO_FORGE_MODE if no_forge else ("content" if content_mode() else "directory"),
-                **({"no_forge": unreachable_note(unreachable)} if no_forge else {}),
+                **(
+                    {"no_forge": unreachable_note(unreachable, probe=decision.probe)}
+                    if no_forge
+                    else {}
+                ),
                 **diverted_marker(unreachable),
                 # The ledger is in the report store and chat; the fixes still
                 # open on the forge. There is no ledger issue, so `issue` is
@@ -18569,6 +18594,7 @@ def _finish_without_forge(
     waiver: str,
     timers: Callable[[], dict],
     unreachable: tuple[str, str] | None = None,
+    probe: str = REACHABILITY_PROBE_VERB,
 ) -> None:
     """Keep a run on an install with no forge in the report store, and print its line.
 
@@ -18580,6 +18606,8 @@ def _finish_without_forge(
     repositories are managed and none could be chosen: its key is
     `no_repository_chosen`, and its envelope, marked so, goes under
     `NO_FORGE_REPO`. Either run is never silent, and its delta is unknown.
+    `probe` is the read that found the repository unreachable, which the
+    note's advice follows (`unreachable_note`).
 
     Everything `finish` does with a ledger is skipped: the issue, its delta
     comment, the remediation sweep and the stale closes all need a repository.
@@ -18675,7 +18703,7 @@ def _finish_without_forge(
     stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
-    note = unreachable_note(unreachable, stored=stored)
+    note = unreachable_note(unreachable, stored=stored, probe=probe)
     payload["no_forge"] = note
     payload.update(marker)
     # For the same reason, a run the store does not hold is never quiet. A
@@ -19364,6 +19392,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         _finish_without_forge(
             audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload,
             unreachable=unreachable,
+            probe=decision.probe if decision is not None else REACHABILITY_PROBE_VERB,
         )
         return
     earlier = earlier_finish(audit_id, repo, now)
