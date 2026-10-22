@@ -18960,10 +18960,33 @@ def _finish_store_ledger(
     current_ids = finding_ids(findings)
     withheld_ids = set(finding_ids(withheld))
     held_exclude = set(current_ids) | withheld_ids
-    # A previous finding the collector still flags and this document left out
-    # is held, as the ledger issue holds it: the document leaving it out is not
-    # the condition clearing.
-    held = sorted((set(previous_ids) & still_flagged) - held_exclude)
+    # The held set as the forge path builds it from the ledger issue's stored
+    # body: a previous finding the collector still flags and this document
+    # left out is held, because the document leaving it out is not the
+    # condition clearing. Without a manifest, the ids the previous body
+    # recorded as held are carried. Over a lost memory nothing is held.
+    held_entries: list[dict] = []
+    held_dropped: list[dict] = []
+    carried_without_manifest = False
+    if delta_known and manifest is not None:
+        held_entries, held_dropped = cap_held_entries(
+            collector_held_entries(
+                manifest, data, exclude=held_exclude, previous_body=previous_body
+            )
+        )
+    elif delta_known:
+        held_entries, held_dropped = cap_held_entries(
+            carried_held_entries(previous_body, exclude=held_exclude | _declared_ids(data))
+        )
+        if held_entries:
+            carried_without_manifest = True
+            still_flagged = {entry["id"] for entry in held_entries}
+    held = [entry["id"] for entry in held_entries]
+    if held_dropped:
+        log(
+            f"WARNING: the stored ledger stops tracking {len(held_dropped)} finding(s) the "
+            f"collector still flags; it holds at most {MAX_HELD_IDS} at once, lowest ids first."
+        )
     # Over a lost memory a clean run cannot tell what the stored ledger
     # carried, so it closes no fix, as the forge path's lost-memory gap says.
     if not delta_known and not findings:
@@ -19129,6 +19152,9 @@ def _finish_store_ledger(
             below_floor=plan.below_floor,
             triage_reasons=triage_reasons,
             switched_off=plan.switched_off,
+            held=held_entries,
+            held_overflow=len(held_dropped),
+            held_carried=carried_without_manifest,
             new_ids=set(new_ids) if delta_known and memory else None,
             blocked_by=blocking_prs(pr_by_finding, claimed),
             file_url=fix_plan.file_url,

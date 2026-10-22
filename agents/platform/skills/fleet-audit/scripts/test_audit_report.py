@@ -29206,5 +29206,34 @@ class TestStoreLedger(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
 
+    def test_a_held_finding_stays_on_the_stored_ledger_and_in_the_next_start(self):
+        """Review finding: the held finding was in `current_ids` but not in
+        `ledger_body`, so the next `start` did not carry it."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.touch(self.B_PATH)
+        self.run_once(make_doc())
+        held_id = self.latest()["current_ids"][0]
+        candidate = {
+            "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+            "object": "Namespace/no-network-policy", "severity": "major",
+            "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
+        }
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(_full_manifest(candidates=[candidate])), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[self.two_findings()[1]])), encoding="utf-8")
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        latest = self.latest()
+        self.assertIn(held_id, latest["current_ids"])
+        self.assertIn(held_id, audit_report.parse_delta_block(latest["ledger_body"]))
+        self.assertIn(held_id, audit_report.parse_held_ids(latest["ledger_body"]))
+        started = self.start()
+        self.assertIn(held_id, [entry["id"] for entry in started[audit_report.CARRIED_KEY]])
+
 if __name__ == "__main__":
     unittest.main()
