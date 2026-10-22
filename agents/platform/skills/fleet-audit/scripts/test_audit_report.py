@@ -29154,5 +29154,57 @@ class TestStoreLedger(HarnessTestCase):
         [create] = self.harness.forge_calls("proposal-create")
         self.assertNotIn("Part of #", create["body"])
 
+    # -- review findings: the memory as the forge path reads it -----------------
+
+    B_PATH = "clusters/prod-us-east/b.yaml"
+
+    def two_findings(self):
+        return [
+            make_finding(),
+            make_finding(
+                fid="b",
+                remediation={"kind": "manifest", "path": self.B_PATH, "note": "Apply b."},
+            ),
+        ]
+
+    def resolved_entry(self, finding):
+        return {
+            **{k: finding[k] for k in ("check", "cluster", "namespace", "object")},
+            "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16.",
+        }
+
+    def test_a_failed_store_write_makes_the_next_memory_lost(self):
+        """Review finding: after a run whose store write failed, the next run
+        trusted the run before it, and its clean close missed what the failed
+        run published."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.touch(self.B_PATH)
+        self.run_once(make_doc())  # R1: {A}, stored.
+        real_write = audit_report._atomic_write
+
+        def no_space(path, text):
+            if Path(path).parent.name == audit_report.REPORT_RUNS_DIR:
+                raise OSError(28, "No space left on device")
+            real_write(path, text)
+
+        with patch.object(audit_report, "_atomic_write", no_space):
+            self.run_once(make_doc(findings=self.two_findings()))  # R2: {A, B}, not stored.
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        a, b = validated["findings"]
+        pr_a = self.open_proposal(8, {"findings": [a]})
+        pr_b = self.open_proposal(9, {"findings": [b]})
+        self.harness.replies["proposal-list"] = {"proposals": [pr_a, pr_b], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": pr_b["body"]}}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [self.resolved_entry(a)]
+        out = self.run_once(clean)  # R3: clean, explains A only.
+        self.assertNotIn(pr_b["url"], out["prs_closed"])
+        self.assertEqual(out["prs_closed"], [])
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
 if __name__ == "__main__":
     unittest.main()

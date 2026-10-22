@@ -18396,6 +18396,8 @@ def _previous_store_envelope(
     drops `latest.json` and leaves the ring, and on these runs nothing else
     remembers the run. A store with envelopes and none trusted is (None,
     False): unknowable rather than empty. `writer` names the run for the log.
+    The no-forge path reads it; it opens and closes no fix. The store-ledger
+    path, which closes fixes, reads `_store_ledger_envelope` instead.
     """
     try:
         directory = reports_dir_for(audit_id, store_repo)
@@ -18445,19 +18447,87 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
     return [str(fid) for fid in (envelope or {}).get("current_ids") or []]
 
 
+def _store_ledger_envelope(audit_id: str, repo: str) -> tuple[dict | None, bool]:
+    """The envelope the previous store-ledger run of `repo` wrote, and whether it is knowable.
+
+    Read as `read_report_memory` reads the memory of a ledger issue, with the
+    one difference that this ledger has no issue to vouch for it:
+
+    - No store directory for `repo` is (None, True): the run is first. The
+      forge path's first run is the one with no open issue.
+    - An absent or unreadable `latest.json` in a directory that exists is a
+      lost memory (None, False). `write_report` drops `latest.json` when its
+      write fails, so the newest envelope in `runs/` may be the run before the
+      one that failed; trusting it would miss what the failed run published.
+    - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
+      `runs/` that is not diverted (`_newest_published_envelope`). When there
+      is none the memory stays lost. The forge path seeds once from the issue
+      body there (`seed_memory_from_ledger`); this ledger has no other copy,
+      and a run that kept its ledger here may have aged out of the ring, so it
+      is unavoidably lost until a findings run stores a new ledger.
+    - The envelope is trusted when a run that kept its ledger in the store
+      (`STORE_LEDGER_STATUS`) wrote it for this repository and it has a
+      readable ledger. Anything else is a lost memory, as a store written for
+      another issue is on the forge path; the ring is not searched past it.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError as exc:
+        log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
+        return None, False
+    if not directory.exists():
+        return None, True
+    path = directory / REPORT_LATEST_NAME
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log(
+            f"No stored ledger for {audit_id} in {repo}: latest.json is absent from a store "
+            f"that exists, as after a failed store write; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    except (OSError, ValueError) as exc:
+        log(
+            f"WARNING: stored ledger for {audit_id} in {repo} is unreadable "
+            f"({exc}{_ownership_note(exc)}); {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    if is_diverted(envelope):
+        envelope = _newest_published_envelope(directory / REPORT_RUNS_DIR)
+        if envelope is None:
+            log(
+                f"Stored reports for {audit_id} in {repo} are all from runs that could not "
+                f"reach it; {MEMORY_UNKNOWABLE}"
+            )
+            return None, False
+    if not (
+        isinstance(envelope, dict)
+        and envelope.get("status") == STORE_LEDGER_STATUS
+        and _ledger_key(envelope.get("repo")) == _ledger_key(repo)
+        and isinstance(envelope.get("current_ids"), list)
+        and isinstance(envelope.get("ledger_body"), str)
+        and envelope.get("id_scheme") == ID_SCHEME
+    ):
+        log(
+            f"WARNING: the stored ledger for {audit_id} in {repo} was not written by a run "
+            f"that keeps its ledger in the store under id scheme {ID_SCHEME}; "
+            f"{MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    return envelope, True
+
+
 def previous_store_ledger(audit_id: str, repo: str) -> tuple[dict | None, bool]:
     """The ledger that the previous store-ledger run of `repo` stored, and whether it is knowable.
 
     The memory of a run whose forge has no issue tracker (`STORE_LEDGER_STATUS`):
     its envelope in `repo`'s own store directory, read as
-    `_previous_store_envelope` says. Its `ledger_body` is the ledger the run
+    `_store_ledger_envelope` says. Its `ledger_body` is the ledger the run
     rendered and its `current_ids` the ids that ledger carries. An envelope
     that a no-forge run diverted here, or that a forge run wrote, is not this
     memory.
     """
-    envelope, known = _previous_store_envelope(
-        audit_id, repo, STORE_LEDGER_STATUS, "a run that keeps its ledger in the store"
-    )
+    envelope, known = _store_ledger_envelope(audit_id, repo)
     if isinstance(envelope, dict) and envelope.get("ledger_held_open") and (
         envelope.get("delta_known") is False
     ):
