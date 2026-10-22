@@ -26,6 +26,7 @@ import signal
 import shutil
 import socket
 import socketserver
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -2294,6 +2295,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_key: str
     upstream_host = "127.0.0.1"
     upstream_port = 8642
+    workspace_root: str = "/opt/data"
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
 
@@ -2330,7 +2332,9 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
-        if self._targets_bridge_session(self.path, self.headers):
+        if self._targets_bridge_session(
+            self.path, self.headers, workspace_root=self.workspace_root
+        ):
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -2351,6 +2355,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
+        if body and self._targets_bridge_session(
+            self.path, self.headers, body=body, workspace_root=self.workspace_root
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -2410,13 +2419,72 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
 
-    @staticmethod
-    def _targets_bridge_session(path: str, headers: Any) -> bool:
-        """Return True when an external request names an `a2a-*` bridge session.
+    @classmethod
+    def _is_bridge_session_id(
+        cls,
+        raw_session_id: Any,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        val = str(raw_session_id or "").strip()
+        while (unquoted := urllib.parse.unquote(val)) != val:
+            val = unquoted
+        sid = val.strip()
+        if not sid:
+            return False
+        if sid.lower().startswith("a2a-"):
+            return True
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+            or os.getenv("HERMES_HOME")
+            or "/opt/data"
+        )
+        db_paths: list[Path] = [root / "state.db"]
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
+        for db_path in db_paths:
+            if not db_path.is_file():
+                continue
+            try:
+                with contextlib.closing(
+                    sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                ) as conn:
+                    cur = sid
+                    seen = {cur}
+                    for _ in range(256):
+                        row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ?",
+                            (cur,),
+                        ).fetchone()
+                        parent = str(row[0] or "").strip() if row else ""
+                        if not parent or parent in seen:
+                            break
+                        if parent.lower().startswith("a2a-"):
+                            return True
+                        seen.add(parent)
+                        cur = parent
+            except Exception as exc:
+                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return False
+
+    @classmethod
+    def _targets_bridge_session(
+        cls,
+        path: str,
+        headers: Any,
+        body: bytes | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        """Return True when an external request names an `a2a-*` bridge session or child.
 
         `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
-        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths and
-        session headers on the external proxy stops a holder of
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        child continuations on the external proxy stops a holder of
         `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
         `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
         """
@@ -2427,22 +2495,37 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 else [headers.get(header, "")]
             )
             for raw_val in raw_values:
-                val = str(raw_val or "").strip()
-                while (unquoted := urllib.parse.unquote(val)) != val:
-                    val = unquoted
-                if val.strip().lower().startswith("a2a-"):
+                if cls._is_bridge_session_id(raw_val, workspace_root):
                     return True
         raw_path = urllib.parse.urlsplit(path).path
         while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
             raw_path = unquoted
         normalized = posixpath.normpath(raw_path.replace("\\", "/"))
-        segments = [seg.lower() for seg in normalized.split("/") if seg]
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
         for idx, seg in enumerate(segments):
             if seg.startswith("a2a-"):
                 return True
             if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
-                if idx + 1 < len(segments) and segments[idx + 1].startswith("a2a-"):
+                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
+                    raw_segments[idx + 1], workspace_root
+                ):
                     return True
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+                if b"a2a-" in unquoted_body:
+                    return True
+            else:
+                if isinstance(parsed, dict):
+                    for key in ("session_id", "sessionId", "gateway_session_key"):
+                        if key in parsed and parsed[key] is not None:
+                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
+                                parsed[key], workspace_root
+                            ):
+                                return True
         return False
 
     @staticmethod
@@ -10757,6 +10840,11 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
     AgentAPIProxyHandler.upstream_key = os.getenv(
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    AgentAPIProxyHandler.workspace_root = (
+        os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+        or os.getenv("HERMES_HOME")
+        or "/opt/data"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
     server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
