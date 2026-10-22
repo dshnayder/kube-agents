@@ -185,18 +185,19 @@ While Hindsight's observation synthesis works well for chat preferences and owne
 
 ### Architecture overview: two memory layers
 
-`kube-agents` separates fast-changing conversational facts from pull-request-governed infrastructure decisions:
+`kube-agents` separates **per-user personal memory** (`kube-agents-memory`) from **shared organizational, decision, and lesson memory** (`knowledge/` + `kube-agents-decisions`), so there is only one shared store for team rules and decisions:
 
-| Dimension                      | Layer 1: Conversational memory (`kube-agents-memory`)                                 | Layer 2: Decision and lesson memory (`knowledge/` + `kube-agents-decisions`)                                |
-| ------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **Primary source of truth**    | Hindsight PostgreSQL database (or `MEMORY.md` + `users/<id>.md` in `file` mode).      | GitOps repository `knowledge/decisions/*.md` and `knowledge/lessons/*.md` (versioned in Git).               |
-| **Role of Hindsight**          | Primary store using LLM fact extraction and background observation synthesis.         | Rebuildable semantic index using verbatim chunk mode (`retain_extraction_mode: chunks`).                    |
-| **What it stores**             | User preferences, personal scratch clusters, team ownership, and escalation contacts. | Architectural decisions (`DEC-*`), incident lessons (`LES-*`), PR provenance, and YAML/regex guards.        |
-| **How memories are written**   | Automatic personal capture in DMs; explicit `memory_retain(scope="shared")`.          | Pull requests generated from verified PR outcomes, 2-hour repo bootstrap, or explicit chat requests.        |
-| **How memories enter context** | Per-turn semantic prefetch injected into the user message sidecar (`api_content`).    | Deterministic file/resource matching during manifest drafting, PR submission (`submit-suggestion`), and CI. |
-| **How agents query on demand** | `memory_recall` and `memory_reflect` tools.                                           | `decision_memory.py why` and `check` CLI commands plus the read-only Hindsight MCP endpoint.                |
-| **How contradictions resolve** | Background observation consolidation and vector reranking.                            | Five deterministic precedence rules, explicit `supersedes` chains, and `status: active` filtering.          |
-| **Background maintenance**     | Optional TTL checkpoint curator (`memory_ttl_curator.py`).                            | Nightly `dream` job that checks guards against Git `HEAD`, flags drift, and refreshes summaries.            |
+| Dimension                      | Layer 1: Personal user memory (`kube-agents-memory`)                                  | Layer 2: Shared decision, convention, and lesson memory (`knowledge/` + `kube-agents-decisions`)                 |
+| ------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **Primary source of truth**    | Hindsight PostgreSQL database (or `users/<id>.md` in `file` mode).                    | GitOps repository `knowledge/decisions/*.md` and `knowledge/lessons/*.md` (versioned in Git).                    |
+| **Role of Hindsight**          | Primary store using LLM fact extraction and background observation synthesis.         | Rebuildable semantic index using verbatim chunk mode (`retain_extraction_mode: chunks`).                         |
+| **What it stores**             | Each engineer's private DM preferences, response verbosity, and scratch cluster name. | All shared team conventions, ownership rules, architectural decisions (`DEC-*`), incident lessons (`LES-*`), and guards. |
+| **Lifecycle states**           | Active per-user observations (`user:<id>`).                                           | Single `document_id` (`okf:<repo>:<id>`) transitioning in-place: `status:proposed` $\to$ `status:active` \| `status:rejected` \| `status:superseded`. |
+| **How memories are written**   | Automatic personal capture in DMs; explicit `memory_retain(scope="personal")`.        | Immediately indexed as `status:proposed` when a PR opens; upgraded to `status:active` on merge or `status:rejected` on close. |
+| **How memories enter context** | Per-turn semantic prefetch injected into the user message sidecar (`api_content`).    | Deterministic file/resource matching during manifest drafting, PR submission (`submit-suggestion`), and CI.      |
+| **How agents query on demand** | `memory_recall` and `memory_reflect` tools (`user:<id>`).                             | `curator why` / `check` CLI commands, NATS `a2a.topics.shared.decisions`, and read-only Hindsight MCP.           |
+| **How contradictions resolve** | Background observation consolidation per `user:<id>`.                                 | Five deterministic precedence rules, explicit `supersedes` chains, and `status:active` vs `status:proposed` filtering. |
+| **Background maintenance**     | Optional TTL checkpoint curator (`memory_ttl_curator.py`).                            | Go Curator / Dreamer (`a2a/cmd/curator`) checking guards against Git `HEAD`, flagging drift, and federating across clusters. |
 
 ### Shared database footprint and operational state boundary
 
@@ -469,47 +470,72 @@ Each frontmatter field serves a specific operational purpose:
 
 #### 1. How the agent learns across three core operational scenarios
 
-No agent or background job ever writes directly to the default branch or directly to the `kube-agents-decisions` Hindsight bank. Every Layer 2 write path opens a pull request against `knowledge/`. Only after a human merges that pull request does the Curator update the `kube-agents-decisions` bank and broadcast the update on NATS.
+All shared team rules, conventions, architectural decisions (`DEC-*`), and incident lessons (`LES-*`) live in a single shared memory bank (`kube-agents-decisions`) backed by the GitOps repository (`knowledge/`). Each shared record carries one deterministic `document_id` (`okf:<repo>:<id>`) and moves in-place through four lifecycle states (`status:proposed` $\to$ `status:active`, `status:rejected`, or `status:superseded`), eliminating any split-brain between chat and Git:
 
-The table below summarizes how the agent learns across the three primary operational scenarios:
-
-| Scenario | Example trigger | What happens immediately | How it becomes a durable, enforced rule |
+| Scenario | Example trigger | What happens immediately (`status:proposed`) | How it resolves when the PR is merged or rejected |
 | :--- | :--- | :--- | :--- |
-| **Scenario 1: Learning from chat** (e.g., in a group space someone says _"Let's not submit any infrastructure PRs on Friday"_) | An engineer states a team-wide convention, freeze, or ownership rule in a group chat or DM. | **Layer 1 (`kube-agents-memory`)**: The Chat Agent calls `memory_retain(scope="shared")` to store the rule under `scope:shared` and confirms in chat. Every subsequent chat turn and scheduled run recalls this rule immediately via `prefetch_all`. | **Layer 2 (`knowledge/decisions/DEC-*.md`)**: Because the rule governs GitOps pull requests, the Chat Agent also publishes a decision candidate to NATS (`a2a.topics.agent.chat.outcomes`) or offers to open a PR adding `DEC-YYYY-NNN.md` (for example, blocking Friday PR submissions on `clusters/**` and `infrastructure/**`). Once merged, `submit-suggestion` enforces the rule deterministically before `git push`. |
-| **Scenario 2: Learning from troubleshooting & monitoring** (e.g., a Cluster Agent detects an outage and submits a fix PR to the infra repo) | An event watcher, fleet audit check, or troubleshooting run diagnoses a cluster failure and opens a remediation PR. | The remediation PR includes a `Lesson draft` (`LES-YYYY-NNN.md`, `status: proposed`) scoping the affected workload and YAML path. After the PR merges (or is closed), post-merge verification checks Argo CD/Flux health, 24-hour event silence, and the fleet-audit ledger. | The Cluster Agent publishes the verified outcome (`resolved-merged`, `pr-merged-persists`, or `refused`) to NATS (`a2a.topics.agent.<profile>.outcomes`). The Go Curator synthesizes a verified `LES-*` record (or promotes a recurring multi-cluster pattern into a fleet-wide `DEC-*` rule), opens a `knowledge/` PR, indexes the merged record into Hindsight, and publishes `a2a.topics.shared.decisions`. |
-| **Scenario 3: Learning on Day-0 installation** (scanning an existing GitOps repo when the agent is first installed) | A GitOps repository is registered on a new installation and `knowledge/STATE_OF_BEING.md` does not yet exist. | The Go Curator automatically launches `bootstrap --since 2y --budget-minutes 120`. Stage 1 scans 2 years of commits, merged/closed PRs, review comments, and issues in $0\text{–}15\text{ min}$ with zero LLM calls, and Stage 2 prunes deleted workloads (`anachronistic`) and noise against `HEAD`. | Stage 3 uses concurrent goroutines to diff YAML/HCL ASTs, calls LiteLLM (`POST /v1/chat/completions`) to write OKF sections with exact PR/issue links, and verifies every candidate guard against `HEAD`. Stage 4 opens one onboarding PR (`STATE_OF_BEING.md` + `DEC-*`/`LES-*` files) and indexes the corpus into Hindsight within 2 hours of installation. |
+| **Scenario 1: Learning from chat** (e.g., in a group space someone says _"Let's not submit any infrastructure PRs on Friday"_) | An engineer states a team-wide convention, change freeze, or ownership rule in a group chat or DM. | The Chat Agent publishes the candidate decision to NATS (`a2a.topics.agent.chat.outcomes`). The Go Curator opens a PR adding `knowledge/decisions/DEC-2026-004.md` (`status: proposed`) and immediately indexes `document_id=okf:<repo>:DEC-2026-004` into `kube-agents-decisions` with tag **`status:proposed`** so agents warn users that the rule is awaiting review. | **Merged**: The Curator replaces `document_id=okf:<repo>:DEC-2026-004` in-place with tag **`status:active`**, and `submit-suggestion` blocks Friday PRs (`exit 2`).<br/>**Rejected (closed unmerged)**: The Curator replaces the same `document_id` in-place with **`status:rejected`** (recording the reviewer's reason), leaving zero stale rules behind. |
+| **Scenario 2: Learning from troubleshooting & monitoring** (e.g., a Cluster Agent detects an outage and submits a fix PR to the infra repo) | An event watcher, fleet audit check, or troubleshooting run diagnoses a cluster failure and opens a remediation PR. | The Cluster Agent opens the fix PR and publishes a proposed lesson (`status:proposed`) to `a2a.topics.agent.<profile>.outcomes`. The Go Curator indexes `LES-YYYY-NNN` as **`status:proposed`** in `kube-agents-decisions`. After the fix PR merges (or closes), post-merge verification checks Argo CD/Flux health, 24-hour event silence, and the fleet-audit ledger. | The Cluster Agent publishes the verified outcome (`resolved-merged`, `pr-merged-persists`, or `refused`) to NATS. The Go Curator synthesizes a verified `LES-*` record (or promotes a recurring $\ge 2$-cluster pattern into a fleet-wide `DEC-*` rule), opens a `knowledge/` PR, updates the `document_id` in-place to **`status:active`**, and broadcasts `a2a.topics.shared.decisions`. |
+| **Scenario 3: Learning on Day-0 installation** (scanning an existing GitOps repo when the agent is first installed) | A GitOps repository is registered on a new installation and `knowledge/STATE_OF_BEING.md` does not yet exist. | The Go Curator automatically launches `bootstrap --since 2y --budget-minutes 120`. Stage 1 scans 2 years of commits, merged/closed PRs, review comments, and issues in $0\text{–}15\text{ min}$ with zero LLM calls, and Stage 2 prunes deleted workloads (`anachronistic`) and noise against `HEAD`. | Stage 3 uses concurrent goroutines to diff YAML/HCL ASTs, calls LiteLLM (`POST /v1/chat/completions`) to write OKF sections with exact PR/issue links, and verifies every candidate guard against `HEAD`. Stage 4 opens one onboarding PR (`STATE_OF_BEING.md` + `DEC-*`/`LES-*` files) and indexes the corpus into `kube-agents-decisions` within 2 hours of installation. |
 
 ##### Path W1 — Learn automatically from troubleshooting, monitoring, and pull request outcomes
 
 ```mermaid
 sequenceDiagram
-  participant A as Cluster / Platform Agent
-  participant G as GitOps Repository
-  participant V as Verification Signals (Audit / Events / Argo CD)
-  participant N as NATS JetStream (TOPICS-JOURNAL & TOPICS-STATE)
-  participant C as Go Curator / Dreamer (a2a/cmd/curator)
-  participant H as Hindsight (kube-agents-decisions)
+  autonumber
+  participant Mon as Monitoring / Fleet Audit
+  participant ClA as Cluster Agent Profile
+  participant Git as GitOps Repo (Manifests & knowledge/)
+  participant NATS as NATS Bus (TOPICS-JOURNAL / STATE)
+  participant Cur as Go Curator / Dreamer (a2a/cmd/curator)
+  participant LLM as LiteLLM Gateway
+  participant HD as Hindsight (kube-agents-decisions)
 
-  A->>G: Open remediation PR (with proposed lesson draft)
-  Note over G: Human merges or closes PR
-  V-->>A: Verify outcome (resolved-merged | pr-merged-persists | refused)
-  A->>N: Publish outcome to a2a.topics.agent.<profile>.outcomes
-  N->>C: Deliver outcome event
-  C->>C: Synthesize OKF via LiteLLM + verify guard against HEAD + check multi-cluster recurrence
-  C->>G: Open PR for LES-YYYY-NNN.md (or promoted fleet-wide DEC-YYYY-NNN.md)
-  Note over G: Human merges knowledge/ PR
-  C->>H: Upsert verbatim chunk (document_id = okf:<repo>:<path>)
-  C->>N: Publish updated digest to a2a.topics.shared.decisions
+  Mon->>ClA: Alert / finding on cluster-eu-01 (e.g. Autopilot CPU mutation loop)
+  ClA->>ClA: Diagnose root cause & run `curator check` against active guards
+  ClA->>Git: Open fix PR #275 (requests.cpu: 400m)
+  ClA->>NATS: Publish proposed lesson (status:proposed, pr:275) to a2a.topics.agent.cluster-eu-01.outcomes
+  NATS->>Cur: Index LES-2026-019 as [status:proposed] in kube-agents-decisions
+
+  Note over Git: Human merges fix PR #275 (or closes unmerged)
+
+  rect rgb(255, 248, 235)
+    Note over Mon,ClA: Step 1 — Post-Merge Outcome Verification
+    Mon-->>ClA: Check Argo CD Synced+Healthy, 24h event silence, audit finding resolved
+    ClA->>NATS: Publish verified outcome (resolved-merged | pr-merged-persists | refused)
+  end
+
+  rect rgb(235, 245, 255)
+    Note over NATS,Git: Step 2 — Go Curator Synthesis & Cross-Cluster Federation
+    NATS->>Cur: Consume verified outcome
+    Cur->>LLM: 1-shot completion: synthesize OKF sections & candidate guard JSON
+    LLM-->>Cur: Structured OKF prose + guard.expect (requests.cpu >= 400m)
+    Cur->>Cur: Deterministically verify guard against Git HEAD
+
+    alt First cluster to hit this issue
+      Cur->>Git: Open PR to commit knowledge/lessons/LES-2026-019.md (status: active)
+    else >= 2 clusters hit the same check / YAML path
+      Cur->>Git: Open 1 fleet-wide PR: promote to DEC-2026-005 (clusters: ["*"])<br/>+ supersede per-cluster LES-* + consolidate shared skill
+    end
+  end
+
+  rect rgb(240, 252, 240)
+    Note over Git,HD: Step 3 — Replace `status:proposed` -> `status:active` & Broadcast
+    Note over Git: Human merges knowledge/ PR
+    Cur->>HD: Replace document_id in kube-agents-decisions with [status:active]
+    Cur->>NATS: Publish updated catalog to a2a.topics.shared.decisions
+    NATS-->>ClA: All Cluster & Platform Agents enforce guard (<5ms before git push)
+  end
 ```
 
-1. **Propose a lesson alongside the fix**: When a Cluster Agent or Platform Agent diagnoses an issue from monitoring alerts or fleet-audit findings and opens a remediation pull request, it includes a `Lesson draft` section in the PR description (or commits `knowledge/lessons/LES-YYYY-NNN.md` with `status: proposed`) so the human reviewer can approve both the manifest fix and the lesson in one review.
+1. **Propose a lesson alongside the fix**: When a Cluster Agent or Platform Agent diagnoses an issue from monitoring alerts or fleet-audit findings and opens a remediation pull request, it publishes a `status:proposed` lesson candidate to `a2a.topics.agent.<profile>.outcomes` (or includes the draft in the PR) so `kube-agents-decisions` immediately tracks the pending fix.
 2. **Verify post-merge resolution (`resolved-merged`)**: After a fix PR merges, the outcome recorder checks four deterministic signals (from strongest to weakest):
    - **Fleet audit verification**: `audit_report.py finish` confirms that the next complete audit run no longer reproduces the finding ([`fleet-audit-issue-ledger.md` §4](fleet-audit-issue-ledger.md#4-finding-lifecycle)).
    - **Cluster event silence**: `intercepted_events` records zero occurrences of the workload failure reason for $24\text{ hours}$ after merge.
    - **GitOps sync and health**: Argo CD or Flux reports `Synced` at or after the merge commit SHA and `Healthy`.
    - **Findings queue closure**: `findings_queue.py` confirms `pr_state=merged` and verifies that the finding has cleared.
 3. **Learn from failed or rejected fixes (`pr-merged-persists` and `refused`)**:
-   - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), the Curator drafts a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
+   - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), the Curator updates the `document_id` in `kube-agents-decisions` to a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
    - When the LiteLLM inference gateway is available (`LITELLM_BASE_URL`, `model.base_url` in `config.yaml`, or `--llm-url`, defaulting to `http://inference-gateway.<namespace>.svc.cluster.local/v1` with model `model-default`), `from-outcome` makes a single-shot OpenAI-compatible completion call to synthesize clean OKF sections (`What happened`, `What fixed it`, `How we know it worked`, `Prevent it next time`) and a candidate `guard` from unstructured PR descriptions and review comments, then deterministically verifies that the proposed guard passes against `HEAD` before writing the file.
 
 ##### Path W2 — Day-0 repository onboarding: bounded history bootstrap ("midterm" vs. multi-year)
@@ -533,17 +559,56 @@ Running `bootstrap --since 2y --budget-minutes 120` executes four stages:
 
 For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
 
-##### Path W3 — Learn from chat: team conventions (`scope:shared`) and Git-governed decisions (`DEC-*`)
+##### Path W3 — Learn from chat: `status:proposed` $\to$ `status:active` or `status:rejected` in `kube-agents-decisions`
 
-When an engineer states an operational rule in chat—for example, saying _"Let's not submit any infrastructure PRs on Friday"_ in a group channel—`kube-agents` captures the rule across both memory layers according to its scope:
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as Engineer (Group Chat)
+  participant CA as Chat Agent
+  participant NATS as NATS Bus (TOPICS-JOURNAL / STATE)
+  participant Cur as Go Curator (a2a/cmd/curator)
+  participant Git as GitOps Repo (knowledge/)
+  participant HD as Hindsight (kube-agents-decisions)
 
-1. **Immediate shared conversational memory (`Layer 1`, `kube-agents-memory`)**:
-   - In a group space, the session runs in state `unattributable-shared` (personal memory disabled, shared memory enabled).
-   - Following [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6, the Chat Agent recognizes the statement as a team-wide operational convention, calls `memory_retain(content="Change-freeze policy: do not submit or open infrastructure pull requests on Fridays.", scope="shared")`, and confirms in chat what it saved.
-   - Because every interactive session and unattended job prefetches `scope:shared` on every turn, all agents immediately recall this convention in conversation.
-2. **Deterministic GitOps enforcement (`Layer 2`, `knowledge/decisions/DEC-YYYY-NNN.md`)**:
-   - Prompt recall alone is advisory; to guarantee that no agent profile or automated job opens an infrastructure pull request on a Friday (or violates an architectural constraint stated in chat), the Chat Agent also offers to open a pull request adding `knowledge/decisions/DEC-YYYY-NNN.md` (or publishes a decision candidate to `a2a.topics.agent.chat.outcomes` for the Curator).
-   - Following `SOUL.md` §1.6, the agent displays the proposed `DEC-YYYY-NNN.md` record in chat before opening the pull request. Once merged, `submit-suggestion` and CI enforce the rule deterministically before `git push`.
+  U->>CA: "Let's not submit any infrastructure PRs on Friday"
+  CA->>NATS: Publish proposed decision to a2a.topics.agent.chat.outcomes
+  NATS->>Cur: Consume proposed decision
+
+  rect rgb(235, 245, 255)
+    Note over Cur,HD: Step 1 — Immediately Available as `status:proposed` + PR Opened
+    Cur->>Git: Open PR #280 adding knowledge/decisions/DEC-2026-004.md (status: proposed)
+    Cur->>HD: Upsert document_id=okf:<repo>:DEC-2026-004 with tag [status:proposed, pr:280]
+    Cur->>NATS: Publish digest to a2a.topics.shared.decisions
+    CA-->>U: "Recorded DEC-2026-004 as proposed and opened PR #280 for team review."
+  end
+
+  alt Reviewer MERGES PR #280
+    rect rgb(240, 252, 240)
+      Note over Cur,HD: Step 2a — Approved: In-Place Upgrade to `status:active` (Hard Guard)
+      Git-->>Cur: PR #280 merged
+      Cur->>HD: Replace document_id=okf:<repo>:DEC-2026-004 with tag [status:active]
+      Cur->>NATS: Publish updated active guard to a2a.topics.shared.decisions
+    end
+  else Reviewer CLOSES PR #280 Unmerged
+    rect rgb(255, 240, 240)
+      Note over Cur,HD: Step 2b — Rejected: In-Place Update to `status:rejected` (No Stale Rule)
+      Git-->>Cur: PR #280 closed unmerged ("EU clusters deploy on Fridays")
+      Cur->>HD: Replace document_id=okf:<repo>:DEC-2026-004 with tag [status:rejected] + reviewer reason
+      Cur->>NATS: Publish updated digest to a2a.topics.shared.decisions
+    end
+  end
+```
+
+When an engineer states a team-wide operational rule in chat—for example, saying _"Let's not submit any infrastructure PRs on Friday"_ in a group channel—`kube-agents` stores it in `kube-agents-decisions` with an explicit proposal lifecycle rather than writing a separate unreviewed copy into `kube-agents-memory`:
+
+1. **Immediate indexing as `status:proposed`**:
+   - The Chat Agent publishes the proposed rule to `a2a.topics.agent.chat.outcomes`.
+   - The Go Curator opens a pull request (`PR #280`) adding `knowledge/decisions/DEC-2026-004.md` (`status: proposed`) and immediately upserts `document_id = okf:<repo>:DEC-2026-004` into `kube-agents-decisions` with tags `["scope:shared", "kind:decision", "status:proposed", "pr:280"]`.
+   - While `PR #280` is open, any agent that queries `kube-agents-decisions` sees that `DEC-2026-004` is **`status:proposed` (awaiting review in PR #280)** and warns the user accordingly.
+2. **In-place resolution when the PR is merged or rejected (`update_mode: replace`)**:
+   - **If `PR #280` merges**: The Curator replaces `document_id = okf:<repo>:DEC-2026-004` in `kube-agents-decisions` with **`status:active`**, upgrading it from an advisory warning to a hard pre-submit `block` guard.
+   - **If `PR #280` is closed unmerged (`refused`)**: The Curator replaces the exact same `document_id = okf:<repo>:DEC-2026-004` in `kube-agents-decisions` with **`status:rejected`** and attaches the reviewer's closing rationale. Because `update_mode: replace` overwrites the `status:proposed` unit in place, no stale rule remains in memory.
 
 ##### Path W4 — Synchronize Git records into the Hindsight `kube-agents-decisions` bank
 
@@ -624,6 +689,14 @@ The federated learning loop runs in three steps over NATS:
 1. **Publish candidate lessons and skills to `TOPICS-JOURNAL` (`a2a.topics.agent.<profile>.outcomes`)**: When a Cluster Agent resolves a cluster-specific incident (`resolved-merged`), sees a fix fail post-merge (`pr-merged-persists`), has a PR rejected (`refused`), or discovers a reusable diagnostic pattern, it publishes a structured outcome artifact on its NATS outcome topic.
 2. **Central curation and fleet-wide graduation (`a2a/cmd/curator`)**: The Go Curator consumes outcome events across all clusters and runs Phase 5 policy graduation (`dream`). When two or more clusters report the same failure signature or guarded YAML path (for example, an Autopilot resource floor or a CoreDNS `ndots` regression), the Curator promotes the cluster-scoped `LES-*` records into a single fleet-wide `DEC-*` rule (`clusters: ["*"]`, `supersedes: [LES-...]`), consolidates the best diagnostic steps into one shared skill, and opens one fleet-wide pull request.
 3. **Index and broadcast to `TOPICS-STATE` (`a2a.topics.shared.decisions`)**: Once the curated record or skill merges, the Curator upserts the verbatim chunk into Hindsight (`kube-agents-decisions`) and publishes an updated catalog digest to `a2a.topics.shared.decisions` so every Cluster Agent and Platform Agent profile can read the latest fleet rules via `ReadTopicLatest` and enforce them immediately without rediscovering the issue on the remaining clusters.
+
+NATS JetStream topics, publishers, subscribers, and persistence used by the memory system (`spec.mode: next`, backed by the `40Gi` `data-platform-agent-a2a-nats-0` PVC in [`k8s-operator/internal/controller/platformagent_a2a_manifests.go`](../../k8s-operator/internal/controller/platformagent_a2a_manifests.go)):
+
+| NATS subject / KV bucket | JetStream stream & persistence (`--storage=file`) | Publisher | Subscriber / reader | Role in the memory architecture |
+| :--- | :--- | :--- | :--- | :--- |
+| `a2a.topics.agent.<profile>.outcomes` | **`TOPICS-JOURNAL`** (`--retention=limits`, `--max-age=720h` / 30d, `--max-bytes=5 GiB`, `--discard=old`) | Cluster Agents (`cluster-*`), Platform Agent (`platform`), Chat Agent (`chat`) | Go Curator (`a2a/cmd/curator`) via a durable JetStream consumer with explicit `Ack()` | **Append-only outcome journal**: Durably queues verified incident outcomes (`resolved-merged`, `pr-merged-persists`), PR review decisions (`approved`, `refused`), and chat rule proposals (`proposed`) so no learning event is lost if the Curator pod restarts. |
+| `a2a.topics.shared.decisions` | **`TOPICS-STATE`** (`--retention=limits`, `--max-msgs-per-subject=8`, `--max-bytes=1 GiB`, `--allow-direct`, no age expiry) | Go Curator (`a2a/cmd/curator`) | All Cluster Agent, Platform Agent, and Chat Agent profiles via `ReadTopicLatest` (`$JS.API.DIRECT.GET`) or watch | **Latest-state decision catalog digest**: Publishes the active Git `HEAD` commit SHA, active/proposed record counts, and latest graduated `DEC-*`/`LES-*` IDs so every agent profile sees updates in $O(1)$ without polling Git or Hindsight on every turn. |
+| `a2a.tasks.<agent>.<taskId>.in` & `KV_cap` (`cap.<taskId>`) | **`TASKS`** (`20 GiB` file store) & **`KV_cap`** (`256 MiB` file-backed KV bucket) | `a2a/gateway` (chat/webhook ingress) and calling agents | `hermes-bridge` sidecar on the target agent pod | **Authenticated user & audience propagation**: Carries `authority.requester.principal` (`hmac:<32-hex>`) and `authority.audience.kind` (`"dm"` \| `"group"`), verified against `KV_cap`, so `hermes-bridge` scopes Layer 1 personal memory (`kube-agents-memory`) to `user:<id>` in DMs and keeps group chats shared. |
 
 #### 5. Reference implementation: how `decision_memory.py` works
 
