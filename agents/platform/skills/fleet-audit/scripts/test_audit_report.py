@@ -29191,6 +29191,34 @@ class TestStoreLedger(HarnessTestCase):
         [create] = self.harness.forge_calls("proposal-create")
         self.assertNotIn("Part of #", create["body"])
 
+    def test_a_direct_ask_with_unreadable_capabilities_opens_the_fix(self):
+        """Review finding: with `capabilities` unreadable, `remediate` took the
+        forge path, learnt `labels: false` from the label refusal, and the
+        ledger lookup then refused the whole ask."""
+        self.touch(self.NETPOL)
+        path = self.write_findings(make_doc())
+        validated = audit_report.load_findings(path, AUDIT)
+        fid = validated["findings"][0]["id"]
+        Path(path).write_text(json.dumps(validated), encoding="utf-8")
+        self.new_process()
+        self.harness.failures["capabilities"] = 1
+        code = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid])
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(
+            self.stdout_json()["prs_opened"], ["https://forge.invalid/acme/fleet/pull-requests/8"]
+        )
+        self.assertEqual([], self.harness.forge_calls("issue-*"))
+
+    def test_the_ledger_lookup_refusal_names_start_as_the_remedy(self):
+        """Review finding: the refusal said the audit cannot run on such a
+        forge, which is no longer true: `start` keeps its ledger in the store."""
+        audit_report._LABELS[self.REPO] = False
+        with self.assertRaises(audit_report.GitHubLookupError) as caught:
+            audit_report.find_existing_issue(self.REPO, AUDIT)
+        message = str(caught.exception)
+        self.assertNotIn("cannot run this audit", message)
+        self.assertIn("`start`", message)
+
     # -- review findings: the memory as the forge path reads it -----------------
 
     B_PATH = "clusters/prod-us-east/b.yaml"

@@ -13607,8 +13607,9 @@ def find_existing_issue(
     if not forge_has_labels(repo):
         raise GitHubLookupError(
             f"the ledger for audit:{audit_id} in {repo} is found by its label, and "
-            "this forge has no labels, so the ledger cannot be kept on it; this "
-            "harness cannot run this audit against a repository on such a forge"
+            "this forge has no labels, so the ledger cannot be kept on it. Run "
+            "`start` again: it reads the forge's capabilities and keeps the ledger "
+            "of such a forge in the report store"
         )
     try:
         answer = forge(
@@ -18296,6 +18297,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
 
     issue_number = args.issue
+    if issue_number is None and on_forge and not forge_has_labels(repo):
+        # `capabilities` could not be read, and `ensure_labels` then learnt
+        # that the forge has no labels: no ledger issue can be found on it,
+        # so the fix opens with no ledger link, as on the store path.
+        log(
+            f"{repo} has no labels, so no ledger issue of audit:{audit_id} can be "
+            f"found on it; the {noun} opens with no ledger link."
+        )
+        on_forge = False
     if issue_number is None and on_forge:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
