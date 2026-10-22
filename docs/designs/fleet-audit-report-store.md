@@ -73,6 +73,19 @@ envelope in the ring that is not marked. A directory that holds only marked enve
 that no published run wrote, so the next run that reaches the repository seeds its memory once from
 the open ledger, as in §4.
 
+A repository on a forge with no issue tracker, or with issues and no labels, has no ledger issue
+([`version-control-support.md`](version-control-support.md#the-ledger-without-issues) §8), and the
+store is the ledger. Its run writes under the repository's own directory with `status:
+STORE_LEDGER`, `issue_number: null`, `ledger: store`, the PR URL lists of the fixes it opened, found
+and closed on the forge, and a `ledger_body`: the body the forge path would post, stored and never
+posted. The envelope is not marked, because the run published. The next run of that repository
+trusts it on its own, as the no-forge run trusts its own (its `status`, `repo` and `id_scheme`, then
+the ring), takes the delta from its `current_ids`, and reads the locations of the findings it
+carries from its `ledger_body`, so the clean-close guard of §4 has the same input as on the forge
+path. A clean run that does not close keeps the previous body and ids, with `ledger_held_open`
+true. The no-forge path and the forge path do not read it as a memory: its `status` is not
+`NO_FORGE`, and it names no issue.
+
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
@@ -286,6 +299,9 @@ returns one finding's prose. `checks` reaches `scope.clusters[].checks_run[]`, w
 ledger drops from its body with a notice pointing at the stored report. The reader is its own skill
 because skill selection runs off the description, and `fleet-audit`'s describes publishing; a
 question about a past run should not pull the publish procedure into context.
+
+A `STORE_LEDGER` envelope is read like any other: `streams`, `show` and the status view show its
+`status` and its PR URLs, and the agent gives those links where it would give the ledger URL.
 
 **The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and
