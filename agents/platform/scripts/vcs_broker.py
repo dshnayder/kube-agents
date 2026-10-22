@@ -268,11 +268,14 @@ def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceEr
     empty file -- so the credential is read first, and that case is
     FORGE_CREDENTIAL_UNAVAILABLE, not the forge's refusal.
     """
-    if not forge.git_refused or not _git_refused_credential(stderr):
+    # Read as an optional member: a caller may hand in any object with the
+    # forge's shape, and one without the member has no text of its own.
+    text = getattr(forge, "git_refused", "")
+    if not text or not _git_refused_credential(stderr):
         return None
     forge.credential.headers(repo)
     LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
-    return WorkspaceError(forge.git_refused, status=401, code="FORGE_UNAUTHENTICATED")
+    return WorkspaceError(text, status=401, code="FORGE_UNAUTHENTICATED")
 
 
 def _login_key(login: str) -> str:
