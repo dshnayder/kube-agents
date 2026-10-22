@@ -104,16 +104,26 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
-	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
-	// shell_sandbox_manifests.go the sandbox's claim at the same path.
+	// agentDataStorageSize is the default size of the agent's own /opt/data
+	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
+	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
+	// the one place that decides, and every reader of the size calls it.
 	//
-	// The two are one constant on purpose. sandbox_mirror.py copies a subset of
+	// The two claims share one value on purpose. sandbox_mirror.py copies a subset of
 	// the agent's volume into the sandbox's on upgrade, so destination >= source
 	// makes the copy fit by construction and there is nothing left for a byte
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
 	// 10Gi and the mirror needed a cap that silently truncated the migration on
 	// any install whose working directories were larger than the guess.
-	agentDataStorageSize = "10Gi"
+	//
+	// 50Gi holds a scope of a few hundred clusters at today's per-profile cost.
+	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
+	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
+	// board's SQLite then failed every write while the CR stayed Ready. On an
+	// existing install growDataClaim widens both claims to the resolved size,
+	// online, where the StorageClass allows expansion. install.defaults.env and
+	// the Terraform variable carry the same default, and a test pins them equal.
+	agentDataStorageSize = "50Gi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
@@ -634,7 +644,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -712,6 +722,26 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
 		add(gkeProjectEnvKey, harness.ProjectID)
 	}
+
+	// The stall watch's three knobs (spec.harness.stallWatch), pinned on every install and
+	// empty when the CR does not set them; stall_watch.py reads an empty value as its
+	// default. The watch is a cron script that inherits the gateway's environment after
+	// the PVC .env is applied, and each knob changes what it reads or when it alerts. Unpinned, one
+	// `STALL_WATCH_EXCLUDE_NAMESPACES=payments` line written by the agent would silence
+	// the alerts for a namespace nobody excluded; pinned, save_env_value refuses the keys
+	// and the CR stays the only answer. Not in the container env: one delivery path means
+	// one answer, as for the mode key.
+	var stallWatch agentv1alpha1.StallWatchSpec
+	if harness := agent.Spec.Harness; harness != nil && harness.StallWatch != nil {
+		stallWatch = *harness.StallWatch
+	}
+	stallWatchMinAge := ""
+	if stallWatch.MinStallAgeMinutes != nil {
+		stallWatchMinAge = strconv.FormatInt(int64(*stallWatch.MinStallAgeMinutes), 10)
+	}
+	add(stallWatchExcludeNamespacesEnvKey, strings.Join(stallWatch.ExcludeNamespaces, stallWatchListSeparator))
+	add(stallWatchMinAgeEnvKey, stallWatchMinAge)
+	add(stallWatchKindsEnvKey, strings.Join(stallWatch.Kinds, stallWatchListSeparator))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -976,9 +1006,11 @@ const (
 	scopeFileName   = "scope.json"
 
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
-	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
-	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
-	// by design; a third code site naming this key is a review comment.
+	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
+	// boundary is in force, for the platform MCP server's fleet_scope tool, the
+	// upgrade-readiness-watch and sa-role-watch jobs and the onboarding inventory
+	// scan (bootstrap_scan_gate.py). Two modules spell the key, by design; other code
+	// reads it only through their constants, and a third spelling is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
@@ -986,6 +1018,14 @@ const (
 	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
 	// container and pinned in the managed .env (see renderManagedEnv).
 	gkeProjectEnvKey = "GKE_PROJECT_ID"
+	// stallWatchExcludeNamespacesEnvKey, stallWatchMinAgeEnvKey and stallWatchKindsEnvKey
+	// carry spec.harness.stallWatch to stall_watch.py. They are pinned in the managed .env
+	// only (see renderManagedEnv), and the script names the same keys.
+	stallWatchExcludeNamespacesEnvKey = "STALL_WATCH_EXCLUDE_NAMESPACES"
+	stallWatchMinAgeEnvKey            = "STALL_WATCH_MIN_AGE_MINUTES"
+	stallWatchKindsEnvKey             = "STALL_WATCH_KINDS"
+	// stallWatchListSeparator joins a list field into one env value; the script splits on it.
+	stallWatchListSeparator = ","
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -1684,6 +1724,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 			if host := resolved.GitHubHost(); host != agentv1alpha1.DefaultGitHubHost {
 				data[gitopsStateGitHubHostKey] = host
 			}
+			if repo, ok := declaredGitOpsRepo(agent); ok && repo != "" {
+				data[gitopsStateGitOpsRepoKey] = repo
+			}
 			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
 				gitopsStateManagedReposKey: managed,
 				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
@@ -2138,11 +2181,23 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+					corev1.ResourceStorage: ResolveDataStorageSize(agent),
 				},
 			},
 		},
 	}
+}
+
+// ResolveDataStorageSize is the size of the agent's data claim and of the
+// sandbox's data claim: spec.storage.size when it is set and above zero, and
+// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// or less, but the chart ships the webhook off; the fallback keeps such a CR on
+// the default rather than on a claim the API server refuses to create.
+func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	if storage := agent.Spec.Storage; storage != nil && storage.Size != nil && storage.Size.Sign() > 0 {
+		return storage.Size.DeepCopy()
+	}
+	return resource.MustParse(agentDataStorageSize)
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
