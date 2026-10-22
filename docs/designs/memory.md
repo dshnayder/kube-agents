@@ -198,6 +198,38 @@ While Hindsight's observation synthesis works well for chat preferences and owne
 | **How contradictions resolve** | Background observation consolidation and vector reranking.                            | Five deterministic precedence rules, explicit `supersedes` chains, and `status: active` filtering.          |
 | **Background maintenance**     | Optional TTL checkpoint curator (`memory_ttl_curator.py`).                            | Nightly `dream` job that checks guards against Git `HEAD`, flags drift, and refreshes summaries.            |
 
+### Shared database footprint and operational state boundary
+
+An enterprise fleet platform tracks two different classes of state:
+
+1. **Operational state and observability cache**: Mutable cluster inventory, profile assignments, scan checkpoints, and open findings that back the NATS event bus and the Web UI so agents do not repeat `kubectl` queries across thousands of clusters.
+2. **Long-term conversational and decision memory**: Durable user preferences, team ownership (`kube-agents-memory`), and pull-request-governed architectural decisions and incident lessons (`knowledge/` + `kube-agents-decisions`).
+
+To avoid deploying separate database engines for each subsystem, `kube-agents` consolidates all in-cluster relational and vector state into **one PostgreSQL deployment** alongside the GitOps repository:
+
+| State domain                                     | Authoritative store                                   | PostgreSQL schema / index                                     | NATS bus integration (`spec.mode: next`)                                                                                  |
+| ------------------------------------------------ | ----------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Operational state & observability cache**      | In-cluster PostgreSQL                                 | `ops_state` schema (clusters, scan checkpoints, findings)     | Cluster and scanner profiles publish scan deltas and checkpoint updates on NATS; the Web UI reads from `ops_state`.       |
+| **Layer 1: Conversational memory**               | In-cluster PostgreSQL (`hindsight` mode) or local PVC | `hindsight` schema (`kube-agents-memory` bank, `pgvector`)    | `a2a/gateway` and `hermes-bridge` propagate verified caller identity (`user_id`, `chat_type`) on NATS task envelopes.     |
+| **Layer 2: Architectural decisions & lessons**   | GitOps repository (`knowledge/decisions/`, `lessons/`) | `hindsight` schema (`kube-agents-decisions` bank, `pgvector`) | Outcome and `dream` profiles subscribe to PR/audit outcomes on NATS and broadcast newly indexed rules and curated skills. |
+
+### Storage sizing and cost model at enterprise scale
+
+Decision and lesson memory stores curated architectural rules and deduplicated incident lessons rather than raw pod logs or per-poll telemetry. When an issue recurs across hundreds of clusters, federated learning (Phase 5 of `dream`) consolidates the pattern into one fleet-wide `DEC-*` record (`clusters: ["*"]`) instead of writing a separate copy per cluster. As a result, storage grows sub-linearly with cluster and workload count:
+
+- **Per-record size in Git**: One OKF Markdown file (`DEC-*` or `LES-*`) averages **$2.5\text{ KB}$** ($40\text{–}70$ lines of YAML frontmatter and prose).
+- **Per-record size in PostgreSQL (`pgvector`)**: One verbatim chunk unit (384-dimensional `float32` embedding, HNSW graph links, metadata, and text) plus one conversational observation averages **$3.5\text{ KB}$** including index overhead.
+
+| Fleet tier                                              | Clusters | Workloads | Active + historical OKF records | Conversational memory units | Git repository size (`knowledge/`) | PostgreSQL `pgvector` size (data + HNSW index) | Fits in default `8Gi` PVC? |
+| ------------------------------------------------------- | -------: | --------: | ------------------------------: | --------------------------: | ---------------------------------: | ---------------------------------------------: | -------------------------- |
+| **Small / Evaluation**                                  |       10 |       200 |                             250 |                       1,500 |                   $\approx 0.6\text{ MiB}$ |                               $\approx 6\text{ MiB}$ | Yes ($< 0.1\%$)            |
+| **Medium Enterprise**                                   |       50 |     3,000 |                           1,500 |                      10,000 |                   $\approx 3.8\text{ MiB}$ |                              $\approx 40\text{ MiB}$ | Yes ($0.5\%$)              |
+| **Large Enterprise**                                    |    1,000 |     5,000 |                           5,000 |                      50,000 |                  $\approx 12.5\text{ MiB}$ |                             $\approx 195\text{ MiB}$ | Yes ($2.4\%$)              |
+| **Hyperscale Fleet**                                    |   10,000 |    25,000 |                          15,000 |                     150,000 |                  $\approx 37.5\text{ MiB}$ |                             $\approx 580\text{ MiB}$ | Yes ($7.1\%$)              |
+| **Maximum Target Scale**                                |   30,000 |    60,000 |                          35,000 |                     350,000 |                  $\approx 87.5\text{ MiB}$ |                            $\approx 1.35\text{ GiB}$ | Yes ($16.9\%$)             |
+
+Even at **30,000 clusters and 60,000 workloads**, the entire Git knowledge base stays under **$90\text{ MiB}$** and the PostgreSQL `pgvector` index stays under **$1.4\text{ GiB}$**—fitting inside the default $8\text{ GiB}$ PersistentVolumeClaim with zero external cloud logging or vector-database billing.
+
 ---
 
 ### Layer 1 — Conversational memory (`kube-agents-memory` and `multiuser_memory`)
@@ -485,7 +517,7 @@ Running `decision_memory.py bootstrap --since 2y --budget-minutes 120` executes 
 | **3. Hybrid guard & record synthesis** | $30\text{–}90\text{ min}$  | Diffs pre-revert and post-revert YAML/HCL ASTs to infer `guard.expect` rules, calls the LiteLLM inference gateway to synthesize clean OKF descriptions and fallback guards from unstructured PR/issue text, verifies every candidate guard against `HEAD`, and writes `DEC-YYYY-NNN.md` and `LES-YYYY-NNN.md` files. | Scoped decision and lesson files with verifiable PR and issue links.          |
 | **4. Baseline "State of Being" PR**    | $90\text{–}120\text{ min}$ | Opens a single onboarding pull request containing `knowledge/STATE_OF_BEING.md` (fleet summary, active guards, superseded policies, and uncovered areas) plus the initial `knowledge/decisions/` and `lessons/` files.                                                                                               | Day-one institutional memory ready for team review within 2 hours.            |
 
-For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
+For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. When a GitOps repository is registered for the first time and `knowledge/STATE_OF_BEING.md` does not yet exist, the onboarding workflow triggers `decision_memory.py bootstrap --since 2y --budget-minutes 120` automatically so the team gets historical coverage within 2 hours of installation. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
 
 ##### Path W3 — Capture explicit architectural decisions from chat
 
@@ -550,6 +582,14 @@ A scheduled job runs `decision_memory.py dream` nightly (and after merges to `kn
 | **6. Coverage scan**        | Finds recent commits to governed paths (`clusters/`, `apps/`, `base/`, `infrastructure/`, `manifests/`) that have no governing record, plus `decision-override` merges. | No        | Queues uncovered commits for harvesting and proposes supersession for overrides. |
 | **7. Summary refresh**      | Refreshes tag-scoped Hindsight summary views (`[scope:shared, kind:decision, area:<name>]`).                                                                            | Yes       | Keeps human-readable area overviews up to date.                                  |
 | **8. Dream report**         | Posts a summary to the platform chat space only when `at_risk`, `conflicts`, `obsolete`, `recurrences`, or `uncovered_changes` are non-empty (`silent: true` if clean). | No        | Zero chat noise on clean nights; immediate alert when drift occurs.              |
+
+##### Cross-cluster federated learning and NATS bus curation (`spec.mode: next`)
+
+In a multi-cluster fleet running `spec.mode: next`, Cluster Agent profiles operate in parallel across clusters and communicate over the NATS bus without depending on Kanban or Hermes:
+
+1. **Publish candidate lessons and skills to NATS**: When a Cluster Agent resolves a cluster-specific incident or discovers a reusable diagnostic pattern, it publishes a structured outcome event (`resolved-merged`, `pr-merged-persists`, or `refused`) and any candidate skill update onto the NATS bus.
+2. **Central curation and fleet-wide graduation**: The Dreamer/Curator profile consumes outcome events across all clusters and runs Phase 5 policy graduation (`decision_memory.py dream`). When two or more clusters report the same failure signature or guarded YAML path (for example, an Autopilot resource floor or a CoreDNS `ndots` regression), the curator promotes the cluster-scoped `LES-*` records into a single fleet-wide `DEC-*` rule (`clusters: ["*"]`) or consolidates the best diagnostic steps into one shared skill, and opens one fleet-wide pull request.
+3. **Broadcast back to all profiles**: Once the curated record or skill merges and `decision_memory.py index` updates Hindsight, the curator publishes a memory-refresh event on NATS so every Cluster Agent and Platform Agent profile immediately enforces the lesson without rediscovering the issue on the remaining clusters.
 
 #### 5. Reference implementation: how `decision_memory.py` works
 
