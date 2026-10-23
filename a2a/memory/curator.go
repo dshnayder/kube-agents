@@ -1121,12 +1121,6 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	backend := "okf-local"
 	var results []HindsightRecallResult
 	var hsErr error
-	if c.cfg.Hindsight != nil && strings.TrimSpace(req.Query) != "" {
-		backend = "hindsight"
-		hsCtx, hsCancel := context.WithTimeout(ctx, 12*time.Second)
-		results, hsErr = c.cfg.Hindsight.Recall(hsCtx, req.Query, tags, tagsMatch)
-		hsCancel()
-	}
 
 	c.mu.Lock()
 	records, _ := LoadRecords(c.cfg.RepoDir)
@@ -1218,6 +1212,16 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		fallbackResults = append(fallbackResults, s.result)
 	}
 
+	// Only call Hindsight HTTP recall when local OKF records have no direct match
+	// (or when no local records exist), keeping common-case NATS recall under 50ms
+	// and well below Hermes MemoryManager's 8.0s prefetch timeout.
+	if c.cfg.Hindsight != nil && strings.TrimSpace(req.Query) != "" && len(fallbackResults) == 0 {
+		backend = "hindsight"
+		hsCtx, hsCancel := context.WithTimeout(ctx, 4*time.Second)
+		results, hsErr = c.cfg.Hindsight.Recall(hsCtx, req.Query, tags, tagsMatch)
+		hsCancel()
+	}
+
 	if len(fallbackResults) > 0 {
 		seenID := map[string]bool{}
 		merged := make([]HindsightRecallResult, 0, len(fallbackResults)+len(results))
@@ -1235,7 +1239,9 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 			merged = append(merged, hr)
 		}
 		results = merged
-		if c.cfg.Hindsight == nil {
+		if c.cfg.Hindsight != nil {
+			backend = "hindsight"
+		} else {
 			backend = "okf-local"
 		}
 	}
