@@ -14950,6 +14950,26 @@ class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
             [derived_id()],
         )
 
+    def test_a_scheduled_gap_run_counts_a_not_re_checked_row_as_published(self):
+        """A row under _Not re-checked this run_ is on the ledger. So a
+        scheduled run does not report it as dropped under a gap or as gone
+        since the last scheduled run, also after an on-demand gap run."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        both = make_doc(findings=[make_finding(), self.stage_finding()])
+        self.assertEqual(self.run_finish(both, scheduled=True), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap, scheduled=False), 0, self.err)
+        for _ in range(2):
+            self.assertEqual(self.run_finish(gap, scheduled=True), 0, self.err)
+            out = self.stdout_json()
+            self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+            self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
+            self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+        # The gap is not news on the second scheduled run, and nothing else moved.
+        self.assertTrue(out["silent_ok"])
+
     def run_tiers_across_two_gap_runs(self, *tiers):
         """A gap run, a second gap run and a complete run, with the held span forced to a lower tier.
 
@@ -28919,6 +28939,20 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=[make_finding()]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
 
+    def test_a_scheduled_gap_run_counts_a_not_re_checked_id_as_published(self):
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        self.finish(make_doc(findings=[make_finding(), stage]), scheduled=True)
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        skipped = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+        gap = make_doc(findings=[make_finding()], clusters=[prod], skipped=skipped)
+        self.finish(gap, scheduled=False)
+        for _ in range(2):
+            out = self.finish(gap, scheduled=True)
+            latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+            self.assertIn(stage_id, latest[audit_report.SCHEDULED_PUBLISHED_IDS_KEY])
+            self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+
     def test_a_run_with_no_repository_chosen_keeps_no_rechecked_ids_and_drops_none(self):
         # The diverted run has no previous record, so it keeps nothing as not
         # re-checked. Its envelope is marked, so the next true no-forge run
@@ -31853,6 +31887,18 @@ class TestStoreLedger(HarnessTestCase):
         # The next full run that sees it again does not call it new.
         both = self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]))
         self.assertEqual((both["new"], both["resolved"]), (0, 0))
+
+    def test_a_scheduled_store_ledger_gap_run_counts_a_not_re_checked_row_as_published(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]), scheduled=True)
+        self.run_once(self.gap_doc([make_finding()]))
+        for _ in range(2):
+            out = self.run_once(self.gap_doc([make_finding()]), scheduled=True)
+            self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.latest()["ledger_body"]))
+            self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
+            self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+            self.assertIn(self.stage_id(), self.latest()[audit_report.SCHEDULED_PUBLISHED_IDS_KEY])
 
     def test_a_store_ledger_gap_run_caps_not_re_checked_ids_and_says_so(self):
         self.claim()
