@@ -954,8 +954,12 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	repoID := c.cfg.RepoID
 	c.mu.Unlock()
 
-	var matchedDigests []BlueprintRecordDigest
-	var fallbackResults []HindsightRecallResult
+	type scoredMatch struct {
+		score  int
+		digest BlueprintRecordDigest
+		result HindsightRecallResult
+	}
+	var scored []scoredMatch
 	qLower := strings.ToLower(strings.TrimSpace(req.Query))
 	for _, r := range records {
 		recTags := r.Tags()
@@ -969,38 +973,82 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 			continue
 		}
 		rendered := r.RenderForIndex()
-		if qLower != "" && !recordMatchesQueryText(rendered, qLower) {
-			continue
+		score := 1
+		if qLower != "" {
+			score = scoreRecordQueryMatch(r, rendered, qLower)
+			if score <= 0 {
+				continue
+			}
 		}
 		var guardRule string
 		if r.Meta.Guard != nil {
 			guardRule = r.Meta.Guard.Rule
 		}
-		matchedDigests = append(matchedDigests, BlueprintRecordDigest{
-			ID:             r.Meta.ID,
-			Type:           r.Meta.Type,
-			Status:         r.Meta.Status,
-			Title:          r.Meta.Title,
-			Path:           r.Path,
-			Clusters:       r.Meta.Scope.Clusters,
-			Checks:         r.Meta.Scope.Checks,
-			Paths:          r.Meta.Scope.Paths,
-			GuardRule:      guardRule,
-			PullRequest:    r.Meta.Evidence.PullRequest,
-			ReviewerReason: r.Meta.Evidence.ReviewerReason,
-			Supersedes:     r.Meta.Supersedes,
-			SupersededBy:   r.Meta.SupersededBy,
-		})
-		fallbackResults = append(fallbackResults, HindsightRecallResult{
-			ID:         r.Meta.ID,
-			DocumentID: r.DocumentID(repoID),
-			Text:       rendered,
-			Tags:       recTags,
+		scored = append(scored, scoredMatch{
+			score: score,
+			digest: BlueprintRecordDigest{
+				ID:             r.Meta.ID,
+				Type:           r.Meta.Type,
+				Status:         r.Meta.Status,
+				Title:          r.Meta.Title,
+				Path:           r.Path,
+				Clusters:       r.Meta.Scope.Clusters,
+				Checks:         r.Meta.Scope.Checks,
+				Paths:          r.Meta.Scope.Paths,
+				GuardRule:      guardRule,
+				PullRequest:    r.Meta.Evidence.PullRequest,
+				ReviewerReason: r.Meta.Evidence.ReviewerReason,
+				Supersedes:     r.Meta.Supersedes,
+				SupersededBy:   r.Meta.SupersededBy,
+			},
+			result: HindsightRecallResult{
+				ID:         r.Meta.ID,
+				DocumentID: r.DocumentID(repoID),
+				Text:       rendered,
+				Tags:       recTags,
+			},
 		})
 	}
 
-	if len(results) == 0 && len(fallbackResults) > 0 {
-		results = fallbackResults
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return scored[i].digest.ID < scored[j].digest.ID
+	})
+
+	maxRecs := req.MaxResults
+	if maxRecs <= 0 {
+		maxRecs = 8
+	}
+	if len(scored) > maxRecs {
+		scored = scored[:maxRecs]
+	}
+
+	var matchedDigests []BlueprintRecordDigest
+	var fallbackResults []HindsightRecallResult
+	for _, s := range scored {
+		matchedDigests = append(matchedDigests, s.digest)
+		fallbackResults = append(fallbackResults, s.result)
+	}
+
+	if len(fallbackResults) > 0 {
+		seenID := map[string]bool{}
+		merged := make([]HindsightRecallResult, 0, len(fallbackResults)+len(results))
+		for _, fb := range fallbackResults {
+			seenID[fb.ID] = true
+			if fb.DocumentID != "" {
+				seenID[fb.DocumentID] = true
+			}
+			merged = append(merged, fb)
+		}
+		for _, hr := range results {
+			if (hr.ID != "" && seenID[hr.ID]) || (hr.DocumentID != "" && seenID[hr.DocumentID]) {
+				continue
+			}
+			merged = append(merged, hr)
+		}
+		results = merged
 		if c.cfg.Hindsight == nil {
 			backend = "okf-local"
 		}
@@ -1113,20 +1161,96 @@ func matchesAnyPathGlob(patterns []string, target string) bool {
 	return false
 }
 
-func recordMatchesQueryText(rendered, qLower string) bool {
-	lowerText := strings.ToLower(rendered)
-	if strings.Contains(lowerText, qLower) {
-		return true
-	}
-	terms := strings.Fields(qLower)
-	if len(terms) == 0 {
-		return true
-	}
-	matched := 0
-	for _, t := range terms {
-		if len(t) <= 2 || strings.Contains(lowerText, t) {
-			matched++
+var queryStopwords = map[string]bool{
+	"a": true, "about": true, "after": true, "against": true, "all": true,
+	"allowed": true, "an": true, "and": true, "any": true, "are": true,
+	"as": true, "at": true, "be": true, "because": true, "been": true,
+	"before": true, "between": true, "both": true, "but": true, "by": true,
+	"can": true, "change": true, "changes": true, "check": true, "could": true,
+	"decide": true, "decided": true, "decision": true, "decisions": true,
+	"did": true, "do": true, "does": true, "for": true, "from": true,
+	"get": true, "got": true, "had": true, "has": true, "have": true,
+	"how": true, "if": true, "in": true, "into": true, "is": true,
+	"it": true, "its": true, "know": true, "learn": true, "learned": true,
+	"lesson": true, "lessons": true, "make": true, "may": true, "me": true,
+	"memory": true, "might": true, "must": true, "my": true, "need": true,
+	"no": true, "not": true, "of": true, "on": true, "or": true,
+	"our": true, "out": true, "over": true, "policy": true, "pr": true,
+	"prs": true, "question": true, "recall": true, "record": true,
+	"records": true, "remember": true, "rule": true, "rules": true,
+	"set": true, "should": true, "so": true, "some": true, "still": true,
+	"such": true, "team": true, "tell": true, "than": true, "that": true,
+	"the": true, "their": true, "them": true, "then": true, "there": true,
+	"these": true, "they": true, "this": true, "those": true, "through": true,
+	"to": true, "under": true, "up": true, "us": true, "use": true,
+	"used": true, "using": true, "was": true, "we": true, "were": true,
+	"what": true, "when": true, "where": true, "which": true, "while": true,
+	"who": true, "why": true, "will": true, "with": true, "would": true,
+	"you": true, "your": true,
+}
+
+func tokenizeQueryTerms(qLower string) []string {
+	rawTokens := strings.FieldsFunc(qLower, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_')
+	})
+	seen := map[string]bool{}
+	var keep []string
+	for _, tok := range rawTokens {
+		tok = strings.Trim(tok, "-_")
+		if len(tok) <= 1 || queryStopwords[tok] {
+			continue
+		}
+		if !seen[tok] {
+			seen[tok] = true
+			keep = append(keep, tok)
 		}
 	}
-	return matched*2 >= len(terms)
+	return keep
+}
+
+func termMatchesText(lowerText, term string) bool {
+	if strings.Contains(lowerText, term) {
+		return true
+	}
+	if len(term) > 3 && strings.HasSuffix(term, "s") {
+		stem := strings.TrimSuffix(term, "s")
+		if strings.Contains(lowerText, stem) {
+			return true
+		}
+	}
+	return false
+}
+
+func scoreRecordQueryMatch(r Record, rendered, qLower string) int {
+	lowerText := strings.ToLower(rendered)
+	lowerTitle := strings.ToLower(r.Meta.Title + " " + r.Meta.ID)
+	if strings.Contains(lowerText, qLower) {
+		return 100
+	}
+	terms := tokenizeQueryTerms(qLower)
+	if len(terms) == 0 {
+		return 1
+	}
+	matched := 0
+	score := 0
+	for _, t := range terms {
+		if termMatchesText(lowerText, t) {
+			matched++
+			score += 10
+			if termMatchesText(lowerTitle, t) {
+				score += 5
+			}
+		}
+	}
+	if matched == 0 {
+		return 0
+	}
+	if len(terms) >= 3 && matched*3 < len(terms) {
+		return 0
+	}
+	return score
+}
+
+func recordMatchesQueryText(rendered, qLower string) bool {
+	return scoreRecordQueryMatch(Record{}, rendered, qLower) > 0
 }

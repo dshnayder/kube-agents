@@ -224,13 +224,14 @@ type BlueprintDigest struct {
 // MemoryQueryRequest is the NATS request payload sent to SubjectMemoryQuery
 // (or SubjectMemoryQueryPublic) to query the semantic memory layer over NATS.
 type MemoryQueryRequest struct {
-	Schema    string   `json:"schema,omitempty"`
-	Query     string   `json:"query"`
-	Bank      string   `json:"bank,omitempty"`
-	Tags      []string `json:"tags,omitempty"`
-	TagsMatch string   `json:"tags_match,omitempty"`
-	Path      string   `json:"path,omitempty"`
-	Cluster   string   `json:"cluster,omitempty"`
+	Schema     string   `json:"schema,omitempty"`
+	Query      string   `json:"query"`
+	Bank       string   `json:"bank,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
+	TagsMatch  string   `json:"tags_match,omitempty"`
+	Path       string   `json:"path,omitempty"`
+	Cluster    string   `json:"cluster,omitempty"`
+	MaxResults int      `json:"max_results,omitempty"`
 }
 
 // MemoryQueryResponse is the NATS reply payload returned by the Curator's
