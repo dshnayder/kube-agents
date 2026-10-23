@@ -493,9 +493,9 @@ sequenceDiagram
   participant HD as Hindsight (kube-agents-decisions)
 
   Mon->>ClA: Alert / finding on cluster-eu-01 (e.g. Autopilot CPU mutation loop)
-  ClA->>ClA: Read-only diagnosis; return RCA + proposed patch on a2a.tasks.<cluster>.<taskId>.events
-  ClA->>PlA: Task `result` artifact (RCA + proposed manifest patch)
-  PlA->>Git: Run `curator check` & open fix PR #275 (requests.cpu: 400m)
+  ClA->>ClA: Read-only diagnosis and return RCA + proposed patch on a2a.tasks.<cluster>.<taskId>.events
+  ClA->>PlA: Task result artifact (RCA + proposed manifest patch)
+  PlA->>Git: Run curator check and open fix PR #275 (requests.cpu: 400m)
   PlA->>NATS: Publish proposed lesson (status:proposed, pr:275) to a2a.topics.shared.annotations
   NATS->>Cur: Index LES-2026-019 as [status:proposed] in kube-agents-decisions
 
@@ -508,21 +508,21 @@ sequenceDiagram
   end
 
   rect rgb(235, 245, 255)
-    Note over NATS,Git: Step 2 — Go Curator Synthesis & Cross-Cluster Federation
+    Note over NATS,Git: Step 2 — Go Curator Synthesis and Cross-Cluster Federation
     NATS->>Cur: Consume verified outcome from TOPICS-JOURNAL
-    Cur->>LLM: 1-shot completion: synthesize OKF sections & candidate guard JSON
+    Cur->>LLM: 1-shot completion: synthesize OKF sections and candidate guard JSON
     LLM-->>Cur: Structured OKF prose + guard.expect (requests.cpu >= 400m)
     Cur->>Cur: Deterministically verify guard against Git HEAD
 
     alt First cluster to hit this issue
       Cur->>Git: Open PR to commit knowledge/lessons/LES-2026-019.md (status: active)
     else >= 2 clusters hit the same check / YAML path
-      Cur->>Git: Open 1 fleet-wide PR: promote to DEC-2026-005 (clusters: ["*"])<br/>+ supersede per-cluster LES-* + consolidate shared skill
+      Cur->>Git: Open 1 fleet-wide PR: promote to DEC-2026-005 (clusters: ["*"]), supersede per-cluster LES-*, and consolidate shared skill
     end
   end
 
   rect rgb(240, 252, 240)
-    Note over Git,HD: Step 3 — Replace `status:proposed` -> `status:active` & Broadcast
+    Note over Git,HD: Step 3 — Replace status:proposed -> status:active and Broadcast
     Note over Git: Human merges knowledge/ PR
     Cur->>HD: Replace document_id in kube-agents-decisions with [status:active]
     Cur->>NATS: Publish updated catalog digest to a2a.topics.shared.blueprint
