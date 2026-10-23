@@ -1249,7 +1249,8 @@ The channel hears only scheduled runs, so a scheduled run measures "did anything
 the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
 last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
 it withheld, and the held ids, or for a clean run that left the body untouched, the ids that body
-still lists; with no forge, its findings and the held ids, which are the ids it
+still lists; with the ledger in the report store, the same ids as with a ledger, and no value when
+it held a ledger it could not read; with no forge, its findings and the held ids, which are the ids it
 stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
@@ -1265,8 +1266,8 @@ run on the open ledger, because `new` and `resolved` then say the change. An id 
 gap, on this run or an earlier one (`reported_under_gap`), is not counted as resolved, and when
 every id that moved left under a gap the key is absent: "0 new, 0 resolved" is not why the run
 speaks. An id that an on-demand run resolved with full coverage is counted as resolved, also on a
-scheduled run with a gap. A run with full coverage clears `reported_under_gap`, with a ledger and
-with no forge, so an id that it resolved is not counted as one that left under a gap.
+scheduled run with a gap. A run with full coverage clears `reported_under_gap`, with a ledger, with
+the ledger in the report store, and with no forge, so an id that it resolved is not counted as one that left under a gap.
 `new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
 that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
 published and that an on-demand run dropped since then is in `unreported_under_gap` only when it

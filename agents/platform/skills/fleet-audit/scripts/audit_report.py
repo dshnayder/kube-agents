@@ -19608,6 +19608,7 @@ def _finish_store_ledger(
     earlier: dict | None,
     noun: str,
     timers: Callable[[], dict],
+    scheduled: bool = False,
 ) -> None:
     """Keep the ledger in the report store and chat, and open the fixes on the forge.
 
@@ -19633,6 +19634,10 @@ def _finish_store_ledger(
     - The JSON line, the envelope and the chat summary carry the links. The
       envelope is published memory, not a marked one: the next run of this
       repository reads it, and the readers of the store show it.
+    - Only a scheduled run (`scheduled`) can be silent, as on the forge path.
+      The memory is also where the last scheduled run's baseline is read
+      from: the store is the only copy of this ledger, as the issue is on
+      the forge path when it is open.
     """
     repo = decision.repo
     findings = list(data["findings"])
@@ -19721,7 +19726,9 @@ def _finish_store_ledger(
         )
         gaps = [*gaps, gap]
         log(f"COVERAGE GAP: {gap}")
-    coverage_moved = coverage_changed(gaps, memory)
+    # A scheduled run compares with the last scheduled run's gaps, because the
+    # channel hears only scheduled runs (`coverage_changed`).
+    coverage_moved = coverage_changed(gaps, memory, scheduled=scheduled)
     # A clean run with complete coverage closes stale fixes only when every
     # finding the stored ledger carries under a check that ran again is
     # explained: the clean-close guard of the forge path, on the stored body.
@@ -19773,15 +19780,71 @@ def _finish_store_ledger(
         else []
     )
     published_ids = held_exclude | set(held)
-    already_reported = {
-        str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
-    } - published_ids
-    unreported_under_gap = (
-        sorted(set(previous_ids) - published_ids - already_reported)
-        if gaps and not stale_scheme
-        else []
+    # The last scheduled run's baseline, read as the forge path reads it with
+    # an open ledger: from the memory. A first run (no memory, and it is
+    # known) has a baseline with no ids. A lost memory shows no baseline, so
+    # a scheduled run speaks.
+    scheduled_memory = memory if memory else ({} if delta_known else None)
+    scheduled_ids = scheduled_published_baseline(scheduled_memory)
+    # As on the forge path, an id stays under `reported_under_gap` until a run
+    # publishes it again or a run with full coverage does not find it.
+    if gaps or stale_scheme:
+        already_reported = {
+            str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
+        } - published_ids
+        scheduled_reported = scheduled_reported_baseline(memory) - published_ids
+    else:
+        already_reported, scheduled_reported = set(), set()
+    # A scheduled run speaks when its ids are not the last scheduled run's, so
+    # a change that an on-demand run saw first still reaches the channel.
+    ids_moved = scheduled and (
+        scheduled_ids is None
+        or (
+            not stale_scheme
+            and published_ids != set(scheduled_ids) - scheduled_reported
+        )
     )
+    if scheduled:
+        # An id that the last scheduled run published and that an on-demand
+        # run dropped under a gap since then is still news to the channel.
+        dropped_since = set(previous_ids) | (set(scheduled_ids or []) & already_reported)
+        unreported_under_gap = (
+            sorted(dropped_since - published_ids - scheduled_reported)
+            if gaps and not stale_scheme
+            else []
+        )
+    else:
+        unreported_under_gap = (
+            sorted(set(previous_ids) - published_ids - already_reported)
+            if gaps and not stale_scheme
+            else []
+        )
     reported_under_gap = sorted(already_reported | set(unreported_under_gap))
+    next_scheduled_reported = (
+        sorted(scheduled_reported | set(unreported_under_gap))
+        if scheduled
+        else sorted(scheduled_reported)
+    )
+    # A clean run that holds the stored ledger still publishes the ids that
+    # the ledger carries, so a scheduled run stores those as its baseline,
+    # with what it published. Over a lost memory it holds a ledger it cannot
+    # read, so no baseline is known, and the next scheduled run speaks.
+    if scheduled and held_open and not delta_known:
+        next_scheduled_ids = None
+    elif scheduled and held_open:
+        next_scheduled_ids = sorted(set(stored_ids) | published_ids)
+    else:
+        next_scheduled_ids = next_scheduled_value(scheduled, published_ids, scheduled_ids)
+    # The change since the last scheduled run, for the JSON line and the chat
+    # summary, when `new` and `resolved` do not say it. An id that left under
+    # a gap is not resolved; the `unreported_under_gap` key names it.
+    since_scheduled = since_last_scheduled(
+        ids_moved,
+        scheduled_memory,
+        scheduled_ids,
+        published_ids,
+        not_resolved=reported_under_gap if gaps else (),
+    )
 
     pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, remediation_prs)
     claimed, _pr_urls = claimed_prs(pr_by_finding)
@@ -19928,6 +19991,26 @@ def _finish_store_ledger(
 
     reported_new = len(new_ids)
     reported_resolved = len(resolved_ids)
+    # The forge path's rule: nothing is wrong with the repository, so a
+    # scheduled run with nothing new stays silent. A lost memory, a delta, a
+    # change since the last scheduled run, a new or changed gap, a finding no
+    # longer reported under a gap, a fix opened or closed, an unaccounted
+    # finding, or the collector speaking is news. A run the store does not
+    # hold is never silent (below). Only a scheduled run can be silent, but
+    # an on-demand run that would have been quiet is no news (`silent_floor`).
+    quiet = not (
+        not delta_known
+        or ids_moved
+        or reported_new
+        or reported_resolved
+        or coverage_moved
+        or unreported_under_gap
+        or prs_opened
+        or prs_closed
+        or unaccounted
+        or collector_speaks
+        or listing_refusal
+    )
     payload = {
         "status": STORE_LEDGER_STATUS,
         "issue_url": None,
@@ -19936,24 +20019,7 @@ def _finish_store_ledger(
         "prs_opened": prs_opened,
         "prs_still_open": prs_still_open,
         "prs_closed": prs_closed,
-        # The forge path's rule: nothing is wrong with the repository, so a
-        # scheduled run with nothing new stays silent. A lost memory, a delta,
-        # a new or changed gap, a finding no longer reported under a gap, a
-        # fix opened or closed, an unaccounted finding, or the collector
-        # speaking is news. A run the store does not hold is never silent
-        # (below).
-        "silent_ok": not (
-            not delta_known
-            or reported_new
-            or reported_resolved
-            or coverage_moved
-            or unreported_under_gap
-            or prs_opened
-            or prs_closed
-            or unaccounted
-            or collector_speaks
-            or listing_refusal
-        ),
+        "silent_ok": scheduled and quiet,
         "partial": bool(gaps),
         "coverage_gaps": gaps,
         "declared": len(declared),
@@ -19961,6 +20027,7 @@ def _finish_store_ledger(
         UNACCOUNTED_KEY: unaccounted_ids,
         **({REMEDIATION_REFUSED_KEY: listing_refusal} if listing_refusal else {}),
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
+        **since_scheduled,
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
@@ -19969,7 +20036,12 @@ def _finish_store_ledger(
     }
     apply_earlier_finish(payload, earlier)
     save_chat_verdict(
-        audit_id, repo, payload["silent_ok"], [], now, news=not payload["silent_ok"]
+        audit_id,
+        repo,
+        payload["silent_ok"],
+        [],
+        now,
+        news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
     )
     envelope = report_envelope(
         audit_id,
@@ -19986,6 +20058,10 @@ def _finish_store_ledger(
         ledger_held_open=held_open,
         delta_known=delta_known,
         reported_under_gap=reported_under_gap,
+        scheduled=scheduled,
+        scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
+        scheduled_published_ids=next_scheduled_ids,
+        scheduled_reported_under_gap=next_scheduled_reported,
     )
     envelope[LEDGER_KEY] = LEDGER_STORE
     if listing_refusal:
@@ -20006,6 +20082,7 @@ def _finish_store_ledger(
         held,
         note,
         len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
+        since_scheduled=since_scheduled_line(payload, delta_known),
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,
@@ -20448,6 +20525,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             earlier=earlier,
             noun=noun,
             timers=timer_payload,
+            scheduled=scheduled,
         )
         return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(

@@ -29922,17 +29922,20 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
         return self.stdout_json()
 
-    def finish(self, doc):
+    def finish(self, doc, scheduled=False):
         path = audit_report.findings_path_for(AUDIT)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(doc), encoding="utf-8")
         self.new_process()
-        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path]
+            + (["--scheduled"] if scheduled else [])
+        )
         return code
 
-    def run_once(self, doc):
+    def run_once(self, doc, scheduled=False):
         self.start()
-        self.assertEqual(self.finish(doc), 0, self.err)
+        self.assertEqual(self.finish(doc, scheduled=scheduled), 0, self.err)
         return self.stdout_json()
 
     def latest(self):
@@ -30212,19 +30215,88 @@ class TestStoreLedger(HarnessTestCase):
         self.claim()
         self.touch(self.NETPOL)
         doc = make_doc()
-        first = self.run_once(doc)
+        first = self.run_once(doc, scheduled=True)
         self.assertFalse(first["silent_ok"])
         self.assertEqual(first["new"], 1)
         validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
         self.harness.replies["proposal-list"] = {
             "proposals": [self.open_proposal(8, validated)], "truncated": False,
         }
-        second = self.run_once(doc)
+        second = self.run_once(doc, scheduled=True)
         self.assertEqual((second["new"], second["resolved"]), (0, 0))
         self.assertEqual(second["prs_opened"], [])
         self.assertEqual(second["prs_still_open"], ["https://forge.invalid/acme/fleet/pull-requests/8"])
         self.assertTrue(second["silent_ok"])
         self.assertEqual(1, len(self.harness.forge_calls("proposal-create")))
+
+
+    # -- only a scheduled run is silent --------------------------------------------
+
+    def two_runs_with_nothing_new(self, scheduled):
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        self.run_once(doc, scheduled=True)
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        self.harness.replies["proposal-list"] = {
+            "proposals": [self.open_proposal(8, validated)], "truncated": False,
+        }
+        return self.run_once(doc, scheduled=scheduled)
+
+    def test_an_on_demand_store_ledger_run_is_never_silent(self):
+        out = self.two_runs_with_nothing_new(scheduled=False)
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertEqual(out["prs_opened"], [])
+        self.assertFalse(out["silent_ok"])
+        latest = self.latest()
+        self.assertIs(latest[audit_report.RUN_SCHEDULED_KEY], False)
+        # An on-demand run copies the last scheduled run's baseline forward.
+        self.assertEqual(latest[audit_report.SCHEDULED_PUBLISHED_IDS_KEY], latest["current_ids"])
+        # It reported nothing new, so it is no news for a later `finish`.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        [part] = [p for p in record["parts"] if p.get("repo") == self.REPO]
+        self.assertIs(part[audit_report.CHAT_REPORT_NEWS_KEY], False)
+
+    def test_a_scheduled_store_ledger_run_with_nothing_new_is_silent(self):
+        out = self.two_runs_with_nothing_new(scheduled=True)
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertTrue(out["silent_ok"])
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+        latest = self.latest()
+        self.assertIs(latest[audit_report.RUN_SCHEDULED_KEY], True)
+        self.assertEqual(latest[audit_report.SCHEDULED_PUBLISHED_IDS_KEY], latest["current_ids"])
+        self.assertEqual(latest[audit_report.SCHEDULED_COVERAGE_GAPS_KEY], [])
+        self.assertEqual(latest[audit_report.SCHEDULED_REPORTED_UNDER_GAP_KEY], [])
+
+    def test_a_store_ledger_run_speaks_on_a_change_an_on_demand_run_saw_first(self):
+        """An on-demand run resolves the finding. The next scheduled run
+        counts 0 resolved against it, but the channel did not hear the
+        resolve, so the scheduled run speaks and names it."""
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        self.run_once(doc, scheduled=True)
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        finding = validated["findings"][0]
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [
+            {**{k: finding[k] for k in ("check", "cluster", "namespace", "object")},
+             "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+        ]
+        on_demand = self.run_once(clean)
+        self.assertEqual(on_demand["resolved"], 1)
+        self.assertFalse(on_demand["silent_ok"])
+        scheduled = self.run_once(make_doc(findings=[]), scheduled=True)
+        self.assertEqual((scheduled["new"], scheduled["resolved"]), (0, 0))
+        self.assertFalse(scheduled["silent_ok"])
+        self.assertEqual(
+            scheduled[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [finding["id"]]}
+        )
+        self.assertIn(finding["id"], scheduled["summary"])
+        self.assertEqual(self.latest()[audit_report.SCHEDULED_PUBLISHED_IDS_KEY], [])
+        # The channel has now heard it: the next scheduled run is silent.
+        again = self.run_once(make_doc(findings=[]), scheduled=True)
+        self.assertTrue(again["silent_ok"])
 
     def test_a_clean_run_closes_the_stale_fix_by_its_description_marker(self):
         self.claim()
@@ -30474,11 +30546,11 @@ class TestStoreLedger(HarnessTestCase):
         """Review finding: with a trusted memory and nothing else moved, only
         the refused listing stops `silent_ok`, and no test held it."""
         self.claim()
-        first = self.run_once(make_doc(findings=[]))
+        first = self.run_once(make_doc(findings=[]), scheduled=True)
         self.assertTrue(first["silent_ok"], first)
         self.start()
         self.harness.failures["proposal-list"] = 1
-        self.assertEqual(self.finish(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.finish(make_doc(findings=[]), scheduled=True), 0, self.err)
         out = self.stdout_json()
         self.assertIn("could not list remediation", out[audit_report.REMEDIATION_REFUSED_KEY])
         self.assertEqual(out["coverage_gaps"], [])
@@ -30626,7 +30698,7 @@ class TestStoreLedger(HarnessTestCase):
         envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
         self.assertTrue(known)
         self.assertFalse(envelope["ledger_held_open"])
-        second = self.run_once(make_doc(findings=[]))
+        second = self.run_once(make_doc(findings=[]), scheduled=True)
         self.assertTrue(second["silent_ok"])
 
     def test_only_diverted_envelopes_with_an_open_fix_stay_lost_until_a_findings_run(self):
@@ -30701,6 +30773,34 @@ class TestStoreLedger(HarnessTestCase):
         envelope, known = audit_report.previous_store_ledger(AUDIT, self.REPO)
         self.assertTrue(known)
         self.assertEqual(envelope["current_ids"], published["current_ids"])
+
+    def test_a_diverted_envelope_is_never_the_scheduled_baseline(self):
+        """A diverted `latest.json` that says a scheduled run published
+        nothing is not read: the baseline is the published run's, so a
+        scheduled run with nothing new stays silent."""
+        self.claim()
+        self.touch(self.NETPOL)
+        doc = make_doc()
+        self.run_once(doc, scheduled=True)
+        published = self.latest()
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        self.harness.replies["proposal-list"] = {
+            "proposals": [self.open_proposal(8, validated)], "truncated": False,
+        }
+        (self.store_dir() / "latest.json").write_text(json.dumps({
+            "status": audit_report.NO_FORGE_STATUS, "repo": self.REPO,
+            "id_scheme": audit_report.ID_SCHEME, "current_ids": [],
+            audit_report.RUN_SCHEDULED_KEY: True,
+            audit_report.SCHEDULED_PUBLISHED_IDS_KEY: [],
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": self.REPO, "reason": "r"},
+        }), encoding="utf-8")
+        self.assertEqual(
+            audit_report.newest_stored_record(AUDIT, self.REPO)[audit_report.SCHEDULED_PUBLISHED_IDS_KEY],
+            published[audit_report.SCHEDULED_PUBLISHED_IDS_KEY],
+        )
+        out = self.run_once(doc, scheduled=True)
+        self.assertNotIn(audit_report.SINCE_SCHEDULED_KEY, out)
+        self.assertTrue(out["silent_ok"])
 
     def test_a_held_finding_stays_on_the_stored_ledger_and_in_the_next_start(self):
         """Review finding: the held finding was in `current_ids` but not in

@@ -234,7 +234,10 @@ follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
   silent. A previous finding the collector
   still flags is held on the stored ledger, and the next `start` lists it in `carried`.
 - `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
-  run with nothing new is silent. A run the store does not hold is never silent.
+  run with nothing new is silent, and an on-demand run is never silent. The stored ledger keeps the
+  findings of the last scheduled run (`scheduled_published_ids`), so a change that an on-demand run
+  saw first still makes the next scheduled run speak, with `since_last_scheduled` on the JSON line
+  and in `summary`. A run the store does not hold is never silent.
 - If the store lost the previous ledger, a clean run closes no pull request, and its
   `coverage_gaps` says why. The store loses it when its last write failed, or when its record cannot
   be read. A store that does not exist, or that holds only records of runs that could not reach the
