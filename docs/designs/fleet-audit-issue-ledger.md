@@ -1305,10 +1305,10 @@ flag then reports, and does not go silent.
 The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
 the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
 last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
-it withheld, and the held ids, or for a clean run that left the body untouched, the ids that body
-still lists; with the ledger in the report store, the same ids as with a ledger, and no value when
-it held a ledger it could not read; with no forge, its findings and the held ids, which are the ids it
-stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+it withheld, the held ids and the ids under _Not re-checked this run_, or for a clean run that left
+the body untouched, the ids that body still lists; with the ledger in the report store, the same ids
+as with a ledger, and no value when it held a ledger it could not read; with no forge, its findings,
+the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
