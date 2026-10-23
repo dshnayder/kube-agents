@@ -1061,6 +1061,9 @@ CAPABILITY_VERBS_KEY = "verbs"
 CAPABILITY_LABELS_KEY = "labels"
 # The broker's refusal of a label field on a forge with no labels.
 LABELS_UNSUPPORTED_CODE = "LABELS_UNSUPPORTED"
+# The JSON line's and the envelope's key for why a store-ledger run could not
+# list its remediation proposals, and so ran with remediation off.
+REMEDIATION_REFUSED_KEY = "remediation_refused"
 
 # What a remediation is called when the forge's own noun cannot be read. Every
 # GitHub repository is spoken of this way; a GitLab one as a "merge request".
@@ -18604,8 +18607,9 @@ def render_no_forge_summary(
 
     A run whose ledger is in the store and whose fixes open on the forge also
     passes `prs`, its JSON line, for the links to the remediation proposals it
-    opened, found waiting and closed, and `unaccounted`, the previous findings
-    that keep its ledger open.
+    opened, found waiting and closed, and the refusal of their listing
+    (`REMEDIATION_REFUSED_KEY`), and `unaccounted`, the previous findings that
+    keep its ledger open.
     """
     findings = list(data.get("findings") or [])
     clusters = len((data.get("scope") or {}).get("clusters") or [])
@@ -18657,6 +18661,12 @@ def render_no_forge_summary(
         urls = [str(url) for url in (prs or {}).get(key) or []]
         if urls:
             lines.append(f"{label}: " + ", ".join(urls))
+    refusal = (prs or {}).get(REMEDIATION_REFUSED_KEY)
+    if refusal:
+        lines.append(
+            "No fix was opened, updated or closed, because the remediation proposals "
+            f"could not be listed: {redact_secrets(str(refusal))}"
+        )
     unaccounted = list(unaccounted)
     if unaccounted:
         lines.append(
@@ -18836,6 +18846,8 @@ class _FixPlan(NamedTuple):
     unlinked_paths: frozenset[str]
     file_url: str | None
     file_ref: str
+    # Why the listing refused, when the caller let it (`listing_may_refuse`).
+    listing_refusal: str | None = None
 
 
 def _plan_remediation_files(
@@ -18852,6 +18864,7 @@ def _plan_remediation_files(
     promised: dict[str, str],
     degraded: list[str],
     unlisted: list[str],
+    listing_may_refuse: bool = False,
 ) -> _FixPlan:
     """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
 
@@ -18859,9 +18872,22 @@ def _plan_remediation_files(
     and the store ledger's. Lists the stream's proposals, refuses a fix the
     sweep would open and the worker did not write (`unwritten_refusal_message`),
     writes the fixes `finish` derives itself, and closes `probe`.
+
+    With `listing_may_refuse`, a refused listing does not stop the run: the
+    plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
+    and no unwritten-fix refusal, because no fix can be told to exist. The
+    store ledger asks for this: its store write is the only record of the run.
     """
-    remediation_prs = list_remediation_prs(repo, audit_id)
-    sweep_on = auto_promotion_enabled()
+    listing_refusal = None
+    try:
+        remediation_prs = list_remediation_prs(repo, audit_id)
+    except GitHubLookupError as exc:
+        if not listing_may_refuse:
+            raise
+        listing_refusal = str(exc)
+        log(f"WARNING: {listing_refusal}; this run opens, syncs and closes no proposal.")
+        remediation_prs = []
+    sweep_on = auto_promotion_enabled() and listing_refusal is None
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -18876,7 +18902,7 @@ def _plan_remediation_files(
     # one is refused, planned and written the same, and opened only on request.
     unwritten = without_refused_paths(
         unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
-        if findings
+        if findings and listing_refusal is None
         else {},
         degraded,
         promised,
@@ -18928,7 +18954,7 @@ def _plan_remediation_files(
         )
     finally:
         probe.close()
-    return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref)
+    return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 
 def _finish_store_ledger(
@@ -18988,15 +19014,20 @@ def _finish_store_ledger(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted,
+        listing_may_refuse=True,
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
+    # A refused listing leaves the fixes unknown: this run opens, syncs and
+    # closes none, and its store write still keeps the findings.
+    listing_refusal = fix_plan.listing_refusal
 
     # The store is the only copy of this ledger, so an absent one is a first
     # run only when no fix of this stream is open (`_store_ledger_envelope`).
     memory, delta_known = previous_store_ledger(
         audit_id,
         repo,
-        open_fix=any(str(pr.get("state") or "").upper() == "OPEN" for pr in remediation_prs),
+        open_fix=listing_refusal is not None
+        or any(str(pr.get("state") or "").upper() == "OPEN" for pr in remediation_prs),
     )
     previous_ids = [str(fid) for fid in (memory or {}).get("current_ids") or []]
     previous_body = str((memory or {}).get("ledger_body") or "")
@@ -19154,7 +19185,7 @@ def _finish_store_ledger(
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation {noun}; not replacing it.")
-    if findings:
+    if findings and listing_refusal is None:
         sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
         comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
 
@@ -19162,7 +19193,9 @@ def _finish_store_ledger(
     # coverage gap, and not over a previous finding this run left unexplained,
     # except the shield's close, which rests on the declaration.
     hold_closes = bool(gaps or unaccounted)
-    if hold_closes and not shielded_namespaces:
+    if listing_refusal is not None:
+        prs_closed = []
+    elif hold_closes and not shielded_namespaces:
         prs_closed: list[str] = []
         log(
             f"No remediation {noun} was closed as stale: coverage is partial or a "
@@ -19194,7 +19227,7 @@ def _finish_store_ledger(
         repo,
         audit_id,
         findings,
-        plan.promote,
+        plan.promote if listing_refusal is None else [],
         pr_by_finding,
         root=root,
         issue_number=None,
@@ -19292,12 +19325,14 @@ def _finish_store_ledger(
             or prs_closed
             or unaccounted
             or collector_speaks
+            or listing_refusal
         ),
         "partial": bool(gaps),
         "coverage_gaps": gaps,
         "declared": len(declared),
         POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
         UNACCOUNTED_KEY: unaccounted_ids,
+        **({REMEDIATION_REFUSED_KEY: listing_refusal} if listing_refusal else {}),
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
@@ -19324,6 +19359,8 @@ def _finish_store_ledger(
         reported_under_gap=reported_under_gap,
     )
     envelope[LEDGER_KEY] = LEDGER_STORE
+    if listing_refusal:
+        envelope[REMEDIATION_REFUSED_KEY] = listing_refusal
     stored = write_report(audit_id, envelope, now, ledger_unchanged=held_open)
     note = store_ledger_note(decision, stored=stored, noun=noun)
     payload[LEDGER_NOTE_KEY] = note

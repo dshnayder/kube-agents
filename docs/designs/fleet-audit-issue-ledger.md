@@ -562,7 +562,10 @@ with the same cap and switch, through the label-free paths on a forge with no la
 ledger and reads no `/remediate` comment: a person asks in chat, and `remediate` opens the fix with
 no ledger link. A clean run closes a stale pull request only over complete coverage and with every
 finding of the stored ledger accounted for, as step 5 requires: a finding that the collector still
-flags is not accounted for, whatever `resolved_because` says. The previous ledger is read as the
+flags is not accounted for, whatever `resolved_because` says. A refused listing of the remediation
+pull requests (the scan cap of a forge with no labels, or an unknown login) does not stop the run:
+the store is its only record, so it stores the findings, opens, syncs and closes no pull request,
+and names the refusal under `remediation_refused` in its JSON line, its envelope and its summary. The previous ledger is read as the
 forge path reads the stored body of the issue, with no issue to check it against
 ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2): the held set and the carried held
 rows come from its body, a body from an earlier identity scheme is re-spelled and withholds

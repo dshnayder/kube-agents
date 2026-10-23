@@ -219,7 +219,11 @@ follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
   previous such run, `prs_opened`, `prs_still_open`, `prs_closed`, `unaccounted`, `findings`,
   `critical`, `"ledger": "store"`, the `ledger_note`, and `summary`. A clean run closes a stale pull
   request only when coverage is complete and every finding the stored ledger carries is reported or
-  explained under `resolved_because` and not still flagged by the collector, as with a ledger issue. A previous finding the collector
+  explained under `resolved_because` and not still flagged by the collector, as with a ledger issue.
+  If the forge refuses the listing of the remediation pull requests (too many pull requests in the
+  repository, or an unknown login), `finish` still stores the findings, opens, updates and closes
+  no pull request, and says why in `remediation_refused` and in `summary`. Such a run is never
+  silent. A previous finding the collector
   still flags is held on the stored ledger, and the next `start` lists it in `carried`.
 - `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
   run with nothing new is silent. A run the store does not hold is never silent.

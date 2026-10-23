@@ -29219,6 +29219,40 @@ class TestStoreLedger(HarnessTestCase):
         self.assertNotIn("cannot run this audit", message)
         self.assertIn("`start`", message)
 
+    def test_a_refused_proposal_listing_still_stores_the_findings(self):
+        """Review finding: a refused listing at `finish` (the scan cap, or an
+        unknown login) failed the run before its store write, so a repository
+        with too many pull requests lost its findings on every run. The run
+        now stores them with remediation off and says why."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.start()
+        self.harness.failures["proposal-list"] = 1
+        self.assertEqual(self.finish(make_doc()), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual(out["prs_closed"], [])
+        self.assertIn("could not list remediation", out[audit_report.REMEDIATION_REFUSED_KEY])
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual([], self.harness.forge_calls("proposal-create"))
+        self.assertIn("could not list remediation", out["summary"])
+        latest = self.latest()
+        self.assertEqual(len(latest["current_ids"]), 1)
+        self.assertIn("could not list remediation", latest[audit_report.REMEDIATION_REFUSED_KEY])
+
+    def test_a_clean_run_with_a_refused_listing_closes_nothing_and_trusts_no_absent_store(self):
+        """With the listing refused, no fix can be known to be closed, and a
+        store with no ledger cannot be read as a first run."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.start()
+        self.harness.failures["proposal-list"] = 1
+        self.assertEqual(self.finish(make_doc(findings=[])), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["prs_closed"], [])
+        self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
     # -- review findings: the memory as the forge path reads it -----------------
 
     B_PATH = "clusters/prod-us-east/b.yaml"
