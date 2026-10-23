@@ -2528,6 +2528,31 @@ class SubnetsListedMarkTest(unittest.TestCase):
         # The Pod range still gets its own subnet entry, measured on the Pod range alone.
         self.assertIn("host/us-central1/shared", by_name)
 
+    # A cluster on a host subnet that GKE reported no Pod-range utilization for.
+    @staticmethod
+    def unreported_cluster():
+        return {"name": "c", "location": "us-central1",
+                "networkConfig": {"subnetwork": "projects/host/regions/us-central1/subnetworks/shared"},
+                "ipAllocationPolicy": {"clusterSecondaryRangeName": "pods"}}
+
+    def test_a_service_project_cluster_on_an_unmeasured_host_subnet_without_utilization_gets_no_mark(self):
+        # The cluster names its subnet, so the subnet is known to be in use
+        # even though no Pod-range report names it.
+        manifest, by_name = self.fleet({"svc": project_answers(**{
+            "subnets list": [], "clusters list": [self.unreported_cluster()], "instances list": []})})
+        self.assertNotIn(self.KEY, by_name["project/svc"])
+        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_a_service_project_cluster_on_a_measured_host_subnet_without_utilization_is_marked(self):
+        manifest, by_name = self.fleet({
+            "host": project_answers(**{"subnets list": [subnet("shared", "10.0.0.0/24", project="host")]}),
+            "svc": project_answers(**{"subnets list": [], "clusters list": [self.unreported_cluster()],
+                                      "instances list": []}),
+        })
+        self.assertEqual(by_name["project/svc"][self.KEY], 0)
+        self.assertIn("host/us-central1/shared", by_name)
+        self.assertEqual(self.gaps(manifest), [])
+
     def test_a_project_entry_that_is_not_collected_gets_no_mark(self):
         failed = {"name": "project/p1", "project": "p1", "location": "global",
                   "outcome": networking_audit.OUTCOME_GATE_FAILED, "error": "PERMISSION_DENIED"}

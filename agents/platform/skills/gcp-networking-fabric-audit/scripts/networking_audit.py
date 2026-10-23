@@ -622,6 +622,41 @@ def _prefix(value: object) -> int | None:
     return prefix if prefix is not None and 0 <= prefix <= IPV4_BITS else None
 
 
+def cluster_default_subnet(cluster: dict, pools: list, project_id: str) -> tuple[str, str, str] | None:
+    """The (project, region, subnet) key of a cluster's default subnet, or None if it names none.
+
+    `networkConfig.subnetwork` is the full link; without it, a node pool link
+    with the same name as the bare `subnetwork` field gives the owner, and the
+    bare name alone falls back to `project_id`.
+    """
+    bare_subnet = cluster.get("subnetwork", "")
+    default_subnet = subnet_key((cluster.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+    if default_subnet is None:
+        for pool in pools:
+            pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+            if pool_subnet and pool_subnet[2] == bare_subnet:
+                return pool_subnet
+    if default_subnet is None and bare_subnet:
+        default_subnet = (project_id, region_of_location(cluster.get("location", "")), bare_subnet)
+    return default_subnet
+
+
+def cluster_subnets(cluster: dict, project_id: str) -> set[tuple[str, str, str]]:
+    """Every (project, region, subnet) key a cluster's listing names: its default subnet and each node pool's.
+
+    The listing names the subnet whether or not GKE reported a Pod-range
+    utilization on it.
+    """
+    pools = [p for p in cluster.get("nodePools") or [] if isinstance(p, dict)]
+    default_subnet = cluster_default_subnet(cluster, pools, project_id)
+    keys = {default_subnet} if default_subnet else set()
+    for pool in pools:
+        pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+        if pool_subnet:
+            keys.add(pool_subnet)
+    return keys
+
+
 def pod_range_utilization(
     clusters: list, project_id: str, ranges: dict | None = None
 ) -> dict[tuple[str, str, str, str], dict]:
@@ -668,16 +703,7 @@ def pod_range_utilization(
         name = cluster.get("name", "")
         policy = cluster.get("ipAllocationPolicy") or {}
         pools = [p for p in cluster.get("nodePools") or [] if isinstance(p, dict)]
-        bare_subnet = cluster.get("subnetwork", "")
-        default_subnet = subnet_key((cluster.get("networkConfig") or {}).get("subnetwork", ""), project_id)
-        if default_subnet is None:
-            for pool in pools:
-                pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
-                if pool_subnet and pool_subnet[2] == bare_subnet:
-                    default_subnet = pool_subnet
-                    break
-        if default_subnet is None and bare_subnet:
-            default_subnet = (project_id, region_of_location(cluster.get("location", "")), bare_subnet)
+        default_subnet = cluster_default_subnet(cluster, pools, project_id)
 
         def keyed(subnet, range_name):
             return (*subnet, range_name) if subnet and range_name else None
@@ -777,7 +803,8 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
     project and keyed by the subnet's owning project, so a Shared VPC host
     subnet counts the nodes, Pods and load balancers of its service projects.
     Returns the merged Pod-range reports, the unique primary-range addresses
-    per subnet, the projects whose reads named an address in each subnet, and
+    per subnet, the projects whose reads named an address in each subnet, the
+    projects whose clusters read named each subnet, and
     the limitations of each project's failed or partial reads, keyed by project,
     and the projects whose clusters read failed or was partial. A caller that
     passes `instance_cache` gets each project's `instances list` result in it,
@@ -786,6 +813,7 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
     pod_ranges: dict[tuple[str, str, str, str], dict] = {}
     used_ips: dict[tuple[str, str, str], set[str]] = {}
     readers: dict[tuple[str, str, str], set[str]] = {}
+    cluster_users: dict[tuple[str, str, str], set[str]] = {}
     limitations: dict[str, list[str]] = {}
     autopilot_networks: dict[str, set[str]] = {}
     clusters_unread: set[str] = set()
@@ -808,7 +836,11 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
             own.append(_partial_limitation("Pod ranges", cmds["clusters"], partial))
         pod_range_utilization(clusters, project_id, pod_ranges)
         for cluster in clusters:
-            if isinstance(cluster, dict) and (cluster.get("autopilot") or {}).get("enabled"):
+            if not isinstance(cluster, dict):
+                continue
+            for key in cluster_subnets(cluster, project_id):
+                cluster_users.setdefault(key, set()).add(project_id)
+            if (cluster.get("autopilot") or {}).get("enabled"):
                 network = (cluster.get("networkConfig") or {}).get("network") or cluster.get("network", "")
                 autopilot_networks.setdefault(_network_key(network, project_id), set()).add(
                     f"{project_id}/{cluster.get('location', '')}/{cluster.get('name', '')}"
@@ -844,6 +876,9 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
         "pod_ranges": pod_ranges,
         "used_ips": used_ips,
         "readers": readers,
+        # The projects whose clusters read named each subnet, with or
+        # without a Pod-range utilization on it.
+        "cluster_users": cluster_users,
         "limitations": limitations,
         # Network key to the Autopilot clusters on it, from the clusters reads
         # that passed. The firewall check marks an untargeted rule on such a
@@ -1057,7 +1092,8 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
         # Shared VPC service project on a host subnet outside the scope.
         unmeasured = {
             reader
-            for key, reader_set in usage["readers"].items() if key not in evaluated
+            for users in (usage["readers"], usage["cluster_users"])
+            for key, reader_set in users.items() if key not in evaluated
             for reader in reader_set
         } | {
             pod["project"] for (owner, region, subnet_name, _), pod in usage["pod_ranges"].items()
