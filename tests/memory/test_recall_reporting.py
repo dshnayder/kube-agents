@@ -175,6 +175,13 @@ class TestRecallReporting(unittest.TestCase):
             )
             self.assertEqual(personal_res["status"], "no_match")
 
+            reflect_res = json.loads(
+                p.handle_tool_call("memory_reflect", {"query": "Friday", "scope": "shared"})
+            )
+            self.assertEqual(reflect_res["status"], "found")
+            self.assertIn("DEC-2026-004", reflect_res["result"])
+            self.assertIn("STATUS: REJECTED", reflect_res["result"])
+
 
 if __name__ == "__main__":
     unittest.main()

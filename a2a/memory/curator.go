@@ -140,19 +140,83 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 
 	// Catch up with the latest entry on TOPICS-JOURNAL if present and not yet processed.
-	latestEnv, err := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectAnnotations)
-	if err == nil && latestEnv != nil {
-		c.handleAnnotationEnvelope(ctx, latestEnv)
-	} else if err != nil && !errors.Is(err, lib.ErrTopicEmpty) {
-		c.log.Debug("curator: initial journal read skipped", "err", err)
+	records, err := LoadRecords(c.cfg.RepoDir)
+	latestEnv, latestErr := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectAnnotations)
+	if latestErr == nil && latestEnv != nil {
+		if !shouldSkipStartupEnvelope(latestEnv, records) {
+			c.handleAnnotationEnvelope(ctx, latestEnv)
+			records, err = LoadRecords(c.cfg.RepoDir)
+		}
+	} else if latestErr != nil && !errors.Is(latestErr, lib.ErrTopicEmpty) {
+		c.log.Debug("curator: initial journal read skipped", "err", latestErr)
 	}
 
 	// Publish initial blueprint state if records exist on disk.
-	records, err := LoadRecords(c.cfg.RepoDir)
 	if err == nil && len(records) > 0 {
 		_ = c.publishBlueprint(ctx, records, "startup-sync", "")
 	}
 	return nil
+}
+
+func shouldSkipStartupEnvelope(env *lib.Envelope, records []Record) bool {
+	ev, ok := ExtractOutcomeEvent(env)
+	if !ok {
+		return true
+	}
+	if ev.Kind == OutcomeProposed && ev.RecordID == "" {
+		if matchExistingProposedOrActive(ev, records) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCompareText(s string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
+}
+
+func matchExistingProposedOrActive(ev OutcomeEvent, records []Record) string {
+	rtype := ev.RecordType
+	if rtype == "" {
+		if strings.HasPrefix(ev.RecordID, "LES-") {
+			rtype = RecordTypeLesson
+		} else {
+			rtype = RecordTypeDecision
+		}
+	}
+	wantRule := normalizeCompareText(ev.Rule)
+	wantTitle := normalizeCompareText(ev.Title)
+	wantSlug := Slug(firstNonEmpty(ev.Title, ev.Rule, ev.Summary))
+	prRef := formatPRRef(ev)
+
+	for _, r := range records {
+		if r.Meta.Type != rtype {
+			continue
+		}
+		if r.Meta.Status != StatusProposed && r.Meta.Status != StatusActive {
+			continue
+		}
+		if prRef != "" && r.Meta.Evidence.PullRequest == prRef {
+			return r.Meta.ID
+		}
+		var haveRule string
+		if r.Meta.Guard != nil {
+			haveRule = normalizeCompareText(r.Meta.Guard.Rule)
+		}
+		haveTitle := normalizeCompareText(r.Meta.Title)
+		if wantRule != "" && (haveRule == wantRule || haveTitle == wantRule) {
+			return r.Meta.ID
+		}
+		if wantTitle != "" && (haveTitle == wantTitle || haveRule == wantTitle) {
+			return r.Meta.ID
+		}
+		if wantSlug != "" && wantSlug != "record" {
+			if Slug(r.Meta.Title) == wantSlug || (r.Meta.Guard != nil && Slug(r.Meta.Guard.Rule) == wantSlug) {
+				return r.Meta.ID
+			}
+		}
+	}
+	return ""
 }
 
 // Stop unsubscribes from NATS.
@@ -277,18 +341,28 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	var targetRec Record
 	switch ev.Kind {
 	case OutcomeProposed:
+		if ev.RecordID == "" {
+			if dupID := matchExistingProposedOrActive(ev, records); dupID != "" {
+				ev.RecordID = dupID
+			}
+		}
 		if ev.RecordID != "" {
-			if existing, ok := byID[ev.RecordID]; ok && existing.Meta.Status == StatusProposed {
+			if existing, ok := byID[ev.RecordID]; ok && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusActive) {
 				prRef := formatPRRef(ev)
 				if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+					var branch, prMarkdown string
+					if existing.Meta.Status == StatusProposed {
+						branch = existing.ProposalBranch()
+						prMarkdown = existing.RenderForPR()
+					}
 					digest := BuildBlueprintDigest(repoID, records, "noop:"+existing.Meta.ID, c.graduatedIDs)
 					return OutcomeProcessResult{
 						RecordID:           existing.Meta.ID,
 						Status:             existing.Meta.Status,
 						Path:               existing.Path,
-						Branch:             existing.ProposalBranch(),
+						Branch:             branch,
 						Title:              existing.Meta.Title,
-						PRMarkdown:         existing.RenderForPR(),
+						PRMarkdown:         prMarkdown,
 						DocumentID:         existing.DocumentID(repoID),
 						GraduatedDecisions: c.graduatedIDs,
 						Blueprint:          digest,
@@ -378,7 +452,20 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if rid == "" {
 		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
 	}
-	existing := byID[rid]
+	existing, hasExisting := byID[rid]
+
+	// When attaching a pull request URL to an already-synthesized record without new
+	// rule or summary text, preserve the existing title, guard, and body rather than
+	// re-running LLM synthesis on empty fields.
+	if hasExisting && ev.Title == "" && ev.Rule == "" && ev.Summary == "" && ev.RootCause == "" && ev.Fix == "" {
+		prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
+		existing.Meta.Evidence.PullRequest = prRef
+		existing.Meta.Evidence.BreakingPR = firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR)
+		existing.Meta.Evidence.Incident = firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident)
+		existing.Meta.Evidence.Commit = firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit)
+		existing.Meta.Evidence.FindingID = firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID)
+		return existing
+	}
 
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
 	title := firstNonEmpty(ev.Title, synthTitle(synth), existing.Meta.Title, ev.Rule, ev.Summary, "Proposed operational rule "+rid)
@@ -394,7 +481,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 		ID:     rid,
 		Title:  title,
 		Status: StatusProposed,
-		Date:   dateStr,
+		Date:   firstNonEmpty(existing.Meta.Date, dateStr),
 		Scope:  scope,
 		Guard:  guard,
 		Evidence: RecordEvidence{
@@ -404,7 +491,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 			Commit:      firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
 			FindingID:   firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
 		},
-		Supersedes: ev.Supersedes,
+		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
 	}
 	body := buildRecordBody(rtype, ev, synth, existing.Body, StatusProposed, "")
 	return Record{
@@ -440,12 +527,17 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 			rtype = RecordTypeDecision
 		}
 	}
-	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
+	var synth *SynthesizedRecord
+	if !hasExisting || strings.TrimSpace(existing.Body) == "" {
+		synth = c.cfg.LLM.Synthesize(ctx, rtype, ev)
+	}
 	title := firstNonEmpty(ev.Title, existing.Meta.Title, synthTitle(synth), "Approved decision "+rid)
 	scope := mergeScope(existing.Meta.Scope, ev)
 	guard := mergeGuard(c.cfg.RepoDir, existing.Meta.Guard, ev, synth, scope.Resources)
-	if guard != nil && guard.Severity == "" {
-		guard.Severity = "block"
+	if guard != nil && (guard.Severity == "" || guard.Severity == "warn") {
+		g := *guard
+		g.Severity = "block"
+		guard = &g
 	}
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	meta := RecordMeta{

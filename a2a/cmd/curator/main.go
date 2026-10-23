@@ -314,7 +314,7 @@ func runEmit(args []string) error {
 		summaryText = fmt.Sprintf("Memory outcome %s (%s): %s", ev.Kind, ev.RecordID, ev.Title)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	client, err := connectNATS(ctx, "emit", log)
@@ -378,7 +378,7 @@ func runPending(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if os.Getenv("NATS_URL") != "" {

@@ -516,4 +516,47 @@ spec:
 	if len(report.Findings) != 1 || report.Findings[0].ID != "DEC-2026-005" {
 		t.Fatalf("expected finding from DEC-2026-005, got %+v", report.Findings)
 	}
+
+	// Verify duplicate proposed rule emission reuses the existing DEC-* ID, and linking a PR URL preserves the title/body.
+	prop1, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Repo:       "dshnayder-org/infra",
+		Title:      "All staging Ingress resources must include managed-certificates",
+		Summary:    "Staging Ingress resources require networking.gke.io/managed-certificates.",
+		Rule:       "All staging Ingress resources must include the networking.gke.io/managed-certificates annotation.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome prop1: %v", err)
+	}
+	prop2, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Repo:       "dshnayder-org/infra",
+		Title:      "All staging Ingress resources must include managed-certificates",
+		Summary:    "Staging Ingress resources require networking.gke.io/managed-certificates.",
+		Rule:       "All staging Ingress resources must include the networking.gke.io/managed-certificates annotation.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome prop2: %v", err)
+	}
+	if prop1.RecordID != prop2.RecordID {
+		t.Fatalf("expected duplicate proposal to reuse %s, got %s", prop1.RecordID, prop2.RecordID)
+	}
+
+	linked, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeProposed,
+		RecordID:    prop1.RecordID,
+		Repo:        "dshnayder-org/infra",
+		PullRequest: "https://github.com/dshnayder-org/infra/pull/273 (#273)",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome link PR: %v", err)
+	}
+	if linked.Title != prop1.Title {
+		t.Fatalf("expected PR link to preserve title %q, got %q", prop1.Title, linked.Title)
+	}
 }

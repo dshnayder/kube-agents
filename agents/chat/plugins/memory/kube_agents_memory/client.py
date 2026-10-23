@@ -319,6 +319,10 @@ def recall_decisions(query: str, max_results: int = 4) -> List[str]:
             reason = str(rec_meta.get("reviewer_reason") or "").strip()
             note = f" (Reason: {reason})" if reason else ""
             header = f"{header} [STATUS: REJECTED — do not enforce as active policy{note}]"
+        elif status == "proposed":
+            pr_ref = str(rec_meta.get("pull_request") or "").strip()
+            pr_note = f" in {pr_ref}" if pr_ref else ""
+            header = f"{header} [STATUS: PROPOSED — awaiting pull request review{pr_note}; not yet active policy]"
         elif status:
             header = f"{header} [status: {status}]"
         formatted.append(f"{header}\n{text}")
@@ -417,7 +421,7 @@ def emit_shared_decision(content: str, context: str = "") -> Dict[str, Any] | No
         text,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
         if proc.returncode != 0 or not proc.stdout.strip():
             return None
         payload = json.loads(proc.stdout)

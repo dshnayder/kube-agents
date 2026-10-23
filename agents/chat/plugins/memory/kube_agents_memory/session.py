@@ -513,6 +513,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 status="unreachable",
                 searched=searched,
             )
+        if scope in ("shared", "both"):
+            decisions = client.recall_decisions(query)
+            if decisions:
+                dec_section = "## Architecture Decisions & Operational Lessons\n" + "\n\n".join(decisions)
+                text = f"{text}\n\n{dec_section}" if text else dec_section
         if not text:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "result": NO_MATCH_GUIDANCE}
