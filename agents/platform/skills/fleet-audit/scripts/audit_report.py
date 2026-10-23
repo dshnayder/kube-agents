@@ -909,15 +909,19 @@ REACHABILITY_PROBE_VERB = "issue-list"
 REACHABILITY_PROBE_LIMIT = 1
 UNREACHABLE_NOTE = (
     "The repository {repo} could not be reached through the broker ({reason}), so "
-    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "{ledger} and no remediation {noun} was opened. The run did "
     "not choose another repository. {remedy} The findings are in the report store."
 )
 UNREACHABLE_UNSTORED_NOTE = (
     "The repository {repo} could not be reached through the broker ({reason}), so "
-    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "{ledger} and no remediation {noun} was opened. The run did "
     "not choose another repository. {remedy} The report store write failed, so the "
     "store may not hold this run: keep this message."
 )
+# What the unreachable note says of the ledger: an issue for the issue probe,
+# and the stored ledger for the store probe (`STORE_REACHABILITY_PROBE_VERB`).
+UNREACHABLE_ISSUE_LEDGER = "no ledger issue was written"
+UNREACHABLE_STORE_LEDGER = "the ledger in the report store was not updated"
 # What to do about an unreachable repository: the broker does not manage it,
 # or the forge cannot find it or refuses the credential.
 UNREACHABLE_NOT_MANAGED_REMEDY = (
@@ -13337,7 +13341,14 @@ def unreachable_note(
         remedy = UNREACHABLE_FORBIDDEN_REMEDY
     else:
         remedy = UNREACHABLE_FORGE_REMEDY
-    return template.format(repo=repo, reason=reason, noun=_proposal_noun(repo), remedy=remedy)
+    ledger = (
+        UNREACHABLE_ISSUE_LEDGER
+        if probe == REACHABILITY_PROBE_VERB
+        else UNREACHABLE_STORE_LEDGER
+    )
+    return template.format(
+        repo=repo, reason=reason, noun=_proposal_noun(repo), remedy=remedy, ledger=ledger
+    )
 
 
 def store_ledger_note(decision: LedgerDecision, *, stored: bool = True, noun: str | None = None) -> str:
@@ -18595,6 +18606,7 @@ def render_no_forge_summary(
     *,
     prs: dict | None = None,
     unaccounted: Iterable[str] = (),
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
@@ -18609,7 +18621,7 @@ def render_no_forge_summary(
     passes `prs`, its JSON line, for the links to the remediation proposals it
     opened, found waiting and closed, and the refusal of their listing
     (`REMEDIATION_REFUSED_KEY`), and `unaccounted`, the previous findings that
-    keep its ledger open.
+    keep its ledger open. `noun` is the forge's word for them.
     """
     findings = list(data.get("findings") or [])
     clusters = len((data.get("scope") or {}).get("clusters") or [])
@@ -18654,9 +18666,9 @@ def render_no_forge_summary(
             f"the report store lists them under `{UNPUBLISHED_CANDIDATES_KEY}`."
         )
     for label, key in (
-        ("Pull requests opened", "prs_opened"),
-        ("Pull requests waiting for review", "prs_still_open"),
-        ("Pull requests closed", "prs_closed"),
+        (f"{noun.capitalize()}s opened", "prs_opened"),
+        (f"{noun.capitalize()}s waiting for review", "prs_still_open"),
+        (f"{noun.capitalize()}s closed", "prs_closed"),
     ):
         urls = [str(url) for url in (prs or {}).get(key) or []]
         if urls:
@@ -19379,6 +19391,7 @@ def _finish_store_ledger(
         len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
         prs=payload,
         unaccounted=unaccounted_ids,
+        noun=noun,
     )
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))

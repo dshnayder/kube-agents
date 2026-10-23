@@ -29253,6 +29253,24 @@ class TestStoreLedger(HarnessTestCase):
         self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
 
+    def test_the_summary_names_proposals_in_the_forge_s_own_noun(self):
+        summary = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=[]), [], [], [], True, [], "note.",
+            prs={"prs_opened": ["https://forge.invalid/mr/1"]}, noun="merge request",
+        )
+        self.assertIn("Merge requests opened: https://forge.invalid/mr/1", summary)
+        self.assertNotIn("Pull requests", summary)
+
+    def test_the_unreachable_note_of_a_store_probe_names_no_ledger_issue(self):
+        note = audit_report.unreachable_note(
+            (self.REPO, "FORGE_NOT_FOUND: no such repository"),
+            probe=audit_report.STORE_REACHABILITY_PROBE_VERB,
+        )
+        self.assertNotIn("ledger issue", note)
+        self.assertIn("ledger issue", audit_report.unreachable_note(
+            (self.REPO, "FORGE_NOT_FOUND: no such repository")
+        ))
+
     # -- review findings: the memory as the forge path reads it -----------------
 
     B_PATH = "clusters/prod-us-east/b.yaml"
