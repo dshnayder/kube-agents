@@ -312,6 +312,16 @@ spec:
 	if !matchesTags(doc004.Tags, []string{"scope:shared", "kind:decision", "status:proposed", "id:DEC-2026-004"}, "all_strict") {
 		t.Fatalf("unexpected tags on proposed DEC-2026-004: %v", doc004.Tags)
 	}
+	if len(bp.Records) != 1 || bp.Records[0].Branch != "platform-agent/memory/DEC-2026-004" || !strings.Contains(bp.Records[0].PRMarkdown, "status: active") {
+		t.Fatalf("expected proposed record in blueprint to carry branch platform-agent/memory/DEC-2026-004 and PRMarkdown with status: active, got %+v", bp.Records)
+	}
+	pendingResp, err := QueryViaNATS(ctx, client, MemoryQueryRequest{Action: "pending"})
+	if err != nil {
+		t.Fatalf("QueryViaNATS pending: %v", err)
+	}
+	if len(pendingResp.Records) != 1 || pendingResp.Records[0].ID != "DEC-2026-004" || !strings.Contains(pendingResp.Records[0].PRMarkdown, "status: active") {
+		t.Fatalf("expected DEC-2026-004 in pending query with status: active PRMarkdown, got %+v", pendingResp.Records)
+	}
 
 	// -------------------------------------------------------------------------
 	// Scenario 1b: PR #280 is closed unmerged (refused) -> in-place update to status:rejected

@@ -1537,5 +1537,140 @@ class ResolverPathTest(unittest.TestCase):
                 self.assertEqual(gate._resolver_path(), expected)
 
 
+class MemoryProposalsSweepTest(unittest.TestCase):
+    """Tests for ``sweep_memory_proposals`` (PR filing, merge approval, and close refusal)."""
+
+    def test_pending_record_without_pr_files_card_for_platform_agent(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-010\nstatus: active\n---\n\n## Decision\n\nRequire ttl-hours.",
+                }
+            ],
+        })
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", return_value=_completed(pending_json)), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", return_value={"proposals": []}):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(len(result.cards), 1)
+        card = result.cards[0]
+        self.assertEqual(card.idempotency_key, "memory-pr-dshnayder-org-infra-DEC-2026-010")
+        self.assertIn("submit_suggestion.py prepare", card.body)
+        self.assertIn("platform-agent/memory/DEC-2026-010", card.body)
+        self.assertIn("status: active", card.body)
+
+    def test_merged_pr_emits_approved_to_curator(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 295,
+                         "state": "merged",
+                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                     }
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("approved", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+
+    def test_closed_unmerged_pr_emits_refused_with_reviewer_reason(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 295,
+                         "state": "closed",
+                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                         "comments": [
+                             {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
+                         ],
+                     }
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("refused", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+        self.assertIn("Stateful preview namespaces cannot use automatic TTL deletion.", emit_cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

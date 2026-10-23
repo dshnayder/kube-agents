@@ -53,6 +53,9 @@ type OutcomeProcessResult struct {
 	RecordID           string          `json:"record_id"`
 	Status             RecordStatus    `json:"status"`
 	Path               string          `json:"path"`
+	Branch             string          `json:"branch,omitempty"`
+	Title              string          `json:"title,omitempty"`
+	PRMarkdown         string          `json:"pr_markdown,omitempty"`
 	DocumentID         string          `json:"document_id"`
 	GraduatedDecisions []string        `json:"graduated_decisions,omitempty"`
 	Blueprint          BlueprintDigest `json:"blueprint"`
@@ -274,6 +277,25 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	var targetRec Record
 	switch ev.Kind {
 	case OutcomeProposed:
+		if ev.RecordID != "" {
+			if existing, ok := byID[ev.RecordID]; ok && existing.Meta.Status == StatusProposed {
+				prRef := formatPRRef(ev)
+				if prRef == "" || existing.Meta.Evidence.PullRequest == prRef {
+					digest := BuildBlueprintDigest(repoID, records, "noop:"+existing.Meta.ID, c.graduatedIDs)
+					return OutcomeProcessResult{
+						RecordID:           existing.Meta.ID,
+						Status:             existing.Meta.Status,
+						Path:               existing.Path,
+						Branch:             existing.ProposalBranch(),
+						Title:              existing.Meta.Title,
+						PRMarkdown:         existing.RenderForPR(),
+						DocumentID:         existing.DocumentID(repoID),
+						GraduatedDecisions: c.graduatedIDs,
+						Blueprint:          digest,
+					}, nil
+				}
+			}
+		}
 		targetRec = c.buildProposedRecord(ctx, ev, byID, year, dateStr)
 	case OutcomeApproved:
 		targetRec = c.buildApprovedRecord(ctx, ev, byID, year, dateStr)
@@ -324,10 +346,19 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		}
 	}
 
+	var branch, prMarkdown string
+	if targetRec.Meta.Status == StatusProposed {
+		branch = targetRec.ProposalBranch()
+		prMarkdown = targetRec.RenderForPR()
+	}
+
 	return OutcomeProcessResult{
 		RecordID:           targetRec.Meta.ID,
 		Status:             targetRec.Meta.Status,
 		Path:               targetRec.Path,
+		Branch:             branch,
+		Title:              targetRec.Meta.Title,
+		PRMarkdown:         prMarkdown,
 		DocumentID:         targetRec.DocumentID(repoID),
 		GraduatedDecisions: newlyGraduated,
 		Blueprint:          digest,
@@ -914,6 +945,54 @@ func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg) {
 // memory backend (Hindsight + local OKF records) with in-memory caching that is
 // automatically invalidated whenever ProcessOutcome updates the store.
 func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) MemoryQueryResponse {
+	switch req.Action {
+	case "propose", "resolve":
+		if req.Outcome == nil {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Error:  "outcome payload is required for action " + req.Action,
+			}
+		}
+		res, err := c.ProcessOutcome(ctx, *req.Outcome, "")
+		if err != nil {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Error:  err.Error(),
+			}
+		}
+		return MemoryQueryResponse{
+			Schema:  MemoryQueryReplySchema,
+			Backend: "curator",
+			Bank:    DefaultBankID,
+			Outcome: &res,
+		}
+	case "pending":
+		c.mu.Lock()
+		records, err := LoadRecords(c.cfg.RepoDir)
+		repoID := c.cfg.RepoID
+		c.mu.Unlock()
+		if err != nil {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Error:  err.Error(),
+			}
+		}
+		digest := BuildBlueprintDigest(repoID, records, "pending-query", nil)
+		var pending []BlueprintRecordDigest
+		for _, rec := range digest.Records {
+			if rec.Status == StatusProposed {
+				pending = append(pending, rec)
+			}
+		}
+		return MemoryQueryResponse{
+			Schema:  MemoryQueryReplySchema,
+			Backend: "curator",
+			Bank:    DefaultBankID,
+			Records: pending,
+			Results: []HindsightRecallResult{},
+		}
+	}
+
 	tags := append([]string(nil), req.Tags...)
 	if len(tags) == 0 {
 		tags = []string{SharedTag}
@@ -984,6 +1063,11 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		if r.Meta.Guard != nil {
 			guardRule = r.Meta.Guard.Rule
 		}
+		var branch, prMarkdown string
+		if r.Meta.Status == StatusProposed {
+			branch = r.ProposalBranch()
+			prMarkdown = r.RenderForPR()
+		}
 		scored = append(scored, scoredMatch{
 			score: score,
 			digest: BlueprintRecordDigest{
@@ -992,6 +1076,8 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 				Status:         r.Meta.Status,
 				Title:          r.Meta.Title,
 				Path:           r.Path,
+				Branch:         branch,
+				PRMarkdown:     prMarkdown,
 				Clusters:       r.Meta.Scope.Clusters,
 				Checks:         r.Meta.Scope.Checks,
 				Paths:          r.Meta.Scope.Paths,

@@ -29,7 +29,8 @@ const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator for kube
 
 usage:
   curator daemon [flags]         subscribe to a2a.topics.shared.annotations, index into Hindsight, serve NATS memory queries, and publish blueprint digests
-  curator emit [flags]           publish a kube-agents.memory.outcome/v1 event to a2a.topics.shared.annotations
+  curator emit [flags]           publish a kube-agents.memory.outcome/v1 event and return the synthesized record metadata
+  curator pending [flags]        list status:proposed OKF records awaiting pull request creation or review
   curator check [flags]          evaluate active and proposed OKF guards against changed files (exits 2 on block)
   curator index [flags]          sync local knowledge/ records into the kube-agents-decisions Hindsight bank
   curator recall [flags] <query> query semantic memory over NATS (with fallback to Hindsight REST)
@@ -70,6 +71,8 @@ func run(args []string) error {
 		return runDaemon(args[1:])
 	case "emit", "publish":
 		return runEmit(args[1:])
+	case "pending":
+		return runPending(args[1:])
 	case "check":
 		return runCheck(args[1:])
 	case "index":
@@ -320,11 +323,30 @@ func runEmit(args []string) error {
 	}
 	defer client.Close()
 
+	corr := lib.NewCorrelationID()
+	action := "resolve"
+	if ev.Kind == memory.OutcomeProposed {
+		action = "propose"
+	}
+	var outcomeRes *memory.OutcomeProcessResult
+	if qResp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
+		Schema:  memory.MemoryQuerySchema,
+		Action:  action,
+		Outcome: &ev,
+	}); qErr == nil && qResp.Outcome != nil {
+		outcomeRes = qResp.Outcome
+		if ev.RecordID == "" {
+			ev.RecordID = outcomeRes.RecordID
+		}
+		if ev.Title == "" {
+			ev.Title = outcomeRes.Title
+		}
+	}
+
 	art, err := lib.NewTopicArtifact("annotations", summaryText, ev)
 	if err != nil {
 		return err
 	}
-	corr := lib.NewCorrelationID()
 	if err := client.PublishTopic(ctx, memory.SubjectAnnotations,
 		lib.Party{Session: busUser(), Profile: os.Getenv("A2A_PROFILE")},
 		"", "", corr, art); err != nil {
@@ -335,9 +357,65 @@ func runEmit(args []string) error {
 		"correlation_id": corr,
 		"event":          ev,
 	}
+	if outcomeRes != nil {
+		out["record_id"] = outcomeRes.RecordID
+		out["status"] = outcomeRes.Status
+		out["path"] = outcomeRes.Path
+		out["branch"] = outcomeRes.Branch
+		out["title"] = outcomeRes.Title
+		out["pr_markdown"] = outcomeRes.PRMarkdown
+		out["document_id"] = outcomeRes.DocumentID
+	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+func runPending(args []string) error {
+	fs := flag.NewFlagSet("curator pending", flag.ContinueOnError)
+	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory (used as local fallback)")
+	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if os.Getenv("NATS_URL") != "" {
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		if client, err := connectNATS(ctx, "pending", log); err == nil {
+			defer client.Close()
+			if resp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
+				Schema: memory.MemoryQuerySchema,
+				Action: "pending",
+			}); qErr == nil {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(map[string]any{
+					"repo":    *repoID,
+					"records": resp.Records,
+				})
+			}
+		}
+	}
+
+	records, err := memory.LoadRecords(*repoDir)
+	if err != nil {
+		return err
+	}
+	digest := memory.BuildBlueprintDigest(*repoID, records, "local-pending", nil)
+	var pending []memory.BlueprintRecordDigest
+	for _, r := range digest.Records {
+		if r.Status == memory.StatusProposed {
+			pending = append(pending, r)
+		}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"repo":    *repoID,
+		"records": pending,
+	})
 }
 
 func runCheck(args []string) error {

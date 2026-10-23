@@ -63,6 +63,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -792,9 +793,228 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     return SweepResult(cards=cards, warnings=warnings)
 
 
+# --------------------------------------------------------------------------
+# Sweep: Decision Memory proposals (PR creation, merge, and rejection)
+# --------------------------------------------------------------------------
+
+_PR_NUM_RE = re.compile(r"(?:/pull/|/-/merge_requests/|#)(\d+)")
+
+
+def _resolve_curator_bin() -> str:
+    configured = os.environ.get("CURATOR_BIN", "").strip()
+    if configured:
+        return configured
+    if os.path.isfile("/usr/local/bin/curator") and os.access("/usr/local/bin/curator", os.X_OK):
+        return "/usr/local/bin/curator"
+    return shutil.which("curator") or ""
+
+
+def _parse_pr_number(pr_ref: str) -> int | None:
+    if not pr_ref:
+        return None
+    m = _PR_NUM_RE.search(str(pr_ref))
+    return int(m.group(1)) if m else None
+
+
+def _memory_pr_card(record: dict, repo: str) -> Card:
+    record_id = str(record.get("id") or "")
+    title = str(record.get("title") or f"Record {record_id}")
+    rel_path = str(record.get("path") or f"knowledge/decisions/{record_id}.md")
+    branch = str(record.get("branch") or f"platform-agent/memory/{record_id}")
+    pr_markdown = str(record.get("pr_markdown") or "").strip()
+    repo_flag = f" --repo {shlex.quote(repo)}" if repo else ""
+    body = (
+        f"Curator synthesized **{record_id}** (`{rel_path}`) with `status: active` "
+        "in its frontmatter for team review.\n\n"
+        "Open the pull request on the GitOps repository using the **submit-suggestion** "
+        "skill (`/v1/vcs/*` + local `git` in the sandbox):\n\n"
+        f"1. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"prepare{repo_flag} --branch {shlex.quote(branch)}` and read the `workspace` path.\n"
+        f"2. Write the exact Markdown below to `<workspace>/{rel_path}` (creating parent "
+        "directories if needed).\n"
+        f"3. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"submit{repo_flag} --branch {shlex.quote(branch)} "
+        f"--title {shlex.quote(f'docs(knowledge): record {record_id} ({title})')[:120]} "
+        f"--body {shlex.quote(f'Records {record_id} (`{rel_path}`) in Decision Memory with `status: active` upon merge.')}`.\n\n"
+        f"### `{rel_path}`\n\n"
+        f"```markdown\n{pr_markdown}\n```\n"
+    )
+    return Card(
+        title=f"Open Decision Memory PR for {record_id}: {title}"[:200],
+        body=body,
+        idempotency_key=f"memory-pr-{_slug(repo or 'default')}-{_key_part(record_id)}",
+    )
+
+
+def _extract_reviewer_reason(comments: list, viewer: str) -> str:
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    for comment in reversed(comments or []):
+        if not isinstance(comment, dict):
+            continue
+        author = str(comment.get("author") or "")
+        if viewer_key and forge.normalise_login(author) == viewer_key:
+            continue
+        text = str(comment.get("body") or "").strip()
+        if text:
+            return text[:500]
+    return "Proposal closed unmerged by reviewer."
+
+
+def sweep_memory_proposals(dry_run: bool = False) -> SweepResult:
+    """Reconcile ``status:proposed`` OKF records in Curator with GitOps PR states.
+
+    - If a proposed record has no PR open or closed on ``platform-agent/memory/<ID>``,
+      files an idempotent Kanban card for ``platform`` to open the PR via
+      ``submit-suggestion``.
+    - If the PR was merged (``state == "merged"``), emits ``approved`` to Curator
+      so Hindsight updates ``okf:<repo>:<ID>`` in-place to ``status:active``.
+    - If the PR was closed unmerged (``state == "closed"``), emits ``refused``
+      with the reviewer's comment so Hindsight updates ``okf:<repo>:<ID>``
+      in-place to ``status:rejected``.
+    """
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin or not os.environ.get("NATS_URL", "").strip():
+        return SweepResult()
+
+    try:
+        proc = subprocess.run(
+            [curator_bin, "pending"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return SweepResult()
+        payload = json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: curator pending failed: {exc}\n")
+        return SweepResult()
+
+    records = payload.get("records") or []
+    if not records:
+        return SweepResult()
+
+    managed = gitops_workspace.get_managed_repos()
+    repo = str(payload.get("repo") or "").strip()
+    if managed:
+        repo = gitops_workspace.qualify(repo, managed) if repo else managed[0]
+        if repo not in managed:
+            repo = managed[0]
+    if not repo:
+        return SweepResult()
+
+    provider = forge.BrokerProvider()
+    viewer = ""
+    try:
+        viewer = provider.viewer_login(repo)
+    except Exception:  # noqa: BLE001
+        pass
+
+    cards: list[Card] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rec_id = str(rec.get("id") or "").strip()
+        if not rec_id:
+            continue
+        branch = str(rec.get("branch") or f"platform-agent/memory/{rec_id}").strip()
+        pr_ref = str(rec.get("pull_request") or "").strip()
+        pr_num = _parse_pr_number(pr_ref)
+
+        if pr_num is None:
+            try:
+                ans = forge.call(
+                    "proposal-list",
+                    {"source": branch, "state": "all", "limit": 5},
+                    repo,
+                    retry_transient=True,
+                )
+                proposals = ans.get("proposals") or []
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"github_scan_gate: proposal-list for {branch} failed: {exc}\n")
+                continue
+            if not proposals:
+                if rec.get("pr_markdown"):
+                    cards.append(_memory_pr_card(rec, repo))
+                continue
+            latest = proposals[0]
+            pr_num = int(latest.get("number") or 0) or None
+            pr_url = str(latest.get("url") or "").strip()
+            pr_ref = f"{pr_url} (#{pr_num})" if pr_url and pr_num else (pr_url or f"#{pr_num}")
+            if pr_num and not dry_run and latest.get("state") == "open":
+                subprocess.run(
+                    [curator_bin, "emit", "--kind", "proposed", "--id", rec_id, "--repo", repo, "--pr", pr_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+
+        if pr_num is None:
+            continue
+
+        try:
+            view_ans = forge.call(
+                "proposal-view",
+                {"number": pr_num, "comments": True},
+                repo,
+                retry_transient=True,
+            )
+            prop = view_ans.get("proposal") or {}
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"github_scan_gate: proposal-view #{pr_num} failed: {exc}\n")
+            continue
+
+        state = str(prop.get("state") or "").strip().lower()
+        pr_url = str(prop.get("url") or "").strip()
+        if pr_url:
+            pr_ref = f"{pr_url} (#{pr_num})"
+
+        if state == "merged":
+            if dry_run:
+                sys.stderr.write(f"github_scan_gate: would approve {rec_id} from merged {pr_ref}\n")
+                continue
+            subprocess.run(
+                [curator_bin, "emit", "--kind", "approved", "--id", rec_id, "--repo", repo, "--pr", pr_ref],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        elif state == "closed":
+            reason = _extract_reviewer_reason(prop.get("comments") or [], viewer)
+            if dry_run:
+                sys.stderr.write(f"github_scan_gate: would refuse {rec_id} from closed {pr_ref}: {reason}\n")
+                continue
+            subprocess.run(
+                [
+                    curator_bin,
+                    "emit",
+                    "--kind",
+                    "refused",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    reason,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+
+    return SweepResult(cards=cards)
+
+
 SWEEPS = {
     "issues": sweep_issues,
     "pr_comments": sweep_pr_comments,
+    "memory_proposals": sweep_memory_proposals,
 }
 
 # Insertion order is run order, so this is the registry read one way rather

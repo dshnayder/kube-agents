@@ -196,6 +196,8 @@ type BlueprintRecordDigest struct {
 	Status         RecordStatus `json:"status"`
 	Title          string       `json:"title"`
 	Path           string       `json:"path"`
+	Branch         string       `json:"branch,omitempty"`
+	PRMarkdown     string       `json:"pr_markdown,omitempty"`
 	Clusters       []string     `json:"clusters,omitempty"`
 	Checks         []string     `json:"checks,omitempty"`
 	Paths          []string     `json:"paths,omitempty"`
@@ -222,16 +224,18 @@ type BlueprintDigest struct {
 }
 
 // MemoryQueryRequest is the NATS request payload sent to SubjectMemoryQuery
-// (or SubjectMemoryQueryPublic) to query the semantic memory layer over NATS.
+// (or SubjectMemoryQueryPublic) to query or update the semantic memory layer over NATS.
 type MemoryQueryRequest struct {
-	Schema     string   `json:"schema,omitempty"`
-	Query      string   `json:"query"`
-	Bank       string   `json:"bank,omitempty"`
-	Tags       []string `json:"tags,omitempty"`
-	TagsMatch  string   `json:"tags_match,omitempty"`
-	Path       string   `json:"path,omitempty"`
-	Cluster    string   `json:"cluster,omitempty"`
-	MaxResults int      `json:"max_results,omitempty"`
+	Schema     string        `json:"schema,omitempty"`
+	Action     string        `json:"action,omitempty"`
+	Query      string        `json:"query"`
+	Bank       string        `json:"bank,omitempty"`
+	Tags       []string      `json:"tags,omitempty"`
+	TagsMatch  string        `json:"tags_match,omitempty"`
+	Path       string        `json:"path,omitempty"`
+	Cluster    string        `json:"cluster,omitempty"`
+	MaxResults int           `json:"max_results,omitempty"`
+	Outcome    *OutcomeEvent `json:"outcome,omitempty"`
 }
 
 // MemoryQueryResponse is the NATS reply payload returned by the Curator's
@@ -245,6 +249,7 @@ type MemoryQueryResponse struct {
 	Cached  bool                    `json:"cached"`
 	Results []HindsightRecallResult `json:"results"`
 	Records []BlueprintRecordDigest `json:"records,omitempty"`
+	Outcome *OutcomeProcessResult   `json:"outcome,omitempty"`
 	Error   string                  `json:"error,omitempty"`
 }
 
@@ -406,6 +411,36 @@ func RenderRecord(meta RecordMeta, body string) (string, error) {
 	return buf.String(), nil
 }
 
+// ProposalBranch returns the canonical Git branch name used by the platform
+// agent when opening a pull request for this record.
+func (r Record) ProposalBranch() string {
+	if r.Meta.ID == "" {
+		return ""
+	}
+	return "platform-agent/memory/" + r.Meta.ID
+}
+
+// RenderForPR renders the Markdown document to commit on a proposal pull request
+// branch. In Git, a proposed record is committed with status: active (and a
+// blocking guard) so that merging the pull request activates the record on the
+// default branch without requiring a second post-merge commit.
+func (r Record) RenderForPR() string {
+	meta := r.Meta
+	meta.Status = StatusActive
+	if r.Meta.Guard != nil {
+		g := *r.Meta.Guard
+		if g.Severity == "" || g.Severity == "warn" {
+			g.Severity = "block"
+		}
+		meta.Guard = &g
+	}
+	rendered, err := RenderRecord(meta, r.Body)
+	if err != nil {
+		return ""
+	}
+	return rendered
+}
+
 // ValidateRecord checks structural validity of an OKF record.
 func ValidateRecord(r Record) []string {
 	var errs []string
@@ -565,12 +600,19 @@ func BuildBlueprintDigest(repoID string, records []Record, lastEvent string, gra
 		if r.Meta.Guard != nil {
 			guardRule = r.Meta.Guard.Rule
 		}
+		var branch, prMarkdown string
+		if r.Meta.Status == StatusProposed {
+			branch = r.ProposalBranch()
+			prMarkdown = r.RenderForPR()
+		}
 		digest.Records = append(digest.Records, BlueprintRecordDigest{
 			ID:             r.Meta.ID,
 			Type:           r.Meta.Type,
 			Status:         r.Meta.Status,
 			Title:          r.Meta.Title,
 			Path:           r.Path,
+			Branch:         branch,
+			PRMarkdown:     prMarkdown,
 			Clusters:       r.Meta.Scope.Clusters,
 			Checks:         r.Meta.Scope.Checks,
 			Paths:          r.Meta.Scope.Paths,

@@ -424,13 +424,28 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         context = str(args.get("context") or "").strip()
         if context:
             item["context"] = context
+        if scope == "shared":
+            decision = client.emit_shared_decision(content, context)
+            if decision and decision.get("record_id"):
+                rec_id = decision["record_id"]
+                rel_path = decision.get("path") or f"knowledge/decisions/{rec_id}.md"
+                branch = decision.get("branch") or f"platform-agent/memory/{rec_id}"
+                return json.dumps({
+                    "result": (
+                        f"Stored in shared memory as proposed decision {rec_id} "
+                        f"({rel_path} on branch {branch}) and queued a pull request "
+                        "for team review."
+                    ),
+                    "record_id": rec_id,
+                    "status": "proposed",
+                    "path": rel_path,
+                    "branch": branch,
+                })
         try:
             client.retain(self._hindsight, item)
         except Exception as e:
             logger.warning("%s: retain failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(f"Failed to store the memory: {e}")
-        if scope == "shared":
-            client.emit_shared_decision(content, context)
         return json.dumps({"result": f"Stored in {scope} memory."})
 
     def _read(self, tool_name: str, args: Dict[str, Any], scope: str) -> str:
