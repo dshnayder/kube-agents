@@ -1655,10 +1655,10 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                          "number": 295,
                          "state": "closed",
                          "url": "https://github.com/dshnayder-org/infra/pull/295",
-                         "comments": [
-                             {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
-                         ],
-                     }
+                     },
+                     "comments": [
+                         {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
+                     ],
                  },
              ):
             bp_cls.return_value.viewer_login.return_value = "dshnayder"

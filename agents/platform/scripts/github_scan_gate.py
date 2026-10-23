@@ -983,7 +983,10 @@ def sweep_memory_proposals(dry_run: bool = False) -> SweepResult:
                 check=False,
             )
         elif state == "closed":
-            reason = _extract_reviewer_reason(prop.get("comments") or [], viewer)
+            comments = view_ans.get("comments")
+            if not isinstance(comments, list):
+                comments = prop.get("comments") or []
+            reason = _extract_reviewer_reason(comments, viewer)
             if dry_run:
                 sys.stderr.write(f"github_scan_gate: would refuse {rec_id} from closed {pr_ref}: {reason}\n")
                 continue

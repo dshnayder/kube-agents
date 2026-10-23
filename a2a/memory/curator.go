@@ -669,13 +669,19 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 	// If an existing proposed record (such as a proposed chat rule DEC-*) is refused,
 	// transition that exact record in-place to status:rejected so update_mode:replace
 	// overwrites the proposed entry in Hindsight and leaves no stale rule behind.
-	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Type == RecordTypeDecision) {
+	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusRejected || existing.Meta.Type == RecordTypeDecision) {
 		existing.Meta.Status = StatusRejected
 		existing.Meta.Evidence.ReviewerReason = reason
 		if prRef != "" {
 			existing.Meta.Evidence.RejectedProposals = appendUnique(existing.Meta.Evidence.RejectedProposals, prRef)
 		}
-		existing.Body = strings.TrimSpace(existing.Body) + "\n\n## Rejection Rationale\n\n" + reason
+		rationaleBlock := "## Rejection Rationale\n\n" + reason
+		if !strings.Contains(existing.Body, rationaleBlock) {
+			if idx := strings.Index(existing.Body, "\n\n## Rejection Rationale\n\n"); idx >= 0 {
+				existing.Body = strings.TrimSpace(existing.Body[:idx])
+			}
+			existing.Body = strings.TrimSpace(existing.Body) + "\n\n" + rationaleBlock
+		}
 		return existing
 	}
 

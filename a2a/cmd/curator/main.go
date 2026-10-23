@@ -341,16 +341,16 @@ func runEmit(args []string) error {
 		if ev.Title == "" {
 			ev.Title = outcomeRes.Title
 		}
-	}
-
-	art, err := lib.NewTopicArtifact("annotations", summaryText, ev)
-	if err != nil {
-		return err
-	}
-	if err := client.PublishTopic(ctx, memory.SubjectAnnotations,
-		lib.Party{Session: busUser(), Profile: os.Getenv("A2A_PROFILE")},
-		"", "", corr, art); err != nil {
-		return err
+	} else {
+		art, err := lib.NewTopicArtifact("annotations", summaryText, ev)
+		if err != nil {
+			return err
+		}
+		if err := client.PublishTopic(ctx, memory.SubjectAnnotations,
+			lib.Party{Session: busUser(), Profile: os.Getenv("A2A_PROFILE")},
+			"", "", corr, art); err != nil {
+			return err
+		}
 	}
 	out := map[string]any{
 		"published":      memory.SubjectAnnotations,
