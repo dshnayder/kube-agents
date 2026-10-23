@@ -17150,7 +17150,9 @@ def _open_store_ledger(repo: str, audit_id: str) -> tuple[Path, list[dict[str, s
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id, reset=True)
     ensure_labels(repo, audit_id)
-    memory, _known = previous_store_ledger(audit_id, repo)
+    # `start` lists no remediation proposals, so it cannot tell a first run
+    # from a lost memory; `finish` lists them and decides.
+    memory, _known = previous_store_ledger(audit_id, repo, open_fix=None)
     carried = [
         {"id": fid, "check": fid.split(".", 1)[0], **where}
         for fid, where in sorted(
@@ -18472,14 +18474,15 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
 
 
 def _store_ledger_envelope(
-    audit_id: str, repo: str, *, open_fix: bool = True
+    audit_id: str, repo: str, *, open_fix: bool | None = True
 ) -> tuple[dict | None, bool]:
     """The envelope the previous store-ledger run of `repo` wrote, and whether it is knowable.
 
     Read as `read_report_memory` reads the memory of a ledger issue, with the
     one difference that this ledger has no issue to vouch for it. `open_fix`
     says whether a remediation proposal of this stream may be open: True when
-    the listing found one, and when the caller did not list them.
+    the listing found one, False when it found none, and None when the caller
+    did not list them. None reads as True, and only the log says otherwise.
 
     - No store directory for `repo` is (None, True) when no fix of this stream
       is open: the run is first, as the forge path's first run is the one with
@@ -18514,8 +18517,14 @@ def _store_ledger_envelope(
         log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
         return None, False
     if not directory.exists():
-        if not open_fix:
+        if open_fix is False:
             return None, True
+        if open_fix is None:
+            log(
+                f"No stored ledger for {audit_id} in {repo}; no listing of remediation "
+                "proposals was made, so it is not known here whether this is the first run"
+            )
+            return None, False
         log(
             f"No stored ledger for {audit_id} in {repo}, but a remediation proposal of this "
             f"stream is open; {MEMORY_UNKNOWABLE}"
@@ -18539,7 +18548,7 @@ def _store_ledger_envelope(
     if is_diverted(envelope):
         runs = directory / REPORT_RUNS_DIR
         envelope = _newest_published_envelope(runs)
-        if envelope is None and not open_fix:
+        if envelope is None and open_fix is False:
             try:
                 ring = len(list(runs.glob("*.json")))
             except OSError:
@@ -18568,7 +18577,7 @@ def _store_ledger_envelope(
 
 
 def previous_store_ledger(
-    audit_id: str, repo: str, *, open_fix: bool = True
+    audit_id: str, repo: str, *, open_fix: bool | None = True
 ) -> tuple[dict | None, bool]:
     """The ledger that the previous store-ledger run of `repo` stored, and whether it is knowable.
 
@@ -18577,7 +18586,7 @@ def previous_store_ledger(
     `_store_ledger_envelope` says. Its `ledger_body` is the ledger the run
     rendered and its `current_ids` the ids that ledger carries. An envelope
     that a no-forge run diverted here, or that a forge run wrote, is not this
-    memory.
+    memory. `open_fix` is as `_store_ledger_envelope` says.
     """
     envelope, known = _store_ledger_envelope(audit_id, repo, open_fix=open_fix)
     if isinstance(envelope, dict) and envelope.get("ledger_held_open") and (
