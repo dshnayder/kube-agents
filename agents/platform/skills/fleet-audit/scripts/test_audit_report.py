@@ -30705,5 +30705,151 @@ class TestStoreLedger(HarnessTestCase):
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertEqual(sorted(self.latest()["current_ids"]), sorted([a["id"], b["id"]]))
 
+    # -- not re-checked ------------------------------------------------------------
+
+    SKIPPED = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+    PROD = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+
+    def stage_finding(self):
+        return make_finding(
+            fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy"
+        )
+
+    def stage_id(self):
+        return derived_id(cluster="stage-eu", fid="stage")
+
+    def gap_doc(self, findings):
+        return make_doc(findings=findings, clusters=[self.PROD], skipped=self.SKIPPED)
+
+    def test_a_store_ledger_gap_run_keeps_a_finding_on_an_unchecked_target(self):
+        """The forge path keeps a previous finding on a target that a gap run
+        did not check as a row under _Not re-checked this run_. The stored
+        ledger must keep it the same way: the row in `ledger_body`, the id in
+        its hidden block, and the place under `not_rechecked`."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]))
+        out = self.run_once(self.gap_doc([make_finding()]))
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
+        self.assertIn(f"HELD: {self.stage_id()}", self.err)
+        self.assertIn("Not re-checked this run", out["summary"])
+        self.assertIn(self.stage_id(), out["summary"])
+        latest = self.latest()
+        body = latest["ledger_body"]
+        self.assertIn(audit_report.UNREAD_HELD_HEADING, body)
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+        self.assertIn("- **Not re-checked:** `stage-eu` was not read this run.", body)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        self.assertIn(self.stage_id(), latest["current_ids"])
+        self.assertEqual(
+            [entry["id"] for entry in latest[audit_report.NOT_RECHECKED_KEY]], [self.stage_id()]
+        )
+        self.assertNotIn(audit_report.REPORTED_UNDER_GAP_KEY, latest)
+        # A second gap run reads the row back from the stored ledger.
+        self.run_once(self.gap_doc([make_finding()]))
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.latest()["ledger_body"]))
+        # The next full run that sees it again does not call it new.
+        both = self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]))
+        self.assertEqual((both["new"], both["resolved"]), (0, 0))
+
+    def test_a_store_ledger_gap_run_caps_not_re_checked_ids_and_says_so(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.run_once(make_doc(findings=[make_finding(), self.stage_finding(), other]))
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        self.run_once(self.gap_doc([make_finding()]))
+        body = self.latest()["ledger_body"]
+        self.assertNotIn(past_cap, audit_report.parse_delta_block(body))
+        self.assertIn("stops tracking 1 previous finding(s) on a target this run did not check", self.err)
+        self.assertIn(past_cap, self.err)
+
+    def shielded_finish(self, doc, candidates):
+        """`finish` with the declaration of api filed by `start`, so the shield closes over the gap."""
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(_full_manifest(candidates=candidates)), encoding="utf-8")
+        self.start()
+        audit_report.write_declarations(AUDIT, self.REPO, [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": self.REPO, "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": self.REPO, "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        self.new_process()
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def account_proposal(self, number, ids):
+        return {
+            "number": number,
+            "source": f"platform-agent/fix-{AUDIT}-default-sa-automount-{number}",
+            "sourceRepo": self.REPO,
+            "target": "main",
+            "state": "open",
+            "author": Recorder.VIEWER.removesuffix("[bot]"),
+            "url": f"https://forge.invalid/acme/fleet/pull-requests/{number}",
+            "labels": [],
+            "body": audit_report.delta_block(ids) + "\n" + audit_report.remediation_stream_marker(AUDIT),
+        }
+
+    def run_shielded_gap(self, with_worker):
+        """Seed a stored ledger of api, worker and far; then a run over a gap on dr-west.
+
+        #9 covers what the shield closes; #6 covers api and far, on dr-west,
+        which the run did not read. The forge path keeps #6 open
+        (`TestFinishManifestFlag`), and so must the store ledger.
+        """
+        self.claim()
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        fix = {"kind": "manifest", "path": path, "note": "shared file"}
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation=fix)
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation=fix)
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major", remediation={"kind": "manual", "note": "far"})
+        clusters = [
+            {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+            {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+        ]
+        self.touch(path)
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: audit_report.AUTO_PROMOTE_OFF}):
+            self.run_once(make_doc(findings=[api, worker, far], clusters=clusters))
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.assertIn(far_id, self.latest()["current_ids"])
+        shielded = [api_id, worker_id] if with_worker else [api_id]
+        pr9, pr6 = self.account_proposal(9, shielded), self.account_proposal(6, [api_id, far_id])
+        self.harness.replies["proposal-list"] = {"proposals": [pr9, pr6], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": pr9["body"]}}
+        candidates = [
+            {"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": obj, "severity": "major", "excerpt": "automountServiceAccountToken unset on the default ServiceAccount"}
+            for obj in (["Deployment/api", "Deployment/worker"] if with_worker else ["Deployment/api"])
+        ]
+        doc = make_doc(
+            findings=[worker] if with_worker else [],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        out = self.shielded_finish(doc, candidates)
+        return out, pr9, pr6, far_id
+
+    def test_a_store_ledger_gap_run_keeps_the_fix_of_a_not_re_checked_finding_open(self):
+        out, pr9, pr6, far_id = self.run_shielded_gap(with_worker=True)
+        self.assertTrue(out["partial"])
+        self.assertIn(far_id, audit_report.parse_delta_block(self.latest()["ledger_body"]))
+        self.assertNotIn(pr6["url"], out["prs_closed"])
+        self.assertEqual(out["prs_closed"], [pr9["url"]])
+
+    def test_a_clean_store_ledger_gap_run_keeps_the_fix_of_a_not_re_checked_finding_open(self):
+        out, pr9, pr6, far_id = self.run_shielded_gap(with_worker=False)
+        self.assertTrue(self.latest()["ledger_held_open"])
+        self.assertNotIn(pr6["url"], out["prs_closed"])
+        self.assertEqual(out["prs_closed"], [pr9["url"]])
+
+
 if __name__ == "__main__":
     unittest.main()

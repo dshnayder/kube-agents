@@ -161,7 +161,7 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
   the document, or it is gone. A finding whose target the run cannot find on the previous ledger or
   in the stored report is not kept either. The run keeps these findings only when a ledger is open
   and the report store holds a trusted record of it (with no forge: a trusted record of the
-  previous run);
+  previous run; with the ledger in the report store: a trusted stored ledger);
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps (not again on the next clean run if the gaps did not change). `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes

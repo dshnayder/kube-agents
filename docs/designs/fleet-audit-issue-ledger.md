@@ -1225,6 +1225,9 @@ not answered as "no longer reproduces", and the shield's close counts them as cu
 retire a pull request whose other finding was not re-checked. A run on an install with no forge
 keeps the same findings in the `current_ids` of its stored record, with their places, when the store
 holds a trusted record of the previous such run.
+A run that keeps its ledger in the report store (`STORE_LEDGER`, [version-control design §8](version-control-support.md#the-ledger-without-issues))
+does all of this on the body it stores, when the store holds a trusted stored ledger. There is no
+ledger thread on that path, so no `/remediate` comment is read or deferred.
 
 `partial` is `true` if and only if `coverage_gaps` is non-empty, on both `finish` branches. The
 tempting generalisation — also raising it when the body budget (§7.1) dropped findings from the

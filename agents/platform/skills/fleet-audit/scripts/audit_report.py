@@ -19645,6 +19645,10 @@ def _finish_store_ledger(
       and stores but never posts, gives the held set, the locations `start`
       prints and the clean-run join reads (`unaccounted_previous_findings`),
       as the stored body of the issue gives them on the forge path.
+    - Over a coverage gap, a previous finding on a target this run did not
+      check stays on the stored ledger as not re-checked
+      (`unread_held_entries`), with its place under `NOT_RECHECKED_KEY`,
+      and its fix stays open, as on the forge path.
     - The remediation proposals are found, opened and closed as on the forge
       path, through the label-free paths on a forge with no labels: the
       automatic sweep with its cap and switch, the label or marker sync, the
@@ -19733,6 +19737,37 @@ def _finish_store_ledger(
             f"WARNING: the stored ledger stops tracking {len(held_dropped)} finding(s) the "
             f"collector still flags; it holds at most {MAX_HELD_IDS} at once, lowest ids first."
         )
+    # The previous findings on a target this run did not read or did not
+    # check, as the forge path keeps them (`unread_held_entries`): only over
+    # a gap and with a trusted stored ledger. A findings run renders them as
+    # rows under _Not re-checked this run_ in the stored body, after the
+    # collector-held entries and in the same `MAX_HELD_IDS`; a clean run
+    # keeps the previous body, which still carries them, so it has no cap.
+    # `unchecked_ids` also has the ids past the cap: their fixes stay open.
+    unread_entries: list[dict] = []
+    unread_dropped: list[dict] = []
+    if memory and delta_known and gaps:
+        unread_entries = unread_held_entries(
+            previous_body, memory, data, exclude=held_exclude | set(held) | _declared_ids(data)
+        )
+        if findings:
+            room = max(MAX_HELD_IDS - len(held_entries), 0)
+            unread_entries, unread_dropped = unread_entries[:room], unread_entries[room:]
+    unread_ids = {entry["id"] for entry in unread_entries}
+    unchecked_ids = unread_ids | {entry["id"] for entry in unread_dropped}
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is on the stored ledger and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays on the ledger as not re-checked "
+            "rather than resolved."
+        )
+    if unread_dropped:
+        log(
+            f"WARNING: the stored ledger stops tracking {len(unread_dropped)} previous "
+            "finding(s) on a target this run did not check — it holds at most "
+            f"{MAX_HELD_IDS} at once. Their {noun}s stay open: "
+            + ", ".join(entry["id"] for entry in unread_dropped)
+        )
     # Over a lost memory a clean run cannot tell what the stored ledger
     # carried, so it closes no fix, as the forge path's lost-memory gap says.
     if not delta_known and not findings:
@@ -19786,7 +19821,9 @@ def _finish_store_ledger(
     held_open = not findings and bool(gaps or unaccounted or held) and (
         bool(memory) or not delta_known
     )
-    stored_ids = sorted(set(previous_ids) if held_open else set(current_ids) | set(held))
+    stored_ids = sorted(
+        set(previous_ids) if held_open else set(current_ids) | set(held) | unread_ids
+    )
     new_ids = sorted(set(current_ids) - set(previous_ids)) if delta_known else []
     # Over a coverage gap an absence means "not checked", not fixed.
     resolved_ids = (
@@ -19794,7 +19831,7 @@ def _finish_store_ledger(
         if delta_known and not gaps and not (stale_scheme and findings)
         else []
     )
-    published_ids = held_exclude | set(held)
+    published_ids = held_exclude | set(held) | unread_ids
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
     } - published_ids
@@ -19855,7 +19892,10 @@ def _finish_store_ledger(
             repo,
             audit_id,
             remediation_prs,
-            set(current_ids) | still_flagged,
+            # And every previous finding on a target this run did not check,
+            # the ones past `MAX_HELD_IDS` too: absence there is not evidence
+            # of a fix.
+            set(current_ids) | still_flagged | unchecked_ids,
             previous_titles,
             {},
             now,
@@ -19923,9 +19963,10 @@ def _finish_store_ledger(
             below_floor=plan.below_floor,
             triage_reasons=triage_reasons,
             switched_off=plan.switched_off,
-            held=held_entries,
+            held=held_entries + unread_entries,
             held_overflow=len(held_dropped),
             held_carried=carried_without_manifest,
+            unread_overflow=len(unread_dropped),
             new_ids=set(new_ids) if delta_known and memory and not stale_scheme else None,
             blocked_by=blocking_prs(pr_by_finding, claimed),
             file_url=fix_plan.file_url,
@@ -19941,7 +19982,13 @@ def _finish_store_ledger(
     # itself held open, else the memory's own document. A held run's own
     # document is its empty set, not what the ledger renders.
     ledger_document = None
+    # The places of the findings that the ledger keeps as not re-checked
+    # (`NOT_RECHECKED_KEY`): this run's entries, or, when it keeps the
+    # previous body, the entries the stored run recorded.
+    not_rechecked = unread_entries
     if held_open:
+        kept = (memory or {}).get(NOT_RECHECKED_KEY)
+        not_rechecked = [e for e in kept if isinstance(e, dict)] if isinstance(kept, list) else []
         carried = (memory or {}).get("ledger_document")
         if not isinstance(carried, dict) and not (memory or {}).get("ledger_held_open"):
             carried = (memory or {}).get("document")
@@ -20006,6 +20053,7 @@ def _finish_store_ledger(
         ledger_held_open=held_open,
         delta_known=delta_known,
         reported_under_gap=reported_under_gap,
+        not_rechecked=not_rechecked,
     )
     envelope[LEDGER_KEY] = LEDGER_STORE
     if listing_refusal:
@@ -20026,6 +20074,7 @@ def _finish_store_ledger(
         held,
         note,
         len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
+        unread=sorted(unread_ids),
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,
