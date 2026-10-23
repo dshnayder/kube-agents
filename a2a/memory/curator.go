@@ -117,19 +117,21 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 	c.sub = sub
 
-	// Register the NATS request-reply responder for semantic memory queries so
-	// callers can query memory over NATS without coupling to a specific storage backend.
-	for _, qSubj := range []string{SubjectMemoryQuery, SubjectMemoryQueryPublic} {
+	// Register the NATS request-reply responder for semantic memory queries on
+	// SubjectMemoryQuery (_INBOX.agent.memory.query, covered by the agent
+	// principal's publish and subscribe grants) so callers can query memory over
+	// NATS without coupling to a specific storage backend.
+	querySubjects := []string{SubjectMemoryQuery}
+	if extra := strings.TrimSpace(os.Getenv("CURATOR_QUERY_SUBJECT")); extra != "" && extra != SubjectMemoryQuery {
+		querySubjects = append(querySubjects, extra)
+	}
+	for _, qSubj := range querySubjects {
 		qSub, qErr := c.cfg.Client.SubscribeCore(qSubj, func(msg *nats.Msg) {
 			c.handleQueryMsg(context.Background(), msg)
 		})
 		if qErr != nil {
-			if qSubj == SubjectMemoryQuery {
-				c.Stop()
-				return fmt.Errorf("curator subscribe %s: %w", qSubj, qErr)
-			}
-			c.log.Debug("curator: optional public query subject skipped", "subject", qSubj, "err", qErr)
-			continue
+			c.Stop()
+			return fmt.Errorf("curator subscribe %s: %w", qSubj, qErr)
 		}
 		c.querySubs = append(c.querySubs, qSub)
 	}
