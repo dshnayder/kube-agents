@@ -747,6 +747,9 @@ the answer. A pull request carries the fix when its delta block names the findin
 degraded fix, when it is on the branch that the promised path names. Only an open pull request
 counts: when a merged fix still reproduces (`pr-merged-persists`) or a person closed the pull
 request (`refused`), the reader must make the change by hand, so the row gets the route notes.
+The ledger that a forge with no issue tracker keeps in the report store gets the same notes, with
+the same rules. When that run cannot list the pull requests, no fix counts as carried, and each
+`manual` fix gets its notes.
 The notes give the location; a worker clause that contradicts them stays, and the note beside it is the correction. The worker's note is
 cut first when the total is longer than the note cap, measured after redaction and the escape of a
 comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut

@@ -19657,8 +19657,6 @@ class _FixPlan(NamedTuple):
     file_ref: str
     # Why the listing refused, when the caller let it (`listing_may_refuse`).
     listing_refusal: str | None = None
-    # The findings that get no route note (`route_note_skip`).
-    route_note_skip: frozenset[str] = frozenset()
 
 
 def _plan_remediation_files(
@@ -19688,6 +19686,9 @@ def _plan_remediation_files(
     plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
     and no unwritten-fix refusal, because no fix can be told to exist. The
     store ledger asks for this: its store write is the only record of the run.
+
+    Last, it adds the route notes to each `manual` remediation
+    (`disclose_manual_routes_and_log`), because both ledgers publish them.
     """
     listing_refusal = None
     try:
@@ -19765,12 +19766,18 @@ def _plan_remediation_files(
         )
     finally:
         probe.close()
-    skip = route_note_skip(
-        unwritten, declines, planned, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)
+    # After every pass that changes a remediation, so the notes describe the
+    # remediation that is published, on both ledgers. A fix that `finish`
+    # wrote, that the worker declined, or that an open pull request carries
+    # gets no route note (`route_note_skip`). A refused listing shows no pull
+    # request, so no fix counts as carried and each `manual` fix gets its
+    # notes: they still say where the fix belongs.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        route_note_skip(unwritten, declines, planned, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)),
     )
-    return _FixPlan(
-        remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal, frozenset(skip)
-    )
+    return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 
 def _finish_store_ledger(
@@ -20813,11 +20820,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref
-    # After every pass that changes a remediation, so the notes describe the
-    # remediation that is published. A fix that `finish` wrote, that the
-    # worker declined, or that an open pull request carries gets no route
-    # note (`route_note_skip`).
-    disclose_manual_routes_and_log(findings, manifest, fix_plan.route_note_skip)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens, the refresh of an open coverage ledger -- and just after the

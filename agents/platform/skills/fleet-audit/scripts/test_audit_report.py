@@ -30569,5 +30569,51 @@ class TestStoreLedger(HarnessTestCase):
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertEqual(sorted(self.latest()["current_ids"]), sorted([a["id"], b["id"]]))
 
+    def finish_manual_with_reconciler(self, proposals=()):
+        """The stored ledger body of a run whose `manual` fix the collector
+        found a reconciler for, with `proposals` listed on the forge."""
+        self.claim()
+        finding = make_finding(remediation={"kind": "manual", "note": "Write a default-deny policy."})
+        doc = make_doc(findings=[finding])
+        fid = audit_report.derive_finding_id(dict(finding))
+        listed = []
+        for number, state in proposals:
+            # A manual fix stages no file, so no branch is named after it: the
+            # pull request carries it by its delta block, on another branch of
+            # this stream.
+            listed.append({
+                "number": number,
+                "source": f"platform-agent/fix-{AUDIT}-elsewhere",
+                "sourceRepo": self.REPO,
+                "target": "main",
+                "state": state,
+                "author": Recorder.VIEWER.removesuffix("[bot]"),
+                "url": f"https://forge.invalid/acme/fleet/pull-requests/{number}",
+                "labels": [],
+                "body": audit_report.delta_block([fid]) + "\n" + audit_report.remediation_stream_marker(AUDIT),
+            })
+        if listed:
+            self.harness.replies["proposal-list"] = {"proposals": listed, "truncated": False}
+        self.finish_with_manifest(doc, [{**self.netpol_candidate(), "reconciler": "`flux`"}])
+        return self.latest()["ledger_body"]
+
+    def test_the_stored_ledger_carries_the_route_note_of_a_manual_fix(self):
+        """The store ledger writes the same `manual` remediations as the forge
+        path, so the route-note pass runs on it too."""
+        body = self.finish_manual_with_reconciler()
+        self.assertIn("Write a default-deny policy.", body)
+        self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
+        self.assertIn("now names where the fix belongs", self.err)
+
+    def test_an_open_pull_request_suppresses_the_route_note_on_the_stored_ledger(self):
+        body = self.finish_manual_with_reconciler(proposals=[(8, "open")])
+        self.assertIn("Write a default-deny policy.", body)
+        self.assertNotIn(audit_report.RECONCILED_NOTE_LEDE, body)
+
+    def test_a_merged_pull_request_does_not_suppress_the_route_note_on_the_stored_ledger(self):
+        """A merged fix whose finding still reproduces did not fix it."""
+        body = self.finish_manual_with_reconciler(proposals=[(8, "merged")])
+        self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
+
 if __name__ == "__main__":
     unittest.main()
