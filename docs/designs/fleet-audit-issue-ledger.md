@@ -45,6 +45,19 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
+  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
+  time, usually just after a label write, and `start` and `finish` ensure the labels just before the
+  lookup (the forge writes a label only when its colour or description changed). If the list is
+  empty and the stream's report store ([`fleet-audit-report-store.md`](fleet-audit-report-store.md))
+  names an issue for this repository, the harness reads that issue directly. The issue is the ledger
+  only when it is open and still carries the `audit:<audit-id>` label, and the run logs a warning
+  that the list omitted it. A closed issue stays closed, and a failed read gives "no ledger". The
+  harness reads the issue number from `latest.json`, or, when a diverted run marked `latest.json`,
+  from the newest envelope in the ring that is not marked. A marked envelope never names the ledger.
+  Read as "no ledger", an omitted ledger makes `finish` open a second ledger with no memory and lose
+  the state of the first one (held rows, carried findings).
 - The run-over-run delta mechanism is carried over unchanged: the hidden
   `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
   `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of

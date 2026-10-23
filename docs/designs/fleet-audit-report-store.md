@@ -172,7 +172,8 @@ rewrites the ledger without writing this store leaves a record that passes both:
 image that predates the store, during a revert or a mixed rollout, or the other pod's copy after the
 shell sandbox is toggled (§3). Joined against it, the delta would re-announce what that window added
 and resolved, and a clean run could close over findings only the window reported. So the record is
-also checked against the ledger itself: `find_existing_issue` lists the open issue with its body, and
+also checked against the ledger itself: `find_existing_issue` lists the open issue with its body (or,
+when the label list omits the issue that this store names, reads that issue directly), and
 the record is trusted only when that body's hidden block names the same ids as the stored
 `ledger_body`'s. The block rather than the whole body, because it is what every join reads and it
 survives the newline and prose edits GitHub or a person can make around it. The listed body is a

@@ -826,6 +826,8 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The neutral `state` of an open issue in the broker's `issue-view` answer.
+FORGE_ISSUE_OPEN = "open"
 # The chat report `finish` leaves for the relay: one record per stream in
 # SCRATCH_DIR, read over ssh by `session_kv_server.audit_chat_report`, which
 # spells these keys the same way.
@@ -13542,7 +13544,7 @@ def find_existing_issue(
             "issue was found; merge or close the remediation backlog on this label"
         )
     if not issues:
-        return None, None, None, None
+        return _ledger_the_listing_left_out(repo, audit_id)
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -13558,6 +13560,80 @@ def find_existing_issue(
     return (
         int(chosen["number"]),
         chosen.get("url"),
+        body if isinstance(body, str) else None,
+        title if isinstance(title, str) else None,
+    )
+
+
+def _stored_ledger_number(audit_id: str, repo: str) -> int | None:
+    """The ledger issue the report store last named for this stream and `repo`, or None.
+
+    `latest.json` first; when a run diverted away from `repo` marked it
+    (`is_diverted`), the newest envelope a publishing run left in the ring, as
+    `read_report_memory` reads it. A marked envelope never names a ledger. An
+    absent or unreadable store, or one written for another repository, names
+    none.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+        envelope = json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if is_diverted(envelope):
+        envelope = _newest_published_envelope(directory / REPORT_RUNS_DIR)
+    if not isinstance(envelope, dict) or _ledger_key(envelope.get("repo")) != _ledger_key(repo):
+        return None
+    number = envelope.get("issue_number")
+    if isinstance(number, bool) or not isinstance(number, int):
+        return None
+    return number
+
+
+def _ledger_the_listing_left_out(
+    repo: str, audit_id: str
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """The open ledger an empty label listing left out, or the four Nones.
+
+    GitHub's label-filtered issue list can leave out an open, labelled issue
+    for a short time, most likely just after a label write, and
+    `ensure_labels` runs a second or two before every lookup. Read as
+    "no ledger", `finish` opens a second ledger with no memory, and the first
+    ledger's state (its held rows, its carried findings) is lost.
+
+    So an empty listing is checked against the issue the report store names
+    (`_stored_ledger_number`). That issue is read directly, and it is the
+    ledger only when it is still open and still carries `audit:<id>`. A closed
+    issue stays closed: a clean full run closes the ledger on purpose, and the
+    next finding opens a fresh one. A failed read is the empty listing it was.
+    """
+    none: tuple[None, None, None, None] = (None, None, None, None)
+    number = _stored_ledger_number(audit_id, repo)
+    if number is None:
+        return none
+    answer = try_forge("issue-view", repo, {"number": number})
+    issue = (answer or {}).get("issue")
+    if not isinstance(issue, dict):
+        log(
+            f"The label listing for audit:{audit_id} in {repo} was empty, and this run "
+            f"could not read #{number}, which the report store names; treating the "
+            "stream as having no open ledger."
+        )
+        return none
+    label = f"audit:{audit_id}".lower()
+    labels = [str(name).lower() for name in issue.get("labels") or []]
+    if str(issue.get("state") or "").lower() != FORGE_ISSUE_OPEN or label not in labels:
+        return none
+    log(
+        f"WARNING: the label listing for audit:{audit_id} in {repo} left out #{number}, "
+        "which the report store names and which is open and carries the label; "
+        f"updating #{number}. The forge's label index can lag a label write."
+    )
+    body = issue.get("body")
+    title = issue.get("title")
+    url = issue.get("url")
+    return (
+        number,
+        url if isinstance(url, str) and url else None,
         body if isinstance(body, str) else None,
         title if isinstance(title, str) else None,
     )
