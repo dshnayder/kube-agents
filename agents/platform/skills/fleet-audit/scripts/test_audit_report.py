@@ -28860,6 +28860,24 @@ class TestStoreLedger(HarnessTestCase):
 
     # -- the run record ----------------------------------------------------------
 
+    def test_a_run_record_whose_keys_disagree_makes_finish_decide_again(self):
+        """Review finding: a record that keeps its ledger in the store with no
+        remediation names a repository it reached, so its keys disagree, and
+        no test held that `finish` then decides on its own."""
+        self.claim()
+        self.start()
+        path = Path(audit_report.run_record_path_for(AUDIT))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record[audit_report.RUN_RECORD_REMEDIATION_KEY] = False
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertIsNone(audit_report.this_runs_decision(AUDIT))
+        self.new_process()
+        decision = audit_report.finish_target(AUDIT, None)
+        self.assertEqual(
+            (decision.repo, decision.ledger, decision.remediation),
+            (self.REPO, audit_report.LEDGER_STORE, True),
+        )
+
     def test_start_records_the_decision_and_finish_follows_it(self):
         self.claim()
         started = self.start()
@@ -28918,6 +28936,15 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(started["pending_remediation_requests"], [])
         self.assertEqual([], self.harness.forge_calls("issue-*"))
         self.assertEqual([], self.harness.forge_calls("label-ensure"))
+
+    def test_a_first_start_does_not_say_that_a_fix_is_open(self):
+        """Review finding: `start` lists no remediation proposals, so its log
+        must not say that one is open."""
+        self.assertFalse(self.store_dir().exists())
+        started = self.start()
+        self.assertEqual(started[audit_report.CARRIED_KEY], [])
+        self.assertNotIn("a remediation proposal of this stream is open", self.err)
+        self.assertIn("no listing of remediation proposals was made", self.err)
 
     def test_start_names_the_findings_the_stored_ledger_carries(self):
         self.touch(self.NETPOL)
@@ -29239,6 +29266,20 @@ class TestStoreLedger(HarnessTestCase):
         latest = self.latest()
         self.assertEqual(len(latest["current_ids"]), 1)
         self.assertIn("could not list remediation", latest[audit_report.REMEDIATION_REFUSED_KEY])
+
+    def test_a_refused_listing_over_a_trusted_memory_is_never_silent(self):
+        """Review finding: with a trusted memory and nothing else moved, only
+        the refused listing stops `silent_ok`, and no test held it."""
+        self.claim()
+        first = self.run_once(make_doc(findings=[]))
+        self.assertTrue(first["silent_ok"], first)
+        self.start()
+        self.harness.failures["proposal-list"] = 1
+        self.assertEqual(self.finish(make_doc(findings=[])), 0, self.err)
+        out = self.stdout_json()
+        self.assertIn("could not list remediation", out[audit_report.REMEDIATION_REFUSED_KEY])
+        self.assertEqual(out["coverage_gaps"], [])
+        self.assertFalse(out["silent_ok"])
 
     def test_a_clean_run_with_a_refused_listing_closes_nothing_and_trusts_no_absent_store(self):
         """With the listing refused, no fix can be known to be closed, and a
