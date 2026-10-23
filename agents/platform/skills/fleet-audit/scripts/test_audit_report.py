@@ -18483,7 +18483,11 @@ class TestSubnetsListedMarker(unittest.TestCase):
     """
 
     AUDIT = "gcp-networking-fabric-audit"
-    KEY = audit_report.SUBNETS_LISTED_KEY
+    # The literal, so that a module without the constant fails on behaviour.
+    KEY = "subnets_listed"
+
+    def test_the_key_is_the_module_constant(self):
+        self.assertEqual(audit_report.SUBNETS_LISTED_KEY, self.KEY)
 
     def _project(self, project, **extra):
         entry = {
@@ -21301,7 +21305,7 @@ class TestFinishManifestFlag(HarnessTestCase):
             "location": "-",
             "project": "acme",
             "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
-            audit_report.SUBNETS_LISTED_KEY: 0,
+            "subnets_listed": 0,
         }
         doc = make_doc(findings=[], audit=audit_id, clusters=[project])
         for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
