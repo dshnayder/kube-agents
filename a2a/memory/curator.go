@@ -1117,7 +1117,9 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	var hsErr error
 	if c.cfg.Hindsight != nil && strings.TrimSpace(req.Query) != "" {
 		backend = "hindsight"
-		results, hsErr = c.cfg.Hindsight.Recall(ctx, req.Query, tags, tagsMatch)
+		hsCtx, hsCancel := context.WithTimeout(ctx, 12*time.Second)
+		results, hsErr = c.cfg.Hindsight.Recall(hsCtx, req.Query, tags, tagsMatch)
+		hsCancel()
 	}
 
 	c.mu.Lock()

@@ -189,7 +189,7 @@ func (h *HindsightClient) Recall(ctx context.Context, query string, tags []strin
 	}
 	body := map[string]any{
 		"query":      query,
-		"budget":     "mid",
+		"budget":     "low",
 		"max_tokens": 2048,
 		"types":      []string{"world", "experience"},
 		"tags":       tags,

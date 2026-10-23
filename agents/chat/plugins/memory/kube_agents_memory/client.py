@@ -281,7 +281,7 @@ def recall_decisions(query: str, max_results: int = 4) -> List[str]:
             [curator_bin, "recall", q],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
             check=False,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
