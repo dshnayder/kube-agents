@@ -278,7 +278,7 @@ def recall_decisions(query: str, max_results: int = 4) -> List[str]:
         return []
     try:
         proc = subprocess.run(
-            [curator_bin, "recall", "--query", q],
+            [curator_bin, "recall", q],
             capture_output=True,
             text=True,
             timeout=5,

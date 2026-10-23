@@ -429,11 +429,15 @@ func runRecall(args []string) error {
 	tagsMatch := fs.String("tags-match", "all_strict", "tags match mode (all_strict|any_strict)")
 	pathFilter := fs.String("path", "", "optional repository path filter")
 	clusterFilter := fs.String("cluster", "", "optional cluster filter")
+	queryFlag := fs.String("query", "", "optional query string (alternative to positional args)")
 	directHS := fs.Bool("direct-hindsight", false, "query Hindsight HTTP REST directly instead of NATS request-reply")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	query := strings.TrimSpace(*queryFlag)
+	if query == "" {
+		query = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
 	if query == "" && *pathFilter == "" && *clusterFilter == "" {
 		return errors.New("recall requires a query string, --path, or --cluster")
 	}
