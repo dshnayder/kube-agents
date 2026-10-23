@@ -168,8 +168,9 @@ An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (an
 no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
 does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
 repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
-check is one issue listing that `start` makes through the broker (one pull request listing on a
-forge with no issue tracker), and `finish` follows its result.
+check is one issue listing that `start` makes through the broker (one pull request listing when the
+ledger goes to the report store: a forge with no issue tracker, or with issues and no labels), and
+`finish` follows its result.
 The run does not choose another repository, and it is never silent (`silent_ok: false`). A run for
 which several repositories are managed and none can be chosen (none has `role: gitops`) is the same
 too: its note gives the reason and the fix, and the JSON line carries it under
