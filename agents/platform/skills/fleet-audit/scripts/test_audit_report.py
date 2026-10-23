@@ -31603,6 +31603,64 @@ class TestStoreLedger(HarnessTestCase):
         self.assertIn("stops tracking 1 previous finding(s) on a target this run did not check", self.err)
         self.assertIn(past_cap, self.err)
 
+    def routed_run(self, doc, names, with_stage):
+        """`finish` with a manifest whose candidates have a reconciler: the
+        netpol candidate on prod-us-east and, if `with_stage`, the stage one."""
+        manifest = _full_manifest(names=names, candidates=[{**self.netpol_candidate(), "reconciler": "`flux`"}])
+        if with_stage:
+            manifest["clusters"][1]["candidates"] = [
+                {
+                    **self.netpol_candidate(),
+                    "cluster": "stage-eu",
+                    "object": "Namespace/stage",
+                    "reconciler": "`argocd`",
+                }
+            ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        self.new_process()
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.latest()["ledger_body"]
+
+    def test_a_not_re_checked_row_gets_no_route_note_and_the_next_run_writes_it_once(self):
+        """A row under _Not re-checked this run_ has no remediation, so the
+        route-note pass does not reach it. The gap run writes the route note
+        of the finding it read, and none for the row it kept. The next run
+        that reads the target writes the route note of that finding again,
+        one time, also when the worker copied it from an older ledger."""
+        self.claim()
+
+        def manual(note):
+            return {"kind": "manual", "note": note}
+
+        prod = make_finding(remediation=manual("Write a default-deny policy."))
+        stage = {**self.stage_finding(), "remediation": manual("Write a stage policy.")}
+        full = self.routed_run(make_doc(findings=[prod, stage]), ("prod-us-east", "stage-eu"), True)
+        self.assertEqual(full.count(audit_report.RECONCILED_NOTE_LEDE), 2)
+        self.assertIn("`argocd`", full)
+        gap = self.routed_run(self.gap_doc([prod]), ("prod-us-east",), False)
+        self.assertIn(audit_report.UNREAD_HELD_HEADING, gap)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(gap))
+        self.assertEqual(gap.count(audit_report.RECONCILED_NOTE_LEDE), 1)
+        self.assertNotIn("`argocd`", gap)
+        self.assertNotIn("Write a stage policy.", gap)
+        # The worker copies the stage note, with its route note, from the older ledger.
+        copied = audit_report.RECONCILED_NOTE.format(reconciler="`argocd`")
+        stage_copied = {
+            **stage,
+            "remediation": manual("Write a stage policy." + audit_report.ROUTE_PARAGRAPH_BREAK + copied),
+        }
+        back = self.routed_run(make_doc(findings=[prod, stage_copied]), ("prod-us-east", "stage-eu"), True)
+        self.assertEqual(back.count(audit_report.RECONCILED_NOTE_LEDE), 2)
+        self.assertEqual(back.count("`argocd`"), 1)
+        self.assertNotIn(audit_report.UNREAD_HELD_HEADING, back)
+
     def shielded_finish(self, doc, candidates):
         """`finish` with the declaration of api filed by `start`, so the shield closes over the gap."""
         manifest_path = self.tmp_path / "manifest.json"
