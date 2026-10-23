@@ -29488,11 +29488,13 @@ class TestStoreLedger(HarnessTestCase):
         started = self.start()
         self.assertIn(held_id, [entry["id"] for entry in started[audit_report.CARRIED_KEY]])
 
-    NETPOL_CANDIDATE = {
-        "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
-        "object": "Namespace/no-network-policy", "severity": "major",
-        "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
-    }
+    @staticmethod
+    def netpol_candidate():
+        return {
+            "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+            "object": "Namespace/no-network-policy", "severity": "major",
+            "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
+        }
 
     def finish_with_manifest(self, doc, candidates):
         manifest_path = self.tmp_path / "manifest.json"
@@ -29524,7 +29526,7 @@ class TestStoreLedger(HarnessTestCase):
         self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": pr_b["body"]}}
         clean = make_doc(findings=[])
         clean["resolved_because"] = [self.resolved_entry(a), self.resolved_entry(b)]
-        out = self.finish_with_manifest(clean, [self.NETPOL_CANDIDATE])
+        out = self.finish_with_manifest(clean, [self.netpol_candidate()])
         self.assertEqual(out["prs_closed"], [])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
         self.assertEqual(out[audit_report.UNACCOUNTED_KEY], [a["id"]])
