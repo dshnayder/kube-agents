@@ -131,9 +131,19 @@ def project_answers(**overrides):
     return answers
 
 
+class Warned:
+    """A `project_answers` answer for a read that exits 0 and writes `stderr`,
+    as a gcloud list does when some regions or zones did not respond."""
+
+    def __init__(self, answer, stderr):
+        self.answer = answer
+        self.stderr = stderr
+
+
 def fake_run_cmd(per_project, calls=None):
     """A `run_cmd` answering each project's reads from `project_answers`. An
-    answer that is a `(rc, stderr)` tuple is a failed read."""
+    answer that is a `(rc, stderr)` tuple is a failed read; a `Warned` answer
+    is a read that passed and wrote its `stderr` too."""
 
     def run(cmd, *args, **kwargs):
         if calls is not None:
@@ -142,6 +152,8 @@ def fake_run_cmd(per_project, calls=None):
         answers = per_project.get(networking_audit.project_flag_value(cmd) or "", {})
         for phrase, answer in answers.items():
             if phrase in joined:
+                if isinstance(answer, Warned):
+                    return (0, json.dumps(answer.answer), answer.stderr)
                 if isinstance(answer, tuple):
                     return (answer[0], "", answer[1])
                 return (0, json.dumps(answer), "")
@@ -2404,7 +2416,9 @@ class SubnetsListedMarkTest(unittest.TestCase):
     """
 
     AUDIT = "gcp-networking-fabric-audit"
-    KEY = networking_audit.SUBNETS_LISTED_KEY
+    # The literal, so that a module without the constant fails on behaviour.
+    KEY = "subnets_listed"
+    INCOMPLETE = "WARNING: The following regions did not respond: us-east1. List results may be incomplete."
 
     def setUp(self):
         sys.path.insert(0, FLEET_AUDIT_SCRIPTS)
@@ -2470,6 +2484,41 @@ class SubnetsListedMarkTest(unittest.TestCase):
                 manifest, by_name = self.fleet({"p1": answers})
                 self.assertNotIn(self.KEY, by_name["project/p1"])
                 self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+
+    def test_the_key_is_the_module_constant(self):
+        self.assertEqual(networking_audit.SUBNETS_LISTED_KEY, self.KEY)
+
+    def test_a_read_that_warns_it_may_be_incomplete_gets_no_mark_and_the_gap_stays(self):
+        # gcloud exits 0 when some regions or zones do not respond. The
+        # subnets it did not list, or the VMs, addresses and forwarding rules
+        # on an out-of-scope host subnet, can be in the part it did not read.
+        for phrase in ("subnets list", "instances list", "addresses list", "forwarding-rules list",
+                       "clusters list"):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{phrase: Warned([], self.INCOMPLETE)})
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertNotIn(self.KEY, by_name["project/p1"])
+                gaps = self.gaps(manifest)
+                self.assertTrue(any("no subnet targets were audited" in gap for gap in gaps), gaps)
+                self.assertTrue(any("did not respond: us-east1" in gap for gap in gaps), gaps)
+
+    def test_a_read_with_an_unrelated_warning_still_marks(self):
+        for phrase in ("subnets list", "instances list", "addresses list", "forwarding-rules list"):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{phrase: Warned([], "WARNING: some unrelated notice")})
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertEqual(by_name["project/p1"][self.KEY], 0)
+                self.assertEqual(self.gaps(manifest), [])
+
+    def test_a_partial_subnet_list_names_the_warning_on_the_subnets_it_listed(self):
+        answers = project_answers(**{"subnets list": Warned([subnet("small", "10.0.0.0/24")], self.INCOMPLETE)})
+        _, by_name = self.fleet({"p1": answers})
+        self.assertNotIn(self.KEY, by_name["project/p1"])
+        limitations = by_name["p1/us-central1/small"]["limitations"]
+        self.assertIn("subnets partially read: `gcloud compute networks subnets list --project=p1", limitations)
+        self.assertIn("did not respond: us-east1", limitations)
 
     def test_a_service_project_on_an_unlisted_host_pod_range_gets_no_mark(self):
         cluster = gke_cluster("svc-c", "shared", "pods", 0.2, [("svc-pool", "pods", 0.2, 24)],
