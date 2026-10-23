@@ -231,8 +231,10 @@ run saves the previous run's finding ids on the entry before it touches the ledg
 that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
 `finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
 whole run, and its line states the run's new and resolved findings, or says the change is unknown
-when the first `finish` had no trusted memory of the previous run. Its JSON line still counts
-against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+when the first `finish` had no trusted memory of the previous run. With the ids, the first
+`finish` saves what it read about the last scheduled run, so the line on that chat report that
+says the change since the last scheduled run also covers the whole run (`run_since_scheduled`).
+The JSON line of the later `finish` still counts against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
 `finish` does not save the mid-run memory it reads after an earlier one filled the entry without
 them. A no-forge or HELD report, or an entry without those
 ids, keeps a label that says its counts are against the earlier `finish`: the report above, or

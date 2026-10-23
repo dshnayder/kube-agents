@@ -861,6 +861,19 @@ CHAT_REPORT_BASELINE_STALE_KEY = "run_baseline_stale"
 # Every id the previous run filed, rendered or not (a body over budget cuts some):
 # none is new on any count of this run, as `finish`'s own count already holds.
 CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
+# Saved with the baseline: what the run's first `finish` read about the last
+# scheduled run. A later `finish` reads the record the earlier one stored, so
+# it uses this value to say the change since the last scheduled run for the
+# whole run (`run_since_scheduled`). The value is an object with these keys:
+# the ids the last scheduled run published (None when no record shows them),
+# the ids a scheduled run reported under a gap, the run kind of the record
+# (None when the record does not say it), and whether the counts of the run
+# are against that record (False with no open ledger).
+CHAT_REPORT_BASELINE_SCHEDULED_KEY = "run_baseline_scheduled"
+SCHEDULED_CONTEXT_IDS_KEY = "ids"
+SCHEDULED_CONTEXT_REPORTED_KEY = "reported"
+SCHEDULED_CONTEXT_KIND_KEY = "record_scheduled"
+SCHEDULED_CONTEXT_AGAINST_KEY = "against_record"
 # Above a later `finish`'s report in the same entry. Its counts cover the whole
 # run when they came from the entry's baseline; otherwise (no ledger, a HELD
 # report, an entry an older image wrote) they are measured against the report
@@ -3472,6 +3485,106 @@ class RunBaseline(NamedTuple):
     filed: list[str]
     # Read off the entry an earlier `finish` of this run saved it on.
     from_entry: bool
+    # What the run's first `finish` read about the last scheduled run
+    # (`scheduled_context`); None on an entry that does not have it.
+    scheduled: dict | None = None
+
+
+def scheduled_context(
+    scheduled_memory: dict | None, memory: dict | None, existing_issue: int | None
+) -> dict:
+    """What this `finish` read about the last scheduled run, to save with the baseline."""
+    kind = (scheduled_memory or {}).get(RUN_SCHEDULED_KEY)
+    return {
+        SCHEDULED_CONTEXT_IDS_KEY: scheduled_published_baseline(scheduled_memory),
+        SCHEDULED_CONTEXT_REPORTED_KEY: sorted(scheduled_reported_baseline(memory)),
+        SCHEDULED_CONTEXT_KIND_KEY: kind if isinstance(kind, bool) else None,
+        SCHEDULED_CONTEXT_AGAINST_KEY: existing_issue is not None,
+    }
+
+
+def _saved_scheduled_context(value: object) -> dict | None:
+    """The `scheduled_context` value saved on an entry, or None when it is not valid."""
+    if not isinstance(value, dict):
+        return None
+    ids = value.get(SCHEDULED_CONTEXT_IDS_KEY)
+    reported = value.get(SCHEDULED_CONTEXT_REPORTED_KEY)
+    kind = value.get(SCHEDULED_CONTEXT_KIND_KEY)
+    if (
+        (ids is None or (isinstance(ids, list) and all(isinstance(fid, str) for fid in ids)))
+        and isinstance(reported, list)
+        and all(isinstance(fid, str) for fid in reported)
+        and (kind is None or isinstance(kind, bool))
+        and isinstance(value.get(SCHEDULED_CONTEXT_AGAINST_KEY), bool)
+    ):
+        return value
+    return None
+
+
+def run_since_scheduled(
+    context: dict,
+    scheduled: bool,
+    published_ids: set[str],
+    gaps: list[str],
+    stale_scheme: bool,
+    reported_under_gap: list[str],
+) -> dict:
+    """The `SINCE_SCHEDULED_KEY` entry for a later `finish`'s chat report, or `{}`.
+
+    The same rule as the JSON line's entry (`since_last_scheduled`), but
+    against what the run's first `finish` read (`context`), and not against
+    the record an earlier `finish` of this run stored. The chat report of a
+    later `finish` counts the whole run, so its line must also cover the
+    whole run.
+    """
+    ids = context[SCHEDULED_CONTEXT_IDS_KEY]
+    reported = (
+        set(context[SCHEDULED_CONTEXT_REPORTED_KEY]) - published_ids
+        if gaps or stale_scheme
+        else set()
+    )
+    moved = scheduled and (
+        ids is None or (not stale_scheme and published_ids != set(ids) - reported)
+    )
+    return since_last_scheduled(
+        moved,
+        {RUN_SCHEDULED_KEY: context[SCHEDULED_CONTEXT_KIND_KEY]},
+        ids,
+        published_ids,
+        not_resolved=reported_under_gap if gaps else (),
+        counted_against_record=context[SCHEDULED_CONTEXT_AGAINST_KEY],
+    )
+
+
+def whole_run_chat_payload(
+    payload: dict,
+    baseline: RunBaseline,
+    scheduled: bool,
+    published_ids: set[str],
+    gaps: list[str],
+    reported_under_gap: list[str],
+) -> dict:
+    """`payload` for the chat report of a later `finish` that counts the whole run.
+
+    Its `SINCE_SCHEDULED_KEY` entry is replaced by the whole run's
+    (`run_since_scheduled`). An entry with no saved context keeps the entry
+    of this `finish`. The JSON line keeps its own entry, as it keeps its
+    own counts.
+    """
+    if baseline.scheduled is None:
+        return payload
+    chat_payload = {key: value for key, value in payload.items() if key != SINCE_SCHEDULED_KEY}
+    chat_payload.update(
+        run_since_scheduled(
+            baseline.scheduled,
+            scheduled,
+            published_ids,
+            gaps,
+            baseline.stale_scheme,
+            reported_under_gap,
+        )
+    )
+    return chat_payload
 
 
 def run_baseline(
@@ -3482,6 +3595,7 @@ def run_baseline(
     stale_scheme: bool,
     filed_ids: Iterable[str],
     now: datetime,
+    scheduled: dict | None = None,
 ) -> RunBaseline:
     """The baseline on `repo`'s entry in this run, else this `finish`'s own, saved there.
 
@@ -3491,8 +3605,11 @@ def run_baseline(
     the first saw. Saved only on an entry no `finish` has filled: an earlier
     one that saved none (an older image, a failed write) leaves this one's
     memory a mid-run snapshot, which no later `finish` may count from.
+    `scheduled` (`scheduled_context`) is saved with the baseline.
     """
-    own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), sorted(set(filed_ids)), False)
+    own = RunBaseline(
+        list(previous_ids), bool(delta_known), bool(stale_scheme), sorted(set(filed_ids)), False, scheduled
+    )
     record = _live_chat_record(audit_id, now)
     filled = None if record is None else _filled_part(record, repo)
     part = filled or (None if record is None else _pending_part(record, repo))
@@ -3510,13 +3627,17 @@ def run_baseline(
         and isinstance(filed, list)
         and all(isinstance(fid, str) for fid in filed)
     ):
-        return RunBaseline(ids, known, stale, filed, True)
+        return RunBaseline(
+            ids, known, stale, filed, True, _saved_scheduled_context(part.get(CHAT_REPORT_BASELINE_SCHEDULED_KEY))
+        )
     if filled is not None:
         return own
     part[CHAT_REPORT_BASELINE_IDS_KEY] = own.ids
     part[CHAT_REPORT_BASELINE_KNOWN_KEY] = own.known
     part[CHAT_REPORT_BASELINE_STALE_KEY] = own.stale_scheme
     part[CHAT_REPORT_BASELINE_FILED_KEY] = own.filed
+    if own.scheduled is not None:
+        part[CHAT_REPORT_BASELINE_SCHEDULED_KEY] = own.scheduled
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
         _write_chat_record(audit_id, record)
@@ -19266,7 +19387,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "a rename as a fix."
         )
     filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
-    baseline = run_baseline(audit_id, repo, previous_ids, delta_known, stale_scheme, filed_cut, now)
+    # Where the last scheduled run's ids are read from (see `scheduled_ids`
+    # below). Read here, so the run's first `finish` saves what it read with
+    # the baseline.
+    scheduled_memory = memory if existing_issue else newest_stored_record(audit_id, repo)
+    baseline = run_baseline(
+        audit_id,
+        repo,
+        previous_ids,
+        delta_known,
+        stale_scheme,
+        filed_cut,
+        now,
+        scheduled_context(scheduled_memory, memory, existing_issue),
+    )
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -19383,7 +19517,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # With no open ledger, `memory` is None, and the ids are in the stream's
     # newest stored record: the record of the ledger that a run closed. When
     # no record shows the ids, the run speaks.
-    scheduled_memory = memory if existing_issue else newest_stored_record(audit_id, repo)
     scheduled_ids = scheduled_published_baseline(scheduled_memory)
     # An id stays under `reported_under_gap` until a run publishes it again
     # or a run with full coverage does not find it. That run resolved it, so
@@ -20071,7 +20204,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             repo,
             render_chat_report(
                 audit_id,
-                payload,
+                whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
+                if whole_run
+                else payload,
                 data,
                 baseline.known if whole_run else delta_known,
                 (0, run_resolved) if whole_run else None,
@@ -20606,7 +20741,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         repo,
         render_chat_report(
             audit_id,
-            payload,
+            whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
+            if baseline.from_entry
+            else payload,
             data,
             baseline.known if baseline.from_entry else delta_known,
             run_counts,

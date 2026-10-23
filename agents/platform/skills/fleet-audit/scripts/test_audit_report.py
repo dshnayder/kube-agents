@@ -28641,6 +28641,58 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
 
+    def test_a_later_finish_says_the_change_since_the_last_scheduled_run_for_the_whole_run(self):
+        """The last run was on demand: its record is not a scheduled run's.
+
+        The later `finish` reads the record the earlier one stored, which is
+        a scheduled run's, so on its own it says nothing since the last
+        scheduled run. Its counts cover the whole run, so the line must too.
+        """
+        last_scheduled = published_body(
+            make_doc(findings=[make_finding(fid="a", severity="major")]), generated_at=NOW
+        )
+        on_demand = published_body(
+            make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")]),
+            generated_at=NOW,
+        )
+        self.start()
+        self.seed_report(
+            on_demand,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: False,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(last_scheduled),
+            },
+        )
+        self.harness.replies["issue-list"] = self.issue_list()
+        three = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b", "c")])
+        [ida] = audit_report.parse_delta_block(last_scheduled)
+        idb, idc = sorted(set(audit_report.parse_delta_block(published_body(three, generated_at=NOW))) - {ida})
+        both = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        self.assertEqual(self.run_finish(three), 0, self.err)
+        [(_, text)] = self.entries()
+        first, second = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
+        self.assertIn(f"Changed since the last scheduled run: 1 new ({idb}), 0 resolved.", first)
+        self.assertIn(": 1 new, 0 resolved;", second.splitlines()[0])
+        self.assertIn(
+            f"Changed since the last scheduled run: 2 new ({', '.join(sorted([idb, idc]))}), 0 resolved.",
+            second,
+        )
+
+    def test_a_later_finish_says_no_scheduled_change_when_the_run_moved_nothing_since_it(self):
+        """The last run was scheduled: the whole run's counts already say it."""
+        self.start()
+        self.on_a_ledger_of("a")
+        both = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        [(_, text)] = self.entries()
+        self.assertNotIn("Changed since the last scheduled run", text)
+        self.assertIn(": 1 new, 0 resolved;", self.heads()[-1])
+
     def test_a_coverage_gap_on_a_later_finish_withholds_the_runs_resolved(self):
         self.start()
         self.on_a_ledger_of("a", "b")
