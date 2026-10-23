@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,14 +34,18 @@ type CuratorConfig struct {
 // Curator ingests learning outcomes from NATS JetStream (a2a.topics.shared.annotations),
 // maintains OKF records in knowledge/, indexes them into Hindsight (kube-agents-decisions)
 // with in-place status transitions, promotes multi-cluster recurrences into fleet-wide
-// decisions, and broadcasts the updated digest on a2a.topics.shared.blueprint.
+// decisions, broadcasts the updated digest on a2a.topics.shared.blueprint, and serves
+// semantic memory queries over NATS request-reply (SubjectMemoryQuery) with automatic
+// cache invalidation on outcome updates.
 type Curator struct {
 	cfg           CuratorConfig
 	log           *slog.Logger
 	mu            sync.Mutex
 	seenEnvelopes map[string]bool
 	graduatedIDs  []string
+	queryCache    map[string]MemoryQueryResponse
 	sub           lib.Subscription
+	querySubs     []lib.Subscription
 }
 
 // OutcomeProcessResult reports what the Curator changed when handling an OutcomeEvent.
@@ -81,11 +86,14 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 		cfg:           cfg,
 		log:           log,
 		seenEnvelopes: map[string]bool{},
+		queryCache:    map[string]MemoryQueryResponse{},
 	}, nil
 }
 
-// Start subscribes to a2a.topics.shared.annotations and processes both any latest
-// unread journal entry on TOPICS-JOURNAL and all live outcome publishes.
+// Start subscribes to a2a.topics.shared.annotations, registers the NATS memory
+// query responder on SubjectMemoryQuery (and SubjectMemoryQueryPublic when
+// permitted by bus grants), and processes both any latest unread journal entry
+// on TOPICS-JOURNAL and all live outcome publishes.
 func (c *Curator) Start(ctx context.Context) error {
 	if c.cfg.Hindsight != nil {
 		if err := c.cfg.Hindsight.EnsureBank(ctx); err != nil {
@@ -109,6 +117,23 @@ func (c *Curator) Start(ctx context.Context) error {
 	}
 	c.sub = sub
 
+	// Register the NATS request-reply responder for semantic memory queries so
+	// callers can query memory over NATS without coupling to a specific storage backend.
+	for _, qSubj := range []string{SubjectMemoryQuery, SubjectMemoryQueryPublic} {
+		qSub, qErr := c.cfg.Client.SubscribeCore(qSubj, func(msg *nats.Msg) {
+			c.handleQueryMsg(context.Background(), msg)
+		})
+		if qErr != nil {
+			if qSubj == SubjectMemoryQuery {
+				c.Stop()
+				return fmt.Errorf("curator subscribe %s: %w", qSubj, qErr)
+			}
+			c.log.Debug("curator: optional public query subject skipped", "subject", qSubj, "err", qErr)
+			continue
+		}
+		c.querySubs = append(c.querySubs, qSub)
+	}
+
 	// Catch up with the latest entry on TOPICS-JOURNAL if present and not yet processed.
 	latestEnv, err := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectAnnotations)
 	if err == nil && latestEnv != nil {
@@ -131,6 +156,10 @@ func (c *Curator) Stop() {
 		c.sub.Stop()
 		c.sub = nil
 	}
+	for _, qs := range c.querySubs {
+		qs.Stop()
+	}
+	c.querySubs = nil
 }
 
 func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelope) {
@@ -285,6 +314,8 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 
 	lastDesc := fmt.Sprintf("%s:%s->%s", ev.Kind, targetRec.Meta.ID, targetRec.Meta.Status)
 	digest := BuildBlueprintDigest(repoID, records, lastDesc, c.graduatedIDs)
+	// Invalidate cached query responses whenever an outcome updates memory state.
+	c.queryCache = map[string]MemoryQueryResponse{}
 	if c.cfg.Client != nil {
 		if err := c.publishBlueprintDigest(ctx, digest, correlationID); err != nil {
 			return OutcomeProcessResult{}, fmt.Errorf("publish blueprint: %w", err)
@@ -851,4 +882,249 @@ func appendUnique(list []string, item string) []string {
 		}
 	}
 	return append(list, item)
+}
+
+func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg) {
+	if msg == nil || msg.Reply == "" {
+		return
+	}
+	var req MemoryQueryRequest
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		resp := MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Error:  fmt.Sprintf("invalid query payload: %v", err),
+		}
+		raw, _ := json.Marshal(resp)
+		_ = msg.Respond(raw)
+		return
+	}
+	qCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	resp := c.HandleQuery(qCtx, req)
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	_ = msg.Respond(raw)
+}
+
+// HandleQuery answers a MemoryQueryRequest against the configured semantic
+// memory backend (Hindsight + local OKF records) with in-memory caching that is
+// automatically invalidated whenever ProcessOutcome updates the store.
+func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) MemoryQueryResponse {
+	tags := append([]string(nil), req.Tags...)
+	if len(tags) == 0 {
+		tags = []string{SharedTag}
+	}
+	sort.Strings(tags)
+	tagsMatch := req.TagsMatch
+	if tagsMatch == "" {
+		tagsMatch = "all_strict"
+	}
+	bank := req.Bank
+	if bank == "" {
+		bank = DefaultBankID
+		if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
+			bank = c.cfg.Hindsight.bankID
+		}
+	}
+	cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%s",
+		bank, strings.TrimSpace(req.Query), strings.Join(tags, ","), tagsMatch, req.Path, req.Cluster)
+
+	c.mu.Lock()
+	if cached, ok := c.queryCache[cacheKey]; ok {
+		c.mu.Unlock()
+		cached.Cached = true
+		return cached
+	}
+	c.mu.Unlock()
+
+	backend := "okf-local"
+	var results []HindsightRecallResult
+	var hsErr error
+	if c.cfg.Hindsight != nil && strings.TrimSpace(req.Query) != "" {
+		backend = "hindsight"
+		results, hsErr = c.cfg.Hindsight.Recall(ctx, req.Query, tags, tagsMatch)
+	}
+
+	c.mu.Lock()
+	records, _ := LoadRecords(c.cfg.RepoDir)
+	repoID := c.cfg.RepoID
+	c.mu.Unlock()
+
+	var matchedDigests []BlueprintRecordDigest
+	var fallbackResults []HindsightRecallResult
+	qLower := strings.ToLower(strings.TrimSpace(req.Query))
+	for _, r := range records {
+		recTags := r.Tags()
+		if !matchTagSlice(recTags, tags, tagsMatch) {
+			continue
+		}
+		if req.Cluster != "" && !matchesClusterScope(r.Meta.Scope.Clusters, req.Cluster) {
+			continue
+		}
+		if req.Path != "" && !matchesAnyPathGlob(r.Meta.Scope.Paths, req.Path) {
+			continue
+		}
+		rendered := r.RenderForIndex()
+		if qLower != "" && !recordMatchesQueryText(rendered, qLower) {
+			continue
+		}
+		var guardRule string
+		if r.Meta.Guard != nil {
+			guardRule = r.Meta.Guard.Rule
+		}
+		matchedDigests = append(matchedDigests, BlueprintRecordDigest{
+			ID:             r.Meta.ID,
+			Type:           r.Meta.Type,
+			Status:         r.Meta.Status,
+			Title:          r.Meta.Title,
+			Path:           r.Path,
+			Clusters:       r.Meta.Scope.Clusters,
+			Checks:         r.Meta.Scope.Checks,
+			Paths:          r.Meta.Scope.Paths,
+			GuardRule:      guardRule,
+			PullRequest:    r.Meta.Evidence.PullRequest,
+			ReviewerReason: r.Meta.Evidence.ReviewerReason,
+			Supersedes:     r.Meta.Supersedes,
+			SupersededBy:   r.Meta.SupersededBy,
+		})
+		fallbackResults = append(fallbackResults, HindsightRecallResult{
+			ID:         r.Meta.ID,
+			DocumentID: r.DocumentID(repoID),
+			Text:       rendered,
+			Tags:       recTags,
+		})
+	}
+
+	if len(results) == 0 && len(fallbackResults) > 0 {
+		results = fallbackResults
+		if c.cfg.Hindsight == nil {
+			backend = "okf-local"
+		}
+	}
+	if results == nil {
+		results = []HindsightRecallResult{}
+	}
+
+	resp := MemoryQueryResponse{
+		Schema:  MemoryQueryReplySchema,
+		Backend: backend,
+		Bank:    bank,
+		Query:   req.Query,
+		Tags:    tags,
+		Cached:  false,
+		Results: results,
+		Records: matchedDigests,
+	}
+	if hsErr != nil && len(results) == 0 {
+		resp.Error = hsErr.Error()
+		return resp
+	}
+
+	c.mu.Lock()
+	c.queryCache[cacheKey] = resp
+	c.mu.Unlock()
+	return resp
+}
+
+// InvalidateCache clears the Curator's in-memory query cache.
+func (c *Curator) InvalidateCache() {
+	c.mu.Lock()
+	c.queryCache = map[string]MemoryQueryResponse{}
+	c.mu.Unlock()
+}
+
+// QueryViaNATS sends a MemoryQueryRequest over NATS to the Curator's memory
+// responder on SubjectMemoryQuery and returns the decoded MemoryQueryResponse.
+func QueryViaNATS(ctx context.Context, client *lib.Client, req MemoryQueryRequest) (MemoryQueryResponse, error) {
+	if client == nil {
+		return MemoryQueryResponse{}, errors.New("NATS client is nil")
+	}
+	if req.Schema == "" {
+		req.Schema = MemoryQuerySchema
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("marshal memory query: %w", err)
+	}
+	nc := client.Conn()
+	msg, err := nc.RequestWithContext(ctx, SubjectMemoryQuery, rawReq)
+	if err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("nats memory query on %s: %w", SubjectMemoryQuery, err)
+	}
+	var resp MemoryQueryResponse
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("decode memory query reply: %w", err)
+	}
+	if resp.Error != "" {
+		return resp, errors.New(resp.Error)
+	}
+	return resp, nil
+}
+
+func matchTagSlice(have, want []string, mode string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	set := map[string]bool{}
+	for _, t := range have {
+		set[t] = true
+	}
+	if mode == "any_strict" {
+		for _, w := range want {
+			if set[w] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesClusterScope(clusters []string, target string) bool {
+	if len(clusters) == 0 {
+		return true
+	}
+	for _, c := range clusters {
+		if c == "*" || c == target {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAnyPathGlob(patterns []string, target string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	for _, p := range patterns {
+		if MatchGlob(p, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func recordMatchesQueryText(rendered, qLower string) bool {
+	lowerText := strings.ToLower(rendered)
+	if strings.Contains(lowerText, qLower) {
+		return true
+	}
+	terms := strings.Fields(qLower)
+	if len(terms) == 0 {
+		return true
+	}
+	matched := 0
+	for _, t := range terms {
+		if len(t) <= 2 || strings.Contains(lowerText, t) {
+			matched++
+		}
+	}
+	return matched*2 >= len(terms)
 }

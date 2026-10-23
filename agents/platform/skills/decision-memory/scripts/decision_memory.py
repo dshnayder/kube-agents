@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -709,6 +710,34 @@ class Hindsight:
 
     def recall(self, query: str, tag_groups: Optional[List[Dict[str, Any]]] = None,
                budget: str = "mid", max_tokens: int = 2048) -> List[Dict[str, Any]]:
+        if os.environ.get("NATS_URL"):
+            curator_bin = shutil.which("curator") or (
+                "/usr/local/bin/curator" if os.path.exists("/usr/local/bin/curator") else None
+            )
+            if curator_bin:
+                flat_tags: List[str] = []
+                if tag_groups:
+                    for g in tag_groups:
+                        for t in g.get("tags") or []:
+                            if t not in flat_tags:
+                                flat_tags.append(t)
+                else:
+                    flat_tags = [SHARED_TAG]
+                try:
+                    proc = subprocess.run(
+                        [curator_bin, "recall", "--bank", self.bank, "--tags", ",".join(flat_tags), query],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        payload = json.loads(proc.stdout)
+                        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+                            return list(payload["results"])
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+
         body: Dict[str, Any] = {"query": query, "budget": budget, "max_tokens": max_tokens,
                                 "types": ["world", "experience"]}
         if tag_groups:

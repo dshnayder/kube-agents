@@ -432,6 +432,65 @@ spec:
 		t.Fatalf("expected exactly DEC-2026-005 in active recall, got %+v", activeResults)
 	}
 
+	// Verify NATS request-reply query (QueryViaNATS) answers from Hindsight, caches repeated queries,
+	// and invalidates the cache when a new outcome is published on NATS.
+	qReq := MemoryQueryRequest{
+		Query:     "checkout cpu request",
+		Tags:      []string{SharedTag, "status:active"},
+		TagsMatch: "all_strict",
+	}
+	qResp1, err := QueryViaNATS(ctx, client, qReq)
+	if err != nil {
+		t.Fatalf("QueryViaNATS first call: %v", err)
+	}
+	if qResp1.Cached {
+		t.Fatalf("expected first NATS query to be uncached (Cached=false)")
+	}
+	if qResp1.Backend != "hindsight" {
+		t.Fatalf("expected backend=hindsight, got %q", qResp1.Backend)
+	}
+	if len(qResp1.Results) != 1 || qResp1.Results[0].ID != "DEC-2026-005" {
+		t.Fatalf("expected DEC-2026-005 from NATS query, got %+v", qResp1.Results)
+	}
+
+	qResp2, err := QueryViaNATS(ctx, client, qReq)
+	if err != nil {
+		t.Fatalf("QueryViaNATS second call: %v", err)
+	}
+	if !qResp2.Cached {
+		t.Fatalf("expected second identical NATS query to hit cache (Cached=true)")
+	}
+
+	// Publish a new active decision and verify that the NATS query cache is invalidated automatically.
+	publishOutcome(OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeApproved,
+		RecordID:    "DEC-2026-006",
+		RecordType:  RecordTypeDecision,
+		Repo:        "dshnayder-org/infra",
+		Title:       "Checkout PDB minimum available replicas",
+		Summary:     "Require minAvailable >= 2 on checkout PodDisruptionBudget.",
+		Rule:        "Keep checkout PDB minAvailable >= 2.",
+		PullRequest: "https://github.com/dshnayder-org/infra/pull/290 (#290)",
+		Scope: &RecordScope{
+			Paths: []string{"clusters/**/checkout/pdb.yaml"},
+		},
+	})
+	waitForBlueprint(func(d BlueprintDigest) bool {
+		return d.Counts.Active == 2
+	})
+
+	qResp3, err := QueryViaNATS(ctx, client, qReq)
+	if err != nil {
+		t.Fatalf("QueryViaNATS after outcome invalidation: %v", err)
+	}
+	if qResp3.Cached {
+		t.Fatalf("expected NATS query cache to be invalidated after new outcome")
+	}
+	if len(qResp3.Results) != 2 {
+		t.Fatalf("expected 2 active records after DEC-2026-006 approval, got %d", len(qResp3.Results))
+	}
+
 	// Verify CheckChangedFiles blocks a regression lowering CPU to 100m.
 	records, err := LoadRecords(repoDir)
 	if err != nil {

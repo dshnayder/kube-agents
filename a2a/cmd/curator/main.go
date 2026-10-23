@@ -28,11 +28,11 @@ import (
 const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator for kube-agents
 
 usage:
-  curator daemon [flags]         subscribe to a2a.topics.shared.annotations, index into Hindsight, and publish blueprint digests
+  curator daemon [flags]         subscribe to a2a.topics.shared.annotations, index into Hindsight, serve NATS memory queries, and publish blueprint digests
   curator emit [flags]           publish a kube-agents.memory.outcome/v1 event to a2a.topics.shared.annotations
   curator check [flags]          evaluate active and proposed OKF guards against changed files (exits 2 on block)
   curator index [flags]          sync local knowledge/ records into the kube-agents-decisions Hindsight bank
-  curator recall [flags] <query> query the kube-agents-decisions Hindsight bank
+  curator recall [flags] <query> query semantic memory over NATS (with fallback to Hindsight REST)
 
 environment:
   NATS_URL            NATS JetStream bus URL
@@ -74,7 +74,7 @@ func run(args []string) error {
 		return runCheck(args[1:])
 	case "index":
 		return runIndex(args[1:])
-	case "recall":
+	case "recall", "query":
 		return runRecall(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(curatorUsage)
@@ -423,19 +423,19 @@ func runIndex(args []string) error {
 
 func runRecall(args []string) error {
 	fs := flag.NewFlagSet("curator recall", flag.ContinueOnError)
-	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
+	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL (used when --direct-hindsight is set or NATS_URL is unset)")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	tagsCSV := fs.String("tags", memory.SharedTag, "comma-separated tags filter")
 	tagsMatch := fs.String("tags-match", "all_strict", "tags match mode (all_strict|any_strict)")
+	pathFilter := fs.String("path", "", "optional repository path filter")
+	clusterFilter := fs.String("cluster", "", "optional cluster filter")
+	directHS := fs.Bool("direct-hindsight", false, "query Hindsight HTTP REST directly instead of NATS request-reply")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *hsURL == "" {
-		return errors.New("--hindsight-url or HINDSIGHT_API_URL is required")
-	}
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if query == "" {
-		return errors.New("recall requires a query string")
+	if query == "" && *pathFilter == "" && *clusterFilter == "" {
+		return errors.New("recall requires a query string, --path, or --cluster")
 	}
 	var tags []string
 	for _, t := range strings.Split(*tagsCSV, ",") {
@@ -445,6 +445,37 @@ func runRecall(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	if !*directHS && os.Getenv("NATS_URL") != "" {
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		client, err := connectNATS(ctx, "recall", log)
+		if err == nil {
+			defer client.Close()
+			resp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
+				Schema:    memory.MemoryQuerySchema,
+				Query:     query,
+				Bank:      *bank,
+				Tags:      tags,
+				TagsMatch: *tagsMatch,
+				Path:      *pathFilter,
+				Cluster:   *clusterFilter,
+			})
+			if qErr == nil {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(resp)
+			}
+			if *hsURL == "" {
+				return qErr
+			}
+		} else if *hsURL == "" {
+			return err
+		}
+	}
+
+	if *hsURL == "" {
+		return errors.New("NATS_URL or --hindsight-url (HINDSIGHT_API_URL) is required")
+	}
 	hs := memory.NewHindsightClient(*hsURL, *bank)
 	results, err := hs.Recall(ctx, query, tags, *tagsMatch)
 	if err != nil {
@@ -452,10 +483,13 @@ func runRecall(args []string) error {
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(map[string]any{
-		"bank":    *bank,
-		"query":   query,
-		"tags":    tags,
-		"results": results,
+	return enc.Encode(memory.MemoryQueryResponse{
+		Schema:  memory.MemoryQueryReplySchema,
+		Backend: "hindsight-direct",
+		Bank:    *bank,
+		Query:   query,
+		Tags:    tags,
+		Cached:  false,
+		Results: results,
 	})
 }

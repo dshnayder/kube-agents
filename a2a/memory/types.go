@@ -46,6 +46,21 @@ const (
 
 	// SubjectBlueprint is the state-class topic for the active knowledge digest.
 	SubjectBlueprint = "a2a.topics.shared.blueprint"
+
+	// MemoryQuerySchema is the request payload schema for NATS memory queries.
+	MemoryQuerySchema = "kube-agents.memory.query/v1"
+
+	// MemoryQueryReplySchema is the reply payload schema for NATS memory queries.
+	MemoryQueryReplySchema = "kube-agents.memory.query.reply/v1"
+
+	// SubjectMemoryQuery is the NATS request-reply subject within the agent
+	// principal's granted _INBOX.agent.> namespace used to query semantic memory
+	// over NATS without coupling callers to a specific storage backend.
+	SubjectMemoryQuery = "_INBOX.agent.memory.query"
+
+	// SubjectMemoryQueryPublic is the top-level NATS request-reply subject for
+	// semantic memory queries when bus policy grants a2a.memory.query.
+	SubjectMemoryQueryPublic = "a2a.memory.query"
 )
 
 // OutcomeKind classifies a learning event published on a2a.topics.shared.annotations.
@@ -204,6 +219,32 @@ type BlueprintDigest struct {
 	SupersededIDs      []string                `json:"superseded_ids"`
 	GraduatedDecisions []string                `json:"graduated_decisions,omitempty"`
 	Records            []BlueprintRecordDigest `json:"records"`
+}
+
+// MemoryQueryRequest is the NATS request payload sent to SubjectMemoryQuery
+// (or SubjectMemoryQueryPublic) to query the semantic memory layer over NATS.
+type MemoryQueryRequest struct {
+	Schema    string   `json:"schema,omitempty"`
+	Query     string   `json:"query"`
+	Bank      string   `json:"bank,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+	TagsMatch string   `json:"tags_match,omitempty"`
+	Path      string   `json:"path,omitempty"`
+	Cluster   string   `json:"cluster,omitempty"`
+}
+
+// MemoryQueryResponse is the NATS reply payload returned by the Curator's
+// memory query responder.
+type MemoryQueryResponse struct {
+	Schema  string                  `json:"schema"`
+	Backend string                  `json:"backend"`
+	Bank    string                  `json:"bank"`
+	Query   string                  `json:"query"`
+	Tags    []string                `json:"tags,omitempty"`
+	Cached  bool                    `json:"cached"`
+	Results []HindsightRecallResult `json:"results"`
+	Records []BlueprintRecordDigest `json:"records,omitempty"`
+	Error   string                  `json:"error,omitempty"`
 }
 
 var (
