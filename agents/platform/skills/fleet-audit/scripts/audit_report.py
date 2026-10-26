@@ -928,7 +928,9 @@ SILENT_FLOOR_KEY = "silent_floor"
 CHAT_REPORT_LEDGER_LINE = "Ledger: {url}"
 # The chat report's line for `SINCE_SCHEDULED_KEY`, and the line when no
 # record shows the last scheduled run.
-CHAT_REPORT_SINCE_SCHEDULED_LINE = "Changed since the last scheduled run: {new}, {resolved}."
+CHAT_REPORT_SINCE_SCHEDULED_LINE = "Changed since the last scheduled run: {changes}."
+# One count on that line, with the ids it counts. A count of zero is left out.
+CHAT_REPORT_SINCE_SCHEDULED_COUNT = "{count} {word} ({ids})"
 CHAT_REPORT_SINCE_SCHEDULED_UNKNOWN_LINE = (
     "The change since the last scheduled run is not known: no stored record shows "
     "what the last scheduled run reported."
@@ -4200,21 +4202,23 @@ def since_scheduled_line(payload: dict, delta_known: bool = True) -> str | None:
     scheduled run, so the channel sees it. With no stored record of the last
     scheduled run, the line says that the change is not known; it is left
     out when the headline already says that the change since the last run is
-    not known (`delta_known` false).
+    not known (`delta_known` false). A count of zero is left out, as in the
+    headline (:func:`findings_headline`), and with no count left there is no
+    line.
     """
     if SINCE_SCHEDULED_KEY not in payload:
         return None
     since = payload[SINCE_SCHEDULED_KEY]
     if since is None:
         return CHAT_REPORT_SINCE_SCHEDULED_UNKNOWN_LINE if delta_known else None
-
-    def counted(ids: list[str], word: str) -> str:
-        return f"{len(ids)} {word} ({', '.join(ids)})" if ids else f"0 {word}"
-
-    return CHAT_REPORT_SINCE_SCHEDULED_LINE.format(
-        new=counted(list(since.get("new") or []), "new"),
-        resolved=counted(list(since.get("resolved") or []), "resolved"),
-    )
+    changes = [
+        CHAT_REPORT_SINCE_SCHEDULED_COUNT.format(count=len(ids), word=word, ids=", ".join(ids))
+        for word, ids in (("new", list(since.get("new") or [])), ("resolved", list(since.get("resolved") or [])))
+        if ids
+    ]
+    if not changes:
+        return None
+    return CHAT_REPORT_SINCE_SCHEDULED_LINE.format(changes=HEADLINE_CLAUSE_SEPARATOR.join(changes))
 
 
 def render_chat_report(
@@ -20649,9 +20653,9 @@ def render_no_forge_summary(
     held: list[str],
     note: str,
     dropped: int = 0,
-    since_scheduled: str | None = None,
     unread: list[str] | None = None,
     *,
+    since_scheduled: str | None = None,
     stored: bool = True,
     prs: dict | None = None,
     unaccounted: Iterable[str] = (),
@@ -20663,14 +20667,15 @@ def render_no_forge_summary(
     `NO_FORGE_SUMMARY_CRITICAL_ROWS` or `NO_FORGE_SUMMARY_TOP_ROWS`
     (:func:`summary_row`), or up to `NO_FORGE_SUMMARY_FINDINGS` of them when
     the store write failed (`stored`) and this message is the only copy, a
-    line counting the rest by severity,
-    the ids the collector still flags that the document left out, the ids
-    kept because this run did not check their target (`unread`), how many of
-    this run's collector candidates the document does not carry (`dropped`),
-    the coverage gaps, and `note`. The change since the last scheduled run
-    when the counts do not say it (`since_scheduled`, from
-    `since_scheduled_line`) comes under the headline. `slack_audit_report.summary_card` reads it
-    back into that card. Redacted like the ledger body, because it is delivered
+    line counting the rest by severity, the change since the last scheduled
+    run when the counts do not say it (`since_scheduled`, from
+    `since_scheduled_line`), the ids the collector still flags that the
+    document left out, the ids kept because this run did not check their
+    target (`unread`), how many of this run's collector candidates the
+    document does not carry (`dropped`), the coverage gaps, and `note`.
+    `slack_audit_report.summary_card` reads it back into that card, which
+    takes finding rows only up to the first line that is not one, so
+    `since_scheduled` comes under the rows. Redacted like the ledger body, because it is delivered
     to a channel the same way.
 
     A run whose ledger is in the store and whose fixes open on the forge also
@@ -20681,8 +20686,6 @@ def render_no_forge_summary(
     """
     findings = list(data.get("findings") or [])
     lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
-    if since_scheduled:
-        lines.append(since_scheduled)
     ordered = sort_findings(findings)
     shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
     lines.extend(summary_row(finding) for finding in shown)
@@ -20696,6 +20699,8 @@ def render_no_forge_summary(
         )
         template = SUMMARY_MORE if stored else SUMMARY_MORE_UNSTORED
         lines.append(template.format(count=more, breakdown=breakdown, verb=SUMMARY_MORE_VERB[more != 1]))
+    if since_scheduled:
+        lines.append(since_scheduled)
     if held:
         shown_held = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
         more_held = len(held) - NO_FORGE_SUMMARY_FINDINGS

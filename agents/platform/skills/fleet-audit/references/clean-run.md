@@ -99,7 +99,7 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   a new or resolved finding first, so `new` and `resolved` can be 0. The channel has not heard it.
   The JSON line then has `since_last_scheduled`: `{"new": [ids], "resolved": [ids]}`, the change
   since the last scheduled run. Report the issue URL and those counts, for example "changed since
-  the last scheduled run: 1 new, 0 resolved". This includes the first scheduled run after an
+  the last scheduled run: 1 new". Leave out a count of zero. This includes the first scheduled run after an
   on-demand run or a person closed the ledger (say that the stream is clean). When no stored record shows the
   last scheduled run's findings, `since_last_scheduled` is `null`: say that the change since the
   last scheduled run is not known. This occurs on the first run after an upgrade, after the

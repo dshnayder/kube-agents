@@ -1387,8 +1387,10 @@ the last run is zero: a finding that an on-demand run saw first, new or resolved
 the channel. An id that a scheduled run already reported under a gap (`scheduled_reported_under_gap`)
 is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
 `since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
-report says them on a line of its own ("Changed since the last scheduled run: …"). A Slack card
-(`KAGE_SLACK_UX` on) replaces the text and does not show this line. When no record shows
+report says them on a line of its own ("Changed since the last scheduled run: 1 resolved (…)."), with
+no count of zero. A Slack card built from the ledger issue (`KAGE_SLACK_UX` on) replaces the text and
+does not show this line. The card of a run with no ledger issue is built from its summary, which puts
+the line under the finding rows, so that card shows it. When no record shows
 the ids, or the record was written under another finding id scheme, the value is `null` and the
 line says that the change is not known. The key is absent when the last stored run was a scheduled
 run on the open ledger, because `new` and `resolved` then say the change. An id that left under a
