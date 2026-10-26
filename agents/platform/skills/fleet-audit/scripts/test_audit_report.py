@@ -17943,7 +17943,7 @@ class TestScheduledBaselineUnknownOrClosed(HarnessTestCase):
             first = self.finish([self.a], scheduled=True, skipped=self.PARTIAL)
         self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, first)
         self.assertEqual(first[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
-        self.assertIn(f"0 new, 1 resolved ({gone}).", chat.call_args.args[2])
+        self.assertIn(f"Changed since the last scheduled run: 1 resolved ({gone}).", chat.call_args.args[2])
         self.assertFalse(first["silent_ok"])
 
     def test_a_held_open_clean_run_keeps_the_ids_the_body_publishes_as_the_baseline(self):
@@ -18041,7 +18041,7 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.assertEqual(
             out[audit_report.SINCE_SCHEDULED_KEY], {"new": [new_id], "resolved": []}
         )
-        self.assertIn(f"Changed since the last scheduled run: 1 new ({new_id}), 0 resolved.", text)
+        self.assertIn(f"Changed since the last scheduled run: 1 new ({new_id}).", text)
 
     def test_a_finding_resolved_on_demand_is_said_on_the_next_scheduled_run(self):
         self.seed_scheduled([self.a, self.c])
@@ -18050,7 +18050,7 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.assertEqual((out["new"], out["resolved"]), (0, 0))
         gone = derived_id(obj="Namespace/c")
         self.assertEqual(out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
-        self.assertIn(f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", text)
+        self.assertIn(f"Changed since the last scheduled run: 1 resolved ({gone}).", text)
 
     def test_a_ledger_closed_on_demand_is_said_on_the_next_scheduled_run(self):
         body = self.seed_scheduled([self.a])
@@ -18061,7 +18061,7 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.assertEqual(
             out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [derived_id(obj="Namespace/a")]}
         )
-        self.assertIn("Changed since the last scheduled run: 0 new, 1 resolved", text)
+        self.assertIn("Changed since the last scheduled run: 1 resolved (", text)
 
     def test_a_finding_dropped_under_a_gap_is_not_said_as_zero_change(self):
         # Every id that moved left under a gap, so "0 new, 0 resolved" is not
@@ -18145,7 +18145,7 @@ class TestScheduledChangeIsSaid(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
         gone = derived_id(obj="Namespace/a")
         self.assertEqual(out[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
-        self.assertIn(f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", text)
+        self.assertIn(f"Changed since the last scheduled run: 1 resolved ({gone}).", text)
 
     def test_a_ledger_a_human_closed_then_a_gap_does_not_resolve_unchecked_ids(self):
         # The last scheduled run published a and c, and a human then closed
@@ -29865,7 +29865,7 @@ class TestNoForge(BaseTestCase):
         gone = derived_id(obj="Namespace/minor-one")
         self.assertEqual(first[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
         self.assertIn(
-            f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", first["summary"]
+            f"Changed since the last scheduled run: 1 resolved ({gone}).", first["summary"]
         )
         # The next scheduled run follows a scheduled run: nothing to add.
         self.assertNotIn(
@@ -29884,7 +29884,7 @@ class TestNoForge(BaseTestCase):
         self.assertFalse(gapped["silent_ok"])
         self.assertEqual(gapped[audit_report.SINCE_SCHEDULED_KEY], {"new": [], "resolved": [gone]})
         self.assertIn(
-            f"Changed since the last scheduled run: 0 new, 1 resolved ({gone}).", gapped["summary"]
+            f"Changed since the last scheduled run: 1 resolved ({gone}).", gapped["summary"]
         )
         self.assertTrue(self.finish(make_doc(findings=THREE_SEVERITIES[1:]))["silent_ok"])
 
@@ -30735,10 +30735,10 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(three), 0, self.err)
         [(_, text)] = self.entries()
         first, second = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
-        self.assertIn(f"Changed since the last scheduled run: 1 new ({idb}), 0 resolved.", first)
-        self.assertIn(": 1 new, 0 resolved;", second.splitlines()[0])
+        self.assertIn(f"Changed since the last scheduled run: 1 new ({idb}).", first)
+        self.assertEqual(second.splitlines()[0], f"{audit_report.audit_name(AUDIT)}: 3 major findings, 1 new.")
         self.assertIn(
-            f"Changed since the last scheduled run: 2 new ({', '.join(sorted([idb, idc]))}), 0 resolved.",
+            f"Changed since the last scheduled run: 2 new ({', '.join(sorted([idb, idc]))}).",
             second,
         )
 
@@ -30751,7 +30751,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(both), 0, self.err)
         [(_, text)] = self.entries()
         self.assertNotIn("Changed since the last scheduled run", text)
-        self.assertIn(": 1 new, 0 resolved;", self.heads()[-1])
+        self.assertEqual(self.heads()[-1], f"{audit_report.audit_name(AUDIT)}: 2 major findings, 1 new.")
 
     def test_a_coverage_gap_on_a_later_finish_withholds_the_runs_resolved(self):
         self.start()
@@ -32064,6 +32064,30 @@ class TestPlainChatLines(unittest.TestCase):
                 self.assertIsNone(sar.summary_card(summary))
                 self.assertIsNone(sar.blocks_from_summary(summary))
                 self.assertIsNone(sar.chat_from_summary(summary))
+
+    def test_the_scheduled_change_line_leaves_out_a_zero_count(self):
+        def line(new, resolved):
+            return audit_report.since_scheduled_line(
+                {audit_report.SINCE_SCHEDULED_KEY: {"new": new, "resolved": resolved}}
+            )
+
+        self.assertEqual(line(["x"], []), "Changed since the last scheduled run: 1 new (x).")
+        self.assertEqual(line([], ["y", "z"]), "Changed since the last scheduled run: 2 resolved (y, z).")
+        self.assertEqual(line(["x"], ["y"]), "Changed since the last scheduled run: 1 new (x), 1 resolved (y).")
+
+    def test_the_scheduled_change_line_keeps_the_finding_rows_on_the_slack_card(self):
+        # The card takes rows only until the first line that is not a row, so
+        # the line goes under the rows, not under the headline.
+        sar = self._slack()
+        since = "Changed since the last scheduled run: 1 resolved (gone)."
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        summary = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE, since_scheduled=since
+        )
+        card = sar.summary_card(summary)
+        self.assertIsNotNone(card)
+        self.assertEqual(card.rows, [{"severity": "critical", "text": "prod-us-east: control plane is public"}])
+        self.assertEqual(card.more, f"{since}\n{audit_report.NO_FORGE_NOTE}")
 
     def test_the_summary_reads_back_as_the_slack_card(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
