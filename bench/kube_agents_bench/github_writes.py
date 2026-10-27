@@ -75,6 +75,7 @@ from typing import Any
 
 from kube_agents_bench.forges import (
     FORGE_ENV_VAR,
+    FORGE_GITHUB,
     FORGE_GITLAB,
     FORGES,
     GITHUB_API_ROOT,
@@ -88,8 +89,11 @@ from kube_agents_bench.forges import (
     gitlab_host,
     gitlab_project_path,
     is_gitlab_token_bot,
+    missing_token_hint,
     proposal_refs,
+    read_token,
     token_env_vars,
+    token_source,
 )
 
 __all__ = [
@@ -426,9 +430,9 @@ class GitHubClient:
     def _refuse(status: int, repo: str, what: str, permission: str) -> None:
         if status == STATUS_UNAUTHORIZED:
             raise GitHubUnreadable(
-                f"GitHub answered 401 for {what} on {repo}: the token is not valid -- an "
-                "installation token expires an hour after it is minted -- so this check "
-                "could not be evaluated"
+                f"GitHub answered 401 for {what} on {repo}: {token_source(FORGE_GITHUB)} is "
+                "not valid -- an installation token expires an hour after it is minted -- "
+                "so this check could not be evaluated"
             )
         if status == STATUS_FORBIDDEN:
             raise GitHubUnreadable(
@@ -898,10 +902,9 @@ def main(argv: list[str] | None = None) -> int:
     except UnknownForge as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREADABLE
-    names = token_env_vars(forge)
-    token = next((v for v in (os.environ.get(n) for n in names) if v), None)
+    token = read_token(forge)
     if not token:
-        print(f"no {forge} read credential: set one of {', '.join(names)}", file=sys.stderr)
+        print(f"no {forge} read credential: {missing_token_hint(forge)}", file=sys.stderr)
         return EXIT_UNREADABLE
     client = client_for(forge, token, _http_get_json, args.timeout)
     try:

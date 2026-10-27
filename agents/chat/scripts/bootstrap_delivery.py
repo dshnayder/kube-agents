@@ -13,6 +13,9 @@ human has connected:
 
 - ``.user_aligned`` present -> a human has opened the chat (set by the plugin;
   never by a background task — see the plugin README).
+- no young ``.bootstrap_greeting_pending.*`` -> the greeting of that opening turn
+  is on its way (the plugin removes the hold), or never came within
+  ``GREETING_WAIT_SECONDS``; the report follows the greeting instead of racing it.
 - ``.bootstrap_completed`` absent -> the report has not been delivered yet.
 - ``INVENTORY.md`` present  -> the background scan has produced the report.
 
@@ -268,6 +271,8 @@ OTHER_FLEET_AUDITS = (
 # A request that needs no chat history, so it works in any conversation; the nightly request-path case
 # sends it verbatim. A test holds every audit the note checks to the store's audits (audit_report.AUDITS).
 AUDITS_REQUEST_FORMAT = "Show me the latest report of each of these fleet audits from the report store: {ids}."
+# The first-run chain's fifth job is not a posture family: named in the note by what it is.
+AUDIT_AREA_EXTRA = {"upgrade-retrospective": "upgrade retrospective"}
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
 # (_lost_audits).
@@ -370,18 +375,65 @@ PLATFORM_KEY = "platform"
 CHAT_ID_KEY = "chat_id"
 THREAD_ID_KEY = "thread_id"
 
+# The plugin's hold on the report while the opening turn's greeting is on its way: one
+# empty file per opening turn (bootstrap_onboarding, GREETING_PENDING_PREFIX), which the
+# plugin removes when the greeting leaves the agent. Aged by mtime here, never read. The
+# wait is the ceiling for a greeting turn that never reports back (a gateway restart
+# inside the turn, a turn that ends with no text): past it the report goes out without
+# the greeting. The longest first turn measured, a real ask that delegated work, took
+# 218 s (#1971, #2009); 300 s covers it with a margin for a loaded model and its provider
+# retries. A greeting that runs longer still arrives, after the report.
+GREETING_PENDING_GLOB = ".bootstrap_greeting_pending.*"
+GREETING_WAIT_SECONDS = 300
+
 
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
 
 
 def _awaiting_delivery(data_dir: Path) -> bool:
-    """True when a human is present; main() has already returned on a delivered report.
+    """True when a human is present and the greeting is not still on its way;
+    main() has already returned on a delivered report.
 
     The markers live on this pod, so this costs a stat or two; it runs before the
     report read, which may cross into the sandbox.
     """
-    return (data_dir / ".user_aligned").exists() or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()
+    if not ((data_dir / ".user_aligned").exists() or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()):
+        return False
+    return not _greeting_pending(data_dir)
+
+
+def _greeting_pending(data_dir: Path) -> bool:
+    """Whether the plugin still holds the report behind the opening turn's greeting.
+
+    The newest hold decides. One older than GREETING_WAIT_SECONDS belongs to a
+    greeting turn that never reported back: every hold is removed, the stage log
+    says so once, and the report goes out. Never raises: a raise here would exit
+    the run non-zero on every tick, which posts to the chat on the origin path
+    and blocks the report for good on the conversation path.
+    """
+    try:
+        holds = list(data_dir.glob(GREETING_PENDING_GLOB))
+    except OSError:
+        return False
+    newest = None
+    for hold in holds:
+        try:
+            at = hold.stat().st_mtime
+        except OSError:
+            continue
+        newest = at if newest is None else max(newest, at)
+    if newest is None:
+        return False
+    if abs(time.time() - newest) < GREETING_WAIT_SECONDS:
+        return True
+    for hold in holds:
+        try:
+            hold.unlink()
+        except OSError:
+            pass
+    _stage_note(data_dir, f"the greeting did not finish within {GREETING_WAIT_SECONDS} s; delivering the report")
+    return False
 
 
 def _bound_conversation(data_dir: Path) -> dict | None:
@@ -988,7 +1040,7 @@ def _stage_sentences(data_dir: Path, state: dict, no_coverage: bool) -> tuple[st
 
 def _area(audit: str) -> str:
     """What ``audit`` reports on, or its job id for an audit with no area."""
-    return inventory_findings.AUDIT_FAMILIES.get(audit) or _audit_label(audit)
+    return inventory_findings.AUDIT_FAMILIES.get(audit) or AUDIT_AREA_EXTRA.get(audit) or _audit_label(audit)
 
 
 def _in_area_order(audits: list[str]) -> list[str]:

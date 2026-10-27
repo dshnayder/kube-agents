@@ -633,7 +633,12 @@ class Digest(RunHarness):
             self.opener.texts[0],
             "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
-            f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"{post_health.NIGHTLY_URL}\n"
+            # No GitHub token in this harness: the nightly section cannot read
+            # the nightly-red issues, so the one line stands and says why
+            # (test_eval_dashboard_nightly_digest.py covers the section).
+            "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
+            f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
         # A truncated night says so instead of numbers; a missing night too.
@@ -650,6 +655,7 @@ class Digest(RunHarness):
         self.assertEqual(rc, 0)
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+        self.assertIn("\n🌙 Nightly section skipped: data.json could not be read.\n", self.opener.texts[4])
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))
@@ -1963,7 +1969,7 @@ class FixtureDrift(RunHarness):
             [
                 (
                     "🟡 *Smoke gate: flaky* — seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET;"
-                    " a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code. Retest once the fleet is re-applied."
+                    " a case that depends on it is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code. Retest once the fleet is re-applied."
                     " The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner. Tracking #1300.\n"
                     f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
                 )
@@ -2001,12 +2007,12 @@ class FixtureDrift(RunHarness):
     def test_the_cause_sentence_the_gate_comment_box_carries(self):
         self.assertEqual(
             post_health.cause_sentence(fixture_drift()),
-            "seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET; a red on a case that depends on it from a run that leased one of those projects is the fixture, not the code.",
+            "seeded fixture crashloop-workload out of designed state on 3 pool projects since 9:00 AM ET; a case that depends on it is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code.",
         )
         two = fixture_drift(roles=(DRIFT_ROLE, "no-pdb-workload"), projects=("kube-agents-evals-1",))
         self.assertEqual(
             post_health.cause_sentence(two),
-            "seeded fixtures crashloop-workload, no-pdb-workload out of designed state on 1 pool project since 9:00 AM ET; a red on a case that depends on them from a run that leased one of those projects is the fixture, not the code.",
+            "seeded fixtures crashloop-workload, no-pdb-workload out of designed state on 1 pool project since 9:00 AM ET; a case that depends on them is recorded as infrastructure on a run whose own scan saw the drift, and a red on one from a run whose scan could not read the role is the fixture, not the code.",
         )
 
     def test_the_digest_carries_one_line_on_the_latest_scan(self):
@@ -2035,7 +2041,7 @@ class FixtureDrift(RunHarness):
         )
         self.assertEqual(
             line(fixture_block(drifted={"kube-agents-evals-1": [DRIFT_ROLE], "kube-agents-evals-4": [DRIFT_ROLE, "no-pdb-workload"]})),
-            ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a red on a case that depends on them there is the fixture, not the code."],
+            ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a case that depends on them is not run there and counts as infrastructure."],
         )
         self.assertEqual(line(fixture_block(checked=0, unknown=True, reason=BLIND_REASON)), [f"🧭 *Seeded fleet:* the 9:00 AM ET scan could check none of 30 pool projects ({BLIND_REASON})."])
         self.assertEqual(line(fixture_block(stale=True)), ["🧭 *Seeded fleet:* the last scan (9:00 AM ET) is stale; someone check the scan job."])

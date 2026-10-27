@@ -186,13 +186,16 @@ _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
-# connection) is tried this many times, with this pause between tries, before
-# the check reports the API unreachable. One slow read must not red a run on
-# rung 2: gitlab.com's API times out a read now and then where GitHub's does
-# not, and the in-job GitLab helper retries its reads for the same reason. An
-# HTTP answer, whatever its status, is not retried: it is an observation.
+# connection) or is answered 5xx is tried this many times, with this pause
+# between tries, before the check reports the API unreachable or returns the
+# last 5xx. One slow read must not red a run on rung 2: gitlab.com's API times
+# out a read now and then where GitHub's does not, and the in-job GitLab helper
+# retries its reads for the same reason; a GitHub 502 on one branch listing
+# redded a merge gate (#3823). Any other HTTP answer is not retried: it is an
+# observation.
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
+_HTTP_SERVER_ERROR_FLOOR = 500
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -882,7 +885,10 @@ _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
 # pod's redactor will not load (its WITHHELD), and the marker its clip ends a
 # cut result with. Both live inside that script's source, so they are
-# spelled again here; test_report_times_in_window.py pins them to it.
+# spelled again here; test_report_times_in_window.py pins them to it. The
+# script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
+# one result of a call that read a credential, is a recorded call whose
+# output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
 _CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
 
@@ -972,6 +978,10 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if result == worker_trajectory.WITHHELD_READ_RESULT:
+            # A credential read, recorded without its output: no time in it,
+            # and no gap in the capture.
             continue
         if _CLIPPED_RESULT.search(result):
             clipped += 1
@@ -1430,11 +1440,13 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The header ``_append_delivered`` opens each card's result with in the final
-# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
-# delivered result runs from its header to the next header of either kind.
+# The headers ``_append_delivered`` opens each card's result and each paused
+# card's question with in the final message (harness.py), and the one
+# ``_append_artifacts`` opens a file with. A delivered result runs from its
+# header to the next header of any kind.
 _DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "
@@ -1635,25 +1647,8 @@ class AnswerFirstVerifier(BaseVerifier):
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
-_TOOL_CALL_WRAPPER = "tool_call"
-
-
-def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
-    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
-    if entry.get("name") != _TOOL_CALL_WRAPPER:
-        return set()
-    args = entry.get("args")
-    if not isinstance(args, dict):
-        return set()
-    names: set[str] = set()
-    if args.get("name"):
-        names.add(str(args["name"]))
-    calls = args.get("calls")
-    if isinstance(calls, list):
-        for c in calls:
-            if isinstance(c, dict) and c.get("name"):
-                names.add(str(c["name"]))
-    return names
+_TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
+_wrapped_tool_names = worker_trajectory.wrapped_tool_names
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1747,6 +1742,9 @@ class ToolCalledVerifier(BaseVerifier):
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too or still match ``arguments``;
     an unread call whose readable arguments rule it out is left out instead.
+    A call that read a credential has its result recorded as
+    ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
+    redacted, matched against the pattern like any other.
     """
 
     type: Literal["tool_called"]
@@ -1879,9 +1877,11 @@ class ToolCalledVerifier(BaseVerifier):
             and not (self.require_success and entry.get("status") == "error")
         ]
         if self.result is not None:
-            # A pod that withholds results withholds arguments too, so the
-            # arguments filter cannot rule out a withheld call; it still rules
-            # out an unread call whose readable arguments name something else.
+            # A pod whose redactor did not load withholds results and
+            # arguments alike, so the arguments filter cannot rule out such a
+            # call; it still rules out an unread call whose readable arguments
+            # name something else. A credential read's WITHHELD_READ_RESULT is
+            # a recorded result, not an unread one.
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
@@ -1956,6 +1956,7 @@ LEDGER_AUDIT_IDS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1971,6 +1972,7 @@ AuditId = Literal[
     "obtainability-audit",
     "security-patch-orchestrator",
     "stockout-prevention",
+    "upgrade-retrospective",
 ]
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
@@ -1982,7 +1984,9 @@ AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_L
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
 # tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
 # this tuple out of the file, without importing bench, to check that CI mints
-# into the name bench reads first.
+# into the name bench reads first. A non-empty file named by
+# forges.GITHUB_TOKEN_FILE_ENV_VAR outranks both: CI seeds it from the same
+# mint and renews it while the unit runs (forges.read_token).
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
@@ -2055,6 +2059,10 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Mirrors audit_report's `NOT_RECHECKED_IDS_COMMENT`: the ids its held span
+# keeps under "Not re-checked this run", previous findings on a target the run
+# did not check.
+_NOT_RECHECKED_IDS_RE = re.compile(r"<!--[ \t]*audit-not-rechecked-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 # Ids quoted in an `every_finding_named` failure; the count is always exact.
 _MAX_UNNAMED_IN_REASON = 5
@@ -2142,20 +2150,17 @@ def _no_pr_url_reason(host: str) -> str:
         f"({forges.GITHUB_HOST_ENV_VAR})"
     )
 
-_NO_TOKEN_REASON = (
-    "no GitHub read credential in the environment: set one of "
-    f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
-    "the eval GitOps repository, or this check cannot be evaluated"
-)
-
-
 def _no_token_reason(forge: str) -> str:
-    """The reason for an absent grading credential, naming the forge's variables."""
+    """The reason for an absent grading credential, naming what was read."""
     if forge == forges.FORGE_GITHUB:
-        return _NO_TOKEN_REASON
+        return (
+            "no GitHub read credential in the environment: "
+            f"{forges.missing_token_hint(forge)} to a token that can read issues on "
+            "the eval GitOps repository, or this check cannot be evaluated"
+        )
     return (
-        f"no {forge} read credential in the environment: set one of "
-        f"{', '.join(forges.token_env_vars(forge))} to a token that can read the eval "
+        f"no {forge} read credential in the environment: "
+        f"{forges.missing_token_hint(forge)} to a token that can read the eval "
         "GitOps repository, or this check cannot be evaluated"
     )
 
@@ -3264,6 +3269,177 @@ class WorkerAgentsVerifier(BaseVerifier):
         )
 
 
+
+# The dispatcher's record of a worker that ran out of its turn budget: the
+# run closes ``timed_out`` with this at the head of ``error`` (hermes
+# ``agent/turn_finalizer.py``, ``_record_kanban_budget_exhausted``). The two
+# numbers are the calls made and the cap in force.
+_BUDGET_EXHAUSTED_RE = re.compile(r"Iteration budget exhausted \((?P<used>\d+)/(?P<cap>\d+)\)")
+
+# Hermes' one-shot checkpoint notice, appended to the newest tool result once a
+# dispatcher-owned kanban worker has used 90% of a finite cap
+# (``agent/turn_iteration_prep.py``, ``ITERATION_BUDGET_WARNING_TEMPLATE``). It
+# names the cap in force whether the worker then stops or runs into the wall,
+# which is why it is the primary read; the worker capture carries it inside
+# the tagged call's ``result``. Matched with its prefix at a paragraph seam,
+# so a notice another session's transcript quotes inside a search result (a
+# JSON string, whose newlines are escaped) is not read as this worker's cap.
+_BUDGET_NOTICE_RE = re.compile(
+    r"(?:^|\n\n)\[SYSTEM NOTICE — iteration budget checkpoint\] "
+    r"You have used (?P<used>\d+) of (?P<cap>\d+) iterations"
+)
+
+# The run outcome the dispatcher records when a worker finished its card
+# (``kanban_db._end_run(outcome="completed")``); the one outcome that says the
+# worker stayed inside its cap. The harness's ceiling archive closes a running
+# card ``reclaimed`` instead, which says nothing about the cap.
+_RUN_COMPLETED = "completed"
+
+_NO_WORKER_RUNS_REASON = (
+    "no delegated card's run rows were captured for this run: either no card was "
+    "delegated, the run ended before the cards settled, or the board could not be "
+    "read -- so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("worker_budget")
+class WorkerBudgetVerifier(BaseVerifier):
+    """Checks the turn budget a delegated worker actually ran under.
+
+    Two records name the cap in force, and the check reads both. Once a
+    dispatcher-owned worker has used 90% of a finite cap, Hermes appends a
+    one-shot notice to its newest tool result, ``You have used N of M
+    iterations``, which the worker capture carries in the tagged call's
+    ``result``; a worker that goes on to exhaust the cap closes its kanban run
+    ``timed_out`` with ``Iteration budget exhausted (N/M)`` in the run's
+    ``error`` (:func:`kube_agents_bench.worker_trajectory.runs`). The notice is
+    the primary read: whether the worker then stops at the checkpoint or runs
+    into the wall is the model's choice, and the cap is on the record either
+    way. A run that finishes inside 90% of its cap records neither.
+
+    ``budget``: the cap every notice and every exhausted run must name.
+
+    Passes when at least one delegated worker reached its checkpoint or ran
+    out, and every cap named is ``budget``. Fails when a cap named is another
+    number, or when nothing was named and a worker finished its card
+    (``outcome`` ``completed``), which for a card written to outrun the cap
+    means the cap in force was larger than the one declared; the reason names
+    each card's captured call count so the read is on the record. Fails closed
+    like its siblings: an empty stash, a run with no card rows, nothing named
+    on a capture that recorded gaps (``worker_capture_gaps``), or nothing named
+    and no completed attempt either (the harness archived the card at its
+    delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
+    still open) is ``status="error"``: none of those says what cap was in force.
+    A notice past the capture's per-result clip is not read, which a card of
+    short tool outputs never reaches; a capture in which every result was
+    withheld or never recorded is unreadable, and with nothing named it is
+    ``status="error"`` too, while a single missing result among readable ones
+    does not turn a plain failure into one.
+    """
+
+    type: Literal["worker_budget"]
+    budget: int = Field(ge=1)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.worker_runs is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_RUNS_REASON,
+            )
+        # (task, used, cap, how) for every record that names a cap.
+        named: list[tuple[str, int, int, str]] = []
+        for row in snap.worker_runs:
+            match = _BUDGET_EXHAUSTED_RE.search(str(row.get("error") or ""))
+            if match:
+                named.append((str(row.get("task") or ""), int(match["used"]), int(match["cap"]), "exhausted"))
+        calls: dict[str, int] = {}
+        # A pod whose redactor failed to load withholds every result, and the
+        # notice with them: with nothing named, that is an unreadable cap, not
+        # evidence of a larger one. One call with no result row (a worker
+        # killed mid-call, an orphaned result) among readable ones is not: the
+        # notice would have landed on one of the others.
+        unreadable = tagged = 0
+        for entry in snap.trajectory:
+            if not entry.get("agent"):
+                continue
+            task = str(entry.get("task") or "")
+            calls[task] = calls.get(task, 0) + 1
+            tagged += 1
+            result = entry.get("result")
+            # A credential read's result is withheld whole, the checkpoint
+            # notice that may have landed in it with the rest: unreadable
+            # here, as a redactor-less pod's results are.
+            if result is None or result in (worker_trajectory.WITHHELD, worker_trajectory.WITHHELD_READ_RESULT):
+                unreadable += 1
+                continue
+            match = _BUDGET_NOTICE_RE.search(str(result))
+            if match:
+                named.append((task, int(match["used"]), int(match["cap"]), "checkpoint"))
+        seen = ", ".join(f"{task}: {n} call(s)" for task, n in sorted(calls.items())) or "no worker calls captured"
+        if not named:
+            outcomes = sorted({f"{r.get('task')}={r.get('outcome')}" for r in snap.worker_runs})
+            if not any(r.get("outcome") == _RUN_COMPLETED for r in snap.worker_runs):
+                # No worker finished inside its cap and none ran out of it: the
+                # card was archived at the delegation ceiling (``reclaimed``),
+                # crashed, or is still open. Nothing here says what cap was in force.
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        "no delegated worker reached its turn-budget checkpoint or ran out, and none finished its "
+                        f"card, so the cap in force cannot be read (runs: {outcomes or ['no run rows']}; {seen})"
+                    ),
+                )
+            all_unreadable = tagged > 0 and unreadable == tagged
+            if snap.worker_capture_gaps or all_unreadable:
+                why = (
+                    "; ".join(snap.worker_capture_gaps)
+                    if snap.worker_capture_gaps
+                    else f"all {unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
+                )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"no delegated worker reached its turn-budget checkpoint or ran out (runs: {outcomes}; {seen}), "
+                        f"but the capture was incomplete, so this check could not be evaluated: {why}"
+                    ),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no delegated worker reached its turn-budget checkpoint or ran out, so the cap in force "
+                    f"was larger than {self.budget} or the card did not outrun it (runs: {outcomes}; {seen})"
+                ),
+            )
+        record = "; ".join(f"{task} {how} {used}/{cap}" for task, used, cap, how in named)
+        wrong = [cap for _, _, cap, _ in named if cap != self.budget]
+        if wrong:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"a delegated worker ran under a {wrong[0]}-turn budget, not {self.budget}: {record}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"delegated worker(s) ran under the {self.budget}-turn budget: {record}",
+        )
+
 _NO_REPLAY_CARD_REASON = (
     f"no {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt was not a "
     "card-wake replay, so there is no planted card to read"
@@ -3747,10 +3923,10 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation. A transport failure is retried
-    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
-    that error; an HTTP answer is returned on the first try, whatever its
-    status.
+    of an observation, not a violation. A transport failure or a 5xx answer is
+    retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
+    forge fault does not become that error; any other HTTP answer is returned
+    on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -3789,6 +3965,9 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
                 payload = None
+            if exc.code >= _HTTP_SERVER_ERROR_FLOOR and attempt < _FORGE_READ_ATTEMPTS:
+                time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+                continue
             return exc.code, payload
         except json.JSONDecodeError as exc:
             raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
@@ -3932,8 +4111,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     the noun does not pass. Exactly one of the reported URLs may satisfy them;
     two would mean the report named two ledgers for a stream that owns one.
 
-    AUTHENTICATION. A GitHub token from ``BENCH_GITHUB_TOKEN`` (preferred) or
-    ``GITHUB_TOKEN``, read by the verifier process — the Prow runner, not the
+    AUTHENTICATION. A GitHub token from the file ``BENCH_GITHUB_TOKEN_FILE``
+    names when it holds one, else ``BENCH_GITHUB_TOKEN`` (preferred) or
+    ``GITHUB_TOKEN`` (:func:`forges.read_token`), read by the verifier process — the Prow runner, not the
     agent. It needs one permission, ``issues: read``, on the eval GitOps
     repositories, which are private and ours (``gke-agentic/
     kube-agents-evals-infra`` and ``…-evals-2-infra``); that they are
@@ -4325,9 +4505,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             body = ledger["body"]
             named = set(_HEADING_ID_RE.findall(body))
             named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
-            # Collector-held ids are the collector's, rendered in what the
-            # findings leave; this check grades the findings the run filed.
-            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            # Collector-held ids are the collector's, and not-re-checked ids
+            # are previous findings this run did not check. Both are rendered
+            # in what the findings leave; this check grades the findings the
+            # run filed.
+            held = {
+                fid
+                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+                for match in pattern.findall(body)
+                for fid in _json_str_list(match)
+            }
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
@@ -4855,6 +5042,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, that exhaust what the pull request
+    # may change: every `filename` and `previous_filename` in `/pulls/{n}/files`
+    # must match at least one glob here. Use when a case knows the exact synced
+    # manifest(s) a targeted remediation touches and must reject bundling any
+    # other path in the repository without enumerating every possible sibling
+    # directory in `unchanged_paths`.
+    changed_paths_only: list[str] | None = Field(default=None, min_length=1)
     # Repository paths, as `fnmatch` globs, the pull request must delete: each
     # glob is matched by at least one file the pull request lists as
     # `removed`. A delete reaches review as the removal of the manifest that
@@ -4923,9 +5117,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
         return texts, None
 
     def _file_entries(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[dict], str | None]:
         """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
+        cap = _PR_FILES_MAX_PAGES * _PR_FILES_PAGE_SIZE
+        if changed is not None and changed > cap:
+            return [], (
+                f"{owner}/{repo}#{number} changes {changed} files, past GitHub's "
+                f"{cap}-file listing cap, so path checks could not inspect the full diff"
+            )
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
@@ -4941,17 +5148,33 @@ class PullRequestOpenedVerifier(BaseVerifier):
             entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
+        else:
+            if changed != cap or len(entries) < cap:
+                return [], (
+                    f"{owner}/{repo}#{number} filled all {_PR_FILES_MAX_PAGES} pages of "
+                    f"{_PR_FILES_PAGE_SIZE} files ({cap}-file listing cap), so path checks "
+                    "could not inspect the full diff"
+                )
         return entries, None
 
     def _changed_paths(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[str], str | None]:
         """``(paths the pull request changes, unevaluable reason)``.
 
         A rename counts under both names: moving the declaration away is as
         much a change to it as rewriting it.
         """
-        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        entries, unevaluable = self._file_entries(
+            owner, repo, number, token, budget, changed=changed
+        )
         paths = [
             str(entry[key])
             for entry in entries
@@ -4961,14 +5184,23 @@ class PullRequestOpenedVerifier(BaseVerifier):
         return paths, unevaluable
 
     def _removed_paths(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[str], str | None]:
         """``(paths the pull request deletes, unevaluable reason)``.
 
         Only status `removed` counts. A rename moves the declaration rather
         than deleting it, so a renamed file's old name is not a removal.
         """
-        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        entries, unevaluable = self._file_entries(
+            owner, repo, number, token, budget, changed=changed
+        )
         removed = [
             str(entry["filename"])
             for entry in entries
@@ -5132,8 +5364,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # token lasts an hour, and telling the reader to widen a permission
             # sends them to the App's settings for a fault that is in the mint.
             return None, (
-                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
-                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                f"GitHub answered 401 for {owner}/{repo}#{number}: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} is not valid — an installation token "
                 "expires an hour after it is minted — so this check could not be "
                 "evaluated"
             )
@@ -5141,8 +5373,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return payload, None
         if first == 403 and status_code == 403:
             return None, (
-                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
-                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} can reach that repository but "
                 "read neither its issues nor its pull requests — add "
                 "`pull_requests: read` to the installation — so this check could "
                 "not be evaluated"
@@ -5203,7 +5435,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
-                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    f"endpoint: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                     "an installation token expires an hour after it is minted — so "
                     "this check could not be evaluated",
                 )
@@ -5214,7 +5446,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
-                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
                     "check could not be evaluated",
                 )
@@ -5250,7 +5482,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
-                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                f"page: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                 "an installation token expires an hour after it is minted — so "
                 "this check could not be evaluated",
             )
@@ -5261,7 +5493,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
-                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
                 "check could not be evaluated",
             )
@@ -5652,13 +5884,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
-                if verdict == "pass" and self.removed_paths:
-                    # removed_paths reads GitHub's file listing too; a merge request
-                    # that adds a marker passes every other clause, so ungraded on
-                    # what it removes it is not a pass either.
+                if verdict == "pass" and (
+                    self.removed_paths or self.unchanged_paths or self.changed_paths_only is not None
+                ):
+                    # The path clauses read GitHub's file listing too; a merge
+                    # request that adds a marker, rewrites the declaration or
+                    # bundles a sibling passes every other clause, so ungraded on
+                    # which paths it changes it is not a pass either.
                     unresolved.append(
-                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
-                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                        f"{full}!{number}: `removed_paths`, `unchanged_paths` and `changed_paths_only` "
+                        "read GitHub's pull request files and are not implemented for GitLab, so this "
+                        "check could not be evaluated"
                     )
                     continue
                 if verdict == "pass":
@@ -5785,7 +6021,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
             if self.removed_paths:
                 try:
-                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                    removed, unevaluable = self._removed_paths(
+                        owner, repo, number, token, budget, changed=changed
+                    )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                     continue
@@ -5803,26 +6041,54 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "delete that leaves the declaration keeps the object"
                     )
                     continue
-            if self.unchanged_paths:
+            if self.unchanged_paths or self.changed_paths_only is not None:
                 try:
-                    paths, unevaluable = self._changed_paths(owner, repo, number, token, budget)
+                    paths, unevaluable = self._changed_paths(
+                        owner, repo, number, token, budget, changed=changed
+                    )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                     continue
                 if unevaluable:
                     unresolved.append(unevaluable)
                     continue
-                touched_kept = sorted(
-                    path for path in paths
-                    if any(fnmatch.fnmatchcase(path, pattern) for pattern in self.unchanged_paths)
-                )
-                if touched_kept:
-                    rejected.append(
-                        f"{slug}: changes {', '.join(touched_kept)}, which this case "
-                        "requires the fix to leave unchanged (`unchanged_paths`) -- a "
-                        "remediation written over the workload's own declaration"
+                if self.unchanged_paths:
+                    touched_kept = sorted(
+                        {
+                            path for path in paths
+                            if any(fnmatch.fnmatchcase(path, pattern) for pattern in self.unchanged_paths)
+                        }
                     )
-                    continue
+                    if touched_kept:
+                        rejected.append(
+                            f"{slug}: changes {', '.join(touched_kept)}, which this case "
+                            "requires the fix to leave unchanged (`unchanged_paths`) -- a "
+                            "remediation written over the workload's own declaration"
+                        )
+                        continue
+                if self.changed_paths_only is not None:
+                    if not paths:
+                        unresolved.append(
+                            f"GitHub returned an empty files listing for {slug} despite "
+                            f"changed_files={changed}, so `changed_paths_only` could not be evaluated"
+                        )
+                        continue
+                    outside_allowed = sorted(
+                        {
+                            path for path in paths
+                            if not any(
+                                fnmatch.fnmatchcase(path, pattern)
+                                for pattern in self.changed_paths_only
+                            )
+                        }
+                    )
+                    if outside_allowed:
+                        rejected.append(
+                            f"{slug}: changes {', '.join(outside_allowed)}, outside the "
+                            f"allowed path(s) {', '.join(self.changed_paths_only)} "
+                            "(`changed_paths_only`)"
+                        )
+                        continue
             if self.content:
                 try:
                     texts, unevaluable = self._head_files(owner, repo, number, token, budget)
@@ -6009,13 +6275,12 @@ class GitHubWritesVerifier(BaseVerifier):
             forge = github_writes.forge_name()
         except github_writes.UnknownForge as exc:
             return done(False, str(exc), status="error")
-        token_vars = github_writes.token_env_vars(forge)
-        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
+        token = forges.read_token(forge)
         if not token:
             return done(
                 False,
-                f"no {forge} read credential in the environment: set one of "
-                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                f"no {forge} read credential in the environment: "
+                f"{forges.missing_token_hint(forge)} to a token that can read the GitOps repository, "
                 "or this check cannot be evaluated",
                 status="error",
             )
@@ -6877,10 +7142,16 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
         return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
+# The check rosters of the five audits the oobe stage runs after the scan
 # (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
 # agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
 # leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+
+# The check rosters of the audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS, in its order; each roster is `AUDITS[<id>].checks`
+# in agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves the four fleet audits' checks to those audits; the upgrade retrospective's are the
+# collector's six, which no scan reports. tests/test_bootstrap_handoff.py re-derives this
 # copy from both files.
 FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "fleet-wide-cost-analysis": (
@@ -6892,7 +7163,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "privileged-container", "host-namespace", "hostpath-mount", "cluster-admin-binding", "wildcard-rbac",
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
-        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding",
+        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -6907,6 +7178,11 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+    "upgrade-retrospective": (
+        "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
+        "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
+        "upgrade-log-volume-rose",
     ),
 }
 
