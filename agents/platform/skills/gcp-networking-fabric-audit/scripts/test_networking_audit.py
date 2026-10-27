@@ -2405,20 +2405,18 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 
-class SubnetsListedMarkTest(unittest.TestCase):
-    """`subnets_listed: 0` on a `project/<id>` entry: a project with no subnet
-    to measure is not a project whose subnets the run lost.
+class IncompleteListingTest(unittest.TestCase):
+    """A gcloud list that exits 0 but warns that it may be incomplete is a
+    partial read for the subnet sweep.
 
-    Without the mark, a fleet with no countable subnet reported "no subnet
-    targets were audited" on every run and stayed partial. The mark goes on a
-    project whose subnet listing completed with no countable subnet, and never
-    on one whose listing failed.
+    gcloud exits 0 when some regions or zones do not respond and names them on
+    stderr. A subnet that the listing did not return, or a VM, address or
+    forwarding rule in a measured subnet, can be in the part it did not read.
     """
 
     AUDIT = "gcp-networking-fabric-audit"
-    # The literal, so that a module without the constant fails on behaviour.
-    KEY = "subnets_listed"
     INCOMPLETE = "WARNING: The following regions did not respond: us-east1. List results may be incomplete."
+    USAGE_READS = ("instances list", "addresses list", "forwarding-rules list")
 
     def setUp(self):
         sys.path.insert(0, FLEET_AUDIT_SCRIPTS)
@@ -2426,11 +2424,11 @@ class SubnetsListedMarkTest(unittest.TestCase):
         networking_audit.PROJECT_NUMBERS.clear()
         self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
 
-    def fleet(self, per_project, check=networking_audit.CHECK_ALL):
+    def fleet(self, per_project):
         with patch.object(networking_audit, "get_target_projects", return_value=list(per_project)), \
                 patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
                 patch("sys.stderr", new_callable=io.StringIO):
-            manifest = networking_audit.collect_fleet(check=check)
+            manifest = networking_audit.collect_fleet()
         return manifest, {e["name"]: e for e in manifest["clusters"]}
 
     def gaps(self, manifest):
@@ -2441,166 +2439,50 @@ class SubnetsListedMarkTest(unittest.TestCase):
         audit_report.cross_check_manifest(doc, manifest)
         return audit_report.coverage_gaps(doc)
 
-    def test_an_empty_subnet_list_marks_the_project_and_lifts_the_gap(self):
-        manifest, by_name = self.fleet({"p1": project_answers()})
-        self.assertEqual(by_name["project/p1"][self.KEY], 0)
-        self.assertEqual(self.gaps(manifest), [])
-
-    def test_a_list_of_only_uncounted_subnets_marks_the_project(self):
-        # SOP 2.1: a proxy-only subnet is not measured and is not a gap.
-        proxy = subnet("proxy", "10.9.0.0/23", purpose="REGIONAL_MANAGED_PROXY")
-        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": [proxy]})})
-        self.assertEqual(by_name["project/p1"][self.KEY], 0)
-        self.assertEqual(self.gaps(manifest), [])
-
-    def test_an_unreadable_listing_gets_no_mark_and_the_gap_stays(self):
-        cases = {
-            "an item that is not an object": ["not-a-subnet"],
-            "a countable subnet with a range that does not parse": [subnet("bad", "10.0.0.0/33")],
-        }
-        for label, listing in cases.items():
-            with self.subTest(case=label):
-                networking_audit.PROJECT_NUMBERS.clear()
-                manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": listing})})
-                self.assertNotIn(self.KEY, by_name["project/p1"])
-                self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
-
-    def test_a_service_project_on_an_unmeasured_host_subnet_gets_no_mark(self):
-        # A Shared VPC service project owns no subnet, but its VMs use a
-        # subnet of a host project outside the scope. Nothing measured that
-        # subnet, so the run must stay partial.
-        nics = [{"name": f"vm-{i}", "networkInterfaces": [
-            {"networkIP": f"10.0.0.{i}", "subnetwork": HOST_LINK.format("shared")}]} for i in range(2, 250)]
-        manifest, by_name = self.fleet({"svc": project_answers(**{"instances list": nics})})
-        self.assertNotIn(self.KEY, by_name["project/svc"])
-        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
-
-    def test_a_failed_usage_read_gets_no_mark_and_the_gap_stays(self):
-        # A failed read cannot say which subnets the project uses.
-        for phrase in ("instances list", "clusters list", "addresses list"):
-            with self.subTest(read=phrase):
-                networking_audit.PROJECT_NUMBERS.clear()
-                answers = project_answers(**{phrase: (1, "ERROR: PERMISSION_DENIED")})
-                manifest, by_name = self.fleet({"p1": answers})
-                self.assertNotIn(self.KEY, by_name["project/p1"])
-                self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
-
-    def test_the_key_is_the_module_constant(self):
-        self.assertEqual(networking_audit.SUBNETS_LISTED_KEY, self.KEY)
-
-    def test_a_read_that_warns_it_may_be_incomplete_gets_no_mark_and_the_gap_stays(self):
-        # gcloud exits 0 when some regions or zones do not respond. The
-        # subnets it did not list, or the VMs, addresses and forwarding rules
-        # on an out-of-scope host subnet, can be in the part it did not read.
-        for phrase in ("subnets list", "instances list", "addresses list", "forwarding-rules list",
-                       "clusters list"):
-            with self.subTest(read=phrase):
-                networking_audit.PROJECT_NUMBERS.clear()
-                answers = project_answers(**{phrase: Warned([], self.INCOMPLETE)})
-                manifest, by_name = self.fleet({"p1": answers})
-                self.assertNotIn(self.KEY, by_name["project/p1"])
-                gaps = self.gaps(manifest)
-                self.assertTrue(any("no subnet targets were audited" in gap for gap in gaps), gaps)
-                self.assertTrue(any("did not respond: us-east1" in gap for gap in gaps), gaps)
-
-    def test_a_read_with_an_unrelated_warning_still_marks(self):
-        for phrase in ("subnets list", "instances list", "addresses list", "forwarding-rules list"):
-            with self.subTest(read=phrase):
-                networking_audit.PROJECT_NUMBERS.clear()
-                answers = project_answers(**{phrase: Warned([], "WARNING: some unrelated notice")})
-                manifest, by_name = self.fleet({"p1": answers})
-                self.assertEqual(by_name["project/p1"][self.KEY], 0)
-                self.assertEqual(self.gaps(manifest), [])
-
     def test_a_partial_subnet_list_names_the_warning_on_the_subnets_it_listed(self):
         answers = project_answers(**{"subnets list": Warned([subnet("small", "10.0.0.0/24")], self.INCOMPLETE)})
-        _, by_name = self.fleet({"p1": answers})
-        self.assertNotIn(self.KEY, by_name["project/p1"])
+        manifest, by_name = self.fleet({"p1": answers})
         limitations = by_name["p1/us-central1/small"]["limitations"]
         self.assertIn("subnets partially read: `gcloud compute networks subnets list --project=p1", limitations)
         self.assertIn("did not respond: us-east1", limitations)
+        self.assertTrue(any("did not respond: us-east1" in gap for gap in self.gaps(manifest)))
 
-    def test_a_service_project_on_an_unlisted_host_pod_range_gets_no_mark(self):
-        cluster = gke_cluster("svc-c", "shared", "pods", 0.2, [("svc-pool", "pods", 0.2, 24)],
-                              subnet_project="host")
-        _, by_name = self.fleet({"svc": project_answers(**{"clusters list": [cluster]})})
-        self.assertNotIn(self.KEY, by_name["project/svc"])
-        # The Pod range still gets its own subnet entry, measured on the Pod range alone.
-        self.assertIn("host/us-central1/shared", by_name)
-
-    # A cluster on a host subnet that GKE reported no Pod-range utilization for.
-    @staticmethod
-    def unreported_cluster():
-        return {"name": "c", "location": "us-central1",
-                "networkConfig": {"subnetwork": "projects/host/regions/us-central1/subnetworks/shared"},
-                "ipAllocationPolicy": {"clusterSecondaryRangeName": "pods"}}
-
-    def test_a_service_project_cluster_on_an_unmeasured_host_subnet_without_utilization_gets_no_mark(self):
-        # The cluster names its subnet, so the subnet is known to be in use
-        # even though no Pod-range report names it.
-        manifest, by_name = self.fleet({"svc": project_answers(**{
-            "subnets list": [], "clusters list": [self.unreported_cluster()], "instances list": []})})
-        self.assertNotIn(self.KEY, by_name["project/svc"])
-        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
-
-    def test_a_service_project_cluster_on_a_measured_host_subnet_without_utilization_is_marked(self):
+    def test_a_partial_subnet_list_with_no_countable_subnet_is_skipped(self):
+        # Another project has a measured subnet, so the run has subnet
+        # targets and only the skipped row says that p1 was not read in full.
         manifest, by_name = self.fleet({
-            "host": project_answers(**{"subnets list": [subnet("shared", "10.0.0.0/24", project="host")]}),
-            "svc": project_answers(**{"subnets list": [], "clusters list": [self.unreported_cluster()],
-                                      "instances list": []}),
+            "p1": project_answers(**{"subnets list": Warned([], self.INCOMPLETE)}),
+            "p2": project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24", project="p2")]}),
         })
-        self.assertEqual(by_name["project/svc"][self.KEY], 0)
-        self.assertIn("host/us-central1/shared", by_name)
-        self.assertEqual(self.gaps(manifest), [])
-
-    def test_a_project_entry_that_is_not_collected_gets_no_mark(self):
-        failed = {"name": "project/p1", "project": "p1", "location": "global",
-                  "outcome": networking_audit.OUTCOME_GATE_FAILED, "error": "PERMISSION_DENIED"}
-        with patch.object(networking_audit, "collect_project_target", return_value=failed):
-            _, by_name = self.fleet({"p1": project_answers()})
-        self.assertNotIn(self.KEY, by_name["project/p1"])
-
-    def test_a_service_project_on_a_measured_host_subnet_is_marked(self):
-        nics = [{"name": "vm-2", "networkInterfaces": [
-            {"networkIP": "10.0.0.2", "subnetwork": HOST_LINK.format("shared")}]}]
-        manifest, by_name = self.fleet({
-            "host": project_answers(**{"subnets list": [subnet("shared", "10.0.0.0/24", project="host")]}),
-            "svc": project_answers(**{"instances list": nics}),
-        })
-        self.assertEqual(by_name["project/svc"][self.KEY], 0)
-        self.assertNotIn(self.KEY, by_name["project/host"])
-        self.assertIn("host/us-central1/shared", by_name)
-        self.assertEqual(self.gaps(manifest), [])
-
-    def test_a_failed_subnet_list_gets_no_mark_and_the_gap_stays(self):
-        failed = (1, "ERROR: PERMISSION_DENIED")
-        manifest, by_name = self.fleet({"p1": project_answers(**{"subnets list": failed})})
-        self.assertNotIn(self.KEY, by_name["project/p1"])
+        row = by_name["p1/UNENUMERATED_SUBNETS"]
+        self.assertEqual(row["outcome"], networking_audit.OUTCOME_GATE_FAILED)
+        self.assertIn("did not respond: us-east1", row["error"])
         gaps = self.gaps(manifest)
         self.assertTrue(any("p1/UNENUMERATED_SUBNETS" in gap for gap in gaps), gaps)
-        self.assertTrue(any("no subnet targets were audited" in gap for gap in gaps), gaps)
 
-    def test_one_failed_project_keeps_the_gap_for_the_fleet(self):
-        failed = (1, "ERROR: PERMISSION_DENIED")
-        manifest, by_name = self.fleet({
-            "p1": project_answers(),
-            "p2": project_answers(**{"subnets list": failed}),
-        })
-        self.assertEqual(by_name["project/p1"][self.KEY], 0)
-        self.assertNotIn(self.KEY, by_name["project/p2"])
-        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+    def test_a_partial_usage_read_names_the_warning_on_the_projects_subnets(self):
+        for phrase in self.USAGE_READS:
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                answers = project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24")],
+                                             phrase: Warned([], self.INCOMPLETE)})
+                manifest, by_name = self.fleet({"p1": answers})
+                limitations = by_name["p1/us-central1/small"]["limitations"]
+                self.assertIn("partially read", limitations)
+                self.assertIn("primary-range use can be undercounted", limitations)
+                gaps = self.gaps(manifest)
+                self.assertTrue(any("did not respond: us-east1" in gap for gap in gaps), gaps)
 
-    def test_a_project_with_a_counted_subnet_gets_no_mark(self):
-        answers = project_answers(**{"subnets list": [subnet("small", "10.0.0.0/24")]})
-        manifest, by_name = self.fleet({"p1": answers})
-        self.assertNotIn(self.KEY, by_name["project/p1"])
-        self.assertIn("p1/us-central1/small", by_name)
-        self.assertEqual(self.gaps(manifest), [])
-
-    def test_a_run_without_the_subnet_sweep_marks_nothing(self):
-        manifest, by_name = self.fleet({"p1": project_answers()}, check=networking_audit.PROJECT_CHECKS_CHOICE)
-        self.assertNotIn(self.KEY, by_name["project/p1"])
-        self.assertTrue(any("no subnet targets were audited" in gap for gap in self.gaps(manifest)))
+    def test_a_read_with_an_unrelated_warning_is_a_full_read(self):
+        for phrase in ("subnets list", *self.USAGE_READS):
+            with self.subTest(read=phrase):
+                networking_audit.PROJECT_NUMBERS.clear()
+                listing = [subnet("small", "10.0.0.0/24")]
+                answers = project_answers(**{"subnets list": listing})
+                answers[phrase] = Warned(listing if phrase == "subnets list" else [], "WARNING: some unrelated notice")
+                manifest, by_name = self.fleet({"p1": answers})
+                self.assertNotIn("limitations", by_name["p1/us-central1/small"])
+                self.assertEqual(self.gaps(manifest), [])
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
