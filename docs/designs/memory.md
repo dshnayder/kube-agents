@@ -243,7 +243,7 @@ Even at **30,000 clusters and 60,000 workloads**, the entire Git knowledge base 
 ### Layer 1 — Conversational memory (`kube-agents-memory` and `multiuser_memory`)
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph Input["1. Chat & Task Ingress"]
     DM["Engineer in DM\n(chat_type=dm)"]
     GRP["Group Thread / Task\n(chat_type=group)"]
@@ -252,7 +252,7 @@ flowchart LR
     GW["a2a/gateway + hermes-bridge\n(hmac:<32-hex> + session_kv.db)"]
     ST["5 Session States\n(attributed-dm | unattributable-shared |\nunattributable-interactive | unattended | read-only)"]
   end
-  subgraph Store["3. Layer 1 Store: kube-agents-memory"]
+  subgraph Store["3. Layer 1 Store: kube-agents-memory (PostgreSQL pgvector)"]
     P["Personal Scope (user:<id>)\nAuto DM capture & memory_retain(personal)"]
     R["Hybrid Retrieval (Vector + BM25 + Graph)\n+ Offline CPU Rerank (~4.3K tokens/turn)"]
   end
@@ -410,16 +410,16 @@ Delegated specialist workers (`agents/platform/config.yaml`) run with no human `
 While Layer 1 handles conversational context, **Layer 2** turns the GitOps repository (`knowledge/decisions/*.md` and `knowledge/lessons/*.md`) into the version-controlled source of truth for architectural decisions and operational lessons, backed by a rebuildable Hindsight chunk index (`kube-agents-decisions`), a compiled Go Curator (`a2a/cmd/curator`), and a zero-LLM deterministic enforcement gate in [`vcs_client.py`](../../agents/platform/scripts/vcs_client.py) and [`decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py).
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph Populate["1. Memory Population (3 Flows)"]
     O["Verified or Rejected PR Outcomes\n(resolved-merged | refused | persists)"]
     C["Shared Chat Decisions\n(memory_retain scope=shared)"]
     H["Day-0 Bootstrap (--since 2y)\n(Commits, Merged & Closed PRs)"]
   end
+  Cur["Go Curator (a2a/cmd/curator)\n1-Shot LLM OKF Synthesis & PR Lifecycle"]
   subgraph Stores["2. Synchronized Layer 2 Stores"]
-    Cur["Go Curator (a2a/cmd/curator)\n1-Shot LLM OKF Synthesis"]
     Git["GitOps Repo: knowledge/decisions/*.md\n& knowledge/lessons/*.md (active | superseded)"]
-    HD["Hindsight: kube-agents-decisions\nVerbatim Chunks (proposed | active | rejected | superseded)"]
+    HD["Hindsight DB: kube-agents-decisions\nVerbatim Chunks (proposed | active | rejected | superseded)"]
   end
   subgraph Defense["3. Two-Stage Defense-in-Depth"]
     S1["Stage A: Reasoning-Time Prevention\n(prefetch & curator recall over NATS:\n~29ms local OKF + Hindsight semantic search)"]
@@ -433,6 +433,7 @@ flowchart LR
   Git -->|decision_memory.py index| HD
   Git --> S1
   HD --> S1
+  S1 -->|"Agent edits manifests &\ncalls vcs_client.publish()"| S2
   Git --> S2
   S2 -->|"severity: block violated"| Blk["Abort Push (DECISION_MEMORY_BLOCKED)\n& Cite DEC-*/LES-* + PRs"]
   S2 -->|"Consistent with guards"| Pass["Publish Branch & Auto-Append\n'Prior decisions and lessons' to PR Body"]
