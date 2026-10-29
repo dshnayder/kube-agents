@@ -32,7 +32,7 @@ This document defines the unified two-layer memory architecture for `kube-agents
 | Proposal PR reconciliation sweep      | [`agents/platform/scripts/github_scan_gate.py`](../../agents/platform/scripts/github_scan_gate.py) (`sweep_memory_proposals`)                                          |
 | Session route store                   | [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go), [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) |
 | Decision memory CLI and skill         | [`agents/platform/skills/decision-memory/`](../../agents/platform/skills/decision-memory/SKILL.md) (`scripts/decision_memory.py`)                                      |
-| Pre-PR submission guard               | [`agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py`](../../agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py)                 |
+| Pre-PR submission guard               | [`agents/platform/scripts/vcs_client.py`](../../agents/platform/scripts/vcs_client.py), [`agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py`](../../agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py) |
 | Installer flag and CRD field          | `install.sh --memory=file\|hindsight\|off`, stored on `PlatformAgent` as `spec.harness.memory.provider`                                                                |
 | Hindsight recall configuration        | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                                       |
 | Hindsight in-cluster manifests        | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                            |
@@ -189,6 +189,11 @@ While Hindsight's observation synthesis works well for chat preferences and owne
 
 `kube-agents` separates **per-user personal memory** (`kube-agents-memory`) from **shared organizational, decision, and lesson memory** (`knowledge/` + `kube-agents-decisions`), so there is only one shared store for team rules and decisions:
 
+- **Layer 1 — Conversational and personal memory (`kube-agents-memory` and `multiuser_memory`)**: Stores each engineer's private direct-message preferences (such as response verbosity, output format, or personal scratch cluster names under `user:<id>`) and informal conversational facts in the self-hosted Hindsight `kube-agents-memory` bank (`hindsight-api` + PostgreSQL `pgvector` with offline CPU embeddings and length-bucketed cross-encoder reranking; or `memories/users/<id>.md` in `--memory=file` mode). Memories are populated automatically at the end of direct-message turns via background LLM fact extraction and observation synthesis, or explicitly via `memory_retain(scope="personal")`, governed by gateway-verified identity (`hmac:<32-hex>`) and five fail-closed session states (`attributed-dm`, `unattributable-shared`, `unattributable-interactive`, `unattended`, and `read-only`). At the start of each turn (`prefetch`) and on demand (`memory_recall`, `memory_reflect`), Hindsight retrieves a budget-bounded block ($\approx 4,264$ tokens at $1,414$ records) with strict tag isolation (`recall_tags_match: "any_strict"`). When a user states a shared team rule in chat (`memory_retain(scope="shared")`), the provider routes it directly to the Layer 2 Curator instead of Layer 1 so unreviewed rules never linger in Layer 1 if the pull request is rejected.
+- **Layer 2 — Decision and lesson memory (`knowledge/` in GitOps + `kube-agents-decisions` in Hindsight + Go Curator + VCS gate)**: Stores shared team conventions, architectural decisions (`DEC-YYYY-NNN.md`), and incident lessons (`LES-YYYY-NNN.md`) in two synchronized stores: (1) the GitOps repository (`knowledge/decisions/` and `knowledge/lessons/` on `main`), which holds approved (`status: active`) and `superseded` Operational Knowledge Format (OKF) Markdown files with YAML `scope` and `guard.expect` invariants, and (2) the Hindsight `kube-agents-decisions` bank, which indexes every record as a single verbatim chunk (`document_id = okf:<repo>:<id>`, `retain_extraction_mode: chunks`, `enable_observations: false`, `update_mode: replace`) across all four lifecycle states (`status:proposed`, `status:active`, `status:rejected`, and `status:superseded`). The Go Curator populates Layer 2 via a single-shot LLM call from three sources: verified pull request outcomes (`resolved-merged`, `pr-merged-persists`, and `refused`), shared team policies stated in chat (`memory_retain(scope="shared")`), and a 2-hour day-0 bootstrap across 2 years of repository history. Layer 2 prevents bad changes through a **two-stage defense-in-depth**:
+  1. **Reasoning-time prevention (during the agentic loop)**: At turn start (`prefetch`) and during investigation (`memory_recall` / `curator recall` over NATS), the Curator scores local OKF records in $\approx 29\text{ ms}$ and falls back to Hindsight semantic, BM25, and graph search on `kube-agents-decisions`. This injects `[ACTIVE]`, `[PROPOSED]`, and `[REJECTED]` rules (including unmerged or rejected proposals that do not exist as `.md` files on `main`) into the agent's context while it plans a fix.
+  2. **Final deterministic gate at publish time (`vcs_client.publish` / `vcs.py` / `submit-suggestion` and PR CI)**: Before any branch is bundled and sent to `/v1/vcs/publish`, `vcs_client._check_decision_memory` runs `decision_memory.py check --base <base> --head HEAD` against `knowledge/*.md` in the local Git checkout in $< 100\text{ ms}$ with $0$ LLM calls and $0$ network calls. If any `severity: block` guard fails, `vcs_client.publish` aborts the push (`DECISION_MEMORY_BLOCKED`) and cites the violating `DEC-*`/`LES-*` record and historical PRs; if the check passes on governed files, `vcs_client.forge` (`proposal-create` / `proposal-update`) automatically appends a `### Prior decisions and lessons` citation section to the pull request description.
+
 | Dimension                      | Layer 1: Personal user memory (`kube-agents-memory`)                                  | Layer 2: Shared decision, convention, and lesson memory (`knowledge/` + `kube-agents-decisions`)                                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Primary source of truth**    | Hindsight PostgreSQL database (or `users/<id>.md` in `file` mode).                    | GitOps repository `knowledge/decisions/*.md` and `knowledge/lessons/*.md` (versioned in Git).                                                                                                                     |
@@ -236,6 +241,31 @@ Even at **30,000 clusters and 60,000 workloads**, the entire Git knowledge base 
 ---
 
 ### Layer 1 — Conversational memory (`kube-agents-memory` and `multiuser_memory`)
+
+```mermaid
+flowchart LR
+  subgraph Input["1. Chat & Task Ingress"]
+    DM["Engineer in DM\n(chat_type=dm)"]
+    GRP["Group Thread / Task\n(chat_type=group)"]
+  end
+  subgraph Identity["2. Identity & Fail-Closed Scoping"]
+    GW["a2a/gateway + hermes-bridge\n(hmac:<32-hex> + session_kv.db)"]
+    ST["5 Session States\n(attributed-dm | unattributable-shared |\nunattributable-interactive | unattended | read-only)"]
+  end
+  subgraph Store["3. Layer 1 Store: kube-agents-memory"]
+    P["Personal Scope (user:<id>)\nAuto DM capture & memory_retain(personal)"]
+    R["Hybrid Retrieval (Vector + BM25 + Graph)\n+ Offline CPU Rerank (~4.3K tokens/turn)"]
+  end
+  subgraph L2Route["4. Shared Policy Handoff"]
+    L2["memory_retain(scope=shared)\nRoutes to Layer 2 Curator (status:proposed)"]
+  end
+  DM --> GW
+  GRP --> GW
+  GW --> ST
+  ST -->|"attributed-dm only"| P
+  ST -->|"scope:shared rule"| L2
+  P --> R -->|"prefetch / memory_recall\n(tags_match: any_strict)"| Ctx["Agent Turn Context\n(api_content sidecar)"]
+```
 
 #### Choosing a provider
 
@@ -377,36 +407,35 @@ Delegated specialist workers (`agents/platform/config.yaml`) run with no human `
 
 ### Layer 2 — Decision and lesson memory (`knowledge/` and `kube-agents-decisions`)
 
-While Layer 1 handles conversational context, **Layer 2** turns the GitOps repository (`knowledge/decisions/*.md` and `knowledge/lessons/*.md`) into the version-controlled source of truth for architectural decisions and operational lessons, backed by a rebuildable Hindsight chunk index (`kube-agents-decisions`) and a zero-LLM deterministic enforcement CLI ([`decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py)).
+While Layer 1 handles conversational context, **Layer 2** turns the GitOps repository (`knowledge/decisions/*.md` and `knowledge/lessons/*.md`) into the version-controlled source of truth for architectural decisions and operational lessons, backed by a rebuildable Hindsight chunk index (`kube-agents-decisions`), a compiled Go Curator (`a2a/cmd/curator`), and a zero-LLM deterministic enforcement gate in [`vcs_client.py`](../../agents/platform/scripts/vcs_client.py) and [`decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py).
 
 ```mermaid
 flowchart LR
-  subgraph Populate["1. Memory Population"]
-    O["Verified PR Outcomes (resolved-merged / refused / persists)"]
-    H["2-Hour Bootstrap & Incremental Harvester (PRs, Issues, /docs)"]
-    C["Explicit Chat Decisions"]
+  subgraph Populate["1. Memory Population (3 Flows)"]
+    O["Verified or Rejected PR Outcomes\n(resolved-merged | refused | persists)"]
+    C["Shared Chat Decisions\n(memory_retain scope=shared)"]
+    H["Day-0 Bootstrap (--since 2y)\n(Commits, Merged & Closed PRs)"]
   end
-  subgraph Truth["2. GitOps Repository (Source of Truth)"]
-    R["knowledge/decisions/*.md\nknowledge/lessons/*.md"]
+  subgraph Stores["2. Synchronized Layer 2 Stores"]
+    Cur["Go Curator (a2a/cmd/curator)\n1-Shot LLM OKF Synthesis"]
+    Git["GitOps Repo: knowledge/decisions/*.md\n& knowledge/lessons/*.md (active | superseded)"]
+    HD["Hindsight: kube-agents-decisions\nVerbatim Chunks (proposed | active | rejected | superseded)"]
   end
-  subgraph Index["3. Hindsight Bank: kube-agents-decisions"]
-    I["Verbatim Chunks (1 doc per record)"]
-    M["Tag-Scoped Mental Models"]
+  subgraph Defense["3. Two-Stage Defense-in-Depth"]
+    S1["Stage A: Reasoning-Time Prevention\n(prefetch & curator recall over NATS:\n~29ms local OKF + Hindsight semantic search)"]
+    S2["Stage B: Final Deterministic Gate\n(vcs_client.publish & submit-suggestion:\ndecision_memory.py check < 100ms, 0 LLM calls)"]
   end
-  subgraph Consume["4. Guard Enforcement & Retrieval"]
-    P["Deterministic Check (Drafting, Submit Gate, PR CI)"]
-    Q["On-Demand Queries (decision_memory.py why & Read-Only MCP)"]
-  end
-  O --> OR["Outcome Recorder"] -->|Draft PR| R
-  H -->|Bootstrap / Triage PR| R
-  C -->|Draft PR| R
-  R -->|decision_memory.py index| I --> M
-  R --> P
-  R --> Q
-  I --> P
-  I --> Q
-  Dream(("Nightly Dream")) -->|Verify Guards, Supersede, Scan Coverage| R
-  Dream -->|Reconcile & Refresh| I
+  O --> Cur
+  C --> Cur
+  H --> Cur
+  Cur -->|"Open knowledge/ PR\n(merge -> active, close -> rejected)"| Git
+  Cur -->|"Upsert okf:<repo>:<id>\n(update_mode: replace)"| HD
+  Git -->|decision_memory.py index| HD
+  Git --> S1
+  HD --> S1
+  Git --> S2
+  S2 -->|"severity: block violated"| Blk["Abort Push (DECISION_MEMORY_BLOCKED)\n& Cite DEC-*/LES-* + PRs"]
+  S2 -->|"Consistent with guards"| Pass["Publish Branch & Auto-Append\n'Prior decisions and lessons' to PR Body"]
 ```
 
 #### Operational Knowledge Format (OKF) schema for decisions and lessons
@@ -634,13 +663,21 @@ Whenever `knowledge/` changes on the default branch (or during Phase 1 of the ni
 
 #### 2. How decision memory enters context and blocks regressions
 
-Decision memory enters agent context through a fast local OKF recall path during interactive chat turns and through deterministic YAML/regex checks when the agent drafts, submits, or reviews infrastructure changes:
+Layer 2 prevents bad changes through two complementary stages—**reasoning-time prevention during the agentic loop** and a **final deterministic gate at publish time**:
+
+1. **Stage A — Reasoning-time prevention (during the agentic loop via Curator & Hindsight)**:
+   - Before an agent picks a file to edit—or when an engineer asks a conceptual policy question in chat—there is no Git diff yet to evaluate `scope.paths` against, and pending (`status:proposed`) or rejected (`status:rejected`) proposals do not exist as `.md` files on `main` in Git.
+   - At turn start (`prefetch`) and during investigation (`memory_recall` / `curator recall` over NATS `_INBOX.agent.memory.query`), the Curator first scores local OKF records in memory ($\approx 29\text{ ms}$) and falls back to Hindsight hybrid semantic, BM25, and graph search on `kube-agents-decisions`. Matching `DEC-*` and `LES-*` records (with explicit `[ACTIVE]`, `[PROPOSED]`, or `[REJECTED]` status badges) enter the agent's prompt so the agent avoids designing a rejected approach in the first place.
+2. **Stage B — Final deterministic gate at publish time (`vcs_client.publish` / `vcs.py` / `submit-suggestion` and PR CI)**:
+   - Even if the LLM overlooks a recalled rule during a long multi-step investigation, every path that publishes a branch to the credential broker (`vcs_client.publish`, used by both `vcs.py publish` and `submit_suggestion.py submit`) runs `decision_memory.py check --base <base> --head HEAD` against `knowledge/*.md` in the local Git checkout in $< 100\text{ ms}$ with $0$ LLM calls and $0$ network calls.
+   - If any active `severity: block` guard fails (and no explicit `--override-decision` is provided), `vcs_client.publish` raises `DecisionMemoryBlockedError` (`code="DECISION_MEMORY_BLOCKED"`) before creating or sending the Git bundle, printing the violating `DEC-*`/`LES-*` ID, guard rule, and historical PR/incident links.
+   - If the check passes on governed files, `vcs_client.forge` (`proposal-create` / `proposal-update`) and `submit_suggestion.py` automatically append a `### Prior decisions and lessons` citation section to the pull request description so human reviewers see which governing records apply.
 
 | Workflow stage                                                                       | What is injected                                                                                                                                                                           | How it runs                                                                                                                                                                           | Latency & token cost                                                             |
 | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| **1. Interactive chat turn** (Chat Agent)                                            | Conversational facts from `kube-agents-memory` plus up to $4$ matching `DEC-*`/`LES-*` records (with explicit `PROPOSED`, `ACTIVE`, or `REJECTED` status headers) from `recall_decisions`. | `KubeAgentsMemoryProvider.prefetch(query)` runs `curator recall <query>` over NATS alongside Layer-1 prefetch and attaches both blocks to `api_content`.                              | $\approx 29\text{ ms}$ for local OKF match; `recall_budget: mid` ($\approx 4.3\text{k}$ tokens). |
+| **1. Interactive chat & task turn** (Reasoning time)                                 | Conversational facts from `kube-agents-memory` plus up to $4$ matching `DEC-*`/`LES-*` records (with explicit `PROPOSED`, `ACTIVE`, or `REJECTED` status headers) from `recall_decisions`. | `KubeAgentsMemoryProvider.prefetch(query)` runs `curator recall <query>` over NATS alongside Layer-1 prefetch and attaches both blocks to `api_content`.                              | $\approx 29\text{ ms}$ for local OKF match; `recall_budget: mid` ($\approx 4.3\text{k}$ tokens). |
 | **2. Change drafting** (`gke-manifest-generation`, `gke-golden-path`, `fleet-audit`) | Active `DEC` and `LES` records whose `scope.paths`, `scope.resources`, `scope.clusters`, or `scope.checks` match the target workload.                                                      | The skill runs `decision_memory.py check --files <targets>` before editing and returns matching records to the agent.                                                                 | $1\text{–}5$ records ($< 500$ tokens, $< 100\text{ ms}$, $0$ LLM calls).         |
-| **3. Pre-PR submission gate** (`submit-suggestion`)                                  | Deterministic guard verdicts (`violates`, `consistent`, `related`) plus any `supersedes` history.                                                                                          | `submit_suggestion.py` runs `decision_memory.py check` before `git push`. If any guard fails with `severity: block`, it aborts the push and prints the violation report and PR links. | $< 100\text{ ms}$ locally ($< 1\text{ s}$ with `--semantic`).                    |
+| **3. Pre-PR publish gate** (`vcs_client.publish`, `vcs.py`, `submit-suggestion`)     | Deterministic guard verdicts (`violates`, `consistent`, `related`) plus any `supersedes` history.                                                                                          | `vcs_client._check_decision_memory` runs `decision_memory.py check` before bundling or pushing. If any `severity: block` guard fails, it aborts the publish; if consistent, `vcs_client.forge` appends `### Prior decisions and lessons` to the PR body. | $< 100\text{ ms}$ locally ($0$ LLM calls, $0$ network calls).                    |
 | **4. Human pull request review** (CI job or review worker)                           | Guard verdicts and governing records for all files modified in `BASE..HEAD`.                                                                                                               | Runs `decision_memory.py check --base $BASE --head $HEAD --markdown` and posts a single sticky comment on the pull request.                                                           | Deterministic; $0$ LLM tokens in CI mode.                                        |
 
 Serving matching OKF records directly from the Curator's local store before falling back to Hindsight HTTP keeps per-turn NATS decision recall under $30\text{ ms}$—avoiding a second $\approx 7\text{ s}$ CPU cross-encoder rerank on chat questions and staying well within Hermes `MemoryManager`'s $8.0\text{ s}$ prefetch timeout.

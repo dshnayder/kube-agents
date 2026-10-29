@@ -72,10 +72,10 @@ PROTECTED_BRANCH_PREFIXES = ("run/",)
 # same reason: what the file holds is posted publicly, so a path the model
 # supplies is a way to publish any file the agent container can read.
 SCRATCH_DIR = "/opt/data/scratch"
-DECISION_MEMORY_DIRS = ("knowledge/decisions", "knowledge/lessons")
-DECISION_MEMORY_SCRIPT_REL = Path("decision-memory/scripts/decision_memory.py")
-DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
-DECISION_MEMORY_VALID_EXIT_CODES = (0, 2)
+DECISION_MEMORY_DIRS = vcs_client.DECISION_MEMORY_DIRS
+DECISION_MEMORY_SCRIPT_REL = vcs_client.DECISION_MEMORY_SCRIPT_REL
+DECISION_MEMORY_HEADING = vcs_client.DECISION_MEMORY_HEADING
+DECISION_MEMORY_VALID_EXIT_CODES = vcs_client.DECISION_MEMORY_VALID_EXIT_CODES
 
 
 def _short_branch(branch: str) -> str:
@@ -595,16 +595,7 @@ def pending_changes(session: dict) -> str:
 
 def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
     """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
-    for candidate in (base, f"origin/{base}", session.get("baseRevision", "")):
-        if not candidate:
-            continue
-        chk = subprocess.run(
-            ["git", "-C", str(ws), "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
-            capture_output=True, text=True, check=False,
-        )
-        if chk.returncode == 0 and chk.stdout.strip():
-            return candidate
-    return session.get("baseRevision") or base
+    return vcs_client._resolve_decision_memory_base(session, ws, base)
 
 
 def _check_decision_memory(
@@ -615,47 +606,9 @@ def _check_decision_memory(
     copy_key: str | None = None,
 ) -> dict | None:
     """Run Decision Memory check on the staged/committed change before publishing."""
-    ws = Path(session["path"])
-    if not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
-        return None
-    dm_script = Path(__file__).resolve().parents[2] / DECISION_MEMORY_SCRIPT_REL
-    if not dm_script.is_file():
-        return None
-    diff_base = _resolve_decision_memory_base(session, ws, base)
-    res = subprocess.run(
-        [sys.executable, str(dm_script), "--repo", str(ws), "check", "--base", diff_base, "--head", "HEAD"],
-        capture_output=True, text=True, check=False,
+    return vcs_client._check_decision_memory(
+        session, base, override, repo=repo, copy_key=copy_key, log_fn=log
     )
-    if res.returncode not in DECISION_MEMORY_VALID_EXIT_CODES or not res.stdout.strip():
-        detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
-        raise RuntimeError(f"Decision Memory check failed on {ws} (base {diff_base}): {detail}")
-    try:
-        out = json.loads(res.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Decision Memory check returned invalid JSON: {exc}") from exc
-    if out.get("verdict") == "block":
-        blocking_ids = [f["id"] for f in out.get("findings", []) if f.get("severity") == "block"]
-        overrides = {s.strip() for s in str(override or "").split(",") if s.strip()}
-        if not blocking_ids or not set(blocking_ids).issubset(overrides):
-            if repo and copy_key:
-                with contextlib.suppress(Exception):
-                    vcs_client.discard(repo, key=copy_key)
-            msg = (
-                "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
-                f"{out.get('markdown', '')}\n\n"
-                "Do NOT open this Pull Request. The working copy has been discarded. "
-                "In your final response (and kanban_complete result), you MUST quote the record IDs "
-                "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
-                "and the technical root-cause details from the block above verbatim."
-            )
-            log(msg)
-            raise PermissionError(msg)
-    elif out.get("findings"):
-        log(
-            "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
-            f"{out.get('markdown', '')}"
-        )
-    return out
 
 
 def handle_submit(args) -> int:
@@ -889,7 +842,11 @@ def handle_submit(args) -> int:
         # to write to the branch a copy came down on otherwise, and that refusal
         # is the one that caught a worker fast-forwarding a branch it had cloned.
         vcs_client.publish(
-            repo, target=base, advance=session["branch"] == branch, key=copy_key
+            repo,
+            target=base,
+            advance=session["branch"] == branch,
+            key=copy_key,
+            override_decision=getattr(args, "override_decision", None),
         )
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
