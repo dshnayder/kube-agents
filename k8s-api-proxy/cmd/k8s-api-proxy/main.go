@@ -172,6 +172,11 @@ func main() {
 		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
 		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+		oidcIssuerURL            = flag.String("oidc-issuer-url", envOrDefault("KUBE_PROXY_OIDC_ISSUER_URL", ""), "Optional OIDC issuer URL (https://<host>) for Actor JWT caller authentication")
+		oidcAudience             = flag.String("oidc-audience", envOrDefault("KUBE_PROXY_OIDC_AUDIENCE", ""), "Required aud claim for OIDC caller JWTs (required when --oidc-issuer-url is set)")
+		oidcCAFile               = flag.String("oidc-ca-file", envOrDefault("KUBE_PROXY_OIDC_CA_FILE", ""), "Optional PEM CA bundle file for verifying the OIDC issuer TLS certificate")
+		oidcAllowedAtespaces     = flag.String("oidc-allowed-atespaces", envOrDefault("KUBE_PROXY_OIDC_ALLOWED_ATESPACES", ""), "Optional comma-separated allowlist of Agent Substrate atespaces (empty allows all)")
+		partitionByAtespace      = flag.Bool("partition-by-atespace", envBoolOrDefault("KUBE_PROXY_PARTITION_BY_ATESPACE", false), "Partition response cache and upstream credentials by Agent Substrate atespace")
 		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
 		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
@@ -201,26 +206,51 @@ func main() {
 		}()
 	}
 
-	callers, err := parseAllowedCallers(*allowedCallers)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
 
-	audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
-	if err != nil {
-		log.Fatal(err)
+	var authenticators []k8sapiproxy.CallerAuthenticator
+	if strings.TrimSpace(*allowedCallers) != "" {
+		callers, err := parseAllowedCallers(*allowedCallers)
+		if err != nil {
+			log.Fatal(err)
+		}
+		audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
+		if err != nil {
+			log.Fatal(err)
+		}
+		trAuthn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
+			Kubernetes:      inCluster,
+			Audience:        *audience,
+			AllowedCallers:  callers,
+			AudienceCallers: audienceCallers,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
+		}
+		authenticators = append(authenticators, trAuthn)
 	}
-
-	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		Kubernetes:      inCluster,
-		Audience:        *audience,
-		AllowedCallers:  callers,
-		AudienceCallers: audienceCallers,
-	})
+	if strings.TrimSpace(*oidcIssuerURL) != "" {
+		var allowedNS []string
+		if rawNS := strings.TrimSpace(*oidcAllowedAtespaces); rawNS != "" {
+			allowedNS = []string{rawNS}
+		}
+		oidcAuthn, err := k8sapiproxy.NewOIDCAuthenticator(k8sapiproxy.OIDCConfig{
+			IssuerURL:        *oidcIssuerURL,
+			Audience:         *oidcAudience,
+			CAFile:           *oidcCAFile,
+			AllowedAtespaces: allowedNS,
+		})
+		if err != nil {
+			log.Fatalf("failed to initialize OIDC authenticator: %v", err)
+		}
+		authenticators = append(authenticators, oidcAuthn)
+	}
+	if len(authenticators) == 0 {
+		log.Fatal("configure at least one caller authenticator: set --allowed-callers (TokenReview) or --oidc-issuer-url (OIDC)")
+	}
+	authn, err := k8sapiproxy.ChainAuthenticators(authenticators...)
 	if err != nil {
-		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
+		log.Fatalf("failed to initialize caller authenticator: %v", err)
 	}
 
 	gcpTokens := newGCPTokenSource(gcpTokenConfig{
@@ -270,6 +300,11 @@ func main() {
 		}
 	}
 
+	var callerPartition func(*k8sapiproxy.CallerIdentity) string
+	if *partitionByAtespace {
+		callerPartition = k8sapiproxy.AtespaceFromCaller
+	}
+
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 		Authenticator: authn,
 		Upstream:      upstreamTransport,
@@ -278,12 +313,13 @@ func main() {
 			RedactSecrets:            *redactSecrets,
 			AllowUpgradeSubresources: *allowUpgradeSubresources,
 		},
-		Cache:          cacheCfg,
-		Exclusions:     k8sapiproxy.NewExclusions(*scopeFile, *excludeHostCluster),
-		Logger:         logger,
-		Metrics:        metrics,
-		TracerProvider: tp,
-		MaxInFlight:    *maxInFlight,
+		Cache:           cacheCfg,
+		Exclusions:      k8sapiproxy.NewExclusions(*scopeFile, *excludeHostCluster),
+		CallerPartition: callerPartition,
+		Logger:          logger,
+		Metrics:         metrics,
+		TracerProvider:  tp,
+		MaxInFlight:     *maxInFlight,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)
@@ -300,8 +336,13 @@ func main() {
 
 	listen := srv.ListenAndServe
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
+		reloader, err := newCertReloader(*tlsCertFile, *tlsKeyFile)
+		if err != nil {
+			log.Fatalf("failed to load server TLS certificate: %v", err)
+		}
+		srv.TLSConfig.GetCertificate = reloader.GetCertificate
 		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
-		listen = func() error { return srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile) }
+		listen = func() error { return srv.ListenAndServeTLS("", "") }
 	} else {
 		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 	}

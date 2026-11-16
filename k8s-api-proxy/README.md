@@ -11,10 +11,12 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
+`NewTokenReviewAuthenticator` (`auth.go`) is the Kubernetes ServiceAccount `CallerAuthenticator`: it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
+
+`NewOIDCAuthenticator` (`oidc.go`) verifies OpenID Connect bearer JWTs (such as Agent Substrate `actorJwt` tokens with `sub: actor/<atespace>/<name>`) against `--oidc-issuer-url`'s discovery document and JWKS (`--oidc-audience`, optional `--oidc-ca-file` and `--oidc-allowed-atespaces`). `ChainAuthenticators` combines TokenReview and OIDC authenticators when both are configured, and `AtespaceFromCaller` partitions cache and upstream credentials per atespace (`--partition-by-atespace`). Server TLS certificates (`--tls-cert-file`, `--tls-key-file`) reload automatically when rotated on disk, supporting combined PEM bundles such as `podCertificate` credentials.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
