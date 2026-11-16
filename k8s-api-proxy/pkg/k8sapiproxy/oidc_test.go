@@ -163,7 +163,7 @@ func signEdDSAJWT(t *testing.T, kid string, key ed25519.PrivateKey, claims map[s
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
-func TestOIDCAuthenticatorVerifiesActorJWTAndKeyRotation(t *testing.T) {
+func TestOIDCAuthenticatorVerifiesJWTClaimsPartitionAndKeyRotation(t *testing.T) {
 	key1, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -179,11 +179,14 @@ func TestOIDCAuthenticatorVerifiesActorJWTAndKeyRotation(t *testing.T) {
 	now := time.Unix(1_760_000_000, 0)
 	currentNow := now
 	authn, err := NewOIDCAuthenticator(OIDCConfig{
-		IssuerURL:        idp.srv.URL,
-		Audience:         "https://k8s-api-proxy.ax-system.svc",
-		CAFile:           caFile,
-		AllowedAtespaces: []string{"team-a"},
-		Now:              func() time.Time { return currentNow },
+		IssuerURL:             idp.srv.URL,
+		Audience:              "https://k8s-api-proxy.ax-system.svc",
+		CAFile:                caFile,
+		RequiredSubjectPrefix: "actor/",
+		PartitionClaim:        `custom\.claim.tenant`,
+		UIDClaim:              `custom\.claim.uid`,
+		AllowedPartitions:     []string{"team-a"},
+		Now:                   func() time.Time { return currentNow },
 	})
 	if err != nil {
 		t.Fatalf("NewOIDCAuthenticator: %v", err)
@@ -196,10 +199,9 @@ func TestOIDCAuthenticatorVerifiesActorJWTAndKeyRotation(t *testing.T) {
 			"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
 			"exp": currentNow.Add(15 * time.Minute).Unix(),
 			"nbf": currentNow.Add(-5 * time.Minute).Unix(),
-			"actor.ate.dev": map[string]string{
-				"atespace":  "team-a",
-				"actorName": "triage-1",
-				"actorUID":  "uid-123",
+			"custom.claim": map[string]string{
+				"tenant": "team-a",
+				"uid":    "uid-123",
 			},
 		}
 	}
@@ -210,8 +212,8 @@ func TestOIDCAuthenticatorVerifiesActorJWTAndKeyRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthenticateRequest valid ES256: %v", err)
 	}
-	if caller.Username != "actor/team-a/triage-1" || caller.UID != "uid-123" || AtespaceFromCaller(caller) != "team-a" {
-		t.Fatalf("unexpected caller: %+v (atespace=%q)", caller, AtespaceFromCaller(caller))
+	if caller.Username != "actor/team-a/triage-1" || caller.UID != "uid-123" || PartitionFromCaller(caller) != "team-a" {
+		t.Fatalf("unexpected caller: %+v (partition=%q)", caller, PartitionFromCaller(caller))
 	}
 
 	// Rotate signing key on the OIDC provider and advance clock past defaultOIDCMinRefreshDelay.
@@ -227,7 +229,7 @@ func TestOIDCAuthenticatorVerifiesActorJWTAndKeyRotation(t *testing.T) {
 	}
 }
 
-func TestOIDCAuthenticatorSupportsRS256AndEdDSA(t *testing.T) {
+func TestOIDCAuthenticatorSupportsArbitrarySubjectsRS256AndEdDSA(t *testing.T) {
 	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +243,7 @@ func TestOIDCAuthenticatorSupportsRS256AndEdDSA(t *testing.T) {
 	now := time.Unix(1_760_000_000, 0)
 	authn, err := NewOIDCAuthenticator(OIDCConfig{
 		IssuerURL:  idp.srv.URL,
-		Audience:   "https://k8s-api-proxy.ax-system.svc",
+		Audience:   "https://k8s-api-proxy.example.com",
 		HTTPClient: idp.srv.Client(),
 		Now:        func() time.Time { return now },
 	})
@@ -249,10 +251,11 @@ func TestOIDCAuthenticatorSupportsRS256AndEdDSA(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Without RequiredSubjectPrefix, numeric/Cloud Run/Entra subjects work out of the box.
 	claims := map[string]any{
 		"iss": idp.srv.URL,
-		"sub": "actor/default/task-1",
-		"aud": "https://k8s-api-proxy.ax-system.svc",
+		"sub": "1149284759201948",
+		"aud": "https://k8s-api-proxy.example.com",
 		"exp": now.Add(10 * time.Minute).Unix(),
 	}
 
@@ -281,11 +284,13 @@ func TestOIDCAuthenticatorRejectsInvalidTokensAndSurfaces503WhenIDPDown(t *testi
 	now := time.Unix(1_760_000_000, 0)
 
 	authn, err := NewOIDCAuthenticator(OIDCConfig{
-		IssuerURL:        idp.srv.URL,
-		Audience:         "https://k8s-api-proxy.ax-system.svc",
-		HTTPClient:       idp.srv.Client(),
-		AllowedAtespaces: []string{"allowed-ns"},
-		Now:              func() time.Time { return now },
+		IssuerURL:             idp.srv.URL,
+		Audience:              "https://k8s-api-proxy.ax-system.svc",
+		HTTPClient:            idp.srv.Client(),
+		RequiredSubjectPrefix: "actor/",
+		PartitionClaim:        "tenant",
+		AllowedPartitions:     []string{"allowed-ns"},
+		Now:                   func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -297,10 +302,11 @@ func TestOIDCAuthenticatorRejectsInvalidTokensAndSurfaces503WhenIDPDown(t *testi
 	idp.mu.Unlock()
 	reqDown, _ := http.NewRequest(http.MethodGet, "https://example.invalid/clusters/in-cluster/api", nil)
 	reqDown.Header.Set("Authorization", "Bearer "+signES256JWT(t, "k1", key, map[string]any{
-		"iss": idp.srv.URL,
-		"sub": "actor/allowed-ns/t1",
-		"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
-		"exp": now.Add(time.Hour).Unix(),
+		"iss":    idp.srv.URL,
+		"sub":    "actor/allowed-ns/t1",
+		"aud":    []string{"https://k8s-api-proxy.ax-system.svc"},
+		"exp":    now.Add(time.Hour).Unix(),
+		"tenant": "allowed-ns",
 	}))
 	if _, err := authn.AuthenticateRequest(reqDown); !errors.Is(err, errAuthenticationUnavailable) {
 		t.Fatalf("IDP 503 error = %v, want errAuthenticationUnavailable", err)
@@ -317,59 +323,60 @@ func TestOIDCAuthenticatorRejectsInvalidTokensAndSurfaces503WhenIDPDown(t *testi
 		{
 			name: "wrong signature",
 			token: signES256JWT(t, "k1", stranger, map[string]any{
-				"iss": idp.srv.URL,
-				"sub": "actor/allowed-ns/t1",
-				"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
-				"exp": now.Add(time.Hour).Unix(),
+				"iss":    idp.srv.URL,
+				"sub":    "actor/allowed-ns/t1",
+				"aud":    []string{"https://k8s-api-proxy.ax-system.svc"},
+				"exp":    now.Add(time.Hour).Unix(),
+				"tenant": "allowed-ns",
 			}),
 		},
 		{
-			name: "worker-for-actor subject rejected",
+			name: "disallowed subject prefix rejected",
 			token: signES256JWT(t, "k1", key, map[string]any{
-				"iss": idp.srv.URL,
-				"sub": "worker-for-actor/allowed-ns/t1",
-				"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
-				"exp": now.Add(time.Hour).Unix(),
+				"iss":    idp.srv.URL,
+				"sub":    "worker/allowed-ns/t1",
+				"aud":    []string{"https://k8s-api-proxy.ax-system.svc"},
+				"exp":    now.Add(time.Hour).Unix(),
+				"tenant": "allowed-ns",
 			}),
 		},
 		{
 			name: "wrong audience",
 			token: signES256JWT(t, "k1", key, map[string]any{
-				"iss": idp.srv.URL,
-				"sub": "actor/allowed-ns/t1",
-				"aud": []string{"https://other.example"},
-				"exp": now.Add(time.Hour).Unix(),
+				"iss":    idp.srv.URL,
+				"sub":    "actor/allowed-ns/t1",
+				"aud":    []string{"https://other.example"},
+				"exp":    now.Add(time.Hour).Unix(),
+				"tenant": "allowed-ns",
 			}),
 		},
 		{
 			name: "expired",
 			token: signES256JWT(t, "k1", key, map[string]any{
-				"iss": idp.srv.URL,
-				"sub": "actor/allowed-ns/t1",
-				"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
-				"exp": now.Add(-5 * time.Minute).Unix(),
+				"iss":    idp.srv.URL,
+				"sub":    "actor/allowed-ns/t1",
+				"aud":    []string{"https://k8s-api-proxy.ax-system.svc"},
+				"exp":    now.Add(-5 * time.Minute).Unix(),
+				"tenant": "allowed-ns",
 			}),
 		},
 		{
-			name: "disallowed atespace",
+			name: "disallowed partition",
 			token: signES256JWT(t, "k1", key, map[string]any{
-				"iss": idp.srv.URL,
-				"sub": "actor/other-ns/t1",
-				"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
-				"exp": now.Add(time.Hour).Unix(),
+				"iss":    idp.srv.URL,
+				"sub":    "actor/other-ns/t1",
+				"aud":    []string{"https://k8s-api-proxy.ax-system.svc"},
+				"exp":    now.Add(time.Hour).Unix(),
+				"tenant": "other-ns",
 			}),
 		},
 		{
-			name: "mismatched actor.ate.dev claim",
+			name: "missing partition claim rejected when configured",
 			token: signES256JWT(t, "k1", key, map[string]any{
 				"iss": idp.srv.URL,
 				"sub": "actor/allowed-ns/t1",
 				"aud": []string{"https://k8s-api-proxy.ax-system.svc"},
 				"exp": now.Add(time.Hour).Unix(),
-				"actor.ate.dev": map[string]string{
-					"atespace":  "other-ns",
-					"actorName": "t1",
-				},
 			}),
 		},
 		{
@@ -390,7 +397,6 @@ func TestOIDCAuthenticatorRejectsInvalidTokensAndSurfaces503WhenIDPDown(t *testi
 		})
 	}
 
-	// Ensure unused x509 import is exercised in CA validation failure test.
 	badCA := filepath.Join(t.TempDir(), "empty.pem")
 	_ = os.WriteFile(badCA, []byte("not a cert"), 0o600)
 	if _, err := NewOIDCAuthenticator(OIDCConfig{

@@ -39,11 +39,10 @@ const (
 	maxBearerTokenBytes        = 16 << 10
 	minRSAKeyBits              = 2048
 
-	actorSubjectPrefix = "actor/"
-	atespaceGroupPref  = "atespace:"
+	callerPartitionGroupPref = "partition:"
 )
 
-// OIDCConfig configures NewOIDCAuthenticator for OpenID Connect JWT callers such as Agent Substrate actors.
+// OIDCConfig configures NewOIDCAuthenticator for OpenID Connect bearer JWT callers.
 type OIDCConfig struct {
 	// IssuerURL is the expected iss claim and discovery base URL (https://<host>[:port]). Required.
 	IssuerURL string
@@ -55,10 +54,17 @@ type OIDCConfig struct {
 	CAFile string
 	// HTTPClient overrides the HTTP client used for OIDC discovery and JWKS fetches; optional.
 	HTTPClient *http.Client
-	// RequiredSubjectPrefix restricts accepted sub claims to this prefix; defaults to "actor/".
+	// RequiredSubjectPrefix restricts accepted sub claims to this prefix when non-empty.
 	RequiredSubjectPrefix string
-	// AllowedAtespaces restricts actor/<atespace>/<name> callers to the listed atespaces; empty allows all atespaces.
-	AllowedAtespaces []string
+	// PartitionClaim is an optional dot-separated claim path (for example "tenant_id" or
+	// "custom.namespace") whose non-empty string value is recorded as the caller's partition.
+	// When set, tokens without a non-empty string at that path are rejected.
+	PartitionClaim string
+	// UIDClaim is an optional dot-separated claim path whose string value populates CallerIdentity.UID.
+	UIDClaim string
+	// AllowedPartitions restricts callers to the listed PartitionClaim values; empty allows all values.
+	// Requires PartitionClaim when non-empty.
+	AllowedPartitions []string
 	// JWKSCacheTTL sets how long a fetched JWKS stays fresh before background refresh; defaults to 5m.
 	JWKSCacheTTL time.Duration
 	// ClockSkew allows small clock differences on exp and nbf claims; defaults to 30s.
@@ -67,13 +73,13 @@ type OIDCConfig struct {
 	Now func() time.Time
 }
 
-// AtespaceFromCaller returns the Agent Substrate atespace recorded on id, or "" when absent.
-func AtespaceFromCaller(id *CallerIdentity) string {
+// PartitionFromCaller returns the OIDC partition value recorded on id, or "" when absent.
+func PartitionFromCaller(id *CallerIdentity) string {
 	if id == nil {
 		return ""
 	}
 	for _, g := range id.Groups {
-		if after, ok := strings.CutPrefix(g, atespaceGroupPref); ok && after != "" {
+		if after, ok := strings.CutPrefix(g, callerPartitionGroupPref); ok && after != "" {
 			return after
 		}
 	}
@@ -120,15 +126,17 @@ func (c *chainedAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIden
 }
 
 type oidcAuthenticator struct {
-	issuer           string
-	issuerHost       string
-	audiences        sets.Set[string]
-	requiredSubPref  string
-	allowedAtespaces sets.Set[string]
-	cacheTTL         time.Duration
-	clockSkew        time.Duration
-	now              func() time.Time
-	httpClient       *http.Client
+	issuer            string
+	issuerHost        string
+	audiences         sets.Set[string]
+	requiredSubPref   string
+	partitionClaim    []string
+	uidClaim          []string
+	allowedPartitions sets.Set[string]
+	cacheTTL          time.Duration
+	clockSkew         time.Duration
+	now               func() time.Time
+	httpClient        *http.Client
 
 	mu            sync.Mutex
 	jwksURI       string
@@ -163,20 +171,28 @@ func NewOIDCAuthenticator(cfg OIDCConfig) (CallerAuthenticator, error) {
 		return nil, errors.New("k8sapiproxy: OIDCConfig.Audience is required")
 	}
 
-	allowedAtespaces := sets.New[string]()
-	for _, raw := range cfg.AllowedAtespaces {
+	partitionClaim, err := parseClaimPath(cfg.PartitionClaim)
+	if err != nil {
+		return nil, fmt.Errorf("k8sapiproxy: OIDCConfig.PartitionClaim: %w", err)
+	}
+	uidClaim, err := parseClaimPath(cfg.UIDClaim)
+	if err != nil {
+		return nil, fmt.Errorf("k8sapiproxy: OIDCConfig.UIDClaim: %w", err)
+	}
+
+	allowedPartitions := sets.New[string]()
+	for _, raw := range cfg.AllowedPartitions {
 		for _, entry := range strings.Split(raw, ",") {
-			ns := strings.TrimSpace(entry)
-			if ns != "" && ns != "*" {
-				allowedAtespaces.Insert(ns)
+			p := strings.TrimSpace(entry)
+			if p != "" && p != "*" {
+				allowedPartitions.Insert(p)
 			}
 		}
 	}
-
-	subPref := cfg.RequiredSubjectPrefix
-	if subPref == "" {
-		subPref = actorSubjectPrefix
+	if allowedPartitions.Len() > 0 && len(partitionClaim) == 0 {
+		return nil, errors.New("k8sapiproxy: OIDCConfig.PartitionClaim is required when AllowedPartitions is set")
 	}
+
 	cacheTTL := cfg.JWKSCacheTTL
 	if cacheTTL <= 0 {
 		cacheTTL = defaultOIDCJWKSCacheTTL
@@ -202,16 +218,55 @@ func NewOIDCAuthenticator(cfg OIDCConfig) (CallerAuthenticator, error) {
 	}
 
 	return &oidcAuthenticator{
-		issuer:           issuer,
-		issuerHost:       u.Host,
-		audiences:        audiences,
-		requiredSubPref:  subPref,
-		allowedAtespaces: allowedAtespaces,
-		cacheTTL:         cacheTTL,
-		clockSkew:        skew,
-		now:              nowFn,
-		httpClient:       client,
+		issuer:            issuer,
+		issuerHost:        u.Host,
+		audiences:         audiences,
+		requiredSubPref:   cfg.RequiredSubjectPrefix,
+		partitionClaim:    partitionClaim,
+		uidClaim:          uidClaim,
+		allowedPartitions: allowedPartitions,
+		cacheTTL:          cacheTTL,
+		clockSkew:         skew,
+		now:               nowFn,
+		httpClient:        client,
 	}, nil
+}
+
+// parseClaimPath splits a dot-separated JSON claim path. Escape literal dots in a claim key with `\.`.
+func parseClaimPath(raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	var segments []string
+	var cur strings.Builder
+	escaped := false
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if escaped {
+			cur.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '.' {
+			if cur.Len() == 0 {
+				return nil, fmt.Errorf("empty segment in claim path %q", raw)
+			}
+			segments = append(segments, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	if escaped || cur.Len() == 0 {
+		return nil, fmt.Errorf("invalid claim path %q", raw)
+	}
+	segments = append(segments, cur.String())
+	return segments, nil
 }
 
 func validateHTTPSIssuer(issuer string) error {
@@ -499,19 +554,12 @@ func (a *jwtAudience) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type ateActorClaim struct {
-	Atespace  string `json:"atespace"`
-	ActorName string `json:"actorName"`
-	ActorUID  string `json:"actorUID"`
-}
-
 type oidcTokenClaims struct {
-	Issuer    string         `json:"iss"`
-	Subject   string         `json:"sub"`
-	Audience  jwtAudience    `json:"aud"`
-	ExpiresAt *int64         `json:"exp"`
-	NotBefore *int64         `json:"nbf"`
-	Actor     *ateActorClaim `json:"actor.ate.dev"`
+	Issuer    string      `json:"iss"`
+	Subject   string      `json:"sub"`
+	Audience  jwtAudience `json:"aud"`
+	ExpiresAt *int64      `json:"exp"`
+	NotBefore *int64      `json:"nbf"`
 }
 
 func (a *oidcAuthenticator) validateClaims(payload []byte) (*CallerIdentity, error) {
@@ -522,7 +570,7 @@ func (a *oidcAuthenticator) validateClaims(payload []byte) (*CallerIdentity, err
 	if claims.Issuer != a.issuer || claims.Subject == "" || claims.ExpiresAt == nil {
 		return nil, errNotAuthenticated
 	}
-	if !strings.HasPrefix(claims.Subject, a.requiredSubPref) {
+	if a.requiredSubPref != "" && !strings.HasPrefix(claims.Subject, a.requiredSubPref) {
 		return nil, errNotAuthenticated
 	}
 	matchedAud := false
@@ -552,25 +600,24 @@ func (a *oidcAuthenticator) validateClaims(payload []byte) (*CallerIdentity, err
 		uid    string
 		groups []string
 	)
-	if after, ok := strings.CutPrefix(claims.Subject, actorSubjectPrefix); ok {
-		parts := strings.Split(after, "/")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	if len(a.partitionClaim) > 0 || len(a.uidClaim) > 0 {
+		var rawMap map[string]any
+		if err := json.Unmarshal(payload, &rawMap); err != nil {
 			return nil, errNotAuthenticated
 		}
-		atespace, actorName := parts[0], parts[1]
-		if claims.Actor != nil {
-			if (claims.Actor.Atespace != "" && claims.Actor.Atespace != atespace) ||
-				(claims.Actor.ActorName != "" && claims.Actor.ActorName != actorName) {
+		if len(a.partitionClaim) > 0 {
+			partition, ok := lookupStringClaim(rawMap, a.partitionClaim)
+			if !ok || partition == "" {
 				return nil, errNotAuthenticated
 			}
-			uid = claims.Actor.ActorUID
+			if a.allowedPartitions.Len() > 0 && !a.allowedPartitions.Has(partition) {
+				return nil, fmt.Errorf("partition %q is not allowed", partition)
+			}
+			groups = []string{callerPartitionGroupPref + partition}
 		}
-		if a.allowedAtespaces.Len() > 0 && !a.allowedAtespaces.Has(atespace) {
-			return nil, fmt.Errorf("atespace %q is not allowed", atespace)
+		if len(a.uidClaim) > 0 {
+			uid, _ = lookupStringClaim(rawMap, a.uidClaim)
 		}
-		groups = []string{atespaceGroupPref + atespace}
-	} else if a.allowedAtespaces.Len() > 0 {
-		return nil, errNotAuthenticated
 	}
 
 	return &CallerIdentity{
@@ -578,6 +625,23 @@ func (a *oidcAuthenticator) validateClaims(payload []byte) (*CallerIdentity, err
 		UID:      uid,
 		Groups:   groups,
 	}, nil
+}
+
+func lookupStringClaim(root map[string]any, path []string) (string, bool) {
+	var cur any = root
+	for _, seg := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		next, exists := m[seg]
+		if !exists {
+			return "", false
+		}
+		cur = next
+	}
+	s, ok := cur.(string)
+	return strings.TrimSpace(s), ok
 }
 
 func (a *oidcAuthenticator) verificationKeys(ctx context.Context, wantKID string, force bool) ([]parsedJWK, error) {

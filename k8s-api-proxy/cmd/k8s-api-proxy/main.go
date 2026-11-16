@@ -172,11 +172,14 @@ func main() {
 		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
 		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
-		oidcIssuerURL            = flag.String("oidc-issuer-url", envOrDefault("KUBE_PROXY_OIDC_ISSUER_URL", ""), "Optional OIDC issuer URL (https://<host>) for Actor JWT caller authentication")
+		oidcIssuerURL            = flag.String("oidc-issuer-url", envOrDefault("KUBE_PROXY_OIDC_ISSUER_URL", ""), "Optional OIDC issuer URL (https://<host>) for bearer JWT caller authentication")
 		oidcAudience             = flag.String("oidc-audience", envOrDefault("KUBE_PROXY_OIDC_AUDIENCE", ""), "Required aud claim for OIDC caller JWTs (required when --oidc-issuer-url is set)")
 		oidcCAFile               = flag.String("oidc-ca-file", envOrDefault("KUBE_PROXY_OIDC_CA_FILE", ""), "Optional PEM CA bundle file for verifying the OIDC issuer TLS certificate")
-		oidcAllowedAtespaces     = flag.String("oidc-allowed-atespaces", envOrDefault("KUBE_PROXY_OIDC_ALLOWED_ATESPACES", ""), "Optional comma-separated allowlist of Agent Substrate atespaces (empty allows all)")
-		partitionByAtespace      = flag.Bool("partition-by-atespace", envBoolOrDefault("KUBE_PROXY_PARTITION_BY_ATESPACE", false), "Partition response cache and upstream credentials by Agent Substrate atespace")
+		oidcRequiredSubPrefix    = flag.String("oidc-required-sub-prefix", envOrDefault("KUBE_PROXY_OIDC_REQUIRED_SUB_PREFIX", ""), "Optional required prefix on OIDC sub claims")
+		oidcPartitionClaim       = flag.String("oidc-partition-claim", envOrDefault("KUBE_PROXY_OIDC_PARTITION_CLAIM", ""), "Optional dot-separated OIDC claim path (escape literal dots with \\.) extracted as the caller partition")
+		oidcUIDClaim             = flag.String("oidc-uid-claim", envOrDefault("KUBE_PROXY_OIDC_UID_CLAIM", ""), "Optional dot-separated OIDC claim path (escape literal dots with \\.) extracted into CallerIdentity.UID")
+		oidcAllowedPartitions    = flag.String("oidc-allowed-partitions", envOrDefault("KUBE_PROXY_OIDC_ALLOWED_PARTITIONS", ""), "Optional comma-separated allowlist of OIDC partition claim values (empty allows all)")
+		partitionByCaller        = flag.Bool("partition-by-caller", envBoolOrDefault("KUBE_PROXY_PARTITION_BY_CALLER", false), "Partition response cache and upstream credentials by the caller's OIDC partition claim")
 		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
 		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
@@ -230,15 +233,18 @@ func main() {
 		authenticators = append(authenticators, trAuthn)
 	}
 	if strings.TrimSpace(*oidcIssuerURL) != "" {
-		var allowedNS []string
-		if rawNS := strings.TrimSpace(*oidcAllowedAtespaces); rawNS != "" {
-			allowedNS = []string{rawNS}
+		var allowedParts []string
+		if rawParts := strings.TrimSpace(*oidcAllowedPartitions); rawParts != "" {
+			allowedParts = []string{rawParts}
 		}
 		oidcAuthn, err := k8sapiproxy.NewOIDCAuthenticator(k8sapiproxy.OIDCConfig{
-			IssuerURL:        *oidcIssuerURL,
-			Audience:         *oidcAudience,
-			CAFile:           *oidcCAFile,
-			AllowedAtespaces: allowedNS,
+			IssuerURL:             *oidcIssuerURL,
+			Audience:              *oidcAudience,
+			CAFile:                *oidcCAFile,
+			RequiredSubjectPrefix: *oidcRequiredSubPrefix,
+			PartitionClaim:        *oidcPartitionClaim,
+			UIDClaim:              *oidcUIDClaim,
+			AllowedPartitions:     allowedParts,
 		})
 		if err != nil {
 			log.Fatalf("failed to initialize OIDC authenticator: %v", err)
@@ -301,8 +307,8 @@ func main() {
 	}
 
 	var callerPartition func(*k8sapiproxy.CallerIdentity) string
-	if *partitionByAtespace {
-		callerPartition = k8sapiproxy.AtespaceFromCaller
+	if *partitionByCaller {
+		callerPartition = k8sapiproxy.PartitionFromCaller
 	}
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
