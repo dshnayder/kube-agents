@@ -145,6 +145,16 @@ func parseAllowedCallers(raw string) ([]string, error) {
 	return callers, nil
 }
 
+func parseCSV(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
 func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[string][]string, error) {
 	aud := strings.TrimSpace(sessionAud)
 	if aud == "" {
@@ -233,10 +243,6 @@ func main() {
 		authenticators = append(authenticators, trAuthn)
 	}
 	if strings.TrimSpace(*oidcIssuerURL) != "" {
-		var allowedParts []string
-		if rawParts := strings.TrimSpace(*oidcAllowedPartitions); rawParts != "" {
-			allowedParts = []string{rawParts}
-		}
 		oidcAuthn, err := k8sapiproxy.NewOIDCAuthenticator(k8sapiproxy.OIDCConfig{
 			IssuerURL:             *oidcIssuerURL,
 			Audience:              *oidcAudience,
@@ -244,7 +250,7 @@ func main() {
 			RequiredSubjectPrefix: *oidcRequiredSubPrefix,
 			PartitionClaim:        *oidcPartitionClaim,
 			UIDClaim:              *oidcUIDClaim,
-			AllowedPartitions:     allowedParts,
+			AllowedPartitions:     parseCSV(*oidcAllowedPartitions),
 		})
 		if err != nil {
 			log.Fatalf("failed to initialize OIDC authenticator: %v", err)

@@ -133,3 +133,14 @@ func TestEnvIntOrDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCSV(t *testing.T) {
+	if got := parseCSV("  , "); len(got) != 0 {
+		t.Fatalf("parseCSV empty = %v, want empty", got)
+	}
+	got := parseCSV(" default , team-a,team-b , ")
+	want := []string{"default", "team-a", "team-b"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("parseCSV = %v, want %v", got, want)
+	}
+}
