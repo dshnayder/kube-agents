@@ -6880,6 +6880,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		},
 	}
 	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	if axModeEnabled() {
+		dep.Spec.Template.Spec.Containers = append(dep.Spec.Template.Spec.Containers, buildAXGatewayBridgeContainer(agent))
+	}
 	return dep
 }
 

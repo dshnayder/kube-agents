@@ -694,7 +694,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			// Two, because one is a single point of failure in front of every
 			// new connection on the bus. They join a queue group, so exactly
 			// one of them answers each request.
-			Replicas: ptr.To(int32(2)),
+			Replicas: ptr.To(a2aCalloutReplicas()),
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,

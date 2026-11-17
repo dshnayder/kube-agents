@@ -133,9 +133,16 @@ func kubeProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	}
 }
 
-func kubeProxyURL(agent *agentv1alpha1.PlatformAgent) string {
+func kubeProxyServiceURL(agent *agentv1alpha1.PlatformAgent) string {
+	if axModeEnabled() {
+		return axKubeProxyServiceURL
+	}
 	return fmt.Sprintf("https://%s.%s.svc.cluster.local:%d",
 		kubeProxyName(agent), agent.Namespace, kubeProxyPort)
+}
+
+func kubeProxyURL(agent *agentv1alpha1.PlatformAgent) string {
+	return kubeProxyServiceURL(agent)
 }
 
 func resolveKubeProxyImage() string {
@@ -654,6 +661,20 @@ func (r *PlatformAgentReconciler) ensureKubeProxyCABundle(ctx context.Context, a
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
+	if axModeEnabled() {
+		for _, obj := range []client.Object{
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
+			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
+			&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
+		} {
+			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+				return fmt.Errorf("failed to delete kube-proxy %T %s/%s in AX mode: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+			}
+		}
+		return nil
+	}
+
 	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
 	if err != nil {
 		return err

@@ -1,0 +1,133 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"os"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+const (
+	axEnabledEnvVar   = "AX_ENABLED"
+	axServerURLEnvVar = "AX_SERVER_URL"
+
+	defaultAXServerURL    = "http://ax-server.ax-system.svc.cluster.local:8080"
+	axKubeProxyServiceURL = "https://k8s-api-proxy.ax-system.svc.cluster.local:8443"
+
+	credentialProxyOIDCIssuerURLEnv = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
+	credentialProxyOIDCCAFileEnv    = "CREDENTIAL_PROXY_OIDC_CA_FILE"
+
+	axOIDCIssuerURL          = "https://idp.ate-system.svc"
+	axServiceDNSCAName       = "servicedns-ca"
+	axServiceDNSCAMountPath  = "/run/servicedns-ca"
+	axServiceDNSCAPath       = "trust-bundle.pem"
+	axOIDCCAFile             = axServiceDNSCAMountPath + "/" + axServiceDNSCAPath
+	axServiceDNSSignerName   = "servicedns.podcert.ate.dev/identity"
+	axCanaryingLabelKey      = "podcert.ate.dev/canarying"
+	axCanaryingLabelLive     = "live"
+	ateSystemNamespace       = "ate-system"
+	ateEgressAppLabel        = "atenet-egress"
+	axBridgeAPIServerKey     = "ax-bridge" // #nosec G101 -- Non-secret sentinel bearer for ax-server
+	axBridgeConcurrencyValue = "2"
+)
+
+func axModeEnabled() bool {
+	return os.Getenv(axEnabledEnvVar) == "true"
+}
+
+func axServerURL() string {
+	if v := strings.TrimSpace(os.Getenv(axServerURLEnvVar)); v != "" {
+		return v
+	}
+	return defaultAXServerURL
+}
+
+func axChatCompletionsURL(agent *agentv1alpha1.PlatformAgent) string {
+	return strings.TrimRight(axServerURL(), "/") + "/v1alpha1/tasks/default/" + agent.Name + "/v1/chat/completions"
+}
+
+func a2aCalloutReplicas() int32 {
+	if axModeEnabled() {
+		return 1
+	}
+	return 2
+}
+
+func a2aVerifierReplicas() int32 {
+	if axModeEnabled() {
+		return 1
+	}
+	return 2
+}
+
+func buildServiceDNSClusterTrustBundleVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: axServiceDNSCAName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(int32(0444)),
+				Sources: []corev1.VolumeProjection{{
+					ClusterTrustBundle: &corev1.ClusterTrustBundleProjection{
+						SignerName: ptr.To(axServiceDNSSignerName),
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{axCanaryingLabelKey: axCanaryingLabelLive},
+						},
+						Path: axServiceDNSCAPath,
+					},
+				}},
+			},
+		},
+	}
+}
+
+func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+	agentImage := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
+	return corev1.Container{
+		Name:            a2aBridgeContainerName,
+		Image:           a2aBridgeImage(agentImage),
+		Command:         []string{"/usr/local/bin/hermes-bridge"},
+		WorkingDir:      "/",
+		Resources:       a2aRenderedBridgeDefaultResources(),
+		SecurityContext: hardenedSecurityContext(),
+		Env: []corev1.EnvVar{
+			{Name: a2aBridgeNATSURLEnvVar, Value: a2aNATSClientURL(agent)},
+			a2aNATSCAFileEnvVar(),
+			{Name: a2aBridgeNATSUserEnvVar, Value: a2aBridgeUser},
+			{Name: a2aBridgeNATSPasswordEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+				Key:                  a2aBridgePasswordKey,
+			}}},
+			{Name: a2aBridgeConcurrencyEnvVar, Value: axBridgeConcurrencyValue},
+			{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"},
+			{Name: a2aBridgeExecutorEnvVar, Value: a2aBridgeExecutorAPI},
+			{Name: "BRIDGE_API_URL", Value: axChatCompletionsURL(agent)},
+			{Name: a2aBridgeAPIServerKeyEnvVar, Value: axBridgeAPIServerKey},
+			{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"},
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.namespace",
+			}}},
+			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		},
+		VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+	}
+}

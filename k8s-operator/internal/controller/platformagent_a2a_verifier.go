@@ -189,7 +189,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 			// is a single point of failure in front of every task, not only
 			// in front of every new connection. They join a NATS queue group,
 			// so exactly one answers each verify request.
-			Replicas: ptr.To(int32(2)),
+			Replicas: ptr.To(a2aVerifierReplicas()),
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,

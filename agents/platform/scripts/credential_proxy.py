@@ -2195,6 +2195,9 @@ DEFAULT_CREDENTIAL_PROXY_PROFILE_AUDIENCE = "kubeagents-credential-proxy-profile
 
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
+ROLE_SHELL = CALLER_ROLE_SHELL
+OIDC_ISSUER_URL_ENV = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
+OIDC_CA_FILE_ENV = "CREDENTIAL_PROXY_OIDC_CA_FILE"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # The session pod the A2A gateway spawns, under the operator's
@@ -4448,6 +4451,388 @@ class ClaimTokens:
         return entry
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects on OIDC discovery and JWKS fetches."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:  # noqa: ARG002
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+@dataclass(frozen=True)
+class _ParsedJWK:
+    kid: str
+    alg: str
+    public_key: Any
+
+
+class _OIDCActorVerifier:
+    """Verify OIDC Actor JWTs against an HTTPS issuer's JWKS."""
+
+    MAX_TOKEN_BYTES = 16384
+    MAX_OIDC_RESPONSE_BYTES = 1 << 20
+    MIN_RSA_KEY_BITS = 2048
+    MIN_REFRESH_DELAY_SECONDS = 10.0
+    SUPPORTED_ALGORITHMS = frozenset({"ES256", "ES384", "RS256", "RS384", "RS512", "EdDSA"})
+
+    def __init__(
+        self,
+        issuer_url: str,
+        audience: str,
+        ca_file: str = "",
+        timeout_seconds: float = 10.0,
+        jwks_cache_seconds: float = 300.0,
+        clock_skew_seconds: float = 30.0,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        parsed = urllib.parse.urlsplit(issuer_url.strip())
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path.endswith("/")
+        ):
+            raise ValueError(
+                f"OIDC issuer URL {issuer_url!r} must use https://<host>[:port] with no trailing slash, query, or fragment"
+            )
+        if not audience:
+            raise ValueError("an audience is required for OIDC Actor JWT verification")
+
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
+
+        self._invalid_signature = InvalidSignature
+        self._hashes = hashes
+        self._ec = ec
+        self._ed25519 = ed25519
+        self._padding = padding
+        self._rsa = rsa
+        self._asym_utils = utils
+
+        self.issuer_url = issuer_url.strip()
+        self.issuer_netloc = parsed.netloc
+        self.audience = audience
+        self.ca_file = ca_file.strip()
+        self.timeout_seconds = timeout_seconds
+        self.jwks_cache_seconds = jwks_cache_seconds
+        self.clock_skew_seconds = clock_skew_seconds
+        self._clock = clock
+
+        self._lock = threading.Lock()
+        self._jwks_uri = ""
+        self._keys: tuple[_ParsedJWK, ...] = ()
+        self._fetched_at = 0.0
+        self._last_refresh_at = 0.0
+
+    @staticmethod
+    def _b64url_decode(segment: str) -> bytes:
+        if not segment or any(ch in segment for ch in " \t\r\n+/="):
+            raise AuthenticationError("malformed JWT segment")
+        padded = segment + ("=" * (-len(segment) % 4))
+        try:
+            return base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise AuthenticationError("malformed base64url in JWT") from exc
+
+    def claims_match_issuer(self, token: str) -> bool:
+        """Return True when ``token`` is a 3-part JWT from ``self.issuer_url``."""
+        if len(token) > self.MAX_TOKEN_BYTES:
+            return False
+        parts = token.split(".")
+        if len(parts) != 3 or not all(parts):
+            return False
+        try:
+            payload_bytes = self._b64url_decode(parts[1])
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except (AuthenticationError, UnicodeDecodeError, ValueError):
+            return False
+        return isinstance(payload, dict) and payload.get("iss") == self.issuer_url
+
+    def verify(self, token: str) -> tuple[Principal, float]:
+        """Verify ``token`` and return ``(Principal, exp_epoch_seconds)``."""
+        if len(token) > self.MAX_TOKEN_BYTES:
+            raise AuthenticationError("the presented token exceeds the maximum size")
+        parts = token.split(".")
+        if len(parts) != 3 or not all(parts):
+            raise AuthenticationError("malformed compact JWT")
+        header_b64, payload_b64, sig_b64 = parts
+        try:
+            header = json.loads(self._b64url_decode(header_b64).decode("utf-8"))
+            payload = json.loads(self._b64url_decode(payload_b64).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise AuthenticationError("malformed JWT JSON") from exc
+        if not isinstance(header, dict) or not isinstance(payload, dict):
+            raise AuthenticationError("malformed JWT claims object")
+
+        alg = header.get("alg")
+        kid = header.get("kid") or ""
+        if not isinstance(alg, str) or alg not in self.SUPPORTED_ALGORITHMS or not isinstance(kid, str):
+            raise AuthenticationError("unsupported JWS algorithm")
+        if payload.get("iss") != self.issuer_url:
+            raise AuthenticationError("OIDC token issuer mismatch")
+        sub = payload.get("sub")
+        if not isinstance(sub, str) or not sub.startswith("actor/") or len(sub) <= len("actor/") or any(ch.isspace() for ch in sub):
+            raise AuthenticationError("the OIDC token subject must start with 'actor/'")
+
+        sig = self._b64url_decode(sig_b64)
+        signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+
+        keys = self._verification_keys(force=False)
+        if not self._verify_with_any_key(keys, alg, kid, signing_input, sig):
+            if kid and all(k.kid != kid for k in keys):
+                refreshed = self._verification_keys(force=True)
+                if not self._verify_with_any_key(refreshed, alg, kid, signing_input, sig):
+                    raise AuthenticationError("OIDC JWT signature verification failed")
+            else:
+                raise AuthenticationError("OIDC JWT signature verification failed")
+
+        aud_claim = payload.get("aud")
+        if isinstance(aud_claim, str):
+            audiences = [aud_claim]
+        elif isinstance(aud_claim, list) and all(isinstance(item, str) for item in aud_claim):
+            audiences = aud_claim
+        else:
+            raise AuthenticationError("OIDC JWT carries no valid audience")
+        if self.audience not in audiences:
+            raise AuthenticationError("the presented OIDC token is for another audience")
+
+        exp = payload.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+            raise AuthenticationError("OIDC JWT carries no valid expiration")
+        now = self._clock()
+        if now >= float(exp) + self.clock_skew_seconds:
+            raise AuthenticationError("the presented OIDC token has expired")
+
+        nbf = payload.get("nbf")
+        if nbf is not None:
+            if isinstance(nbf, bool) or not isinstance(nbf, (int, float)) or not math.isfinite(nbf):
+                raise AuthenticationError("OIDC JWT carries an invalid nbf claim")
+            if now < float(nbf) - self.clock_skew_seconds:
+                raise AuthenticationError("the presented OIDC token is not yet valid")
+
+        uid = self._extract_actor_uid(payload, sub)
+        return Principal(workload=sub, uid=uid, role=CALLER_ROLE_SHELL), float(exp)
+
+    @staticmethod
+    def _extract_actor_uid(payload: Mapping[str, Any], sub: str) -> str:
+        ate_claim = payload.get("actor.ate.dev")
+        if isinstance(ate_claim, Mapping):
+            raw_uid = ate_claim.get("actorUID")
+            if isinstance(raw_uid, str) and raw_uid.strip():
+                return raw_uid.strip()
+        actor_claim = payload.get("actor")
+        if isinstance(actor_claim, Mapping):
+            nested_ate = actor_claim.get("ate.dev")
+            if isinstance(nested_ate, Mapping):
+                raw_uid = nested_ate.get("actorUID")
+                if isinstance(raw_uid, str) and raw_uid.strip():
+                    return raw_uid.strip()
+        jti = payload.get("jti")
+        if isinstance(jti, str) and jti.strip():
+            return jti.strip()
+        return sub
+
+    def _verification_keys(self, force: bool) -> tuple[_ParsedJWK, ...]:
+        with self._lock:
+            now = self._clock()
+            if not force and self._keys and (now - self._fetched_at) < self.jwks_cache_seconds:
+                return self._keys
+            if force and self._keys and (now - self._last_refresh_at) < self.MIN_REFRESH_DELAY_SECONDS:
+                return self._keys
+
+            if not self._jwks_uri:
+                self._jwks_uri = self._fetch_discovery()
+            try:
+                keys = self._fetch_jwks(self._jwks_uri)
+            except AuthenticationError:
+                new_uri = self._fetch_discovery()
+                if new_uri != self._jwks_uri:
+                    self._jwks_uri = new_uri
+                    keys = self._fetch_jwks(self._jwks_uri)
+                else:
+                    raise
+            self._keys = keys
+            self._fetched_at = now
+            self._last_refresh_at = now
+            return self._keys
+
+    def _get_pinned_json(self, path: str, query: str = "") -> Any:
+        target = urllib.parse.urlunsplit(("https", self.issuer_netloc, path, query, ""))
+        request = urllib.request.Request(target, headers={"Accept": "application/json"}, method="GET")
+        try:
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context),
+                _NoRedirectHandler(),
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                if getattr(response, "status", 200) != 200:
+                    raise AuthenticationError("OIDC endpoint returned a non-200 status")
+                data = response.read(self.MAX_OIDC_RESPONSE_BYTES + 1)
+            if len(data) > self.MAX_OIDC_RESPONSE_BYTES:
+                raise AuthenticationError("OIDC response exceeds 1 MiB limit")
+            return json.loads(data.decode("utf-8"))
+        except AuthenticationError:
+            raise
+        except (urllib.error.URLError, OSError, UnicodeDecodeError, ValueError, ssl.SSLError) as exc:
+            raise AuthenticationError(f"OIDC discovery/JWKS request failed: {type(exc).__name__}") from exc
+
+    def _fetch_discovery(self) -> str:
+        base_path = urllib.parse.urlsplit(self.issuer_url).path
+        discovery_path = f"{base_path}/.well-known/openid-configuration"
+        doc = self._get_pinned_json(discovery_path)
+        if not isinstance(doc, dict) or doc.get("issuer") != self.issuer_url:
+            raise AuthenticationError("OIDC discovery issuer mismatch")
+        jwks_uri = doc.get("jwks_uri")
+        if not isinstance(jwks_uri, str):
+            raise AuthenticationError("OIDC discovery returned no jwks_uri")
+        parsed = urllib.parse.urlsplit(jwks_uri)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != self.issuer_netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise AuthenticationError("OIDC jwks_uri must use https on the configured issuer host")
+        return jwks_uri
+
+    def _fetch_jwks(self, jwks_uri: str) -> tuple[_ParsedJWK, ...]:
+        parsed = urllib.parse.urlsplit(jwks_uri)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != self.issuer_netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise AuthenticationError("OIDC jwks_uri must use https on the configured issuer host")
+        doc = self._get_pinned_json(parsed.path, parsed.query)
+        raw_keys = doc.get("keys") if isinstance(doc, dict) else None
+        if not isinstance(raw_keys, list):
+            raise AuthenticationError("OIDC JWKS carries no keys array")
+        parsed_keys: list[_ParsedJWK] = []
+        for raw in raw_keys:
+            if not isinstance(raw, dict):
+                continue
+            use = raw.get("use") or ""
+            if use and use != "sig":
+                continue
+            pub = self._parse_jwk(raw)
+            if pub is None:
+                continue
+            parsed_keys.append(
+                _ParsedJWK(
+                    kid=str(raw.get("kid") or ""),
+                    alg=str(raw.get("alg") or ""),
+                    public_key=pub,
+                )
+            )
+        if not parsed_keys:
+            raise AuthenticationError("OIDC JWKS contains no supported signing keys")
+        return tuple(parsed_keys)
+
+    def _parse_jwk(self, raw: Mapping[str, Any]) -> Any:
+        kty = raw.get("kty")
+        try:
+            if kty == "EC":
+                crv = raw.get("crv")
+                if crv == "P-256":
+                    curve: Any = self._ec.SECP256R1()
+                    coord_len = 32
+                elif crv == "P-384":
+                    curve = self._ec.SECP384R1()
+                    coord_len = 48
+                else:
+                    return None
+                x_bytes = self._b64url_decode(str(raw.get("x") or ""))
+                y_bytes = self._b64url_decode(str(raw.get("y") or ""))
+                if len(x_bytes) != coord_len or len(y_bytes) != coord_len:
+                    return None
+                return self._ec.EllipticCurvePublicNumbers(
+                    int.from_bytes(x_bytes, "big"),
+                    int.from_bytes(y_bytes, "big"),
+                    curve,
+                ).public_key()
+            if kty == "RSA":
+                n_bytes = self._b64url_decode(str(raw.get("n") or ""))
+                e_bytes = self._b64url_decode(str(raw.get("e") or ""))
+                if not n_bytes or not e_bytes or len(e_bytes) > 4:
+                    return None
+                n_val = int.from_bytes(n_bytes, "big")
+                e_val = int.from_bytes(e_bytes, "big")
+                if n_val.bit_length() < self.MIN_RSA_KEY_BITS or e_val < 3 or e_val % 2 == 0:
+                    return None
+                return self._rsa.RSAPublicNumbers(e_val, n_val).public_key()
+            if kty == "OKP":
+                if raw.get("crv") != "Ed25519":
+                    return None
+                x_bytes = self._b64url_decode(str(raw.get("x") or ""))
+                if len(x_bytes) != 32:
+                    return None
+                return self._ed25519.Ed25519PublicKey.from_public_bytes(x_bytes)
+        except (AuthenticationError, ValueError):
+            return None
+        return None
+
+    def _verify_with_any_key(
+        self,
+        keys: Sequence[_ParsedJWK],
+        alg: str,
+        kid: str,
+        signing_input: bytes,
+        sig: bytes,
+    ) -> bool:
+        for key in keys:
+            if kid and key.kid and key.kid != kid:
+                continue
+            if key.alg and key.alg != alg:
+                continue
+            if self._verify_signature(key.public_key, alg, signing_input, sig):
+                return True
+        return False
+
+    def _verify_signature(self, pub: Any, alg: str, signing_input: bytes, sig: bytes) -> bool:
+        try:
+            if alg in ("ES256", "ES384"):
+                if not isinstance(pub, self._ec.EllipticCurvePublicKey):
+                    return False
+                if alg == "ES256":
+                    if not isinstance(pub.curve, self._ec.SECP256R1) or len(sig) != 64:
+                        return False
+                    coord_len = 32
+                    hash_alg: Any = self._hashes.SHA256()
+                else:
+                    if not isinstance(pub.curve, self._ec.SECP384R1) or len(sig) != 96:
+                        return False
+                    coord_len = 48
+                    hash_alg = self._hashes.SHA384()
+                r_int = int.from_bytes(sig[:coord_len], "big")
+                s_int = int.from_bytes(sig[coord_len:], "big")
+                der_sig = self._asym_utils.encode_dss_signature(r_int, s_int)
+                pub.verify(der_sig, signing_input, self._ec.ECDSA(hash_alg))
+                return True
+            if alg in ("RS256", "RS384", "RS512"):
+                if not isinstance(pub, self._rsa.RSAPublicKey) or pub.key_size < self.MIN_RSA_KEY_BITS:
+                    return False
+                rsa_hashes = {
+                    "RS256": self._hashes.SHA256(),
+                    "RS384": self._hashes.SHA384(),
+                    "RS512": self._hashes.SHA512(),
+                }
+                pub.verify(sig, signing_input, self._padding.PKCS1v15(), rsa_hashes[alg])
+                return True
+            if alg == "EdDSA":
+                if not isinstance(pub, self._ed25519.Ed25519PublicKey):
+                    return False
+                pub.verify(sig, signing_input)
+                return True
+        except (self._invalid_signature, ValueError):
+            return False
+        return False
+
+
 class ServiceAccountAuthenticator:
     """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
 
@@ -4506,6 +4891,12 @@ class ServiceAccountAuthenticator:
         mcp_callers: frozenset[str] = frozenset(),
         scope_callers: frozenset[str] = frozenset(),
         profile_identities: Mapping[str, Any] | None = None,
+        oidc_issuer_url: str = "",
+        oidc_ca_file: str = "",
+        shell_audience: str = "",
+        oidc_jwks_cache_seconds: float = 300.0,
+        oidc_clock_skew_seconds: float = 30.0,
+        oidc_clock: Callable[[], float] = time.time,
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -4526,11 +4917,35 @@ class ServiceAccountAuthenticator:
         self.token_file = token_file
         self.timeout_seconds = timeout_seconds
         self.cache_seconds = cache_seconds
+        self._shell_audience = shell_audience.strip() or self._resolve_shell_audience(self.audience_roles)
+        self.oidc_issuer_url = oidc_issuer_url.strip()
+        self.oidc_ca_file = oidc_ca_file.strip()
+        self._oidc_verifier: _OIDCActorVerifier | None = None
+        if self.oidc_issuer_url:
+            self._oidc_verifier = _OIDCActorVerifier(
+                issuer_url=self.oidc_issuer_url,
+                audience=self._shell_audience,
+                ca_file=self.oidc_ca_file,
+                timeout_seconds=self.timeout_seconds,
+                jwks_cache_seconds=oidc_jwks_cache_seconds,
+                clock_skew_seconds=oidc_clock_skew_seconds,
+                clock=oidc_clock,
+            )
         self._cache: dict[str, _CacheEntry] = {}
         self._cache_lock = threading.Lock()
 
+    @staticmethod
+    def _resolve_shell_audience(audience_roles: Mapping[str, str]) -> str:
+        for aud, role in audience_roles.items():
+            if role in (CALLER_ROLE_SHELL, ""):
+                return aud
+        return DEFAULT_CREDENTIAL_PROXY_AUDIENCE
+
     def authenticate(self, headers: Any) -> Principal:
-        header = headers.get("Authorization", "") or ""
+        if isinstance(headers, str):
+            header = headers
+        else:
+            header = headers.get("Authorization", "") or ""
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
             raise AuthenticationError("no bearer token was presented")
@@ -4540,6 +4955,14 @@ class ServiceAccountAuthenticator:
         cached = self._cached(cache_key)
         if cached is not None:
             return cached
+
+        if self._oidc_verifier is not None and self._oidc_verifier.claims_match_issuer(token):
+            principal, exp_epoch = self._oidc_verifier.verify(token)
+            remaining = max(0.0, exp_epoch - self._oidc_verifier._clock())
+            ttl = min(self.cache_seconds, remaining)
+            if ttl > 0:
+                self._remember(cache_key, principal, ttl_seconds=ttl)
+            return principal
 
         principal = self._review(token)
         self._remember(cache_key, principal)
@@ -4559,7 +4982,8 @@ class ServiceAccountAuthenticator:
                 return None
             return entry.principal
 
-    def _remember(self, key: str, principal: Principal) -> None:
+    def _remember(self, key: str, principal: Principal, ttl_seconds: float | None = None) -> None:
+        ttl = self.cache_seconds if ttl_seconds is None else ttl_seconds
         now = time.monotonic()
         with self._cache_lock:
             # Only successful reviews are cached, so a rejected token costs the
@@ -4569,7 +4993,7 @@ class ServiceAccountAuthenticator:
                 for cached_key, entry in self._cache.items()
                 if entry.expires_at > now
             }
-            self._cache[key] = _CacheEntry(now + self.cache_seconds, principal)
+            self._cache[key] = _CacheEntry(now + ttl, principal)
 
     def _own_token(self) -> str:
         try:
@@ -5045,6 +5469,9 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
             "/var/run/secrets/kubernetes.io/serviceaccount/token",
         ).strip(),
+        oidc_issuer_url=os.getenv(OIDC_ISSUER_URL_ENV, "").strip(),
+        oidc_ca_file=os.getenv(OIDC_CA_FILE_ENV, "").strip(),
+        shell_audience=shell_audience,
     )
 
 

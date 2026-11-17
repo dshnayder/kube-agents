@@ -1817,6 +1817,21 @@ func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if axModeEnabled() {
+		pvcs := []*corev1.PersistentVolumeClaim{buildSystemPVC(agent)}
+		customPVCs, err := buildCustomPVCs(agent)
+		if err != nil {
+			return fmt.Errorf("failed to build custom PVCs: %w", err)
+		}
+		pvcs = append(pvcs, customPVCs...)
+		for _, pvc := range pvcs {
+			if err := r.reconcilePersistentVolumeClaim(ctx, agent, pvc); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	dataClaim := buildPVC(agent)
 	pvcs := []*corev1.PersistentVolumeClaim{
 		dataClaim,
@@ -2860,6 +2875,19 @@ func (r *PlatformAgentReconciler) reconcileEventWatcherAlertExcludeConfigMap(ctx
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
+	if axModeEnabled() {
+		for _, obj := range []client.Object{
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}},
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-data", Namespace: agent.Namespace}},
+		} {
+			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+				return fmt.Errorf("failed to delete legacy gateway resource %T %s/%s in AX mode: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+			}
+		}
+		return nil
+	}
+
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
@@ -3109,6 +3137,19 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+	if axModeEnabled() {
+		for _, obj := range []client.Object{
+			&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
+			&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
+		} {
+			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+				return fmt.Errorf("failed to delete shell sandbox %T %s/%s in AX mode: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+			}
+		}
+		return nil
+	}
+
 	if _, err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
 		return err
 	}
@@ -3250,6 +3291,9 @@ func (r *PlatformAgentReconciler) noteDataClaimGrowth(key client.ObjectKey, grow
 // then leave the condition as it stands, because a claim not yet read can be
 // the one the condition names.
 func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha1.PlatformAgent) (msg string, known bool) {
+	if axModeEnabled() {
+		return "", true
+	}
 	var parts []string
 	for _, key := range dataClaimKeys(agent) {
 		recorded, ok := r.dataVolumeExpansion.Load(key)
@@ -3895,7 +3939,7 @@ func (r *PlatformAgentReconciler) agentEgressDNSClusterIPs(ctx context.Context, 
 // the rule's comment in buildAgentEgressNetworkPolicy for why that differs
 // from the gateway policy.
 func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string, otlpEndpoint string) error {
-	if !agentEgressPolicyEnabled(agent) {
+	if axModeEnabled() || !agentEgressPolicyEnabled(agent) {
 		return nil
 	}
 	log := logf.FromContext(ctx)
@@ -3927,6 +3971,10 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if axModeEnabled() {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name, Namespace: agent.Namespace}}
+		return client.IgnoreNotFound(r.Delete(ctx, svc))
+	}
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on Service %s/%s: %w", svc.Namespace, svc.Name, err)
@@ -3938,6 +3986,15 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 }
 
 func (r *PlatformAgentReconciler) reconcilePodDisruptionBudget(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if axModeEnabled() {
+		for _, name := range []string{agent.Name, agent.Name + "-gateway-pdb"} {
+			pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}}
+			if err := client.IgnoreNotFound(r.Delete(ctx, pdb)); err != nil {
+				return fmt.Errorf("failed to delete PodDisruptionBudget %s/%s in AX mode: %w", agent.Namespace, name, err)
+			}
+		}
+		return nil
+	}
 	pdb := buildPlatformPDB(agent)
 	if err := ctrl.SetControllerReference(agent, pdb, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on PodDisruptionBudget %s/%s: %w", pdb.Namespace, pdb.Name, err)
@@ -3998,6 +4055,10 @@ func (r *PlatformAgentReconciler) clearForeignPDBBudgetField(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile, otlpEndpoint string, otlpDisabled bool) error {
+	if axModeEnabled() {
+		netpol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway-netpol", Namespace: agent.Namespace}}
+		return client.IgnoreNotFound(r.Delete(ctx, netpol))
+	}
 	if !profile.Generated {
 		var existingNetpol networkingv1.NetworkPolicy
 		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway-netpol"}, &existingNetpol); err == nil {
@@ -4363,13 +4424,17 @@ type splitWorkloadStatus struct {
 // always a workload here; the only time it is absent is the callout hold, and
 // then it counts as not ready.
 func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) ([]splitWorkloadStatus, string, error) {
-	shell := &appsv1.StatefulSet{}
-	shellName := shellSandboxName(agent)
-	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
-		if !errors.IsNotFound(err) {
-			return nil, "", fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
+	var workloads []splitWorkloadStatus
+	if !axModeEnabled() {
+		shell := &appsv1.StatefulSet{}
+		shellName := shellSandboxName(agent)
+		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
+			if !errors.IsNotFound(err) {
+				return nil, "", fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
+			}
+			shell.Status.ReadyReplicas = 0
 		}
-		shell.Status.ReadyReplicas = 0
+		workloads = append(workloads, splitWorkloadStatus{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas})
 	}
 
 	broker := &appsv1.Deployment{}
@@ -4381,10 +4446,7 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 		broker.Status.ReadyReplicas = 0
 	}
 
-	workloads := []splitWorkloadStatus{
-		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
-		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
-	}
+	workloads = append(workloads, splitWorkloadStatus{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas})
 
 	// The A2A gateway stands in the same relation to Ready as those two: a next
 	// install without one cannot serve an A2A request at all, and nothing about the
@@ -4852,7 +4914,19 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// drop rather than over-claiming it -- and it clears on the next pass.
 	workloadRollIncomplete := rolloutNotKnownIncomplete
 
-	if useStatefulSet(agent) {
+	if axModeEnabled() {
+		dep := &appsv1.Deployment{}
+		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep)
+		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
+			return "", 0, fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", errWorkload)
+		}
+		if errWorkload == nil {
+			newDeploymentStatusName = dep.Name
+			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
+			newObservedVersion = workloadObservedVersion(dep.Spec.Template.Spec.Containers)
+			workloadRollIncomplete = deploymentRollIncomplete(dep)
+		}
+	} else if useStatefulSet(agent) {
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
@@ -5784,6 +5858,9 @@ func statefulSetRollIncomplete(sts *appsv1.StatefulSet) oldPodsPossible {
 // spurious one under-reports a drop that did happen rather than asserting one
 // that did not.
 func (r *PlatformAgentReconciler) gatewayRollIncomplete(ctx context.Context, agent *agentv1alpha1.PlatformAgent) oldPodsPossible {
+	if axModeEnabled() {
+		return rolloutNotKnownIncomplete
+	}
 	key := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
 	if useStatefulSet(agent) {
 		sts := &appsv1.StatefulSet{}
@@ -6008,11 +6085,14 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// introduced a new way to hit: a runtimeClassName the cluster has no node pool
 	// for, and a sandbox or broker image tag nothing published. Neither is visible
 	// from the gateway's own pod any more.
-	selectors := []map[string]string{
-		{"app": agent.Name + "-gateway"},
-		shellSandboxSelector(agent),
-		{"app": credentialProxyName(agent)},
+	var selectors []map[string]string
+	if !axModeEnabled() {
+		selectors = append(selectors,
+			map[string]string{"app": agent.Name + "-gateway"},
+			shellSandboxSelector(agent),
+		)
 	}
+	selectors = append(selectors, map[string]string{"app": credentialProxyName(agent)})
 
 	// Appended last, for that same reason, one release later: readSplitWorkloads
 	// made the A2A gateway gate Ready, and a workload that gates Ready and is never
@@ -6255,6 +6335,9 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 // holds every Secret in the cluster in operator memory and blocks in WaitForCacheSync
 // wherever list/watch on secrets is trimmed from manager-role.
 func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if axModeEnabled() {
+		return "", ""
+	}
 	reader := r.APIReader
 	if reader == nil {
 		reader = r.Client

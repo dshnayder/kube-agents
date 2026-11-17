@@ -4897,6 +4897,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	)
+	if axModeEnabled() {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: credentialProxyOIDCIssuerURLEnv, Value: axOIDCIssuerURL},
+			corev1.EnvVar{Name: credentialProxyOIDCCAFileEnv, Value: axOIDCCAFile},
+		)
+	}
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
 		// `tokenFile` rather than `--token`, since the kubelet rotates the
@@ -5092,6 +5098,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		credentialProxyOIDCIssuerURLEnv,
+		credentialProxyOIDCCAFileEnv,
 		// The dispatcher's seed path, which no broker-side container
 		// reads; reserved so a CR can't hand one a seed file of its choosing.
 		a2aTaskSigningSeedFileEnvVar,

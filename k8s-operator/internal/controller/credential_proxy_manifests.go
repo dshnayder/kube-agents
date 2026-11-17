@@ -792,6 +792,13 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The scope declaration in every mode: spec.scope.exclude.clusters is
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
+	if axModeEnabled() {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      axServiceDNSCAName,
+			MountPath: axServiceDNSCAMountPath,
+			ReadOnly:  true,
+		})
+	}
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -913,6 +920,16 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	// The scope publisher's pods, while the broker confers the scope role,
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
+	if axModeEnabled() {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{labelMetadataName: ateSystemNamespace},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": ateEgressAppLabel},
+			},
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -1013,6 +1030,9 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	// mode next the scope role reads it to bound its arguments.
 	volumes = append(volumes, scopeConfigVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
+	if axModeEnabled() {
+		volumes = append(volumes, buildServiceDNSClusterTrustBundleVolume())
+	}
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
