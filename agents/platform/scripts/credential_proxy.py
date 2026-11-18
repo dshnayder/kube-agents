@@ -2198,6 +2198,8 @@ CALLER_ROLE_SHELL = "shell"
 ROLE_SHELL = CALLER_ROLE_SHELL
 OIDC_ISSUER_URL_ENV = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
 OIDC_CA_FILE_ENV = "CREDENTIAL_PROXY_OIDC_CA_FILE"
+OIDC_REQUIRED_SUB_PREFIX_ENV = "CREDENTIAL_PROXY_OIDC_REQUIRED_SUB_PREFIX"
+OIDC_UID_CLAIM_ENV = "CREDENTIAL_PROXY_OIDC_UID_CLAIM"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # The session pod the A2A gateway spawns, under the operator's
@@ -4465,8 +4467,39 @@ class _ParsedJWK:
     public_key: Any
 
 
+def _parse_oidc_claim_path(raw: str) -> tuple[str, ...]:
+    """Split a dot-separated OIDC claim path where ``\\.`` denotes a literal dot."""
+    trimmed = raw.strip()
+    if not trimmed:
+        return ()
+    parts: list[str] = []
+    cur: list[str] = []
+    escaped = False
+    for ch in trimmed:
+        if escaped:
+            cur.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == ".":
+            if not cur:
+                raise ValueError(f"OIDC claim path {raw!r} contains an empty segment")
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    if escaped:
+        raise ValueError(f"OIDC claim path {raw!r} ends with a trailing escape")
+    if not cur:
+        raise ValueError(f"OIDC claim path {raw!r} contains an empty segment")
+    parts.append("".join(cur))
+    return tuple(parts)
+
+
 class _OIDCActorVerifier:
-    """Verify OIDC Actor JWTs against an HTTPS issuer's JWKS."""
+    """Verify OIDC JWTs against an HTTPS issuer JWKS."""
 
     MAX_TOKEN_BYTES = 16384
     MAX_OIDC_RESPONSE_BYTES = 1 << 20
@@ -4479,6 +4512,8 @@ class _OIDCActorVerifier:
         issuer_url: str,
         audience: str,
         ca_file: str = "",
+        required_sub_prefix: str = "",
+        uid_claim: str = "sub",
         timeout_seconds: float = 10.0,
         jwks_cache_seconds: float = 300.0,
         clock_skew_seconds: float = 30.0,
@@ -4498,7 +4533,7 @@ class _OIDCActorVerifier:
                 f"OIDC issuer URL {issuer_url!r} must use https://<host>[:port] with no trailing slash, query, or fragment"
             )
         if not audience:
-            raise ValueError("an audience is required for OIDC Actor JWT verification")
+            raise ValueError("an audience is required for OIDC JWT verification")
 
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives import hashes
@@ -4516,6 +4551,9 @@ class _OIDCActorVerifier:
         self.issuer_netloc = parsed.netloc
         self.audience = audience
         self.ca_file = ca_file.strip()
+        self.required_sub_prefix = required_sub_prefix
+        self.uid_claim = uid_claim.strip()
+        self._uid_claim_path = _parse_oidc_claim_path(self.uid_claim)
         self.timeout_seconds = timeout_seconds
         self.jwks_cache_seconds = jwks_cache_seconds
         self.clock_skew_seconds = clock_skew_seconds
@@ -4574,8 +4612,14 @@ class _OIDCActorVerifier:
         if payload.get("iss") != self.issuer_url:
             raise AuthenticationError("OIDC token issuer mismatch")
         sub = payload.get("sub")
-        if not isinstance(sub, str) or not sub.startswith("actor/") or len(sub) <= len("actor/") or any(ch.isspace() for ch in sub):
-            raise AuthenticationError("the OIDC token subject must start with 'actor/'")
+        if not isinstance(sub, str) or not sub or any(ch.isspace() for ch in sub):
+            raise AuthenticationError("the OIDC token subject must be a non-empty string without whitespace")
+        if self.required_sub_prefix and (
+            not sub.startswith(self.required_sub_prefix) or len(sub) <= len(self.required_sub_prefix)
+        ):
+            raise AuthenticationError(
+                f"the OIDC token subject must start with {self.required_sub_prefix!r}"
+            )
 
         sig = self._b64url_decode(sig_b64)
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
@@ -4613,26 +4657,19 @@ class _OIDCActorVerifier:
             if now < float(nbf) - self.clock_skew_seconds:
                 raise AuthenticationError("the presented OIDC token is not yet valid")
 
-        uid = self._extract_actor_uid(payload, sub)
+        uid = self._resolve_uid(payload, sub)
         return Principal(workload=sub, uid=uid, role=CALLER_ROLE_SHELL), float(exp)
 
-    @staticmethod
-    def _extract_actor_uid(payload: Mapping[str, Any], sub: str) -> str:
-        ate_claim = payload.get("actor.ate.dev")
-        if isinstance(ate_claim, Mapping):
-            raw_uid = ate_claim.get("actorUID")
-            if isinstance(raw_uid, str) and raw_uid.strip():
-                return raw_uid.strip()
-        actor_claim = payload.get("actor")
-        if isinstance(actor_claim, Mapping):
-            nested_ate = actor_claim.get("ate.dev")
-            if isinstance(nested_ate, Mapping):
-                raw_uid = nested_ate.get("actorUID")
-                if isinstance(raw_uid, str) and raw_uid.strip():
-                    return raw_uid.strip()
-        jti = payload.get("jti")
-        if isinstance(jti, str) and jti.strip():
-            return jti.strip()
+    def _resolve_uid(self, payload: Mapping[str, Any], sub: str) -> str:
+        if not self._uid_claim_path:
+            return sub
+        cur: Any = payload
+        for segment in self._uid_claim_path:
+            if not isinstance(cur, Mapping) or segment not in cur:
+                return sub
+            cur = cur[segment]
+        if isinstance(cur, str) and cur.strip():
+            return cur.strip()
         return sub
 
     def _verification_keys(self, force: bool) -> tuple[_ParsedJWK, ...]:
@@ -4893,6 +4930,8 @@ class ServiceAccountAuthenticator:
         profile_identities: Mapping[str, Any] | None = None,
         oidc_issuer_url: str = "",
         oidc_ca_file: str = "",
+        oidc_required_sub_prefix: str = "",
+        oidc_uid_claim: str = "sub",
         shell_audience: str = "",
         oidc_jwks_cache_seconds: float = 300.0,
         oidc_clock_skew_seconds: float = 30.0,
@@ -4920,12 +4959,16 @@ class ServiceAccountAuthenticator:
         self._shell_audience = shell_audience.strip() or self._resolve_shell_audience(self.audience_roles)
         self.oidc_issuer_url = oidc_issuer_url.strip()
         self.oidc_ca_file = oidc_ca_file.strip()
+        self.oidc_required_sub_prefix = oidc_required_sub_prefix
+        self.oidc_uid_claim = oidc_uid_claim.strip()
         self._oidc_verifier: _OIDCActorVerifier | None = None
         if self.oidc_issuer_url:
             self._oidc_verifier = _OIDCActorVerifier(
                 issuer_url=self.oidc_issuer_url,
                 audience=self._shell_audience,
                 ca_file=self.oidc_ca_file,
+                required_sub_prefix=self.oidc_required_sub_prefix,
+                uid_claim=self.oidc_uid_claim,
                 timeout_seconds=self.timeout_seconds,
                 jwks_cache_seconds=oidc_jwks_cache_seconds,
                 clock_skew_seconds=oidc_clock_skew_seconds,
@@ -5471,6 +5514,8 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         ).strip(),
         oidc_issuer_url=os.getenv(OIDC_ISSUER_URL_ENV, "").strip(),
         oidc_ca_file=os.getenv(OIDC_CA_FILE_ENV, "").strip(),
+        oidc_required_sub_prefix=os.getenv(OIDC_REQUIRED_SUB_PREFIX_ENV, "").strip(),
+        oidc_uid_claim=os.getenv(OIDC_UID_CLAIM_ENV, "sub").strip(),
         shell_audience=shell_audience,
     )
 

@@ -1,0 +1,187 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Multi-target Dockerfile building the 2-container AX ActorTemplate images:
+#   1. --target agent   (Container 1 "guest": Hermes runtime + GKE skills, no kubectl/CLIs, connects to 127.0.0.1:2222 over SSH)
+#   2. --target sandbox (Container 2 "sandbox": isolated rootfs with sshd on 127.0.0.1:2222, kubectl, yq, helm, leeway, /ax/kubeconfig)
+ARG SANDBOX_IMAGE=us-central1-docker.pkg.dev/agentic-harness-demo/demo/agent-sandbox:kube-proxy-1793830865
+ARG AGENT_BASE_IMAGE=us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:pr3639-17184537
+
+FROM ${SANDBOX_IMAGE} AS ssh-keygen-stage
+USER root
+RUN mkdir -p /ssh && \
+    ssh-keygen -q -t ed25519 -N "" -C "ax-loopback-sandbox" -f /ssh/id_ed25519 && \
+    ssh-keygen -q -t ed25519 -N "" -C "ax-sandbox-host" -f /ssh/ssh_host_ed25519_key
+
+# -----------------------------------------------------------------------------
+# Target 1: sandbox (Container 2 "sandbox" inside the Actor)
+# -----------------------------------------------------------------------------
+FROM ${SANDBOX_IMAGE} AS sandbox
+USER root
+
+# Replace wrapper /usr/local/bin/kubectl with stock kubectl 1.34.13 so it uses
+# /ax/kubeconfig directly against k8s-api-proxy in ax-system.
+# Run sshd as non-root user "agent" (uid 1000) so OpenSSH skips chroot("/run/sshd")
+# and setuid/setgid inside ateworker-gvisor (which drops CAP_SYS_CHROOT).
+RUN cp -f /usr/local/libexec/kubectl /usr/local/bin/kubectl && \
+    chmod 0755 /usr/local/bin/kubectl && \
+    rm -f /opt/credential-proxy/bin/gcloud && \
+    printf '#!/bin/sh\nunset KUBECONFIG\nexec /usr/local/bin/credential-proxy-exec gcloud "$@"\n' > /opt/credential-proxy/bin/gcloud && \
+    chmod 0755 /opt/credential-proxy/bin/gcloud && \
+    install -d -m 0755 -o root -g root /home/agent /home/agent/.ssh /etc/sandbox-ssh && \
+    install -d -m 0755 -o agent -g agent /opt/data && \
+    cp -a /opt/defaults/* /opt/data/ && \
+    chown -R root:root /opt/data/skills /opt/data/governance /opt/data/scripts && \
+    install -d -m 0700 -o agent -g agent /home/agent/.kube /ax && \
+    install -d -m 0777 /workspace
+
+COPY --from=ssh-keygen-stage --chmod=0644 /ssh/id_ed25519.pub /home/agent/.ssh/authorized_keys
+COPY --from=ssh-keygen-stage --chown=1000:1000 --chmod=0600 /ssh/ssh_host_ed25519_key /etc/sandbox-ssh/ssh_host_ed25519_key
+COPY --from=ssh-keygen-stage --chmod=0644 /ssh/ssh_host_ed25519_key.pub /etc/sandbox-ssh/ssh_host_ed25519_key.pub
+
+RUN cat <<'EOF' > /etc/sandbox-ssh/sshd_config && \
+    cat <<'EOF2' > /usr/local/bin/ax-sandbox-entrypoint && \
+    chmod 0755 /usr/local/bin/ax-sandbox-entrypoint
+Port 2222
+ListenAddress 127.0.0.1
+HostKey /etc/sandbox-ssh/ssh_host_ed25519_key
+PermitRootLogin no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/agent/.ssh/authorized_keys
+AllowUsers agent
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+AllowTcpForwarding no
+X11Forwarding no
+PrintMotd no
+PidFile /tmp/sshd.pid
+SetEnv PATH="/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" KUBECONFIG="/ax/kubeconfig" SSL_CERT_FILE="/run/ate/egress-trust-bundle/trust-bundle.pem" HOME="/home/agent" HERMES_HOME="/opt/data" PLATFORM_AGENT_HOME="/opt/data" CREDENTIAL_PROXY_URL="http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765" CREDENTIAL_PROXY_TOKEN_FILE="/ax/token" GKE_CLUSTER_NAME="kage-management" GKE_PROJECT_ID="agentic-harness-demo" GKE_LOCATION="us-central1"
+EOF
+#!/bin/sh
+set -eu
+printf 'ax-placeholder\n' > /ax/token && chmod 0600 /ax/token
+/usr/local/bin/ax-task-runner --write-kubeconfig-only
+if [ -f /ax/kubeconfig ]; then
+  ln -sf /ax/kubeconfig /home/agent/.kube/config
+fi
+exec /usr/sbin/sshd -D -e -f /etc/sandbox-ssh/sshd_config
+EOF2
+
+ARG TARGETARCH=amd64
+COPY bin/linux_${TARGETARCH}/ax-task-runner /usr/local/bin/ax-task-runner
+
+USER agent
+ENV HOME=/home/agent \
+    HERMES_HOME=/opt/data \
+    PLATFORM_AGENT_HOME=/opt/data \
+    KUBECONFIG=/ax/kubeconfig \
+    SSL_CERT_FILE=/run/ate/egress-trust-bundle/trust-bundle.pem \
+    CREDENTIAL_PROXY_URL=http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765 \
+    CREDENTIAL_PROXY_TOKEN_FILE=/ax/token \
+    GKE_CLUSTER_NAME=kage-management \
+    GKE_PROJECT_ID=agentic-harness-demo \
+    GKE_LOCATION=us-central1
+
+ENTRYPOINT ["/usr/local/bin/ax-sandbox-entrypoint"]
+
+# -----------------------------------------------------------------------------
+# Target 2: agent (Container 1 "guest" inside the Actor)
+# -----------------------------------------------------------------------------
+FROM ${AGENT_BASE_IMAGE} AS agent
+USER root
+
+# Ensure no cluster CLIs exist in the agent container; all shell commands execute
+# over loopback SSH (127.0.0.1:2222) inside the isolated "sandbox" container.
+RUN rm -f /usr/local/bin/kubectl /usr/local/bin/yq /usr/local/bin/helm /usr/local/bin/leeway && \
+    mkdir -p /etc/sandbox-ssh /root/.ssh /root/.hermes/skills /root/.hermes/logs /root/.hermes/sessions /workspace && \
+    chmod 0700 /root/.ssh && \
+    chmod 0777 /workspace
+
+COPY --from=ssh-keygen-stage --chmod=0600 /ssh/id_ed25519 /etc/sandbox-ssh/id_ed25519
+
+RUN cat <<'EOF' > /root/.ssh/config && \
+    chmod 0600 /root/.ssh/config && \
+    cp -r /opt/cluster-template/SOUL.md /opt/cluster-template/AGENTS.md /opt/cluster-template/CAPABILITIES.md /opt/cluster-template/persona /root/.hermes/ && \
+    cp -r /opt/cluster-template/skills/* /root/.hermes/skills/ && \
+    cp -rn /opt/platform-template/skills/* /root/.hermes/skills/ 2>/dev/null || true && \
+    cat <<'EOF2' > /root/.hermes/config.yaml
+Host 127.0.0.1
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+EOF
+model:
+  provider: custom
+  model: model-default
+  default: model-default
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
+  api_key: dummy
+  api_mode: chat_completions
+
+providers:
+  custom:
+    stale_timeout_seconds: 120
+    request_timeout_seconds: 300
+
+terminal:
+  backend: ssh
+  ssh_host: 127.0.0.1
+  ssh_port: 2222
+  ssh_user: agent
+  ssh_key: /etc/sandbox-ssh/id_ed25519
+  workspace_root: /workspace
+
+platform_toolsets:
+  cli:
+    - hermes-cli
+  api_server:
+    - hermes-api-server
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+agent:
+  environment_probe: false
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
+
+context_file_max_chars: 100000
+
+auxiliary:
+  title_generation:
+    enabled: false
+EOF2
+
+ENV HOME=/root \
+    HERMES_HOME=/root/.hermes \
+    HERMES_DOCKER_EXEC_AS_ROOT=1 \
+    TERMINAL_ENV=ssh \
+    TERMINAL_SSH_HOST=127.0.0.1 \
+    TERMINAL_SSH_PORT=2222 \
+    TERMINAL_SSH_USER=agent \
+    TERMINAL_SSH_KEY=/etc/sandbox-ssh/id_ed25519 \
+    OPENAI_BASE_URL=http://inference-gateway.kubeagents-system.svc.cluster.local/v1 \
+    OPENAI_API_KEY=dummy \
+    PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ARG TARGETARCH=amd64
+COPY bin/linux_${TARGETARCH}/ax-task-runner /usr/local/bin/ax-task-runner
+
+ENTRYPOINT ["/usr/local/bin/ax-task-runner"]

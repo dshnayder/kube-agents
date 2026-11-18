@@ -47,13 +47,24 @@ func startServerNoVerifier(t *testing.T) (*natsserver.Server, string) {
 	return startServerOpt(t, false)
 }
 
+func nextTestPort() int {
+	for {
+		p := int(testPort.Add(1))
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			_ = ln.Close()
+			return p
+		}
+	}
+}
+
 // startServerOpt starts the test server; each mutate sees its options
 // before it starts.
 func startServerOpt(t *testing.T, withVerifier bool, mutate ...func(*natsserver.Options)) (*natsserver.Server, string) {
 	t.Helper()
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
-		Port:      int(testPort.Add(1)),
+		Port:      nextTestPort(),
 		JetStream: true,
 		StoreDir:  t.TempDir(),
 		NoLog:     true,

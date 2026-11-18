@@ -248,6 +248,20 @@ type Config struct {
 	// always checked and its refusal is always honoured; there is no
 	// configuration in which this bridge runs work a verifier refused.
 	CapabilityOptional bool
+	// AXServerAddr, AXAtespace, AXDefaultTask, AXGatewayName and
+	// AXSharedActorTemplate configure ExecutorAX against ax-server.
+	AXServerAddr          string
+	AXAtespace            string
+	AXDefaultTask         string
+	AXGatewayName         string
+	AXSharedActorTemplate string
+	// AtenetRouterAddr, AtenetCertFile, AtenetCAFile, AtenetServerName and
+	// AtenetInsecure configure ExecutorAX process execution over atenet-router.
+	AtenetRouterAddr string
+	AtenetCertFile   string
+	AtenetCAFile     string
+	AtenetServerName string
+	AtenetInsecure   bool
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -276,6 +290,30 @@ func (c *Config) defaults() {
 	}
 	if c.APIModel == "" {
 		c.APIModel = DefaultAPIModel
+	}
+	if c.AXServerAddr == "" {
+		c.AXServerAddr = DefaultAXServerAddr
+	}
+	if c.AXAtespace == "" {
+		c.AXAtespace = DefaultAXAtespace
+	}
+	if c.AXDefaultTask == "" {
+		c.AXDefaultTask = DefaultAXTaskName
+	}
+	if c.AXGatewayName == "" {
+		c.AXGatewayName = DefaultAXGatewayName
+	}
+	if c.AtenetRouterAddr == "" {
+		c.AtenetRouterAddr = DefaultAtenetRouterAddr
+	}
+	if c.AtenetCertFile == "" {
+		c.AtenetCertFile = DefaultAtenetCertFile
+	}
+	if c.AtenetCAFile == "" {
+		c.AtenetCAFile = DefaultAtenetCAFile
+	}
+	if c.AtenetServerName == "" {
+		c.AtenetServerName = DefaultAtenetServerName
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -480,6 +518,8 @@ type Bridge struct {
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
+	// axExec is the AX executor's gRPC client pair (ax.go); nil outside ExecutorAX.
+	axExec *axExecutor
 	// routeClient records conversation routes (route.go).
 	routeClient *http.Client
 	// routesMu guards routes, the route each session last recorded
@@ -506,14 +546,21 @@ type Bridge struct {
 // New connects and sweeps but does not consume yet; Run does.
 func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	cfg.defaults()
+	var axExec *axExecutor
 	switch cfg.Executor {
 	case ExecutorAPI:
 		if err := apiExecutorValid(&cfg); err != nil {
 			return nil, err
 		}
+	case ExecutorAX:
+		var err error
+		axExec, err = newAXExecutor(cfg)
+		if err != nil {
+			return nil, err
+		}
 	case ExecutorCLI:
 	default:
-		return nil, fmt.Errorf("unknown executor %q: %q or %q", cfg.Executor, ExecutorAPI, ExecutorCLI)
+		return nil, fmt.Errorf("unknown executor %q: %q, %q or %q", cfg.Executor, ExecutorAPI, ExecutorCLI, ExecutorAX)
 	}
 	b := &Bridge{
 		cfg: cfg,
@@ -526,6 +573,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
 		apiClient:   newAPIClient(),
+		axExec:      axExec,
 		routeClient: newAPIClient(),
 	}
 	b.stopping, b.stopStopping = context.WithCancel(context.Background())
@@ -546,6 +594,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		lib.WithLogger(cfg.Logger),
 		lib.WithNATSOptions(cfg.NATSOptions...))
 	if err != nil {
+		if b.axExec != nil {
+			_ = b.axExec.Close()
+		}
 		return nil, err
 	}
 	// An async error handler, for the same reason the session executor has one
@@ -584,6 +635,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
+		if b.axExec != nil {
+			_ = b.axExec.Close()
+		}
 		return nil, fmt.Errorf("kv connection: %w", err)
 	}
 	b.js, err = jetstream.New(b.nc)
@@ -606,6 +660,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 func (b *Bridge) close() {
 	b.c.Close()
 	b.nc.Close()
+	if b.axExec != nil {
+		_ = b.axExec.Close()
+	}
 	b.closeActivity()
 }
 
@@ -922,7 +979,7 @@ func (b *Bridge) queueSteer(ctx context.Context, run *taskRun, steer *lib.Envelo
 	n := lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID}
 	_, hasText := promptFromMessage(steer.Payload)
 	switch {
-	case b.cfg.Executor != ExecutorAPI:
+	case b.cfg.Executor != ExecutorAPI && b.cfg.Executor != ExecutorAX:
 		n.Reason = lib.SteerReasonNoResume
 	case !hasText:
 		n.Reason = lib.SteerReasonNoText
@@ -1490,7 +1547,7 @@ func (b *Bridge) checkContext(ctx context.Context, run *taskRun) (context.Contex
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
-	if b.cfg.Executor == ExecutorAPI {
+	if b.cfg.Executor == ExecutorAPI || b.cfg.Executor == ExecutorAX {
 		b.runTaskAPI(ctx, run)
 		return
 	}

@@ -148,7 +148,7 @@ func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 		return
 	}
 	taskID := run.origin.TaskID
-	if b.cfg.Executor != ExecutorAPI {
+	if b.cfg.Executor != ExecutorAPI && b.cfg.Executor != ExecutorAX {
 		b.finalize(run, lib.StateFailed, "reason: "+cardStopUnsupported+
 			" - the cli executor runs no conversation session, so it has no cards to stop", nil)
 		return

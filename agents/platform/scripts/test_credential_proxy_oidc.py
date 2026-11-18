@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for OIDC Actor JWT authentication in credential_proxy.py."""
+"""Unit tests for generic OIDC JWT authentication in credential_proxy.py."""
 
 from __future__ import annotations
 
@@ -186,7 +186,12 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
         self.server.close()
         self._tmpdir.cleanup()
 
-    def _authenticator(self) -> credential_proxy.ServiceAccountAuthenticator:
+    def _authenticator(
+        self,
+        *,
+        required_sub_prefix: str = "",
+        uid_claim: str = "sub",
+    ) -> credential_proxy.ServiceAccountAuthenticator:
         return credential_proxy.ServiceAccountAuthenticator(
             audience_roles={
                 credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
@@ -199,11 +204,34 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
             token_file=str(self.token_file),
             oidc_issuer_url=self.server.issuer_url,
             oidc_ca_file=str(self.ca_path),
+            oidc_required_sub_prefix=required_sub_prefix,
+            oidc_uid_claim=uid_claim,
             oidc_clock=lambda: self.now,
         )
 
-    def test_verifies_es256_and_rs256_actor_jwts(self) -> None:
+    def test_verifies_generic_defaults_with_any_non_empty_subject(self) -> None:
         auth = self._authenticator()
+        token = _sign_es256(
+            self.ec_key,
+            "ec-1",
+            {
+                "iss": self.server.issuer_url,
+                "sub": "workload/alpha",
+                "aud": ["kubeagents-credential-proxy"],
+                "exp": int(self.now) + 300,
+                "nbf": int(self.now) - 10,
+            },
+        )
+        principal = auth.authenticate({"Authorization": f"Bearer {token}"})
+        self.assertEqual(principal.workload, "workload/alpha")
+        self.assertEqual(principal.uid, "workload/alpha")
+        self.assertEqual(principal.role, credential_proxy.CALLER_ROLE_SHELL)
+
+    def test_verifies_es256_and_rs256_with_escaped_dot_uid_claim_and_prefix(self) -> None:
+        auth = self._authenticator(
+            required_sub_prefix="actor/",
+            uid_claim=r"actor\.ate\.dev.actorUID",
+        )
         es_token = _sign_es256(
             self.ec_key,
             "ec-1",
@@ -231,18 +259,21 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
                 "sub": "actor/default/cluster-agent-001",
                 "aud": "kubeagents-credential-proxy",
                 "exp": int(self.now) + 300,
-                "actor": {"ate.dev": {"actorUID": "uid-rs256-456"}},
             },
         )
         rs_principal = auth.authenticate(f"Bearer {rs_token}")
         self.assertEqual(rs_principal.workload, "actor/default/cluster-agent-001")
-        self.assertEqual(rs_principal.uid, "uid-rs256-456")
+        # Falls back to sub when the configured claim path is absent.
+        self.assertEqual(rs_principal.uid, "actor/default/cluster-agent-001")
         self.assertEqual(rs_principal.role, credential_proxy.ROLE_SHELL)
         # Cached JWKS serves the second token without another HTTP round trip.
         self.assertEqual(self.server.jwks_hits, 1)
 
-    def test_rejects_expired_not_yet_valid_wrong_audience_non_actor_and_bad_signature(self) -> None:
-        auth = self._authenticator()
+    def test_rejects_expired_not_yet_valid_wrong_audience_prefix_mismatch_and_bad_signature(self) -> None:
+        auth = self._authenticator(
+            required_sub_prefix="actor/",
+            uid_claim=r"actor\.ate\.dev.actorUID",
+        )
         wrong_key = ec.generate_private_key(ec.SECP256R1())
         cases = [
             (
@@ -299,6 +330,19 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
                 ),
             ),
             (
+                "bare_prefix_subject",
+                _sign_es256(
+                    self.ec_key,
+                    "ec-1",
+                    {
+                        "iss": self.server.issuer_url,
+                        "sub": "actor/",
+                        "aud": "kubeagents-credential-proxy",
+                        "exp": int(self.now) + 300,
+                    },
+                ),
+            ),
+            (
                 "bad_signature",
                 _sign_es256(
                     wrong_key,
@@ -317,6 +361,12 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
                 with mock.patch.object(auth, "_review", side_effect=AssertionError("TokenReview should not be called")):
                     with self.assertRaises(credential_proxy.AuthenticationError):
                         auth.authenticate({"Authorization": f"Bearer {token}"})
+
+    def test_rejects_malformed_uid_claim_paths(self) -> None:
+        for bad_claim in (".leading", "trailing.", "a..b", "trailing\\"):
+            with self.subTest(bad_claim=bad_claim):
+                with self.assertRaises(ValueError):
+                    self._authenticator(uid_claim=bad_claim)
 
     def test_falls_through_to_token_review_for_non_oidc_tokens(self) -> None:
         auth = self._authenticator()
@@ -348,6 +398,8 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
             "KUBERNETES_SERVICE_HOST": "127.0.0.1",
             "CREDENTIAL_PROXY_OIDC_ISSUER_URL": self.server.issuer_url,
             "CREDENTIAL_PROXY_OIDC_CA_FILE": str(self.ca_path),
+            "CREDENTIAL_PROXY_OIDC_REQUIRED_SUB_PREFIX": "actor/",
+            "CREDENTIAL_PROXY_OIDC_UID_CLAIM": r"actor\.ate\.dev.actorUID",
         }
         with mock.patch.dict(os.environ, env, clear=False):
             built = credential_proxy.build_authenticator()
@@ -355,6 +407,14 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
         assert isinstance(built, credential_proxy.ServiceAccountAuthenticator)
         self.assertEqual(built.oidc_issuer_url, self.server.issuer_url)
         self.assertEqual(built.oidc_ca_file, str(self.ca_path))
+        self.assertEqual(built.oidc_required_sub_prefix, "actor/")
+        self.assertEqual(built.oidc_uid_claim, r"actor\.ate\.dev.actorUID")
+
+    def test_credential_proxy_source_has_no_hardcoded_substrate_strings(self) -> None:
+        src = (SCRIPT_DIR / "credential_proxy.py").read_text(encoding="utf-8")
+        self.assertNotIn("ate.dev", src)
+        self.assertNotIn('"actor/"', src)
+        self.assertNotIn("'actor/'", src)
 
 
 if __name__ == "__main__":

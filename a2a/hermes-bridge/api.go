@@ -533,6 +533,9 @@ func apiTurnKey(taskID string, steer *lib.Envelope) string {
 // key is the turn's Idempotency-Key (apiTurnKey), or that key with a suffix
 // for a second request the same turn makes (card_id_leak.go).
 func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev, key string) (string, bool) {
+	if b.cfg.Executor == ExecutorAX {
+		return b.axTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
+	}
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -552,35 +555,8 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set(apiSessionIDHeader, sessionID)
 	req.Header.Set(apiIdempotencyHeader, key)
 
-	if steer != nil {
-		run.mu.Lock()
-		if run.state != stateRunning {
-			// Finalized first; it refused this follow-up with the rest.
-			run.mu.Unlock()
-			return "", false
-		}
-		if run.canceled.Load() || run.deadlineHit.Load() || taskCtx.Err() != nil || b.closing.Load() {
-			// Checked under the lock the cancel and shutdown take before
-			// they end cancelReq, after each has stored its flag: one that
-			// lands after this check ends the request below.
-			run.mu.Unlock()
-			b.finalizeTurnNotSent(run, prev)
-			return "", false
-		}
-		if !takeSteerLocked(run, steer) {
-			// A finalize has taken the queue (and refused it) and is on its
-			// way to the terminal. Unreachable while every finalizer sets a
-			// flag checked above; a request here would contradict its notice.
-			run.mu.Unlock()
-			b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not sending",
-				"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
-			return "", false
-		}
-		// The last answer is on the stream as a turn artifact; from here
-		// a shutdown ends this request, and its terminal names the turn.
-		run.answerHeld = false
-		run.turn = turn
-		run.mu.Unlock()
+	if !b.beginSteerTurn(run, taskCtx, steer, turn, prev) {
+		return "", false
 	}
 
 	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
@@ -684,6 +660,75 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	}
 	b.publishUsageLocked(run, u)
 	return out.Choices[0].Message.Content, true
+}
+
+func (b *Bridge) beginSteerTurn(run *taskRun, taskCtx context.Context, steer *lib.Envelope, turn int, prev string) bool {
+	if steer == nil {
+		return true
+	}
+	run.mu.Lock()
+	if run.state != stateRunning {
+		run.mu.Unlock()
+		return false
+	}
+	if run.canceled.Load() || run.deadlineHit.Load() || taskCtx.Err() != nil || b.closing.Load() {
+		run.mu.Unlock()
+		b.finalizeTurnNotSent(run, prev)
+		return false
+	}
+	if !takeSteerLocked(run, steer) {
+		run.mu.Unlock()
+		b.cfg.Logger.Error("follow-up gone from the queue head before its turn; not sending",
+			"task", run.origin.TaskID, "envelope", steer.EnvelopeID)
+		return false
+	}
+	run.answerHeld = false
+	run.turn = turn
+	run.mu.Unlock()
+	return true
+}
+
+func (b *Bridge) axTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
+	if !b.beginSteerTurn(run, taskCtx, steer, turn, prev) {
+		return "", false
+	}
+
+	startedAt := time.Now()
+	rawAnswer, err := b.axExec.RunTurn(taskCtx, sessionID, prompt)
+	took := time.Since(startedAt)
+	if err != nil {
+		if run.canceled.Load() || b.closing.Load() || taskCtx.Err() != nil {
+			b.finalizeAPIError(run, taskCtx, err, turn)
+			return "", false
+		}
+		b.publishTurnUsage(run, &apiChatResponse{}, took)
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-ax-failed - session: %s%s; error: %s",
+			sessionID, turnNote(turn), tail(scrubAnswer(run, err.Error()), apiBodyTailBytes)), nil)
+		return "", false
+	}
+	if len(rawAnswer) > b.responseCap {
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - session: %s%s; "+
+			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
+			sessionID, turnNote(turn), b.responseCap), nil)
+		return "", false
+	}
+	if opensWithUnstructuredReasoning(rawAnswer) {
+		b.withholdUnstructuredReasoning(run, sessionID, turn, rawAnswer)
+		b.publishTurnUsage(run, &apiChatResponse{}, took)
+		b.finalize(run, lib.StateFailed, unstructuredReasoningReason(sessionID, turn), nil)
+		return "", false
+	}
+
+	answer := scrubAnswer(run, rawAnswer)
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return "", false
+	}
+	run.answerHeld = true
+	u, _ := apiTurnUsage(&apiChatResponse{}, b.cfg.APIModel, took)
+	b.publishUsageLocked(run, u)
+	return answer, true
 }
 
 // sendAPI sends req, retrying a refused connection every

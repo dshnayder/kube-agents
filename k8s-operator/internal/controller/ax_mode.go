@@ -28,42 +28,59 @@ import (
 )
 
 const (
-	axEnabledEnvVar   = "AX_ENABLED"
-	axServerURLEnvVar = "AX_SERVER_URL"
+	axEnabledEnvVar        = "AX_ENABLED"
+	axServerAddrEnvVar     = "AX_SERVER_ADDR"
+	atenetRouterAddrEnvVar = "ATENET_ROUTER_ADDR"
 
-	defaultAXServerURL    = "http://ax-server.ax-system.svc.cluster.local:8080"
-	axKubeProxyServiceURL = "https://k8s-api-proxy.ax-system.svc.cluster.local:8443"
+	defaultAXServerAddr     = "ax-server.ax-system.svc.cluster.local:8080"
+	defaultAtenetRouterAddr = "atenet-router.ate-system.svc.cluster.local:443"
+	axKubeProxyServiceURL   = "https://k8s-api-proxy.ax-system.svc.cluster.local:8443"
 
-	credentialProxyOIDCIssuerURLEnv = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
-	credentialProxyOIDCCAFileEnv    = "CREDENTIAL_PROXY_OIDC_CA_FILE"
+	credentialProxyOIDCIssuerURLEnv         = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
+	credentialProxyOIDCCAFileEnv            = "CREDENTIAL_PROXY_OIDC_CA_FILE"
+	credentialProxyOIDCRequiredSubPrefixEnv = "CREDENTIAL_PROXY_OIDC_REQUIRED_SUB_PREFIX"
+	credentialProxyOIDCUIDClaimEnv          = "CREDENTIAL_PROXY_OIDC_UID_CLAIM"
 
-	axOIDCIssuerURL          = "https://idp.ate-system.svc"
-	axServiceDNSCAName       = "servicedns-ca"
-	axServiceDNSCAMountPath  = "/run/servicedns-ca"
-	axServiceDNSCAPath       = "trust-bundle.pem"
-	axOIDCCAFile             = axServiceDNSCAMountPath + "/" + axServiceDNSCAPath
-	axServiceDNSSignerName   = "servicedns.podcert.ate.dev/identity"
-	axCanaryingLabelKey      = "podcert.ate.dev/canarying"
-	axCanaryingLabelLive     = "live"
-	ateSystemNamespace       = "ate-system"
-	ateEgressAppLabel        = "atenet-egress"
-	axBridgeAPIServerKey     = "ax-bridge" // #nosec G101 -- Non-secret sentinel bearer for ax-server
-	axBridgeConcurrencyValue = "2"
+	axOIDCIssuerURL            = "https://idp.ate-system.svc"
+	axOIDCRequiredSubPrefix    = "actor/"
+	axOIDCUIDClaim             = `actor\.ate\.dev.actorUID`
+	axServiceDNSCAName         = "servicedns-ca"
+	axServiceDNSCAMountPath    = "/run/servicedns-ca"
+	axServiceDNSCAPath         = "trust-bundle.pem"
+	axOIDCCAFile               = axServiceDNSCAMountPath + "/" + axServiceDNSCAPath
+	axServiceDNSSignerName     = "servicedns.podcert.ate.dev/identity"
+	axCanaryingLabelKey        = "podcert.ate.dev/canarying"
+	axCanaryingLabelLive       = "live"
+	axPodIdentityVolumeName    = "podidentity"
+	axPodIdentityMountPath     = "/run/podidentity.podcert.ate.dev"
+	axPodIdentityBundlePath    = "credential-bundle.pem"
+	axPodIdentityCertFile      = axPodIdentityMountPath + "/" + axPodIdentityBundlePath
+	axPodIdentitySignerName    = "podidentity.podcert.ate.dev/identity"
+	axPodIdentityKeyType       = "ECDSAP256"
+	ateSystemNamespace         = "ate-system"
+	ateEgressAppLabel          = "atenet-egress"
+	a2aBridgeExecutorAX        = "ax"
+	axDefaultAtespace          = "default"
+	axDefaultGatewayName       = "kube-agents-cluster-gw"
+	axBridgeConcurrencyValue   = "2"
 )
 
 func axModeEnabled() bool {
 	return os.Getenv(axEnabledEnvVar) == "true"
 }
 
-func axServerURL() string {
-	if v := strings.TrimSpace(os.Getenv(axServerURLEnvVar)); v != "" {
+func axServerAddr() string {
+	if v := strings.TrimSpace(os.Getenv(axServerAddrEnvVar)); v != "" {
 		return v
 	}
-	return defaultAXServerURL
+	return defaultAXServerAddr
 }
 
-func axChatCompletionsURL(agent *agentv1alpha1.PlatformAgent) string {
-	return strings.TrimRight(axServerURL(), "/") + "/v1alpha1/tasks/default/" + agent.Name + "/v1/chat/completions"
+func atenetRouterAddr() string {
+	if v := strings.TrimSpace(os.Getenv(atenetRouterAddrEnvVar)); v != "" {
+		return v
+	}
+	return defaultAtenetRouterAddr
 }
 
 func a2aCalloutReplicas() int32 {
@@ -100,6 +117,24 @@ func buildServiceDNSClusterTrustBundleVolume() corev1.Volume {
 	}
 }
 
+func buildPodIdentityCertificateVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: axPodIdentityVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(int32(0444)),
+				Sources: []corev1.VolumeProjection{{
+					PodCertificate: &corev1.PodCertificateProjection{
+						SignerName:           axPodIdentitySignerName,
+						KeyType:              axPodIdentityKeyType,
+						CredentialBundlePath: axPodIdentityBundlePath,
+					},
+				}},
+			},
+		},
+	}
+}
+
 func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	agentImage := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	return corev1.Container{
@@ -119,15 +154,24 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			}}},
 			{Name: a2aBridgeConcurrencyEnvVar, Value: axBridgeConcurrencyValue},
 			{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"},
-			{Name: a2aBridgeExecutorEnvVar, Value: a2aBridgeExecutorAPI},
-			{Name: "BRIDGE_API_URL", Value: axChatCompletionsURL(agent)},
-			{Name: a2aBridgeAPIServerKeyEnvVar, Value: axBridgeAPIServerKey},
+			{Name: a2aBridgeExecutorEnvVar, Value: a2aBridgeExecutorAX},
+			{Name: axServerAddrEnvVar, Value: axServerAddr()},
+			{Name: atenetRouterAddrEnvVar, Value: atenetRouterAddr()},
+			{Name: "AX_ATESPACE", Value: axDefaultAtespace},
+			{Name: "AX_DEFAULT_TASK", Value: agent.Name},
+			{Name: "AX_GATEWAY_NAME", Value: axDefaultGatewayName},
+			{Name: "ATENET_CERT_FILE", Value: axPodIdentityCertFile},
+			{Name: "ATENET_CA_FILE", Value: axOIDCCAFile},
 			{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"},
 			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
 				FieldPath: "metadata.namespace",
 			}}},
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 		},
-		VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+		VolumeMounts: []corev1.VolumeMount{
+			a2aNATSCABundleMount(),
+			{Name: axServiceDNSCAName, MountPath: axServiceDNSCAMountPath, ReadOnly: true},
+			{Name: axPodIdentityVolumeName, MountPath: axPodIdentityMountPath, ReadOnly: true},
+		},
 	}
 }

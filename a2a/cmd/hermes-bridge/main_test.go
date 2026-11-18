@@ -422,3 +422,48 @@ func TestRealMainLeavesAnExplicitGoMemLimitAlone(t *testing.T) {
 		t.Errorf("realMain logged %q, want the not-derived line naming GOMEMLIMIT", logs.String())
 	}
 }
+
+func TestConfigFromEnvParsesAXExecutorWithoutAPIServerKey(t *testing.T) {
+	t.Setenv("NATS_URL", unreachableNATSURL)
+	t.Setenv("POD_NAMESPACE", "kubeagents-system")
+	t.Setenv("API_SERVER_KEY", "")
+	t.Setenv("BRIDGE_EXECUTOR", hermesbridge.ExecutorAX)
+	t.Setenv("AX_SERVER_ADDR", "ax-server.custom.svc:8080")
+	t.Setenv("AX_ATESPACE", "tenant-a")
+	t.Setenv("AX_DEFAULT_TASK", "platform-agent-custom")
+	t.Setenv("AX_GATEWAY_NAME", "custom-gw")
+	t.Setenv("AX_SHARED_ACTOR_TEMPLATE", "ax-shared-123")
+	t.Setenv("ATENET_ROUTER_ADDR", "atenet-router.custom.svc:443")
+	t.Setenv("ATENET_CERT_FILE", "/custom/cert.pem")
+	t.Setenv("ATENET_CA_FILE", "/custom/ca.pem")
+	t.Setenv("ATENET_SERVER_NAME", "atenet-router.custom.svc")
+	t.Setenv("ATENET_INSECURE", "true")
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+	cfg, err := configFromEnv(log)
+	if err != nil {
+		t.Fatalf("configFromEnv: %v", err)
+	}
+	if cfg.Executor != hermesbridge.ExecutorAX {
+		t.Fatalf("Executor = %q, want %q", cfg.Executor, hermesbridge.ExecutorAX)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey = %q, want empty", cfg.APIKey)
+	}
+	if cfg.AXServerAddr != "ax-server.custom.svc:8080" ||
+		cfg.AXAtespace != "tenant-a" ||
+		cfg.AXDefaultTask != "platform-agent-custom" ||
+		cfg.AXGatewayName != "custom-gw" ||
+		cfg.AXSharedActorTemplate != "ax-shared-123" ||
+		cfg.AtenetRouterAddr != "atenet-router.custom.svc:443" ||
+		cfg.AtenetCertFile != "/custom/cert.pem" ||
+		cfg.AtenetCAFile != "/custom/ca.pem" ||
+		cfg.AtenetServerName != "atenet-router.custom.svc" ||
+		!cfg.AtenetInsecure {
+		t.Errorf("unexpected AX config parsed from env: %+v", cfg)
+	}
+	if strings.Contains(logs.String(), "no API server key") {
+		t.Errorf("BRIDGE_EXECUTOR=ax logged missing API_SERVER_KEY warning: %s", logs.String())
+	}
+}
