@@ -848,6 +848,45 @@ start_envoy() {
     render_envoy_config "${envoy_config}" "${rendered}" "${CREDENTIAL_PROXY_ENVOY_ADDRESS}" || exit 1
     envoy_config="${rendered}"
   fi
+  if [[ -n "${CREDENTIAL_PROXY_TLS_PORT:-}" && -n "${CREDENTIAL_PROXY_TLS_CERT_FILE:-}" ]]; then
+    local tls_rendered=/tmp/envoy-credential-proxy-tls.yaml
+    "${PROXY_PYTHON}" - "${envoy_config}" "${tls_rendered}" "${CREDENTIAL_PROXY_TLS_PORT}" "${CREDENTIAL_PROXY_TLS_CERT_FILE}" "${CREDENTIAL_PROXY_TLS_KEY_FILE:-${CREDENTIAL_PROXY_TLS_CERT_FILE}}" <<'PY'
+import os
+import sys
+from pathlib import Path
+import yaml
+
+src_path, dst_path, raw_port, cert_file, key_file = sys.argv[1:6]
+port = int(raw_port)
+if port < 1 or port > 65535:
+    raise SystemExit(f"start-services: CREDENTIAL_PROXY_TLS_PORT={raw_port} is outside 1-65535")
+doc = yaml.safe_load(Path(src_path).read_text(encoding="utf-8"))
+listeners = doc["static_resources"]["listeners"]
+tls_listener = yaml.safe_load(yaml.safe_dump(listeners[0]))
+tls_listener["name"] = "credential_proxy_tls"
+tls_listener["address"]["socket_address"]["port_value"] = port
+watch_dir = os.path.dirname(os.path.abspath(cert_file))
+tls_cert = {
+    "certificate_chain": {"filename": cert_file},
+    "private_key": {"filename": key_file},
+}
+if watch_dir:
+    tls_cert["watched_directory"] = {"path": watch_dir}
+tls_listener["filter_chains"][0]["transport_socket"] = {
+    "name": "envoy.transport_sockets.tls",
+    "typed_config": {
+        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+        "common_tls_context": {
+            "tls_params": {"tls_minimum_protocol_version": "TLSv1_2"},
+            "tls_certificates": [tls_cert],
+        },
+    },
+}
+listeners.append(tls_listener)
+Path(dst_path).write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+PY
+    envoy_config="${tls_rendered}"
+  fi
   /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &
   envoy_pid=$!
 }

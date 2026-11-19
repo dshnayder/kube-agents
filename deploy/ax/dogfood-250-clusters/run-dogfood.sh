@@ -21,18 +21,26 @@ CONTEXT="${KUBECTL_CONTEXT:-kage-adc}"
 AX_BIN="${AX_BIN:-$(command -v ax || echo "${HOME}/bin/ax")}"
 COUNT="${CLUSTER_COUNT:-250}"
 CONCURRENCY="${CONCURRENCY:-16}"
-IMAGE="${AX_KUBE_AGENT_IMAGE:-us-central1-docker.pkg.dev/agentic-harness-demo/ate-images/ax-kube-agent@sha256:6625820ce5ac879a4771b83d88f3f27541204276f1c7f10b7dfb7c9e8daf825f}"
-SANDBOX_IMAGE="${AX_KUBE_SANDBOX_IMAGE:-us-central1-docker.pkg.dev/agentic-harness-demo/ate-images/ax-kube-sandbox@sha256:9fbb446bed4ae22b67ed9ab78d5cd20d78aeee86186b1eaf638e2b23fa6bc024}"
+AGENT_NAMESPACE="${AGENT_NAMESPACE:-kubeagents-system}"
+AGENT_NAME="${AGENT_NAME:-platform-agent}"
+IMAGE="${AX_KUBE_AGENT_IMAGE:?set AX_KUBE_AGENT_IMAGE to the built ax-kube-agent digest}"
+SANDBOX_IMAGE="${AX_KUBE_SANDBOX_IMAGE:?set AX_KUBE_SANDBOX_IMAGE to the built ax-kube-sandbox digest}"
+TASK_CPU="${AX_TASK_CPU:-500m}"
+TASK_MEMORY="${AX_TASK_MEMORY:-1Gi}"
+BROKER_URL="https://${AGENT_NAME}-a2a-sandbox-broker.${AGENT_NAMESPACE}.svc:8098/v1/sandbox/exec"
+KUBE_PROXY_URL="https://${AGENT_NAME}-kube-proxy.${AGENT_NAMESPACE}.svc:8443"
+CREDENTIAL_PROXY_URL="https://${AGENT_NAME}-credential-proxy.${AGENT_NAMESPACE}.svc:8767"
 
-echo "==> 1. Applying Gateway/kube-agents-cluster-gw from ${SCRIPT_DIR}/gateway.yaml on context ${CONTEXT}..."
+echo "==> 1. Applying stock AX Gateways (kube-agents-agent-gw + kube-agents-sandbox-gw) on context ${CONTEXT}..."
 "${AX_BIN}" apply -f "${SCRIPT_DIR}/gateway.yaml" --context="${CONTEXT}"
 
-echo "==> 2. Provisioning 1 shared 2-container ActorTemplate via cluster-agent-seed (agent=${IMAGE}, sandbox=${SANDBOX_IMAGE}, limits: cpu=2, memory=2Gi)..."
-"${AX_BIN}" apply --context="${CONTEXT}" -f - <<EOF
+echo "==> 2. Ensuring paired ${AGENT_NAME} + ${AGENT_NAME}-sandbox stock AX Tasks..."
+if ! "${AX_BIN}" describe task "${AGENT_NAME}" --context="${CONTEXT}" >/dev/null 2>&1; then
+  "${AX_BIN}" apply --context="${CONTEXT}" -f - <<EOF
 apiVersion: ax.io/v1alpha1
 kind: Task
 metadata:
-  name: cluster-agent-seed
+  name: ${AGENT_NAME}
   atespace: default
 spec:
   debug: true
@@ -40,41 +48,49 @@ spec:
     image: ${IMAGE}
     resources:
       limits:
-        cpu: "2"
-        memory: "2Gi"
+        cpu: "${TASK_CPU}"
+        memory: "${TASK_MEMORY}"
   gateway:
-    name: kube-agents-cluster-gw
+    name: kube-agents-agent-gw
+  commands:
+    - /usr/local/bin/ax-sandbox-ssh-proxy
   env:
-    - name: AX_SANDBOX_IMAGE
-      value: ${SANDBOX_IMAGE}
+    - name: SANDBOX_BROKER_URL
+      value: ${BROKER_URL}
 EOF
-
-SHARED_TEMPLATE="$("${AX_BIN}" get task cluster-agent-seed --context="${CONTEXT}" | awk '/ateActorTemplate:/ {print $2}')"
-if [[ -z "${SHARED_TEMPLATE}" ]]; then
-  echo "error: failed to resolve shared ateActorTemplate from cluster-agent-seed" >&2
-  exit 1
 fi
-echo "    Shared ActorTemplate: ${SHARED_TEMPLATE}"
-
-echo "==> 3. Ensuring default platform-agent AX Task shares ${SHARED_TEMPLATE}..."
-"${AX_BIN}" apply --context="${CONTEXT}" -f - <<EOF
+if ! "${AX_BIN}" describe task "${AGENT_NAME}-sandbox" --context="${CONTEXT}" >/dev/null 2>&1; then
+  "${AX_BIN}" apply --context="${CONTEXT}" -f - <<EOF
 apiVersion: ax.io/v1alpha1
 kind: Task
 metadata:
-  name: platform-agent
+  name: ${AGENT_NAME}-sandbox
   atespace: default
 spec:
   debug: true
   profile:
-    ateActorTemplate: ${SHARED_TEMPLATE}
+    image: ${SANDBOX_IMAGE}
+    resources:
+      limits:
+        cpu: "${TASK_CPU}"
+        memory: "${TASK_MEMORY}"
   gateway:
-    name: kube-agents-cluster-gw
+    name: kube-agents-sandbox-gw
+  env:
+    - name: KUBE_PROXY_URL
+      value: ${KUBE_PROXY_URL}
+    - name: CREDENTIAL_PROXY_URL
+      value: ${CREDENTIAL_PROXY_URL}
 EOF
+fi
 
-echo "==> 4. Creating ${COUNT} Cluster Agent Tasks (cluster-agent-001 .. cluster-agent-$(printf '%03d' "${COUNT}")) sharing ${SHARED_TEMPLATE} (concurrency=${CONCURRENCY})..."
+echo "==> 3. Creating ${COUNT} stock Cluster Agent Tasks (cluster-agent-001 .. cluster-agent-$(printf '%03d' "${COUNT}")) (concurrency=${CONCURRENCY}, cpu=${TASK_CPU}, memory=${TASK_MEMORY}; paired *-sandbox tasks wake lazily on first CLI call)..."
 START_TS="$(date +%s)"
 seq 1 "${COUNT}" | xargs -P "${CONCURRENCY}" -I {} bash -ec '
   idx=$(printf "%03d" "$1")
+  if "$2" describe task "cluster-agent-${idx}" --context="$3" >/dev/null 2>&1; then
+    exit 0
+  fi
   "$2" apply --context="$3" -f - >/dev/null <<EOF
 apiVersion: ax.io/v1alpha1
 kind: Task
@@ -84,10 +100,19 @@ metadata:
 spec:
   debug: true
   profile:
-    ateActorTemplate: $4
+    image: $4
+    resources:
+      limits:
+        cpu: "$6"
+        memory: "$7"
   gateway:
-    name: kube-agents-cluster-gw
+    name: kube-agents-agent-gw
+  commands:
+    - /usr/local/bin/ax-sandbox-ssh-proxy
+  env:
+    - name: SANDBOX_BROKER_URL
+      value: $5
 EOF
-' _ {} "${AX_BIN}" "${CONTEXT}" "${SHARED_TEMPLATE}"
+' _ {} "${AX_BIN}" "${CONTEXT}" "${IMAGE}" "${BROKER_URL}" "${TASK_CPU}" "${TASK_MEMORY}"
 END_TS="$(date +%s)"
-echo "    Created ${COUNT} Cluster Agent Tasks + Substrate Actors sharing ${SHARED_TEMPLATE} in $((END_TS - START_TS))s."
+echo "    Created ${COUNT} stock Cluster Agent Tasks in $((END_TS - START_TS))s."

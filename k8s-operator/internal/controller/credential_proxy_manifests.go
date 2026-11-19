@@ -501,16 +501,24 @@ func credentialProxySandboxURL(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	ports := []corev1.ServicePort{{
+		Name:       "cred-proxy",
+		Port:       credentialProxyPort,
+		TargetPort: intstr.FromString("cred-proxy"),
+	}}
+	if axModeEnabled() {
+		ports = append(ports, corev1.ServicePort{
+			Name:       credentialProxyTLSPortName,
+			Port:       credentialProxyTLSPort,
+			TargetPort: intstr.FromString(credentialProxyTLSPortName),
+		})
+	}
 	svc := &corev1.Service{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
 		Spec: corev1.ServiceSpec{
 			Selector: credentialProxySelector(agent),
-			Ports: []corev1.ServicePort{{
-				Name:       "cred-proxy",
-				Port:       credentialProxyPort,
-				TargetPort: intstr.FromString("cred-proxy"),
-			}},
+			Ports:    ports,
 		},
 	}
 	withCommonLabels(svc, agent)
@@ -699,21 +707,28 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// ReadWriteOnce. Unset, credential_proxy.py falls back to
 	// <state-dir>/workspace inside this pod's own emptyDir, which is where a
 	// `git clone` through the proxy lands and where nothing else can read it.
+	containerPorts := []corev1.ContainerPort{
+		{Name: "cred-proxy", ContainerPort: credentialProxyPort},
+		// The runtime's metrics-only listener, for the chart's PodMonitoring
+		// (see credentialProxyMetricsPort).
+		{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
+		// Envoy's health listener, for the readinessProbe alone (see
+		// credentialProxyHealthPort).
+		{Name: credentialProxyHealthPortName, ContainerPort: credentialProxyHealthPort},
+	}
+	if axModeEnabled() {
+		containerPorts = append(containerPorts, corev1.ContainerPort{
+			Name:          credentialProxyTLSPortName,
+			ContainerPort: credentialProxyTLSPort,
+		})
+	}
 	return corev1.Container{
 		Name:            credentialProxyContainerName,
 		Image:           resolveCredentialProxyImage(agent.Spec.Deployment),
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/usr/local/bin/start-services"},
 		Env:             envVars,
-		Ports: []corev1.ContainerPort{
-			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
-			// The runtime's metrics-only listener, for the chart's PodMonitoring
-			// (see credentialProxyMetricsPort).
-			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
-			// Envoy's health listener, for the readinessProbe alone (see
-			// credentialProxyHealthPort).
-			{Name: credentialProxyHealthPortName, ContainerPort: credentialProxyHealthPort},
-		},
+		Ports:           containerPorts,
 		// On the health listener, not the credentialed one, so that the
 		// fleet's open watches cannot fill the breaker the probe goes
 		// through (credentialProxyHealthPort). No livenessProbe: the start
@@ -793,11 +808,18 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
 	if axModeEnabled() {
-		mounts = append(mounts, corev1.VolumeMount{
-			Name:      axServiceDNSCAName,
-			MountPath: axServiceDNSCAMountPath,
-			ReadOnly:  true,
-		})
+		mounts = append(mounts,
+			corev1.VolumeMount{
+				Name:      axServiceDNSCAName,
+				MountPath: axServiceDNSCAMountPath,
+				ReadOnly:  true,
+			},
+			corev1.VolumeMount{
+				Name:      axServiceDNSCertVolumeName,
+				MountPath: axServiceDNSCertMountPath,
+				ReadOnly:  true,
+			},
+		)
 	}
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
@@ -930,29 +952,35 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 			},
 		})
 	}
+	ingressRules := []networkingv1.NetworkPolicyIngressRule{
+		{
+			From: callers,
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(credentialProxyPort))},
+			},
+		},
+		{
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			}},
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyMetricsPort)},
+		},
+	}
+	if axModeEnabled() {
+		ingressRules[0].Ports = append(ingressRules[0].Ports, networkingv1.NetworkPolicyPort{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(credentialProxyTLSPort)),
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{
-				{
-					From: callers,
-					Ports: []networkingv1.NetworkPolicyPort{{
-						Protocol: &tcp,
-						Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
-					}},
-				},
-				{
-					From: []networkingv1.NetworkPolicyPeer{{
-						NamespaceSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
-						},
-					}},
-					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyMetricsPort)},
-				},
-			},
+			Ingress:     ingressRules,
 		},
 	}
 	withCommonLabels(np, agent)
@@ -1031,7 +1059,10 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, scopeConfigVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	if axModeEnabled() {
-		volumes = append(volumes, buildServiceDNSClusterTrustBundleVolume())
+		volumes = append(volumes,
+			buildServiceDNSClusterTrustBundleVolume(),
+			buildServiceDNSCertificateVolume(),
+		)
 	}
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }

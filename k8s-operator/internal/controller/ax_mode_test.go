@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -42,8 +43,9 @@ func TestAXModeHelpers(t *testing.T) {
 	if axModeEnabled() {
 		t.Fatal("expected axModeEnabled() to be false by default")
 	}
-	if got := kubeProxyServiceURL(agent); got != "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443" {
-		t.Fatalf("kubeProxyServiceURL(default) = %q", got)
+	wantKubeProxyURL := "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+	if got := kubeProxyServiceURL(agent); got != wantKubeProxyURL {
+		t.Fatalf("kubeProxyServiceURL(default) = %q, want %q", got, wantKubeProxyURL)
 	}
 	if got := a2aCalloutReplicas(); got != 2 {
 		t.Fatalf("a2aCalloutReplicas(default) = %d, want 2", got)
@@ -56,11 +58,11 @@ func TestAXModeHelpers(t *testing.T) {
 	if !axModeEnabled() {
 		t.Fatal("expected axModeEnabled() to be true when AX_ENABLED=true")
 	}
-	if got := kubeProxyServiceURL(agent); got != "https://k8s-api-proxy.ax-system.svc.cluster.local:8443" {
-		t.Fatalf("kubeProxyServiceURL(AX) = %q", got)
+	if got := kubeProxyServiceURL(agent); got != wantKubeProxyURL {
+		t.Fatalf("kubeProxyServiceURL(AX) = %q, want %q", got, wantKubeProxyURL)
 	}
-	if got := kubeProxyURL(agent); got != "https://k8s-api-proxy.ax-system.svc.cluster.local:8443" {
-		t.Fatalf("kubeProxyURL(AX) = %q", got)
+	if got := kubeProxyURL(agent); got != wantKubeProxyURL {
+		t.Fatalf("kubeProxyURL(AX) = %q, want %q", got, wantKubeProxyURL)
 	}
 	if got := axServerAddr(); got != "ax-server.ax-system.svc.cluster.local:8080" {
 		t.Fatalf("axServerAddr(default) = %q", got)
@@ -84,7 +86,7 @@ func TestAXModeHelpers(t *testing.T) {
 	}
 }
 
-func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
+func TestAXModeKeepsKubeProxyAndDeletesLegacyGatewayAndShell(t *testing.T) {
 	t.Setenv("AX_ENABLED", "true")
 	ctx := context.Background()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -94,12 +96,7 @@ func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
 		},
 	}
 
-	preexisting := []client.Object{
-		agent,
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
+	legacy := []client.Object{
 		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}},
@@ -115,7 +112,7 @@ func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(preexisting...).
+		WithObjects(append([]client.Object{agent}, legacy...)...).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -145,8 +142,11 @@ func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
 	if err := r.reconcileAgentEgressPolicy(ctx, agent, nil, ""); err != nil {
 		t.Fatalf("reconcileAgentEgressPolicy: %v", err)
 	}
+	if err := r.reconcileAXSandboxBroker(ctx, agent); err != nil {
+		t.Fatalf("reconcileAXSandboxBroker: %v", err)
+	}
 
-	for _, deleted := range preexisting[1:] {
+	for _, deleted := range legacy {
 		probe := deleted.DeepCopyObject().(client.Object)
 		err := cl.Get(ctx, client.ObjectKeyFromObject(deleted), probe)
 		if !errors.IsNotFound(err) {
@@ -154,6 +154,107 @@ func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
 		}
 	}
 
+	// Verify <agent>-kube-proxy Service, Deployment, PDB, and NetworkPolicy are present in kubeagents-system!
+	kpDep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: kubeProxyName(agent)}, kpDep); err != nil {
+		t.Fatalf("expected kube-proxy Deployment in kubeagents-system, got err=%v", err)
+	}
+	kpContainer := kpDep.Spec.Template.Spec.Containers[0]
+	kpEnv := map[string]string{}
+	for _, e := range kpContainer.Env {
+		kpEnv[e.Name] = e.Value
+	}
+	wantKPEnv := map[string]string{
+		"KUBE_PROXY_TLS_CERT_FILE":           "/run/servicedns-cert/credential-bundle.pem",
+		"KUBE_PROXY_TLS_KEY_FILE":            "/run/servicedns-cert/credential-bundle.pem",
+		"KUBE_PROXY_OIDC_ISSUER_URL":          "https://idp.ate-system.svc",
+		"KUBE_PROXY_OIDC_AUDIENCE":            "https://platform-agent-kube-proxy.kubeagents-system.svc:8443",
+		"KUBE_PROXY_OIDC_CA_FILE":             "/run/servicedns-ca/trust-bundle.pem",
+		"KUBE_PROXY_OIDC_REQUIRED_SUB_PREFIX": "actor/",
+		"KUBE_PROXY_OIDC_PARTITION_CLAIM":    `actor\.ate\.dev.atespace`,
+		"KUBE_PROXY_OIDC_UID_CLAIM":          `actor\.ate\.dev.actorUID`,
+		"KUBE_PROXY_OIDC_ALLOWED_PARTITIONS": "default",
+	}
+	for k, want := range wantKPEnv {
+		if got := kpEnv[k]; got != want {
+			t.Errorf("kube-proxy env %s = %q, want %q", k, got, want)
+		}
+	}
+	var kpServiceDNSCert *corev1.PodCertificateProjection
+	var kpServiceDNSCA *corev1.ClusterTrustBundleProjection
+	for _, v := range kpDep.Spec.Template.Spec.Volumes {
+		if v.Name == "servicedns-cert" && v.Projected != nil && len(v.Projected.Sources) == 1 {
+			kpServiceDNSCert = v.Projected.Sources[0].PodCertificate
+		}
+		if v.Name == "servicedns-ca" && v.Projected != nil && len(v.Projected.Sources) == 1 {
+			kpServiceDNSCA = v.Projected.Sources[0].ClusterTrustBundle
+		}
+		if v.Name == kubeProxyTLSVolumeName {
+			t.Errorf("kube-proxy in AX mode must not mount static Secret volume %s", kubeProxyTLSVolumeName)
+		}
+	}
+	if kpServiceDNSCert == nil ||
+		kpServiceDNSCert.SignerName != "servicedns.podcert.ate.dev/identity" ||
+		kpServiceDNSCert.KeyType != "ECDSAP256" ||
+		kpServiceDNSCert.CredentialBundlePath != "credential-bundle.pem" {
+		t.Errorf("kube-proxy servicedns-cert PodCertificate = %+v", kpServiceDNSCert)
+	}
+	if kpServiceDNSCA == nil || kpServiceDNSCA.SignerName == nil || *kpServiceDNSCA.SignerName != "servicedns.podcert.ate.dev/identity" {
+		t.Errorf("kube-proxy servicedns-ca ClusterTrustBundle = %+v", kpServiceDNSCA)
+	}
+
+	kpNP := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: kubeProxyName(agent)}, kpNP); err != nil {
+		t.Fatalf("expected kube-proxy NetworkPolicy, got err=%v", err)
+	}
+	kpAdmitsATEEgress := false
+	for _, peer := range kpNP.Spec.Ingress[0].From {
+		if peer.NamespaceSelector != nil &&
+			peer.NamespaceSelector.MatchLabels[labelMetadataName] == "ate-system" &&
+			peer.PodSelector != nil &&
+			peer.PodSelector.MatchLabels["app"] == "atenet-egress" {
+			kpAdmitsATEEgress = true
+			break
+		}
+	}
+	if !kpAdmitsATEEgress {
+		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress to admit ate-system/atenet-egress, got %+v", kpNP.Spec.Ingress[0].From)
+	}
+
+	// Verify <agent>-a2a-sandbox-broker Service (:8098) + NetworkPolicy are reconciled in AX mode!
+	brokerSvc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSandboxBrokerName(agent)}, brokerSvc); err != nil {
+		t.Fatalf("expected sandbox broker Service, got err=%v", err)
+	}
+	if brokerSvc.Spec.Selector["app"] != a2aGatewayName(agent) || len(brokerSvc.Spec.Ports) != 1 || brokerSvc.Spec.Ports[0].Port != 8098 {
+		t.Errorf("sandbox broker Service = %+v", brokerSvc.Spec)
+	}
+	brokerNP := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSandboxBrokerName(agent)}, brokerNP); err != nil {
+		t.Fatalf("expected sandbox broker NetworkPolicy, got err=%v", err)
+	}
+	if brokerNP.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) ||
+		len(brokerNP.Spec.Ingress) != 1 ||
+		len(brokerNP.Spec.Ingress[0].From) != 1 ||
+		brokerNP.Spec.Ingress[0].From[0].NamespaceSelector.MatchLabels[labelMetadataName] != "ate-system" ||
+		brokerNP.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != "atenet-egress" ||
+		brokerNP.Spec.Ingress[0].Ports[0].Port.IntVal != 8098 {
+		t.Errorf("sandbox broker NetworkPolicy = %+v", brokerNP.Spec)
+	}
+
+	// Turning AX_ENABLED off removes <agent>-a2a-sandbox-broker Service and NetworkPolicy.
+	t.Setenv("AX_ENABLED", "false")
+	if err := r.reconcileAXSandboxBroker(ctx, agent); err != nil {
+		t.Fatalf("reconcileAXSandboxBroker(off): %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSandboxBrokerName(agent)}, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("expected sandbox broker Service removed when AX_ENABLED=false, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSandboxBrokerName(agent)}, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+		t.Errorf("expected sandbox broker NetworkPolicy removed when AX_ENABLED=false, got %v", err)
+	}
+
+	t.Setenv("AX_ENABLED", "true")
 	// reconcileAgentEgressPolicy must be a no-op and not create <agent>-sandbox-metadata-deny.
 	egressNP := &networkingv1.NetworkPolicy{}
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-sandbox-metadata-deny"}, egressNP); !errors.IsNotFound(err) {
@@ -167,6 +268,8 @@ func TestAXModeDeletesLegacyWorkloadsAndSkipsSandboxKeys(t *testing.T) {
 
 func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 	t.Setenv("AX_ENABLED", "true")
+	t.Setenv("AX_AGENT_IMAGE", "us-central1-docker.pkg.dev/demo/ate-images/ax-kube-agent@sha256:1111")
+	t.Setenv("AX_SANDBOX_IMAGE", "us-central1-docker.pkg.dev/demo/ate-images/ax-kube-sandbox@sha256:2222")
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
 	}
@@ -185,6 +288,9 @@ func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 	if bridge.WorkingDir != "/" {
 		t.Errorf("bridge.WorkingDir = %q, want /", bridge.WorkingDir)
 	}
+	if len(bridge.Ports) != 1 || bridge.Ports[0].ContainerPort != 8098 {
+		t.Errorf("bridge.Ports = %+v, want port 8098", bridge.Ports)
+	}
 
 	envByName := map[string]corev1.EnvVar{}
 	for _, e := range bridge.Env {
@@ -200,7 +306,19 @@ func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 		"ATENET_ROUTER_ADDR":        "atenet-router.ate-system.svc.cluster.local:443",
 		"AX_ATESPACE":               "default",
 		"AX_DEFAULT_TASK":           "platform-agent",
-		"AX_GATEWAY_NAME":           "kube-agents-cluster-gw",
+		"PLATFORM_AGENT_NAME":       "platform-agent",
+		"AX_AGENT_GATEWAY_NAME":     "kube-agents-agent-gw",
+		"AX_SANDBOX_GATEWAY_NAME":   "kube-agents-sandbox-gw",
+		"AX_AGENT_IMAGE":            "us-central1-docker.pkg.dev/demo/ate-images/ax-kube-agent@sha256:1111",
+		"AX_SANDBOX_IMAGE":          "us-central1-docker.pkg.dev/demo/ate-images/ax-kube-sandbox@sha256:2222",
+		"AX_TASK_CPU":                      "500m",
+		"AX_TASK_MEMORY":                   "1Gi",
+		"AX_SANDBOX_BROKER_LISTEN":        ":8098",
+		"AX_SANDBOX_BROKER_TLS_CERT_FILE": "/run/servicedns-cert/credential-bundle.pem",
+		"AX_SANDBOX_BROKER_TLS_KEY_FILE":  "/run/servicedns-cert/credential-bundle.pem",
+		"AX_SANDBOX_BROKER_URL":           "https://platform-agent-a2a-sandbox-broker.kubeagents-system.svc:8098/v1/sandbox/exec",
+		"AX_OIDC_ISSUER_URL":        "https://idp.ate-system.svc",
+		"AX_OIDC_CA_FILE":           "/run/servicedns-ca/trust-bundle.pem",
 		"ATENET_CERT_FILE":          "/run/podidentity.podcert.ate.dev/credential-bundle.pem",
 		"ATENET_CA_FILE":            "/run/servicedns-ca/trust-bundle.pem",
 		"BRIDGE_ACTIVITY_LISTEN":    "off",
@@ -230,6 +348,7 @@ func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 	wantMounts := []corev1.VolumeMount{
 		a2aNATSCABundleMount(),
 		{Name: "servicedns-ca", MountPath: "/run/servicedns-ca", ReadOnly: true},
+		{Name: "servicedns-cert", MountPath: "/run/servicedns-cert", ReadOnly: true},
 		{Name: "podidentity", MountPath: "/run/podidentity.podcert.ate.dev", ReadOnly: true},
 	}
 	if !reflect.DeepEqual(bridge.VolumeMounts, wantMounts) {
@@ -292,6 +411,12 @@ func TestAXModeCredentialProxyOIDCAndNetworkPolicy(t *testing.T) {
 	if got := envByName["CREDENTIAL_PROXY_OIDC_UID_CLAIM"]; got != `actor\.ate\.dev.actorUID` {
 		t.Errorf("CREDENTIAL_PROXY_OIDC_UID_CLAIM = %q, want %q", got, `actor\.ate\.dev.actorUID`)
 	}
+	if got := envByName["CREDENTIAL_PROXY_TLS_PORT"]; got != "8767" {
+		t.Errorf("CREDENTIAL_PROXY_TLS_PORT = %q, want 8767", got)
+	}
+	if got := envByName["CREDENTIAL_PROXY_TLS_CERT_FILE"]; got != "/run/servicedns-cert/credential-bundle.pem" {
+		t.Errorf("CREDENTIAL_PROXY_TLS_CERT_FILE = %q, want /run/servicedns-cert/credential-bundle.pem", got)
+	}
 
 	foundMount := false
 	for _, m := range container.VolumeMounts {
@@ -337,7 +462,7 @@ func TestAXModeCredentialProxyOIDCAndNetworkPolicy(t *testing.T) {
 	}
 }
 
-func TestAXModeReadinessTransitionsReadyWithoutLegacyGatewayOrShell(t *testing.T) {
+func TestAXModeReadinessTransitionsReadyAndScansKubeProxyPods(t *testing.T) {
 	t.Setenv("AX_ENABLED", "true")
 	agent := splitReadinessAgent()
 
@@ -351,5 +476,32 @@ func TestAXModeReadinessTransitionsReadyWithoutLegacyGatewayOrShell(t *testing.T
 	}
 	if agent.Status.DeploymentStatus.Name != a2aGatewayName(agent) || agent.Status.DeploymentStatus.ReadyReplicas != 1 {
 		t.Errorf("agent.Status.DeploymentStatus = %+v, want %s with 1 ready replica", agent.Status.DeploymentStatus, a2aGatewayName(agent))
+	}
+
+	// Verify getDeploymentStatusDetails includes kubeProxySelector(agent) in AX mode.
+	kpPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubeProxyName(agent) + "-abc12",
+			Namespace: agent.Namespace,
+			Labels:    kubeProxySelector(agent),
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "kube-proxy",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{
+						Reason:  "ImagePullBackOff",
+						Message: "Back-off pulling image",
+					},
+				},
+			}},
+		},
+	}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, kpPod).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	gotPhase, gotReason, gotMsg := r.getDeploymentStatusDetails(context.Background(), agent, true)
+	if gotPhase != degradedPhase || gotReason != "ImagePullBackOff" || !strings.Contains(gotMsg, kpPod.Name) {
+		t.Fatalf("getDeploymentStatusDetails(kube-proxy ImagePullBackOff) = (%q, %q, %q), want Degraded/ImagePullBackOff", gotPhase, gotReason, gotMsg)
 	}
 }

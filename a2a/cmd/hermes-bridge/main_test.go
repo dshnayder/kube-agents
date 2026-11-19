@@ -431,8 +431,17 @@ func TestConfigFromEnvParsesAXExecutorWithoutAPIServerKey(t *testing.T) {
 	t.Setenv("AX_SERVER_ADDR", "ax-server.custom.svc:8080")
 	t.Setenv("AX_ATESPACE", "tenant-a")
 	t.Setenv("AX_DEFAULT_TASK", "platform-agent-custom")
-	t.Setenv("AX_GATEWAY_NAME", "custom-gw")
-	t.Setenv("AX_SHARED_ACTOR_TEMPLATE", "ax-shared-123")
+	t.Setenv("PLATFORM_AGENT_NAME", "platform-agent-custom")
+	t.Setenv("AX_AGENT_GATEWAY_NAME", "custom-agent-gw")
+	t.Setenv("AX_SANDBOX_GATEWAY_NAME", "custom-sandbox-gw")
+	t.Setenv("AX_AGENT_IMAGE", "registry.example.com/ax-agent:v1")
+	t.Setenv("AX_SANDBOX_IMAGE", "registry.example.com/ax-sandbox:v1")
+	t.Setenv("AX_TASK_CPU", "4")
+	t.Setenv("AX_TASK_MEMORY", "4Gi")
+	t.Setenv("AX_SANDBOX_BROKER_LISTEN", ":8098")
+	t.Setenv("AX_SANDBOX_BROKER_URL", "http://broker.custom.svc:8098/v1/sandbox/exec")
+	t.Setenv("AX_OIDC_ISSUER_URL", "https://idp.custom.svc")
+	t.Setenv("AX_OIDC_CA_FILE", "/custom/oidc-ca.pem")
 	t.Setenv("ATENET_ROUTER_ADDR", "atenet-router.custom.svc:443")
 	t.Setenv("ATENET_CERT_FILE", "/custom/cert.pem")
 	t.Setenv("ATENET_CA_FILE", "/custom/ca.pem")
@@ -454,8 +463,18 @@ func TestConfigFromEnvParsesAXExecutorWithoutAPIServerKey(t *testing.T) {
 	if cfg.AXServerAddr != "ax-server.custom.svc:8080" ||
 		cfg.AXAtespace != "tenant-a" ||
 		cfg.AXDefaultTask != "platform-agent-custom" ||
-		cfg.AXGatewayName != "custom-gw" ||
-		cfg.AXSharedActorTemplate != "ax-shared-123" ||
+		cfg.PlatformAgentName != "platform-agent-custom" ||
+		cfg.PodNamespace != "kubeagents-system" ||
+		cfg.AXAgentGatewayName != "custom-agent-gw" ||
+		cfg.AXSandboxGatewayName != "custom-sandbox-gw" ||
+		cfg.AXAgentImage != "registry.example.com/ax-agent:v1" ||
+		cfg.AXSandboxImage != "registry.example.com/ax-sandbox:v1" ||
+		cfg.AXTaskCPU != "4" ||
+		cfg.AXTaskMemory != "4Gi" ||
+		cfg.AXSandboxBrokerListen != ":8098" ||
+		cfg.AXSandboxBrokerURL != "http://broker.custom.svc:8098/v1/sandbox/exec" ||
+		cfg.AXOIDCIssuerURL != "https://idp.custom.svc" ||
+		cfg.AXOIDCCAFile != "/custom/oidc-ca.pem" ||
 		cfg.AtenetRouterAddr != "atenet-router.custom.svc:443" ||
 		cfg.AtenetCertFile != "/custom/cert.pem" ||
 		cfg.AtenetCAFile != "/custom/ca.pem" ||

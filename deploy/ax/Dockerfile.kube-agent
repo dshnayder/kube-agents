@@ -12,103 +12,266 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-target Dockerfile building the 2-container AX ActorTemplate images:
-#   1. --target agent   (Container 1 "guest": Hermes runtime + GKE skills, no kubectl/CLIs, connects to 127.0.0.1:2222 over SSH)
-#   2. --target sandbox (Container 2 "sandbox": isolated rootfs with sshd on 127.0.0.1:2222, kubectl, yq, helm, leeway, /ax/kubeconfig)
+# Multi-target Dockerfile building pure kube-agents images for stock AX 1-to-1 paired Tasks
+# (zero ax-task-runner binary baked in; stock ax-server mounts ax-runner-volume):
+#   1. --target agent   (<name> Task: runtime + GKE skills + /usr/local/bin/ax-sandbox-ssh-proxy on 127.0.0.1:2222, zero cluster/cloud CLIs)
+#   2. --target sandbox (<name>-sandbox Task: unprivileged USER agent uid 1000, dynamic kubectl wrapper + gcloud shim, /ax/token placeholder)
+#
+# Build from the repository root:
+#   docker build -f deploy/ax/Dockerfile.kube-agent --target agent -t <registry>/ax-kube-agent:<tag> .
+#   docker build -f deploy/ax/Dockerfile.kube-agent --target sandbox -t <registry>/ax-kube-sandbox:<tag> .
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
 ARG SANDBOX_IMAGE=us-central1-docker.pkg.dev/agentic-harness-demo/demo/agent-sandbox:kube-proxy-1793830865
 ARG AGENT_BASE_IMAGE=us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:pr3639-17184537
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS go-builder
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY a2a/go.mod a2a/go.sum ./
+RUN go mod download
+COPY a2a/ ./
+RUN CGO_ENABLED=0 go build -trimpath -o /out/ax-sandbox-ssh-proxy ./cmd/ax-sandbox-ssh-proxy
 
 FROM ${SANDBOX_IMAGE} AS ssh-keygen-stage
 USER root
 RUN mkdir -p /ssh && \
-    ssh-keygen -q -t ed25519 -N "" -C "ax-loopback-sandbox" -f /ssh/id_ed25519 && \
-    ssh-keygen -q -t ed25519 -N "" -C "ax-sandbox-host" -f /ssh/ssh_host_ed25519_key
+    ssh-keygen -q -t ed25519 -N "" -C "ax-loopback-client" -f /ssh/id_ed25519
 
 # -----------------------------------------------------------------------------
-# Target 1: sandbox (Container 2 "sandbox" inside the Actor)
+# Target 1: sandbox (<name>-sandbox single-container AX Task)
 # -----------------------------------------------------------------------------
 FROM ${SANDBOX_IMAGE} AS sandbox
 USER root
 
-# Replace wrapper /usr/local/bin/kubectl with stock kubectl 1.34.13 so it uses
-# /ax/kubeconfig directly against k8s-api-proxy in ax-system.
-# Run sshd as non-root user "agent" (uid 1000) so OpenSSH skips chroot("/run/sshd")
-# and setuid/setgid inside ateworker-gvisor (which drops CAP_SYS_CHROOT).
-RUN cp -f /usr/local/libexec/kubectl /usr/local/bin/kubectl && \
-    chmod 0755 /usr/local/bin/kubectl && \
-    rm -f /opt/credential-proxy/bin/gcloud && \
-    printf '#!/bin/sh\nunset KUBECONFIG\nexec /usr/local/bin/credential-proxy-exec gcloud "$@"\n' > /opt/credential-proxy/bin/gcloud && \
-    chmod 0755 /opt/credential-proxy/bin/gcloud && \
-    install -d -m 0755 -o root -g root /home/agent /home/agent/.ssh /etc/sandbox-ssh && \
-    install -d -m 0755 -o agent -g agent /opt/data && \
+COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
+COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/defaults/scripts/credential_proxy_client.py
+
+RUN python3 -m compileall -f -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py && \
+    rm -f /opt/credential-proxy/bin/gcloud /usr/local/bin/kubectl && \
+    install -d -m 0755 -o agent -g agent /home/agent /home/agent/.hermes /opt/data && \
     cp -a /opt/defaults/* /opt/data/ && \
     chown -R root:root /opt/data/skills /opt/data/governance /opt/data/scripts && \
     install -d -m 0700 -o agent -g agent /home/agent/.kube /ax && \
-    install -d -m 0777 /workspace
+    install -d -m 0777 /workspace && \
+    printf 'ax-placeholder\n' > /ax/token && \
+    chown agent:agent /ax/token && \
+    chmod 0600 /ax/token
 
-COPY --from=ssh-keygen-stage --chmod=0644 /ssh/id_ed25519.pub /home/agent/.ssh/authorized_keys
-COPY --from=ssh-keygen-stage --chown=1000:1000 --chmod=0600 /ssh/ssh_host_ed25519_key /etc/sandbox-ssh/ssh_host_ed25519_key
-COPY --from=ssh-keygen-stage --chmod=0644 /ssh/ssh_host_ed25519_key.pub /etc/sandbox-ssh/ssh_host_ed25519_key.pub
-
-RUN cat <<'EOF' > /etc/sandbox-ssh/sshd_config && \
-    cat <<'EOF2' > /usr/local/bin/ax-sandbox-entrypoint && \
-    chmod 0755 /usr/local/bin/ax-sandbox-entrypoint
-Port 2222
-ListenAddress 127.0.0.1
-HostKey /etc/sandbox-ssh/ssh_host_ed25519_key
-PermitRootLogin no
-PubkeyAuthentication yes
-AuthorizedKeysFile /home/agent/.ssh/authorized_keys
-AllowUsers agent
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-UsePAM no
-AllowTcpForwarding no
-X11Forwarding no
-PrintMotd no
-PidFile /tmp/sshd.pid
-SetEnv PATH="/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" KUBECONFIG="/ax/kubeconfig" SSL_CERT_FILE="/run/ate/egress-trust-bundle/trust-bundle.pem" HOME="/home/agent" HERMES_HOME="/opt/data" PLATFORM_AGENT_HOME="/opt/data" CREDENTIAL_PROXY_URL="http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765" CREDENTIAL_PROXY_TOKEN_FILE="/ax/token" GKE_CLUSTER_NAME="kage-management" GKE_PROJECT_ID="agentic-harness-demo" GKE_LOCATION="us-central1"
-EOF
+RUN cat <<'EOF' > /opt/credential-proxy/bin/gcloud && \
+    chmod 0755 /opt/credential-proxy/bin/gcloud && \
+    cat <<'EOF2' > /usr/local/bin/kubectl && \
+    chmod 0755 /usr/local/bin/kubectl && \
+    cat <<'EOF3' > /home/agent/.kube/config && \
+    chown agent:agent /home/agent/.kube/config && \
+    chmod 0600 /home/agent/.kube/config
 #!/bin/sh
-set -eu
-printf 'ax-placeholder\n' > /ax/token && chmod 0600 /ax/token
-/usr/local/bin/ax-task-runner --write-kubeconfig-only
-if [ -f /ax/kubeconfig ]; then
-  ln -sf /ax/kubeconfig /home/agent/.kube/config
+unset KUBECONFIG
+TOKEN_FILE="${CREDENTIAL_PROXY_TOKEN_FILE:-/ax/token}"
+if [ ! -s "${TOKEN_FILE}" ]; then
+  mkdir -p "$(dirname "${TOKEN_FILE}")" 2>/dev/null || true
+  printf 'ax-placeholder\n' > "${TOKEN_FILE}" 2>/dev/null || true
+  chmod 0600 "${TOKEN_FILE}" 2>/dev/null || true
 fi
-exec /usr/sbin/sshd -D -e -f /etc/sandbox-ssh/sshd_config
-EOF2
+exec /usr/local/bin/credential-proxy-exec gcloud "$@"
+EOF
+#!/usr/bin/env python3
+"""Dynamic kubeconfig wrapper routing kubectl contexts through k8s-api-proxy."""
 
-ARG TARGETARCH=amd64
-COPY bin/linux_${TARGETARCH}/ax-task-runner /usr/local/bin/ax-task-runner
+import fcntl
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+REAL_KUBECTL = "/usr/local/libexec/kubectl"
+DEFAULT_PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc:8443"
+DEFAULT_CA_FILE = "/run/ate/egress-trust-bundle/trust-bundle.pem"
+PLACEHOLDER_TOKEN = "ax-placeholder"
+USER_NAME = "ax-actor"
+SAFE_CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+
+
+def _extract_flags(argv: list[str]) -> tuple[bool, str | None]:
+    has_kubeconfig = False
+    ctx_val: str | None = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            break
+        if arg == "--kubeconfig" or arg.startswith("--kubeconfig="):
+            has_kubeconfig = True
+        elif arg == "--context" and i + 1 < len(argv):
+            ctx_val = argv[i + 1]
+            i += 1
+        elif arg.startswith("--context="):
+            ctx_val = arg.split("=", 1)[1]
+        i += 1
+    return has_kubeconfig, ctx_val
+
+
+def _resolve_kubeconfig_path() -> Path:
+    env_kc = os.environ.get("KUBECONFIG", "").strip()
+    if env_kc and os.pathsep not in env_kc:
+        return Path(env_kc)
+    home = os.environ.get("HOME", "/home/agent").strip() or "/home/agent"
+    return Path(home) / ".kube" / "config"
+
+
+def _ensure_kubeconfig(argv: list[str]) -> None:
+    has_kubeconfig, requested_ctx = _extract_flags(argv)
+    if has_kubeconfig:
+        return
+    proxy_url = (os.environ.get("KUBE_PROXY_URL", "") or DEFAULT_PROXY_URL).strip().rstrip("/")
+    ca_file = (os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_CA_FILE).strip()
+    kc_path = _resolve_kubeconfig_path()
+    kc_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    contexts_needed = ["in-cluster"]
+    if requested_ctx and requested_ctx != "in-cluster" and SAFE_CONTEXT_RE.fullmatch(requested_ctx) and ".." not in requested_ctx:
+        contexts_needed.append(requested_ctx)
+
+    lock_path = kc_path.parent / ".kubeconfig.lock"
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        doc: dict = {}
+        if kc_path.is_file():
+            try:
+                loaded = yaml.safe_load(kc_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    doc = loaded
+            except Exception:
+                doc = {}
+
+        clusters = [c for c in (doc.get("clusters") or []) if isinstance(c, dict)]
+        contexts = [c for c in (doc.get("contexts") or []) if isinstance(c, dict)]
+        users = [u for u in (doc.get("users") or []) if isinstance(u, dict)]
+
+        changed = doc.get("apiVersion") != "v1" or doc.get("kind") != "Config"
+        doc["apiVersion"] = "v1"
+        doc["kind"] = "Config"
+        if not doc.get("current-context"):
+            doc["current-context"] = "in-cluster"
+            changed = True
+
+        want_user = {"name": USER_NAME, "user": {"token": PLACEHOLDER_TOKEN}}
+        if not any(u.get("name") == USER_NAME and u.get("user") == {"token": PLACEHOLDER_TOKEN} for u in users):
+            users = [u for u in users if u.get("name") != USER_NAME]
+            users.append(want_user)
+            doc["users"] = users
+            changed = True
+
+        for ctx_name in contexts_needed:
+            server_url = f"{proxy_url}/clusters/{ctx_name}"
+            want_cluster = {
+                "name": ctx_name,
+                "cluster": {
+                    "server": server_url,
+                    "certificate-authority": ca_file,
+                },
+            }
+            if not any(c.get("name") == ctx_name and c.get("cluster") == want_cluster["cluster"] for c in clusters):
+                clusters = [c for c in clusters if c.get("name") != ctx_name]
+                clusters.append(want_cluster)
+                doc["clusters"] = clusters
+                changed = True
+
+            want_ctx = {
+                "name": ctx_name,
+                "context": {
+                    "cluster": ctx_name,
+                    "user": USER_NAME,
+                },
+            }
+            if not any(c.get("name") == ctx_name and c.get("context") == want_ctx["context"] for c in contexts):
+                contexts = [c for c in contexts if c.get("name") != ctx_name]
+                contexts.append(want_ctx)
+                doc["contexts"] = contexts
+                changed = True
+
+        if changed or not kc_path.exists():
+            fd, tmp_name = tempfile.mkstemp(dir=str(kc_path.parent), prefix=".config.")
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    yaml.safe_dump(doc, fh, sort_keys=False)
+                os.replace(tmp_name, kc_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def main() -> None:
+    try:
+        _ensure_kubeconfig(sys.argv[1:])
+    except Exception:
+        pass
+    os.execv(REAL_KUBECTL, [REAL_KUBECTL, *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()
+EOF2
+apiVersion: v1
+kind: Config
+current-context: in-cluster
+clusters:
+  - name: in-cluster
+    cluster:
+      server: https://platform-agent-kube-proxy.kubeagents-system.svc:8443/clusters/in-cluster
+      certificate-authority: /run/ate/egress-trust-bundle/trust-bundle.pem
+users:
+  - name: ax-actor
+    user:
+      token: ax-placeholder
+contexts:
+  - name: in-cluster
+    context:
+      cluster: in-cluster
+      user: ax-actor
+EOF3
 
 USER agent
+WORKDIR /workspace
 ENV HOME=/home/agent \
     HERMES_HOME=/opt/data \
     PLATFORM_AGENT_HOME=/opt/data \
-    KUBECONFIG=/ax/kubeconfig \
+    KUBECONFIG=/home/agent/.kube/config \
+    KUBE_PROXY_URL=https://platform-agent-kube-proxy.kubeagents-system.svc:8443 \
+    KUBE_PROXY_CA_FILE=/run/ate/egress-trust-bundle/trust-bundle.pem \
     SSL_CERT_FILE=/run/ate/egress-trust-bundle/trust-bundle.pem \
-    CREDENTIAL_PROXY_URL=http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765 \
+    CREDENTIAL_PROXY_URL=https://platform-agent-credential-proxy.kubeagents-system.svc:8767 \
     CREDENTIAL_PROXY_TOKEN_FILE=/ax/token \
-    GKE_CLUSTER_NAME=kage-management \
-    GKE_PROJECT_ID=agentic-harness-demo \
-    GKE_LOCATION=us-central1
-
-ENTRYPOINT ["/usr/local/bin/ax-sandbox-entrypoint"]
+    PATH="/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # -----------------------------------------------------------------------------
-# Target 2: agent (Container 1 "guest" inside the Actor)
+# Target 2: agent (<name> single-container AX Task)
 # -----------------------------------------------------------------------------
 FROM ${AGENT_BASE_IMAGE} AS agent
 USER root
 
-# Ensure no cluster CLIs exist in the agent container; all shell commands execute
-# over loopback SSH (127.0.0.1:2222) inside the isolated "sandbox" container.
-RUN rm -f /usr/local/bin/kubectl /usr/local/bin/yq /usr/local/bin/helm /usr/local/bin/leeway && \
+# Remove all cluster/cloud CLIs from the agent image; tool commands execute over
+# 127.0.0.1:2222 (ax-sandbox-ssh-proxy -> OIDC sandbox broker -> <name>-sandbox).
+RUN rm -f /usr/local/bin/kubectl /usr/local/bin/yq /usr/local/bin/helm /usr/local/bin/leeway \
+          /opt/credential-proxy/bin/gcloud /opt/credential-proxy/bin/kubectl \
+          /usr/bin/kubectl /usr/bin/gcloud && \
     mkdir -p /etc/sandbox-ssh /root/.ssh /root/.hermes/skills /root/.hermes/logs /root/.hermes/sessions /workspace && \
     chmod 0700 /root/.ssh && \
     chmod 0777 /workspace
 
+COPY --from=go-builder --chmod=0755 /out/ax-sandbox-ssh-proxy /usr/local/bin/ax-sandbox-ssh-proxy
 COPY --from=ssh-keygen-stage --chmod=0600 /ssh/id_ed25519 /etc/sandbox-ssh/id_ed25519
 
 RUN cat <<'EOF' > /root/.ssh/config && \
@@ -169,6 +332,7 @@ auxiliary:
     enabled: false
 EOF2
 
+WORKDIR /workspace
 ENV HOME=/root \
     HERMES_HOME=/root/.hermes \
     HERMES_DOCKER_EXEC_AS_ROOT=1 \
@@ -177,11 +341,10 @@ ENV HOME=/root \
     TERMINAL_SSH_PORT=2222 \
     TERMINAL_SSH_USER=agent \
     TERMINAL_SSH_KEY=/etc/sandbox-ssh/id_ed25519 \
+    SSL_CERT_FILE=/run/ate/egress-trust-bundle/trust-bundle.pem \
+    SANDBOX_BROKER_URL=https://platform-agent-a2a-sandbox-broker.kubeagents-system.svc:8098/v1/sandbox/exec \
     OPENAI_BASE_URL=http://inference-gateway.kubeagents-system.svc.cluster.local/v1 \
     OPENAI_API_KEY=dummy \
     PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-ARG TARGETARCH=amd64
-COPY bin/linux_${TARGETARCH}/ax-task-runner /usr/local/bin/ax-task-runner
-
-ENTRYPOINT ["/usr/local/bin/ax-task-runner"]
+CMD ["/usr/local/bin/ax-sandbox-ssh-proxy"]

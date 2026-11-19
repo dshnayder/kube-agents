@@ -248,13 +248,28 @@ type Config struct {
 	// always checked and its refusal is always honoured; there is no
 	// configuration in which this bridge runs work a verifier refused.
 	CapabilityOptional bool
-	// AXServerAddr, AXAtespace, AXDefaultTask, AXGatewayName and
-	// AXSharedActorTemplate configure ExecutorAX against ax-server.
+	// AXServerAddr, AXAtespace, AXDefaultTask, AXAgentGatewayName,
+	// AXSandboxGatewayName, AXAgentImage, AXSandboxImage, AXTaskCPU and
+	// AXTaskMemory configure ExecutorAX against stock ax-server.
 	AXServerAddr          string
 	AXAtespace            string
 	AXDefaultTask         string
 	AXGatewayName         string
-	AXSharedActorTemplate string
+	AXAgentGatewayName    string
+	AXSandboxGatewayName  string
+	AXAgentImage          string
+	AXSandboxImage        string
+	AXTaskCPU             string
+	AXTaskMemory          string
+	AXSandboxBrokerListen      string
+	AXSandboxBrokerTLSCertFile string
+	AXSandboxBrokerTLSKeyFile  string
+	AXSandboxBrokerURL         string
+	AXOIDCIssuerURL       string
+	AXOIDCCAFile          string
+	AXOIDCHTTPClient      *http.Client
+	PlatformAgentName     string
+	PodNamespace          string
 	// AtenetRouterAddr, AtenetCertFile, AtenetCAFile, AtenetServerName and
 	// AtenetInsecure configure ExecutorAX process execution over atenet-router.
 	AtenetRouterAddr string
@@ -300,8 +315,24 @@ func (c *Config) defaults() {
 	if c.AXDefaultTask == "" {
 		c.AXDefaultTask = DefaultAXTaskName
 	}
+	if c.AXAgentGatewayName == "" {
+		if c.AXGatewayName != "" {
+			c.AXAgentGatewayName = c.AXGatewayName
+		} else {
+			c.AXAgentGatewayName = DefaultAXAgentGatewayName
+		}
+	}
 	if c.AXGatewayName == "" {
-		c.AXGatewayName = DefaultAXGatewayName
+		c.AXGatewayName = c.AXAgentGatewayName
+	}
+	if c.AXSandboxGatewayName == "" {
+		c.AXSandboxGatewayName = DefaultAXSandboxGatewayName
+	}
+	if c.AXTaskCPU == "" {
+		c.AXTaskCPU = DefaultAXTaskCPU
+	}
+	if c.AXTaskMemory == "" {
+		c.AXTaskMemory = DefaultAXTaskMemory
 	}
 	if c.AtenetRouterAddr == "" {
 		c.AtenetRouterAddr = DefaultAtenetRouterAddr
@@ -314,6 +345,21 @@ func (c *Config) defaults() {
 	}
 	if c.AtenetServerName == "" {
 		c.AtenetServerName = DefaultAtenetServerName
+	}
+	if c.AXOIDCIssuerURL == "" {
+		c.AXOIDCIssuerURL = DefaultAXOIDCIssuerURL
+	}
+	if c.AXOIDCCAFile == "" {
+		c.AXOIDCCAFile = c.AtenetCAFile
+	}
+	if c.PlatformAgentName == "" {
+		c.PlatformAgentName = c.AXDefaultTask
+	}
+	if c.PodNamespace == "" {
+		c.PodNamespace = DefaultAXNamespace
+	}
+	if c.AXSandboxBrokerURL == "" {
+		c.AXSandboxBrokerURL = fmt.Sprintf("http://%s-a2a-sandbox-broker.%s.svc.cluster.local:8098%s", c.PlatformAgentName, c.PodNamespace, SandboxBrokerExecPath)
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -533,6 +579,11 @@ type Bridge struct {
 	activitySrv  *http.Server
 	activityDone chan struct{} // closed by closeActivity, so serveActivity's shutdown waiter stops too
 	activityOnce sync.Once
+	// The 1-to-1 OIDC sandbox broker (sandbox_broker.go); nil when Config.AXSandboxBrokerListen is "".
+	sandboxBrokerLn   net.Listener
+	sandboxBrokerSrv  *http.Server
+	sandboxBrokerDone chan struct{}
+	sandboxBrokerOnce sync.Once
 	// tasksGet is the task lookup lookupTask retries, in the shape of
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
@@ -654,10 +705,15 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		b.close()
 		return nil, err
 	}
+	if err := b.listenSandboxBroker(); err != nil {
+		b.close()
+		return nil, err
+	}
 	return b, nil
 }
 
 func (b *Bridge) close() {
+	b.closeSandboxBroker()
 	b.c.Close()
 	b.nc.Close()
 	if b.axExec != nil {
@@ -676,6 +732,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("startup sweep: %w", err)
 	}
 	b.serveActivity(ctx)
+	b.serveSandboxBroker(ctx)
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
 		go b.worker(ctx)

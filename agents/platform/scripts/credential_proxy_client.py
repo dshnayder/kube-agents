@@ -385,6 +385,25 @@ class BrokerConnection(http.client.HTTPConnection):
         self.sock.settimeout(None)
 
 
+class BrokerHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS variant of ``BrokerConnection`` honoring ``SSL_CERT_FILE``."""
+
+    def __init__(self, host: str, **kwargs):
+        if kwargs.get("context") is None:
+            import ssl
+
+            kwargs["context"] = ssl.create_default_context()
+        super().__init__(host, **kwargs)
+
+    def connect(self) -> None:
+        self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
+        try:
+            super().connect()
+        except (OSError, UnicodeError) as exc:
+            raise BrokerUnreachable(str(exc)) from exc
+        self.sock.settimeout(None)
+
+
 class BrokerUnreachable(OSError):
     """No connection to the broker could be made, so no request reached it."""
 
@@ -465,6 +484,11 @@ class _BrokerHTTPHandler(urllib.request.HTTPHandler):
         return self.do_open(BrokerConnection, req)
 
 
+class _BrokerHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(BrokerHTTPSConnection, req)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect out of the broker.
 
@@ -486,7 +510,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # proxy in between would make every connect succeed, so a broker that cannot
 # be reached could not be told apart from one that dropped the request.
 _BROKER_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _BrokerHTTPHandler, _NoRedirect()
+    urllib.request.ProxyHandler({}), _BrokerHTTPHandler, _BrokerHTTPSHandler, _NoRedirect()
 )
 
 
@@ -2280,6 +2304,9 @@ class ApiSession:
             # No proxy from the environment, as for the broker opener: through
             # a proxy every connect succeeds, and the fallback would never fire.
             http.trust_env = False
+            ca_file = os.environ.get("SSL_CERT_FILE", "").strip()
+            if ca_file:
+                http.verify = ca_file
         self._http = http
         self._sleep = sleep_fn
         self._rng = rng

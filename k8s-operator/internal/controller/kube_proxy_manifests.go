@@ -134,9 +134,6 @@ func kubeProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 }
 
 func kubeProxyServiceURL(agent *agentv1alpha1.PlatformAgent) string {
-	if axModeEnabled() {
-		return axKubeProxyServiceURL
-	}
 	return fmt.Sprintf("https://%s.%s.svc.cluster.local:%d",
 		kubeProxyName(agent), agent.Namespace, kubeProxyPort)
 }
@@ -249,12 +246,19 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
+	tlsCertPath := kubeProxyTLSMountPath + "/tls.crt"
+	tlsKeyPath := kubeProxyTLSMountPath + "/tls.key"
+	if axModeEnabled() {
+		tlsCertPath = axServiceDNSCertFile
+		tlsKeyPath = axServiceDNSCertFile
+	}
+
 	allowedCallers := fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent))
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
-		{Name: "KUBE_PROXY_TLS_CERT_FILE", Value: kubeProxyTLSMountPath + "/tls.crt"},
-		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
+		{Name: "KUBE_PROXY_TLS_CERT_FILE", Value: tlsCertPath},
+		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: tlsKeyPath},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
 		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
@@ -266,6 +270,17 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "CREDENTIAL_PROXY_KUBE_API_SERVER", Value: inClusterAPIServer},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
+	}
+	if axModeEnabled() {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: kubeProxyOIDCIssuerURLEnv, Value: axOIDCIssuerURL},
+			corev1.EnvVar{Name: kubeProxyOIDCAudienceEnv, Value: axKubeProxyServiceURL(agent)},
+			corev1.EnvVar{Name: kubeProxyOIDCCAFileEnv, Value: axOIDCCAFile},
+			corev1.EnvVar{Name: kubeProxyOIDCRequiredSubPrefixEnv, Value: axOIDCRequiredSubPrefix},
+			corev1.EnvVar{Name: kubeProxyOIDCPartitionClaimEnv, Value: axOIDCPartitionClaim},
+			corev1.EnvVar{Name: kubeProxyOIDCUIDClaimEnv, Value: axOIDCUIDClaim},
+			corev1.EnvVar{Name: kubeProxyOIDCAllowedPartitionsEnv, Value: axDefaultAtespace},
+		)
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		envVars = append(envVars,
@@ -282,46 +297,61 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", Value: host})
 	}
 
-	volumeMounts := []corev1.VolumeMount{
-		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
-		{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
-		scopeConfigMount(brokerScopeDir),
-	}
-
-	volumes := []corev1.Volume{
-		scopeConfigVolume(agent),
-		{
-			Name: kubeProxyTLSVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  kubeProxyTLSSecretName(agent),
-					DefaultMode: ptr.To(kubeProxySecretDefaultMode),
+	var volumeMounts []corev1.VolumeMount
+	var volumes []corev1.Volume
+	if axModeEnabled() {
+		volumeMounts = []corev1.VolumeMount{
+			{Name: axServiceDNSCertVolumeName, MountPath: axServiceDNSCertMountPath, ReadOnly: true},
+			{Name: axServiceDNSCAName, MountPath: axServiceDNSCAMountPath, ReadOnly: true},
+			{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+			scopeConfigMount(brokerScopeDir),
+		}
+		volumes = []corev1.Volume{
+			scopeConfigVolume(agent),
+			buildServiceDNSCertificateVolume(),
+			buildServiceDNSClusterTrustBundleVolume(),
+		}
+	} else {
+		volumeMounts = []corev1.VolumeMount{
+			{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
+			{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+			scopeConfigMount(brokerScopeDir),
+		}
+		volumes = []corev1.Volume{
+			scopeConfigVolume(agent),
+			{
+				Name: kubeProxyTLSVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName:  kubeProxyTLSSecretName(agent),
+						DefaultMode: ptr.To(kubeProxySecretDefaultMode),
+					},
 				},
 			},
-		},
-		{
-			Name: kubeAPITokenVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Projected: &corev1.ProjectedVolumeSource{
-					DefaultMode: ptr.To(kubeProxySecretDefaultMode),
-					Sources: []corev1.VolumeProjection{
-						{
-							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-								ExpirationSeconds: ptr.To(kubeAPITokenExpirationSeconds),
-								Path:              "token",
-							},
+		}
+	}
+	volumes = append(volumes, corev1.Volume{
+		Name: kubeAPITokenVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(kubeProxySecretDefaultMode),
+				Sources: []corev1.VolumeProjection{
+					{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							ExpirationSeconds: ptr.To(kubeAPITokenExpirationSeconds),
+							Path:              "token",
 						},
-						{
-							ConfigMap: &corev1.ConfigMapProjection{
-								LocalObjectReference: corev1.LocalObjectReference{Name: kubeRootCAConfigMapName},
-								Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
-							},
+					},
+					{
+						ConfigMap: &corev1.ConfigMapProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: kubeRootCAConfigMapName},
+							Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
 						},
 					},
 				},
 			},
 		},
-	}
+	})
 
 	if credentialProxyFederation(agent) != nil {
 		envVars = append(envVars, buildCredentialProxyFederationEnv(agent)...)
@@ -484,6 +514,16 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 	if a2aSessionClusterViewEnabled(agent) {
 		callers = append(callers, networkingv1.NetworkPolicyPeer{
 			PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()},
+		})
+	}
+	if axModeEnabled() {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{labelMetadataName: ateSystemNamespace},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": ateEgressAppLabel},
+			},
 		})
 	}
 	np := &networkingv1.NetworkPolicy{
@@ -661,23 +701,13 @@ func (r *PlatformAgentReconciler) ensureKubeProxyCABundle(ctx context.Context, a
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
-	if axModeEnabled() {
-		for _, obj := range []client.Object{
-			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-			&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace}},
-		} {
-			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
-				return fmt.Errorf("failed to delete kube-proxy %T %s/%s in AX mode: %w", obj, obj.GetNamespace(), obj.GetName(), err)
-			}
+	var tlsHash string
+	if !axModeEnabled() {
+		var err error
+		tlsHash, err = r.ensureKubeProxyTLSSecret(ctx, agent)
+		if err != nil {
+			return err
 		}
-		return nil
-	}
-
-	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
-	if err != nil {
-		return err
 	}
 
 	objs := []client.Object{

@@ -17,38 +17,66 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 const (
-	axEnabledEnvVar        = "AX_ENABLED"
-	axServerAddrEnvVar     = "AX_SERVER_ADDR"
-	atenetRouterAddrEnvVar = "ATENET_ROUTER_ADDR"
+	axEnabledEnvVar            = "AX_ENABLED"
+	axServerAddrEnvVar         = "AX_SERVER_ADDR"
+	atenetRouterAddrEnvVar     = "ATENET_ROUTER_ADDR"
+	axAgentImageEnvVar         = "AX_AGENT_IMAGE"
+	axSandboxImageEnvVar       = "AX_SANDBOX_IMAGE"
+	axAgentGatewayNameEnvVar   = "AX_AGENT_GATEWAY_NAME"
+	axSandboxGatewayNameEnvVar = "AX_SANDBOX_GATEWAY_NAME"
+	axTaskCPUEnvVar            = "AX_TASK_CPU"
+	axTaskMemoryEnvVar         = "AX_TASK_MEMORY"
 
 	defaultAXServerAddr     = "ax-server.ax-system.svc.cluster.local:8080"
 	defaultAtenetRouterAddr = "atenet-router.ate-system.svc.cluster.local:443"
-	axKubeProxyServiceURL   = "https://k8s-api-proxy.ax-system.svc.cluster.local:8443"
 
 	credentialProxyOIDCIssuerURLEnv         = "CREDENTIAL_PROXY_OIDC_ISSUER_URL"
 	credentialProxyOIDCCAFileEnv            = "CREDENTIAL_PROXY_OIDC_CA_FILE"
 	credentialProxyOIDCRequiredSubPrefixEnv = "CREDENTIAL_PROXY_OIDC_REQUIRED_SUB_PREFIX"
 	credentialProxyOIDCUIDClaimEnv          = "CREDENTIAL_PROXY_OIDC_UID_CLAIM"
+	credentialProxyTLSPortEnv               = "CREDENTIAL_PROXY_TLS_PORT"
+	credentialProxyTLSCertFileEnv           = "CREDENTIAL_PROXY_TLS_CERT_FILE"
+	credentialProxyTLSPort                  = int32(8767)
+	credentialProxyTLSPortName              = "cred-proxy-tls"
+
+	kubeProxyOIDCIssuerURLEnv         = "KUBE_PROXY_OIDC_ISSUER_URL"
+	kubeProxyOIDCAudienceEnv          = "KUBE_PROXY_OIDC_AUDIENCE"
+	kubeProxyOIDCCAFileEnv            = "KUBE_PROXY_OIDC_CA_FILE"
+	kubeProxyOIDCRequiredSubPrefixEnv = "KUBE_PROXY_OIDC_REQUIRED_SUB_PREFIX"
+	kubeProxyOIDCPartitionClaimEnv    = "KUBE_PROXY_OIDC_PARTITION_CLAIM"
+	kubeProxyOIDCUIDClaimEnv          = "KUBE_PROXY_OIDC_UID_CLAIM"
+	kubeProxyOIDCAllowedPartitionsEnv = "KUBE_PROXY_OIDC_ALLOWED_PARTITIONS"
 
 	axOIDCIssuerURL            = "https://idp.ate-system.svc"
 	axOIDCRequiredSubPrefix    = "actor/"
+	axOIDCPartitionClaim       = `actor\.ate\.dev.atespace`
 	axOIDCUIDClaim             = `actor\.ate\.dev.actorUID`
 	axServiceDNSCAName         = "servicedns-ca"
 	axServiceDNSCAMountPath    = "/run/servicedns-ca"
 	axServiceDNSCAPath         = "trust-bundle.pem"
 	axOIDCCAFile               = axServiceDNSCAMountPath + "/" + axServiceDNSCAPath
 	axServiceDNSSignerName     = "servicedns.podcert.ate.dev/identity"
+	axServiceDNSCertVolumeName = "servicedns-cert"
+	axServiceDNSCertMountPath  = "/run/servicedns-cert"
+	axServiceDNSCertBundlePath = "credential-bundle.pem"
+	axServiceDNSCertFile       = axServiceDNSCertMountPath + "/" + axServiceDNSCertBundlePath
 	axCanaryingLabelKey        = "podcert.ate.dev/canarying"
 	axCanaryingLabelLive       = "live"
 	axPodIdentityVolumeName    = "podidentity"
@@ -61,8 +89,15 @@ const (
 	ateEgressAppLabel          = "atenet-egress"
 	a2aBridgeExecutorAX        = "ax"
 	axDefaultAtespace          = "default"
-	axDefaultGatewayName       = "kube-agents-cluster-gw"
-	axBridgeConcurrencyValue   = "2"
+	axDefaultAgentGatewayName   = "kube-agents-agent-gw"
+	axDefaultSandboxGatewayName = "kube-agents-sandbox-gw"
+	axDefaultTaskCPU            = "500m"
+	axDefaultTaskMemory         = "1Gi"
+	axBridgeConcurrencyValue    = "2"
+	axSandboxBrokerPort         = int32(8098)
+	axSandboxBrokerPortName     = "sandbox-broker"
+	axSandboxBrokerListenAddr   = ":8098"
+	axSandboxBrokerExecPath     = "/v1/sandbox/exec"
 )
 
 func axModeEnabled() bool {
@@ -81,6 +116,62 @@ func atenetRouterAddr() string {
 		return v
 	}
 	return defaultAtenetRouterAddr
+}
+
+func axAgentGatewayName() string {
+	if v := strings.TrimSpace(os.Getenv(axAgentGatewayNameEnvVar)); v != "" {
+		return v
+	}
+	return axDefaultAgentGatewayName
+}
+
+func axSandboxGatewayName() string {
+	if v := strings.TrimSpace(os.Getenv(axSandboxGatewayNameEnvVar)); v != "" {
+		return v
+	}
+	return axDefaultSandboxGatewayName
+}
+
+func axTaskCPU() string {
+	if v := strings.TrimSpace(os.Getenv(axTaskCPUEnvVar)); v != "" {
+		return v
+	}
+	return axDefaultTaskCPU
+}
+
+func axTaskMemory() string {
+	if v := strings.TrimSpace(os.Getenv(axTaskMemoryEnvVar)); v != "" {
+		return v
+	}
+	return axDefaultTaskMemory
+}
+
+func resolveAXAgentImage(agentImage string) string {
+	if v := strings.TrimSpace(os.Getenv(axAgentImageEnvVar)); v != "" {
+		return v
+	}
+	return deriveImageFromOperator(agentImage, "ax-kube-agent")
+}
+
+func resolveAXSandboxImage(agentImage string) string {
+	if v := strings.TrimSpace(os.Getenv(axSandboxImageEnvVar)); v != "" {
+		return v
+	}
+	return deriveImageFromOperator(agentImage, "ax-kube-sandbox")
+}
+
+func a2aSandboxBrokerName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-sandbox-broker"
+}
+
+func axSandboxBrokerServiceURL(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("https://%s.%s.svc:%d%s",
+		a2aSandboxBrokerName(agent), agent.Namespace, axSandboxBrokerPort, axSandboxBrokerExecPath)
+}
+
+func axKubeProxyServiceURL(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("https://%s.%s.svc:%d",
+		kubeProxyName(agent), agent.Namespace, kubeProxyPort)
 }
 
 func a2aCalloutReplicas() int32 {
@@ -117,6 +208,24 @@ func buildServiceDNSClusterTrustBundleVolume() corev1.Volume {
 	}
 }
 
+func buildServiceDNSCertificateVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: axServiceDNSCertVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(int32(0444)),
+				Sources: []corev1.VolumeProjection{{
+					PodCertificate: &corev1.PodCertificateProjection{
+						SignerName:           axServiceDNSSignerName,
+						KeyType:              axPodIdentityKeyType,
+						CredentialBundlePath: axServiceDNSCertBundlePath,
+					},
+				}},
+			},
+		},
+	}
+}
+
 func buildPodIdentityCertificateVolume() corev1.Volume {
 	return corev1.Volume{
 		Name: axPodIdentityVolumeName,
@@ -135,6 +244,86 @@ func buildPodIdentityCertificateVolume() corev1.Volume {
 	}
 }
 
+func buildA2ASandboxBrokerService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	svc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSandboxBrokerName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "sandbox-broker"),
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": a2aGatewayName(agent)},
+			Ports: []corev1.ServicePort{{
+				Name:       "https",
+				Port:       axSandboxBrokerPort,
+				TargetPort: intstr.FromInt32(axSandboxBrokerPort),
+				Protocol:   corev1.ProtocolTCP,
+			}},
+		},
+	}
+	withCommonLabels(svc, agent)
+	return svc
+}
+
+func buildA2ASandboxBrokerNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	np := &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aSandboxBrokerName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "sandbox-broker-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": a2aGatewayName(agent)},
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{labelMetadataName: ateSystemNamespace},
+					},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": ateEgressAppLabel},
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(axSandboxBrokerPort)},
+			}},
+		},
+	}
+	withCommonLabels(np, agent)
+	return np
+}
+
+func (r *PlatformAgentReconciler) reconcileAXSandboxBroker(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if !axModeEnabled() {
+		meta := metav1.ObjectMeta{Name: a2aSandboxBrokerName(agent), Namespace: agent.Namespace}
+		for _, obj := range []client.Object{
+			&corev1.Service{ObjectMeta: meta},
+			&networkingv1.NetworkPolicy{ObjectMeta: meta},
+		} {
+			if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.Client, nil); err != nil {
+				return fmt.Errorf("failed to remove AX sandbox broker %T: %w", obj, err)
+			}
+		}
+		return nil
+	}
+
+	for _, obj := range []client.Object{
+		buildA2ASandboxBrokerService(agent),
+		buildA2ASandboxBrokerNetworkPolicy(agent),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply AX sandbox broker %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+	return nil
+}
+
 func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	agentImage := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	return corev1.Container{
@@ -144,6 +333,11 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		WorkingDir:      "/",
 		Resources:       a2aRenderedBridgeDefaultResources(),
 		SecurityContext: hardenedSecurityContext(),
+		Ports: []corev1.ContainerPort{{
+			Name:          axSandboxBrokerPortName,
+			ContainerPort: axSandboxBrokerPort,
+			Protocol:      corev1.ProtocolTCP,
+		}},
 		Env: []corev1.EnvVar{
 			{Name: a2aBridgeNATSURLEnvVar, Value: a2aNATSClientURL(agent)},
 			a2aNATSCAFileEnvVar(),
@@ -159,7 +353,19 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			{Name: atenetRouterAddrEnvVar, Value: atenetRouterAddr()},
 			{Name: "AX_ATESPACE", Value: axDefaultAtespace},
 			{Name: "AX_DEFAULT_TASK", Value: agent.Name},
-			{Name: "AX_GATEWAY_NAME", Value: axDefaultGatewayName},
+			{Name: "PLATFORM_AGENT_NAME", Value: agent.Name},
+			{Name: axAgentGatewayNameEnvVar, Value: axAgentGatewayName()},
+			{Name: axSandboxGatewayNameEnvVar, Value: axSandboxGatewayName()},
+			{Name: axAgentImageEnvVar, Value: resolveAXAgentImage(agentImage)},
+			{Name: axSandboxImageEnvVar, Value: resolveAXSandboxImage(agentImage)},
+			{Name: axTaskCPUEnvVar, Value: axTaskCPU()},
+			{Name: axTaskMemoryEnvVar, Value: axTaskMemory()},
+			{Name: "AX_SANDBOX_BROKER_LISTEN", Value: axSandboxBrokerListenAddr},
+			{Name: "AX_SANDBOX_BROKER_TLS_CERT_FILE", Value: axServiceDNSCertFile},
+			{Name: "AX_SANDBOX_BROKER_TLS_KEY_FILE", Value: axServiceDNSCertFile},
+			{Name: "AX_SANDBOX_BROKER_URL", Value: axSandboxBrokerServiceURL(agent)},
+			{Name: "AX_OIDC_ISSUER_URL", Value: axOIDCIssuerURL},
+			{Name: "AX_OIDC_CA_FILE", Value: axOIDCCAFile},
 			{Name: "ATENET_CERT_FILE", Value: axPodIdentityCertFile},
 			{Name: "ATENET_CA_FILE", Value: axOIDCCAFile},
 			{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"},
@@ -171,6 +377,7 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		VolumeMounts: []corev1.VolumeMount{
 			a2aNATSCABundleMount(),
 			{Name: axServiceDNSCAName, MountPath: axServiceDNSCAMountPath, ReadOnly: true},
+			{Name: axServiceDNSCertVolumeName, MountPath: axServiceDNSCertMountPath, ReadOnly: true},
 			{Name: axPodIdentityVolumeName, MountPath: axPodIdentityMountPath, ReadOnly: true},
 		},
 	}

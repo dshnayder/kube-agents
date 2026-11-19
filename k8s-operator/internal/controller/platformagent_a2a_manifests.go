@@ -6884,6 +6884,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		dep.Spec.Template.Spec.Containers = append(dep.Spec.Template.Spec.Containers, buildAXGatewayBridgeContainer(agent))
 		dep.Spec.Template.Spec.Volumes = append(dep.Spec.Template.Spec.Volumes,
 			buildServiceDNSClusterTrustBundleVolume(),
+			buildServiceDNSCertificateVolume(),
 			buildPodIdentityCertificateVolume(),
 		)
 	}
@@ -7087,6 +7088,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aMCPDoorEnabled() {
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
+	}
+	if axModeEnabled() {
+		fences = append(fences, buildA2ASandboxBrokerNetworkPolicy(agent))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -7752,6 +7756,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
+		return state, err
+	}
+	if err := r.reconcileAXSandboxBroker(ctx, agent); err != nil {
 		return state, err
 	}
 

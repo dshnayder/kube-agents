@@ -4903,6 +4903,8 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 			corev1.EnvVar{Name: credentialProxyOIDCCAFileEnv, Value: axOIDCCAFile},
 			corev1.EnvVar{Name: credentialProxyOIDCRequiredSubPrefixEnv, Value: axOIDCRequiredSubPrefix},
 			corev1.EnvVar{Name: credentialProxyOIDCUIDClaimEnv, Value: axOIDCUIDClaim},
+			corev1.EnvVar{Name: credentialProxyTLSPortEnv, Value: strconv.Itoa(int(credentialProxyTLSPort))},
+			corev1.EnvVar{Name: credentialProxyTLSCertFileEnv, Value: axServiceDNSCertFile},
 		)
 	}
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
@@ -5104,6 +5106,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyOIDCCAFileEnv,
 		credentialProxyOIDCRequiredSubPrefixEnv,
 		credentialProxyOIDCUIDClaimEnv,
+		credentialProxyTLSPortEnv,
+		credentialProxyTLSCertFileEnv,
 		// The dispatcher's seed path, which no broker-side container
 		// reads; reserved so a CR can't hand one a seed file of its choosing.
 		a2aTaskSigningSeedFileEnvVar,

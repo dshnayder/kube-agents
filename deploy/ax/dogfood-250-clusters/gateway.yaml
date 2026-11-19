@@ -15,13 +15,9 @@
 apiVersion: ax.io/v1alpha1
 kind: Gateway
 metadata:
-  name: kube-agents-cluster-gw
+  name: kube-agents-agent-gw
   atespace: default
 spec:
-  kubernetes:
-    clusters:
-      - in-cluster
-    defaultCluster: in-cluster
   egress:
     - http:
         hostnames:
@@ -37,13 +33,51 @@ spec:
         ports:
           numbers:
             - 8888
-    - http:
+    - https:
         hostnames:
-          - platform-agent-credential-proxy.kubeagents-system.svc.cluster.local
-          - platform-agent-credential-proxy.kubeagents-system.svc
+          - platform-agent-a2a-sandbox-broker.kubeagents-system.svc
+          - platform-agent-a2a-sandbox-broker.kubeagents-system.svc.cluster.local
         ports:
           numbers:
-            - 8765
+            - 8098
+        effects:
+          replaceHeaders:
+            - header: Authorization
+              prefix: "Bearer "
+              actorJwt:
+                audiences:
+                  - kubeagents-a2a-sandbox-broker
+                expirationSeconds: 900
+---
+apiVersion: ax.io/v1alpha1
+kind: Gateway
+metadata:
+  name: kube-agents-sandbox-gw
+  atespace: default
+spec:
+  egress:
+    - https:
+        hostnames:
+          - platform-agent-kube-proxy.kubeagents-system.svc
+          - platform-agent-kube-proxy.kubeagents-system.svc.cluster.local
+        ports:
+          numbers:
+            - 8443
+        effects:
+          replaceHeaders:
+            - header: Authorization
+              prefix: "Bearer "
+              actorJwt:
+                audiences:
+                  - https://platform-agent-kube-proxy.kubeagents-system.svc:8443
+                expirationSeconds: 900
+    - https:
+        hostnames:
+          - platform-agent-credential-proxy.kubeagents-system.svc
+          - platform-agent-credential-proxy.kubeagents-system.svc.cluster.local
+        ports:
+          numbers:
+            - 8767
         effects:
           replaceHeaders:
             - header: Authorization

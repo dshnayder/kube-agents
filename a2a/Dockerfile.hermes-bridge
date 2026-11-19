@@ -33,7 +33,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -o /out/hermes-bridge ./cmd/hermes-bridge
+RUN CGO_ENABLED=0 go build -trimpath -o /out/hermes-bridge ./cmd/hermes-bridge && \
+    CGO_ENABLED=0 go build -trimpath -o /out/ax-sandbox-ssh-proxy ./cmd/ax-sandbox-ssh-proxy
 
 # Everything else -- the hermes CLI at /opt/hermes/.venv/bin, the agent
 # entrypoint, the runtime user -- is the platform-agent image's. The ENTRYPOINT
@@ -43,6 +44,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/hermes-bridge ./cmd/hermes-bridge
 # container (deploy/shared/docker-entrypoint.sh, step 1.5).
 FROM ${PLATFORM_AGENT_IMAGE}
 COPY --from=build /out/hermes-bridge /usr/local/bin/hermes-bridge
+COPY --from=build /out/ax-sandbox-ssh-proxy /usr/local/bin/ax-sandbox-ssh-proxy
 # The platform-agent image's own runtime user, restated: the base already ends
 # on it, and the pod imposes the same uid, but a Dockerfile scanner reads this
 # file alone.

@@ -6091,6 +6091,8 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			map[string]string{"app": agent.Name + "-gateway"},
 			shellSandboxSelector(agent),
 		)
+	} else {
+		selectors = append(selectors, kubeProxySelector(agent))
 	}
 	selectors = append(selectors, map[string]string{"app": credentialProxyName(agent)})
 
