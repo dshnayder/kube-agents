@@ -10,6 +10,7 @@ import os
 from dataclasses import replace
 import queue
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -37,6 +38,7 @@ import credential_proxy
 import credential_proxy_client
 import feedback_broker
 import gke_endpoint
+import logging_reads
 import no_live_kubectl
 import providers
 import scope_exclude
@@ -110,6 +112,27 @@ _STATE_DB_FD_SUFFIXES = ("state.db", "state.db-wal", "state.db-shm")
 
 # The process's own descriptor table, one symlink per open descriptor.
 _SELF_FD_DIR = Path("/proc/self/fd")
+
+
+def _a_half_closed_peer_reports_a_hang_up() -> bool:
+    """Whether this kernel reports POLLHUP on a socket whose peer shut only its
+    writing half. Linux does not; macOS does."""
+    ours, theirs = socket.socketpair()
+    try:
+        theirs.shutdown(socket.SHUT_WR)
+        poller = select.poll()
+        poller.register(ours, select.POLLIN)
+        return any(events & select.POLLHUP for _, events in poller.poll(0))
+    finally:
+        ours.close()
+        theirs.close()
+
+
+_NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER = (
+    "needs a kernel that reports no POLLHUP for a peer that shut only its writing half, as "
+    "Linux does: the broker reads POLLHUP as a caller that is gone, and the test shows that "
+    "the command of a half-closed caller runs to its end"
+)
 
 # A state.db busy timeout short enough to wait out inside a test, in seconds.
 # The lookup reads it from the module at call time, so patching it reaches the
@@ -1323,6 +1346,16 @@ class GitHardeningTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.marker = Path(self.temp_dir.name) / "EXECUTED"
+        # The push guard reads the remote's default branch from the files ref format, and
+        # refuses a push from a clone in another format (#6593). A git whose default is
+        # reftable would make each repository of these tests in that format. The variable
+        # wins over the host's config, and an older git ignores it; a test of another
+        # format names the format in its command. git has had two names for it.
+        ref_format = mock.patch.dict(
+            os.environ, {"GIT_DEFAULT_REF_FORMAT": "files", "GIT_DEFAULT_REF_STORAGE_FORMAT": "files"}
+        )
+        ref_format.start()
+        self.addCleanup(ref_format.stop)
         self.payload = Path(self.temp_dir.name) / "payload.sh"
         self.payload.write_text(
             f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
@@ -1594,6 +1627,8 @@ class GitHardeningTest(unittest.TestCase):
             "gpg.ssh.defaultKeyCommand": "false",
             "gpg.x509.program": "false",
             "help.autocorrect": "0",
+            # A push stays in the repository that the command names.
+            "push.recurseSubmodules": "no",
         }
         for key, value in expected.items():
             result = executor.execute(
@@ -1931,6 +1966,228 @@ class GitHardeningTest(unittest.TestCase):
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
+
+    # -- a push that also pushes the submodules -------------------------------
+
+    SUBMODULE_PUSH_REFUSAL = (
+        "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+        "inside each submodule too, and the broker judges only the repository that the command names."
+    )
+
+    def superproject_with_a_submodule(self, name):
+        """With the host's git: a clone of one remote, with a submodule of a second remote.
+        Each remote has the one branch `release-trunk`, and both work trees are on that
+        branch, as a push into a submodule needs. The submodule has one commit that its
+        remote does not have, and the superproject records it. No git variable and no
+        config file of the host is read. Returns the superproject, a function that says if
+        the submodule's remote got that commit, and the environment of the git calls."""
+        base = Path(self.temp_dir.name) / name
+        base.mkdir()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_DEFAULT_REF_FORMAT="files")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def must(*arguments):
+            done = subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}{done.stdout}")
+            return done.stdout.strip()
+
+        remotes = {}
+        for remote_name in ("superproject", "module"):
+            remotes[remote_name] = base / f"{remote_name}.git"
+            seed = base / f"{remote_name}-seed"
+            must("init", "--quiet", "--bare", "-b", "release-trunk", str(remotes[remote_name]))
+            must("clone", "--quiet", str(remotes[remote_name]), str(seed))
+            (seed / "README.md").write_text(f"{remote_name}\n", encoding="utf-8")
+            must("-C", str(seed), "add", ".")
+            must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+            must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        superproject = base / "clone"
+        must("clone", "--quiet", str(remotes["superproject"]), str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        must("-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet", str(remotes["module"]), "module")
+        module = superproject / "module"
+        self.assertTrue((module / ".git").is_file())
+        (module / "change.txt").write_text("a change in the submodule\n", encoding="utf-8")
+        must("-C", str(module), "add", ".")
+        must("-C", str(module), *identity, "commit", "--quiet", "-m", "a change in the submodule")
+        must("-C", str(superproject), "add", ".")
+        must("-C", str(superproject), *identity, "commit", "--quiet", "-m", "add the module")
+        made = must("-C", str(module), "rev-parse", "HEAD")
+        self.assertNotEqual(made, must("-C", str(remotes["module"]), "rev-parse", "release-trunk"))
+
+        def module_remote_got_the_commit():
+            return made == must("-C", str(remotes["module"]), "rev-parse", "release-trunk")
+
+        return superproject, module_remote_got_the_commit, environment
+
+    def forced_config_layer(self, executor, without=None):
+        """The executor's forced config, as the environment layer that git reads; `without`
+        leaves one key out, for the control of a pin."""
+        environment = executor.environment
+        count = int(environment["GIT_CONFIG_COUNT"])
+        pairs = tuple((environment[f"GIT_CONFIG_KEY_{index}"], environment[f"GIT_CONFIG_VALUE_{index}"]) for index in range(count))
+        kept = tuple(pair for pair in pairs if pair[0] != without)
+        if without is not None:
+            self.assertEqual(count - 1, len(kept), f"{without} is not in the forced config")
+        return credential_proxy._git_forced_config_environment(kept)
+
+    def test_a_push_does_not_push_the_submodules_whatever_the_repository_config_says(self):
+        # `push.recurseSubmodules = on-demand` (or `only`, the same class) and
+        # `submodule.recurse = true` each make a plain `git push` also push inside each
+        # submodule, to that submodule's own remote. The agent can write both in `.git/config`,
+        # the argv has no flag for the push guard to see, and the guard judges only the
+        # repository that the command names. The control shows that the push goes into the
+        # submodule without the pin, so the first half is not true of a fixture that could
+        # never push there.
+        executor = self.executor()
+        for number, setting in enumerate(("[push]\n\trecurseSubmodules = on-demand\n", "[submodule]\n\trecurse = true\n")):
+            for pinned in (False, True):
+                with self.subTest(config=setting.split()[0], pinned=pinned):
+                    superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(
+                        f"config-{number}-{'pinned' if pinned else 'control'}"
+                    )
+                    self.append_repository_config(superproject, "\n" + setting)
+                    layer = self.forced_config_layer(executor, without=None if pinned else "push.recurseSubmodules")
+                    pushed = subprocess.run(
+                        ["git", "push", "origin", "HEAD:release-trunk"],
+                        cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(0, pushed.returncode, pushed.stderr)
+                    self.assertEqual(not pinned, module_remote_got_the_commit(), pushed.stderr)
+
+    def test_a_push_that_asks_git_to_push_the_submodules_is_refused(self):
+        # The flag outranks the forced config, so the pin above does not hold it: the control
+        # is the refusal. The test below runs the spellings that push into a submodule with git.
+        from credential_proxy import GIT_PUSH_RECURSE_SUBMODULES_REFUSAL, git_push_violation
+
+        self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, GIT_PUSH_RECURSE_SUBMODULES_REFUSAL)
+        for flags in (
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules=only"],
+            ["--recurse-submodules=check"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+            # The rule is each value but the word `no`: a value that git reads as on-demand
+            # under another name, values that git reads as off, and values that git refuses.
+            ["--recurse-submodules=only-is-on-demand"],
+            ["--recurse-submodules=false"],
+            ["--recurse-submodules=No"],
+            ["--recurse-submodules=yes"],
+            ["--recurse-submodules=none"],
+            ["--recurse-submodules="],
+            # The last one wins in git; the guard does not rely on the order.
+            ["--recurse-submodules=no", "--recurse-submodules=on-demand"],
+            ["--recurse-submodules=on-demand", "--recurse-submodules=no"],
+        ):
+            for argv in (
+                ["git", "push", *flags, "origin", "HEAD:feature"],
+                ["git", "push", "origin", "HEAD:feature", *flags],
+                ["git", "-C", "clone", "push", *flags, "origin", "HEAD:feature"],
+            ):
+                with self.subTest(argv=argv[1:]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_argument_violation(argv))
+        # The flag as the last word has no value: not `no`.
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature", "--recurse-submodules"])
+        )
+        # The flag in a push of tags only (the one push with no refspec that the guard lets
+        # pass), after an option that takes the next word, and as a prefix that names two
+        # options (an error in git).
+        for argv in (
+            ["git", "push", "--tags", "--recurse-submodules=on-demand", "origin"],
+            ["git", "push", "-o", "x", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--repo", "origin", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--rec=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--re=on-demand", "origin", "HEAD:feature"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+        # A prefix that names two options with the value `no` passes this rule; git itself
+        # stops on the prefix.
+        self.assertIsNone(git_push_violation(["git", "push", "--re=no", "origin", "HEAD:feature"]))
+        # Pass-through: the value `no`, the negated flag, no flag, and a command that is not a push.
+        for argv in (
+            ["git", "push", "--recurse-submodules=no", "origin", "HEAD:feature"],
+            ["git", "push", "--recurse-submodules", "no", "origin", "HEAD:feature"],
+            ["git", "push", "--no-recurse-submodules", "origin", "HEAD:feature"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "fetch", "--recurse-submodules=on-demand", "origin"],
+            ["git", "submodule", "update", "--init"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertIsNone(git_push_violation(argv))
+                self.assertIsNone(git_argument_violation(argv))
+        # After `--` the word is a refspec, and another rule judges it.
+        self.assertNotEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "origin", "--", "--recurse-submodules=on-demand"]),
+        )
+        # The refusals that come before it in the argv keep their text.
+        self.assertIn("`git push --all` is refused", git_push_violation(["git", "push", "--all", "--recurse-submodules=on-demand"]) or "")
+        # Through the executor's own check, with the lease switch on and off, and through an alias.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(repository, "\n[alias]\n\tdeep = push --recurse-submodules=on-demand\n")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv in (
+                ["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+                ["git", "deep", "origin", "HEAD:feature"],
+            ):
+                with self.subTest(lease=lease, argv=argv[1]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, executor.git_lease_violation(argv, cwd=str(repository)))
+        # In a clone that the guard refuses for its ref format too, the flag's refusal answers first.
+        self.append_repository_config(repository, "\n[extensions]\n\trefStorage = reftable\n")
+        self.assertIn("reftable", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repository) or "")
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"], cwd=repository),
+        )
+
+    def test_git_takes_each_spelling_of_the_submodule_push_flag_that_is_refused(self):
+        # With the host's git and the executor's forced config: the flag with the value
+        # `on-demand` or `only`, in each spelling of the name and of the value's place, pushes
+        # inside the submodule. So the pin does not hold the flag, and git reads these
+        # spellings as the guard does. `check` is in the list of the test above and not here:
+        # it stops the push and pushes nothing into a submodule.
+        executor = self.executor()
+        layer = self.forced_config_layer(executor)
+        self.assertIn("push.recurseSubmodules", layer.values())
+        for number, flags in enumerate((
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+        )):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"flag-{number}")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertTrue(module_remote_got_the_commit(), pushed.stderr)
+                self.assertEqual(
+                    self.SUBMODULE_PUSH_REFUSAL,
+                    git_argument_violation(["git", "push", *flags, "origin", "HEAD:release-trunk"]),
+                )
+        # The value `no` and the negated flag keep the push out of the submodule, also where
+        # the repository config asks for it.
+        for number, flags in enumerate((["--recurse-submodules=no"], ["--no-recurse-submodules"])):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"off-{number}")
+                self.append_repository_config(superproject, "\n[push]\n\trecurseSubmodules = on-demand\n")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject,
+                    env={**environment, **self.forced_config_layer(executor, without="push.recurseSubmodules")},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertFalse(module_remote_got_the_commit(), pushed.stderr)
 
     def test_the_help_viewer_cannot_run_a_command(self):
         # `git help -m <page>` runs `man.<man.viewer>.cmd` through
@@ -2418,7 +2675,13 @@ class GitHardeningTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(seed_work), "push", "origin", "release-trunk"], check=True, capture_output=True)
 
         clone_dir = Path(executor.workspace_dir) / "clone_trunk"
-        subprocess.run(["git", "clone", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        # The files ref format: the broker reads refs/remotes/origin/HEAD as a file, and a
+        # git whose default is reftable keeps no such file (the broker refuses a push there: #6593).
+        # The variable wins over the host's config and environment; an older git ignores it.
+        subprocess.run(
+            ["git", "clone", str(bare_remote), str(clone_dir)],
+            check=True, capture_output=True, env={**os.environ, "GIT_DEFAULT_REF_FORMAT": "files"},
+        )
         # Push to release-trunk is detected and refused as a protected rollout/base branch even without lease checks
         executor.require_git_lease = False
         v = executor.git_lease_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=str(clone_dir))
@@ -2659,6 +2922,253 @@ class GitHardeningTest(unittest.TestCase):
             self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
 
 
+    # -- the ref format of the clone (#6593) ---------------------------------
+
+    def clone_folder(self, name, config_text, default_branch=None):
+        """A clone folder written by hand, so no test here depends on the host's git:
+        `.git/config` with `config_text`, and for `default_branch` the file that the
+        files ref format keeps for the remote's HEAD."""
+        repo = Path(self.temp_dir.name) / name
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_text(config_text, encoding="utf-8")
+        if default_branch is not None:
+            head = repo / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+            head.parent.mkdir(parents=True)
+            head.write_text(f"ref: refs/remotes/origin/{default_branch}\n", encoding="utf-8")
+        return repo
+
+    FILES_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+    REFTABLE_CONFIG = "[extensions]\n\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n"
+
+    def test_the_ref_format_of_a_clone_is_read_from_its_own_config_file(self):
+        from credential_proxy import _repo_ref_format
+
+        cases = {
+            "no extensions section": (self.FILES_CONFIG, "files"),
+            "the key as git writes it": (self.REFTABLE_CONFIG, "reftable"),
+            "the key in another letter case": ("[Extensions]\n\tRefStorage = Reftable\n", "reftable"),
+            "the key on the line of its section": ("[extensions] refStorage = reftable\n", "reftable"),
+            "files written out": ("[extensions]\n\trefStorage = files\n" + self.FILES_CONFIG, "files"),
+            "a value with a comment after it": ("[extensions]\n\trefStorage = reftable ; the format\n", "reftable"),
+            "a value with the other comment character after it": ("[extensions]\n\trefStorage = reftable # the format\n", "reftable"),
+            "another plain name": ("[extensions]\n\trefStorage = packed-v2\n", "packed-v2"),
+            "a value in quotes": ('[extensions]\n\trefStorage = "reftable"\n', "reftable"),
+            "the last value of two": ("[extensions]\n\trefStorage = files\n\trefStorage = reftable\n", "reftable"),
+            "the key in a comment": ("[extensions]\n\t# refStorage = reftable\n\t; refStorage = reftable\n", "files"),
+            "the key in another section": ("[core]\n\trefStorage = reftable\n", "files"),
+            "the key in a subsection": ('[extensions "other"]\n\trefStorage = reftable\n', "files"),
+            "another key of the section": ("[extensions]\n\tobjectFormat = sha256\n", "files"),
+            "an empty file": ("", "files"),
+        }
+        for number, (name, (text, expected)) in enumerate(cases.items()):
+            with self.subTest(config=name):
+                self.assertEqual(expected, _repo_ref_format(self.clone_folder(f"format-{number}", text)))
+
+    def test_a_ref_format_name_that_is_not_a_plain_word_is_shown_as_unknown(self):
+        """The name goes into the refusal text, and the agent can write the config file."""
+        from credential_proxy import GIT_REF_FORMAT_UNKNOWN, _repo_ref_format
+
+        for number, value in enumerate(("ref table", "x" * 40, "reftable\\n`id`", "$(id)", "réftable", "")):
+            with self.subTest(value=value):
+                repo = self.clone_folder(f"odd-{number}", f"[extensions]\n\trefStorage = {value}\n")
+                self.assertEqual(GIT_REF_FORMAT_UNKNOWN, _repo_ref_format(repo))
+
+    def test_a_config_file_past_the_size_limit_is_not_read_and_its_format_is_unknown(self):
+        """git reads a config of any size. The broker does not, and it does not take
+        the format of such a clone for the files format."""
+        from credential_proxy import GIT_CONFIG_MAX_BYTES, GIT_REF_FORMAT_UNKNOWN, _repo_ref_format, git_push_violation
+
+        filler = "# filler\n" * (GIT_CONFIG_MAX_BYTES // len("# filler\n") + 1)
+        for name, config in (("large-reftable", self.REFTABLE_CONFIG + filler), ("large-files", self.FILES_CONFIG + filler)):
+            with self.subTest(config=name):
+                repo = self.clone_folder(name, config)
+                self.assertEqual(GIT_REF_FORMAT_UNKNOWN, _repo_ref_format(repo))
+                self.assertIn(
+                    "'unknown' ref format",
+                    git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repo) or "",
+                )
+        at_the_limit = self.FILES_CONFIG + "#" * (GIT_CONFIG_MAX_BYTES - len(self.FILES_CONFIG))
+        self.assertEqual("files", _repo_ref_format(self.clone_folder("at-the-limit", at_the_limit)))
+
+    def test_the_config_file_is_read_with_a_limit_whatever_its_size_reads_as(self):
+        """The reader does not trust a size that it asks before the read. The stand-in is a
+        file with no end, as a link to a file whose size reads as 0 can be: the reader asks
+        for one byte more than the limit, one time, and takes the clone for no known format."""
+        import credential_proxy
+
+        asked = []
+
+        class NoEnd:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    raise AssertionError("a read with no limit")
+                asked.append(size)
+                return b"#" * size
+
+        repo = self.clone_folder("no-end", self.FILES_CONFIG)
+        with mock.patch.object(credential_proxy, "open", lambda *_a, **_k: NoEnd(), create=True):
+            self.assertEqual(credential_proxy.GIT_REF_FORMAT_UNKNOWN, credential_proxy._repo_ref_format(repo))
+        self.assertEqual([credential_proxy.GIT_CONFIG_MAX_BYTES + 1], asked)
+
+    def test_a_config_file_that_is_absent_or_cannot_be_opened_takes_the_files_path(self):
+        from credential_proxy import _repo_ref_format
+
+        no_config = Path(self.temp_dir.name) / "no-config"
+        (no_config / ".git").mkdir(parents=True)
+        self.assertEqual("files", _repo_ref_format(no_config))
+        closed = self.clone_folder("closed", self.REFTABLE_CONFIG)
+        config = closed / ".git" / "config"
+        config.chmod(0)
+        self.addCleanup(config.chmod, 0o600)
+        if os.access(config, os.R_OK):
+            self.skipTest("this user can read a file with no permission bits")
+        self.assertEqual("files", _repo_ref_format(closed))
+
+    def test_a_git_file_that_points_to_the_git_directory_is_not_followed(self):
+        """A known limit, held so that a change of it is a decision: a linked worktree, a
+        submodule and a clone with a separate git directory have a `.git` file. The reader
+        does not follow it, so the format reads as `files` and the push is judged as before."""
+        from credential_proxy import _repo_ref_format, git_push_violation
+
+        main = self.clone_folder("main-clone", self.REFTABLE_CONFIG)
+        linked = Path(self.temp_dir.name) / "linked-worktree"
+        linked.mkdir()
+        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        self.assertEqual("files", _repo_ref_format(linked))
+        self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
+
+    def test_a_byte_that_is_not_utf8_does_not_hide_the_format(self):
+        from credential_proxy import _repo_ref_format
+
+        repo = self.clone_folder("bytes", "")
+        (repo / ".git" / "config").write_bytes(b"[user]\n\tname = \xff\xfe\n" + self.REFTABLE_CONFIG.encode())
+        self.assertEqual("reftable", _repo_ref_format(repo))
+
+    def test_the_config_of_a_bare_layout_is_read_only_when_the_clone_has_no_git_folder(self):
+        from credential_proxy import _repo_ref_format
+
+        bare = Path(self.temp_dir.name) / "bare.git"
+        bare.mkdir()
+        (bare / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        self.assertEqual("reftable", _repo_ref_format(bare))
+        # A file named `config` in the work tree of a clone is not the clone's config.
+        clone = self.clone_folder("with-a-config-file", self.FILES_CONFIG)
+        (clone / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        self.assertEqual("files", _repo_ref_format(clone))
+
+    def test_a_push_from_a_clone_that_does_not_use_the_files_ref_format_is_refused_by_name(self):
+        """The guard reads the remote's default branch from a file that only the files
+        ref format has. In another format it cannot tell a push to that branch from
+        another push, so each push is refused, with the format in the reason."""
+        from credential_proxy import git_push_violation
+
+        repo = self.clone_folder("reftable", self.REFTABLE_CONFIG)
+        for target in ("feature", "release-trunk", "platform-agent/work"):
+            with self.subTest(target=target):
+                violation = git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=repo)
+                self.assertEqual(
+                    "`git push` from a clone that uses the 'reftable' ref format is refused: the broker reads "
+                    "the remote's default branch from the files ref format only, so it cannot tell a push to "
+                    "that branch from another.",
+                    violation,
+                )
+        # From a folder inside the clone too.
+        inside = repo / "manifests"
+        inside.mkdir()
+        self.assertIn("'reftable' ref format", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=inside) or "")
+        # A command that is not a push is not this guard's.
+        self.assertIsNone(git_push_violation(["git", "status"], cwd=repo))
+        # Each format that is not the files format, by its name; a name that is not a plain word as `unknown`.
+        for number, (value, shown) in enumerate((("packed-v2", "packed-v2"), ("ref table", "unknown"))):
+            with self.subTest(ref_format=value):
+                other = self.clone_folder(f"other-{number}", f"[extensions]\n\trefStorage = {value}\n")
+                self.assertIn(
+                    f"'{shown}' ref format",
+                    git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=other) or "",
+                )
+
+    def test_the_executor_refuses_a_push_from_a_reftable_clone_that_the_command_names(self):
+        """Through the executor's own check, with the clone named by `-C` and by the working directory."""
+        executor = self.executor()
+        executor.require_git_lease = False
+        repo = Path(executor.workspace_dir) / "reftable-clone"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        for argv, cwd in (
+            (["git", "push", "origin", "HEAD:feature"], str(repo)),
+            (["git", "-C", str(repo), "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+        ):
+            with self.subTest(argv=argv[1]):
+                self.assertIn("'reftable' ref format", executor.git_lease_violation(argv, cwd=cwd) or "")
+
+    def test_a_push_from_a_clone_with_the_files_ref_format_is_judged_as_before(self):
+        from credential_proxy import git_push_violation
+
+        written_out = "[extensions]\n\trefStorage = files\n" + self.FILES_CONFIG
+        for name, config in (("no-key", self.FILES_CONFIG), ("files-written-out", written_out)):
+            with self.subTest(config=name):
+                repo = self.clone_folder(name, config, default_branch="release-trunk")
+                self.assertIn(
+                    "protected branch 'release-trunk'",
+                    git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=repo) or "",
+                )
+                self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repo))
+
+    def test_a_clone_that_git_makes_with_each_ref_format(self):
+        """With the host's git and none of the host's git settings: no `GIT_*` variable, no
+        global config and no system config. A default ref format or a default remote name
+        on the host then changes nothing here."""
+        from credential_proxy import _repo_ref_format, git_push_violation
+
+        git_env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        git_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def git(*args, check=True):
+            return subprocess.run(["git", *args], check=check, capture_output=True, text=True, env=git_env)
+
+        base = Path(self.temp_dir.name)
+        remote = base / "remote.git"
+        git("init", "--quiet", "--bare", "-b", "release-trunk", str(remote))
+        seed = base / "seed"
+        git("clone", "--quiet", str(remote), str(seed))
+        (seed / "README.md").write_text("hello\n", encoding="utf-8")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+        git("-C", str(seed), "add", ".")
+        git("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+        git("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        for ref_format in ("files", "reftable"):
+            with self.subTest(ref_format=ref_format):
+                clone = base / f"clone-{ref_format}"
+                # git has had two names for the option.
+                for option in ("--ref-format", "--ref-storage-format"):
+                    made = git("clone", "--quiet", f"{option}={ref_format}", str(remote), str(clone), check=False)
+                    if made.returncode == 0 or "unknown option" not in made.stderr:
+                        break
+                if made.returncode != 0 and "unknown option" in made.stderr and ref_format == "files":
+                    # A git with no option for the format makes the files format only, so
+                    # the control row still runs there.
+                    made = git("clone", "--quiet", str(remote), str(clone), check=False)
+                if made.returncode != 0 and ("unknown option" in made.stderr or "ref storage format" in made.stderr):
+                    self.skipTest(f"this git cannot make a clone in the {ref_format} ref format")
+                self.assertEqual(0, made.returncode, made.stderr)
+                self.assertEqual(ref_format, _repo_ref_format(clone))
+                to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
+                to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
+                if ref_format == "files":
+                    self.assertIn("protected branch 'release-trunk'", to_default)
+                    self.assertIsNone(to_work)
+                else:
+                    self.assertIn("'reftable' ref format", to_default)
+                    self.assertIn("'reftable' ref format", to_work or "")
+
+
 class GitArgumentRefusalTest(unittest.TestCase):
     """The backup check: argv that would override the environment.
 
@@ -2837,10 +3347,12 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("kubernetes.read-only", body["rule"])
         self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
         self.assertFalse(body["local_render"])
+        self.assertIs(True, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
         self.assertEqual(403, status)
         self.assertEqual(["create"], body["verb"])
         self.assertTrue(body["local_render"])
+        self.assertIs(False, body["write_refusal"])
         status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
         self.assertEqual(["rollout", "restart"], body["verb"])
         status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
@@ -3105,7 +3617,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         body = json.dumps({"repository": "acme/fleet", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
 
-        def wait_out_the_queue():
+        def wait_out_the_queue(*_args):
             time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
             raise credential_proxy.CommandSlotUnavailable("every slot is taken")
 
@@ -5501,7 +6013,7 @@ class CommandExecutorTest(unittest.TestCase):
         # bytes captured, so it never exceeds the cap.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=4096),
-            body="head -c 100000 /dev/zero | tr '\\0' '\\377'",
+            body="head -c 100000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -5544,7 +6056,9 @@ class CommandExecutorTest(unittest.TestCase):
         # decoded text's UTF-8 size, not only on the bytes captured.
         executor = self.fake_kubectl(
             self.executor(max_output_bytes=64 << 10),
-            body="head -c 200000 /dev/zero | tr '\\0' '\\377'",
+            # LC_ALL=C: in a UTF-8 locale the tr of macOS writes \377 as the two bytes of
+            # U+00FF, which is valid UTF-8.
+            body="head -c 200000 /dev/zero | LC_ALL=C tr '\\0' '\\377'",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -6036,10 +6550,15 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertEqual("done\n", result.stdout)
 
+    # Never on Linux, where the broker runs: there the test must run.
+    @unittest.skipIf(
+        sys.platform != "linux" and _a_half_closed_peer_reports_a_hang_up(),
+        _NEEDS_NO_HANG_UP_FOR_A_HALF_CLOSED_PEER,
+    )
     def test_a_half_closed_caller_is_not_taken_for_a_hang_up(self):
         # A peer that shut its writing half after the request is still there,
         # waiting for the response; it reads as EOF, and EOF alone must not
-        # end its command. Only a peer that closed for good reports POLLHUP.
+        # end its command. On Linux only a peer that closed for good reports POLLHUP.
         executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
         ours, theirs = socket.socketpair()
         self.addCleanup(ours.close)
@@ -7794,6 +8313,22 @@ class CurrentContextTest(unittest.TestCase):
             ("empty document", ""),
             ("syntax error", "current-context: [unterminated\n"),
             ("several documents", "current-context: gke_a_l_c\n---\ncurrent-context: gke_b_l_c\n"),
+        ):
+            with self.subTest(label):
+                self.assertIsNone(read_current_context(document))
+
+    def test_returns_none_for_text_that_the_yaml_reader_refuses_with_a_plain_exception(self):
+        # PyYAML builds a tagged or dated scalar with int(), datetime, a lookup
+        # table and a pattern match. For text that does not fit, those raise a
+        # ValueError, a KeyError, an IndexError or an AttributeError, and not a
+        # yaml.YAMLError.
+        for label, document in (
+            ("a date that does not exist (ValueError)", "current-context: gke_p_l_c\na: 2001-13-45\n"),
+            ("an int tag on text (ValueError)", "current-context: gke_p_l_c\na: !!int x\n"),
+            ("a bool tag on text (KeyError)", "current-context: gke_p_l_c\na: !!bool x\n"),
+            ("an int tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!int ''\n"),
+            ("a float tag on nothing (IndexError)", "current-context: gke_p_l_c\na: !!float ''\n"),
+            ("a timestamp tag on text (AttributeError)", "current-context: gke_p_l_c\na: !!timestamp x\n"),
         ):
             with self.subTest(label):
                 self.assertIsNone(read_current_context(document))
@@ -10246,7 +10781,9 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
-                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining"},
+                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
+                     # Refused before the route ran anything (#6247).
+                     credential_proxy.BUSY_BEFORE_ADMISSION_KEY: True},
                     captured["payload"],
                 )
                 handler.metrics.record_refusal.assert_called_once_with(
@@ -10713,7 +11250,10 @@ class SlackRelayTest(unittest.TestCase):
         retried = relay.pull(timeout_seconds=1)
         self.assertEqual("events_api", retried["type"])
 
-    def test_nack_does_not_block_or_lose_receipt_when_queue_is_full(self):
+    def test_nack_against_a_full_queue_drops_the_event_and_spends_the_receipt(self):
+        # Nothing retries a failed nack, so an event kept back here would
+        # never be delivered and the receipt table would grow; the event is
+        # dropped, with a warning, and the queue's own entries are untouched.
         relay = self.relay()
         relay._events = queue.Queue(maxsize=1)
         relay._receipts["receipt"] = {
@@ -10722,11 +11262,14 @@ class SlackRelayTest(unittest.TestCase):
         }
         relay._events.put_nowait({"type": "existing", "payload": {}})
 
-        with self.assertLogs("credential-proxy", level="WARNING"):
-            self.assertFalse(relay.settle("receipt", acknowledge=False))
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
 
-        self.assertIn("receipt", relay._receipts)
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertNotIn("receipt", relay._receipts)
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
         self.assertEqual("existing", relay._events.get_nowait()["type"])
+        self.assertTrue(relay._events.empty())
 
     def test_incoming_event_is_acknowledged_and_dropped_when_queue_is_full(self):
         relay = self.relay()
@@ -10912,6 +11455,30 @@ class ReadOnlyGateTest(unittest.TestCase):
         self.assertIsNotNone(refusal)
         self.assertEqual("kubernetes.read-only", refusal["rule"])
         self.assertEqual("SECURITY_POLICY_BLOCKED", refusal["code"])
+
+    def test_only_a_refused_kubectl_write_is_marked_a_write_refusal(self):
+        # The mark the in-pod client records for a profile worker's stop
+        # (credential_proxy_client.record_write_refusal).
+        writes = (
+            ["kubectl", "delete", "ns", "prod"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "certificate", "approve", "csr-1"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=server"],
+        )
+        for argv in writes:
+            with self.subTest(argv=argv):
+                self.assertIs(True, self._decide(argv)[credential_proxy.WRITE_REFUSAL_KEY])
+        not_writes = (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"],  # a local render
+            ["kubectl", "exec", "web-0", "--", "sh"],  # refused, but not a state change the runtime stops on
+            ["kubectl", "rollout", "csr-tenant-b", "deploy/x"],  # a positional, not a subverb
+            ["kubectl", "--as=admin", "get", "pods"],  # a flag rule
+            ["gcloud", "container", "clusters", "delete", "prod"],  # gcp.read-only: also refuses unlisted reads
+        )
+        for argv in not_writes:
+            with self.subTest(argv=argv):
+                self.assertIs(False, self._decide(argv).get(credential_proxy.WRITE_REFUSAL_KEY, False))
 
     def test_the_gate_can_be_switched_off(self):
         CredentialProxyHandler.enforce_read_only = False
@@ -11136,19 +11703,108 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
-    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
-        # An exec pod's state volume is sized for no gcloud log files; the
-        # broker and the sidecar roles keep gcloud's default.
-        for role, off in (
-            (credential_proxy_client.EXEC_ROLE, True),
-            ("broker", False),
-            ("combined", False),
-        ):
+    def test_serve_turns_gcloud_file_logging_off_in_every_role(self):
+        # No role's state volume is sized for gcloud's log files: each command
+        # leaves one, and gcloud keeps them for 30 days.
+        for role in (credential_proxy_client.EXEC_ROLE, "broker", "combined"):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 env = CredentialProxyHandler.executor.environment
+                self.assertEqual("1", env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV))
+
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
+        # The proxy gives the commands it runs a fixed list of names from its
+        # own environment. These two, which an operator can set on the pod
+        # (`platformAgent.deployment.env`), are not on it, and every role
+        # sets the gcloud name itself, to its own value. This keeps both in the
+        # proxy's environment from the start of `serve` to the end of each
+        # command, and reads what a gcloud and a kubectl command were given.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # A stand-in prints these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log. Each has the tool's
+        # file name, in a directory of its own: the proxy reads that name.
+        script = "#!/bin/bash\n" + "".join(
+            f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\"\n" for name in pod_environment
+        )
+        commands = (["gcloud", "config", "list"], ["kubectl", "get", "pods"])
+        stand_ins = {}
+        for argv in commands:
+            stand_in = Path(self.tmp.name) / f"fake-{argv[0]}-bin" / argv[0]
+            stand_in.parent.mkdir()
+            stand_in.write_text(script, encoding="utf-8")
+            stand_in.chmod(0o755)
+            stand_ins[argv[0]] = str(stand_in)
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", "1"),
+            ("combined", "1"),
+        ):
+            self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
+            executor = CredentialProxyHandler.executor
+            executor.executables.update(stand_ins)
+            for argv in commands:
+                with self.subTest(role=role, command=argv[0]):
+                    with mock.patch.dict(os.environ, pod_environment):
+                        result = executor.execute(argv)
+                    self.assertEqual(0, result.exit_code, result.stderr)
+                    self.assertEqual(
+                        {
+                            "MALLOC_ARENA_MAX": unset,
+                            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                        },
+                        dict(line.split("=", 1) for line in result.stdout.splitlines()),
+                    )
+
+    def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_the_bootstrap_command(self):
+        # `bootstrap` gives its command the command environment plus a second
+        # list of names from the proxy's own environment. A `serve` with no
+        # bootstrap command does not reach that list. This starts `serve` with
+        # one, for each role, with both names in the proxy's environment, and
+        # reads what the command was given. On GKE the operator's bootstrap
+        # command runs gcloud. Every role sets the gcloud name itself, to
+        # its own value; the pod's value must not replace it.
+        pod_environment = {
+            "MALLOC_ARENA_MAX": "2",
+            credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: "0",
+        }
+        unset = "<unset>"
+        # The command writes these two names and nothing else, so a failure
+        # cannot put the rest of an environment in a log.
+        command = (
+            "{ "
+            + " ".join(f"printf '{name}=%s\\n' \"${{{name}-{unset}}}\";" for name in pod_environment)
+            + ' } > "$HOME/bootstrap-names"'
+        )
+        for role, gcloud_logging_off in (
+            (credential_proxy_client.EXEC_ROLE, "1"),
+            ("broker", "1"),
+            ("combined", "1"),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(
+                    None,
+                    extra_env={
+                        "CREDENTIAL_PROXY_ROLE": role,
+                        "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": command,
+                        **pod_environment,
+                    },
+                )
+                written = CredentialProxyHandler.executor.home_dir / "bootstrap-names"
+                given = written.read_text(encoding="utf-8")
+                # Removed before the assertion, so the next role starts with no
+                # file also when this role fails: a bootstrap that did not run
+                # cannot pass, or fail, on the file of the role before it.
+                written.unlink()
                 self.assertEqual(
-                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
+                    {
+                        "MALLOC_ARENA_MAX": unset,
+                        credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV: gcloud_logging_off,
+                    },
+                    dict(line.split("=", 1) for line in given.splitlines()),
                 )
 
     def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
@@ -11930,6 +12586,21 @@ class VcsGitPathTest(unittest.TestCase):
         )
         self.assertEqual(str(scratch.resolve()), result.stdout.strip())
 
+    def test_a_call_that_names_its_bare_working_directory_runs(self):
+        # The broker names its own bare repositories (`vcs_broker.GIT_DIR_IS_CWD`):
+        # under `safe.bareRepository=explicit` git does not take one from the
+        # working directory. The door reads the subcommand behind the argument.
+        executor = self.executor()
+        bare = executor.vcs_root / "bare.git"
+        bare.mkdir(parents=True)
+        executor.execute_vcs_git(["git", "init", "--quiet", "--bare"], bare)
+        explicit = (("safe.bareRepository", "explicit"),)
+        argv = ["git", "rev-parse", "--is-bare-repository"]
+        unnamed = executor.execute_vcs_git(argv, bare, check=False, config=explicit)
+        self.assertNotEqual(0, unnamed.returncode)
+        named = executor.execute_vcs_git([argv[0], vcs_broker.GIT_DIR_IS_CWD, *argv[1:]], bare, config=explicit)
+        self.assertEqual("true", named.stdout.strip())
+
     def test_it_cannot_run_outside_its_own_root(self):
         executor = self.executor()
         for cwd in (
@@ -12133,7 +12804,7 @@ class VcsRouteTest(unittest.TestCase):
         why = "the caller disconnected while queued for the memory budget"
 
         @contextlib.contextmanager
-        def gone():
+        def gone(*_args):
             raise credential_proxy.CallerHungUp(why)
             yield  # pragma: no cover - a generator, never reached
 
@@ -12276,7 +12947,8 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view", "revision-contains"},
+             "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
+             "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -13506,6 +14178,68 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
             with self.assertRaises(credential_proxy.AuthenticationError):
                 authenticator.authenticate(self._headers("Bearer agent-token"))
 
+    def test_an_answer_that_is_not_http_is_a_rejection_not_a_dropped_connection(self):
+        # An error of `http.client` is not an `OSError`. One that leaves `_review`
+        # ends the caller's request with no answer, where the caller is owed a 401.
+        class CutShort(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status":')
+
+        for label, answer in (
+            ("a status line that is not HTTP", http.client.BadStatusLine("garbage")),
+            ("a body that ends early", [CutShort()]),
+        ):
+            with self.subTest(label):
+                # `urlopen` goes through an opener's `open` too, so this stands in for both.
+                with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=answer):
+                    with self.assertRaises(credential_proxy.AuthenticationError):
+                        self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_body_that_the_parser_refuses_for_its_depth_is_a_rejection(self):
+        # The depth that the JSON parser refuses is the interpreter's and differs
+        # between Python versions, so the parser's refusal is given directly.
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(urllib.request.OpenerDirector, "open", return_value=Response(b"[]")), \
+                mock.patch.object(credential_proxy.json, "load", side_effect=RecursionError("too deep")):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+
+    def test_a_status_with_a_value_of_the_wrong_type_is_a_rejection(self):
+        for label, overrides in (
+            ("the user is a string", {"user": "system:serviceaccount:kubeagents-system:agent"}),
+            ("the user is a list", {"user": [self.CALLER]}),
+            ("the username is a list", {"user": {"username": [self.CALLER]}}),
+            ("the audiences are a number", {"audiences": 1}),
+            ("the audiences are a mapping", {"audiences": {self.AUDIENCE: True}}),
+            ("the groups are a number", {"user": {"username": self.CALLER, "groups": 1}}),
+            ("the groups are a mapping", {"user": {"username": self.CALLER, "groups": {"system:serviceaccounts": True}}}),
+            ("the groups are text", {"user": {"username": self.CALLER, "groups": "system:serviceaccounts"}}),
+            ("the uid is a list", {"user": {"username": self.CALLER, "uid": ["sa-uid"]}}),
+        ):
+            with self.subTest(label):
+                authenticator = self._with_review(self._authenticator(), self._ok_status(**overrides))
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_an_own_token_file_that_is_not_utf8_is_a_rejection(self):
+        self.own_token.write_bytes(b"\xff\xfe not text")
+        with mock.patch.object(urllib.request.OpenerDirector, "open") as opened:
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                self._authenticator().authenticate(self._headers("Bearer agent-token"))
+        opened.assert_not_called()
+
     def test_the_review_asks_for_the_configured_audience(self):
         authenticator = self._authenticator()
         captured = {}
@@ -13745,6 +14479,95 @@ class SessionCallerBindingTest(unittest.TestCase):
         self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
 
 
+class A2AChatCallerBindingTest(unittest.TestCase):
+    """The a2a-chat role is bound to the A2A gateway's ServiceAccount in both directions.
+
+    The session binding's shape (SessionCallerBindingTest), empty list
+    included: with no a2a-chat callers named, the audience alone decides, as
+    it did before the binding existed, so an older operator's rendering keeps
+    Google Chat working through an upgrade or a rollback.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    A2A_CHAT = "kubeagents-credential-proxy-a2a-chat"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    SHELL_SA = "system:serviceaccount:kubeagents-system:agent-shell"
+    A2A_GATEWAY_SA = "system:serviceaccount:kubeagents-system:agent-a2a-gateway"
+
+    def _authenticator(self, a2a_chat_callers=frozenset({A2A_GATEWAY_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.A2A_CHAT: credential_proxy.CALLER_ROLE_A2A_CHAT,
+            },
+            allowed_callers=frozenset({self.AGENT, self.SHELL_SA, self.A2A_GATEWAY_SA}),
+            a2a_chat_callers=a2a_chat_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_the_a2a_gateway_presenting_the_a2a_chat_audience_is_the_a2a_chat_role(self):
+        principal = self._authenticator()._principal_from(
+            self._review(self.A2A_GATEWAY_SA, self.A2A_CHAT)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal.role)
+
+    def test_another_caller_presenting_the_a2a_chat_audience_is_refused(self):
+        for caller in (self.AGENT, self.SHELL_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for the A2A gateway"
+                ):
+                    self._authenticator()._principal_from(self._review(caller, self.A2A_CHAT))
+
+    def test_the_a2a_gateway_presenting_another_audience_is_refused(self):
+        # The A2A gateway's ServiceAccount is admitted on the a2a-chat
+        # audience and the a2a-reports one (#6098), and refused on every
+        # other one.
+        for audience in (self.SHELL, self.CHAT):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError,
+                    "only the a2a-chat or a2a-reports audience",
+                ):
+                    self._authenticator()._principal_from(
+                        self._review(self.A2A_GATEWAY_SA, audience)
+                    )
+
+    def test_the_other_callers_keep_their_own_roles(self):
+        authenticator = self._authenticator()
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_SHELL,
+            authenticator._principal_from(self._review(self.SHELL_SA, self.SHELL)).role,
+        )
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_CHAT,
+            authenticator._principal_from(self._review(self.AGENT, self.CHAT)).role,
+        )
+
+    def test_with_no_a2a_chat_callers_named_the_audience_alone_decides(self):
+        # The skew case: a broker rendered by an operator that names no a2a-chat
+        # callers behaves as it did before the binding existed.
+        principal = self._authenticator(frozenset())._principal_from(
+            self._review(self.AGENT, self.A2A_CHAT)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_A2A_CHAT, principal.role)
+
+
 class PrincipalPodTest(unittest.TestCase):
     """A brokered call names the pod that made it, so it traces to a conversation."""
 
@@ -13864,11 +14687,60 @@ class RequiredRoleTest(unittest.TestCase):
             credential_proxy.required_roles("/v1/chat/api"),
         )
 
+    def test_the_teams_intake_admits_the_chat_role_and_the_inbound_receiver(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_TEAMS_INBOUND),
+            credential_proxy.required_roles(credential_proxy.TEAMS_INBOUND_ROUTE),
+        )
+
     def test_the_a2a_event_route_stays_its_own(self):
         self.assertEqual(
             (credential_proxy.CALLER_ROLE_A2A_CHAT,),
             credential_proxy.required_roles("/v1/chat/a2a/events"),
         )
+
+    def test_the_teams_routes_admit_the_a2a_gateway_only_when_the_operator_says_so(self):
+        """The Teams relay has one consumer per install, Hermes or the A2A
+        gateway's teams backend (the operator's A2A_TEAMS_BACKEND switch). The
+        broker learns which from CREDENTIAL_PROXY_TEAMS_A2A_CALLER: without it
+        the routes are the chat role's alone, so a Chat-armed gateway's token
+        cannot reach a Hermes-served Teams queue; with it both roles are
+        admitted. The Slack and legacy Chat event routes stay the chat role's."""
+        teams_paths = (
+            "/v1/chat/teams/events",
+            "/v1/chat/teams/events/ack",
+            "/v1/chat/teams/events/nack",
+            "/v1/chat/teams/api",
+        )
+        self.assertEqual((credential_proxy.CALLER_ROLE_CHAT,), credential_proxy._teams_route_roles(False))
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT),
+            credential_proxy._teams_route_roles(True),
+        )
+        for armed in (False, True):
+            consumer = credential_proxy._teams_route_roles(armed)
+            # The intake's exact entry carries the consumer roles plus the
+            # inbound receiver's; the prefix entry carries the consumer roles.
+            table = tuple(
+                (prefix, consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,))
+                if prefix == credential_proxy.TEAMS_INBOUND_ROUTE
+                else (prefix, consumer) if prefix == "/v1/chat/teams/" else (prefix, roles)
+                for prefix, roles in credential_proxy.ROUTE_ROLES
+            )
+            credential_proxy._validate_route_roles(table)
+            with mock.patch.object(credential_proxy, "ROUTE_ROLES", table):
+                for path in teams_paths:
+                    # The intake entry is a prefix like the rest of the table, so
+                    # the pull and its receipts resolve to it too; _role_permits,
+                    # not this table, holds the receiver to POST on the exact path.
+                    want = consumer
+                    if path.startswith(credential_proxy.TEAMS_INBOUND_ROUTE):
+                        want = consumer + (credential_proxy.CALLER_ROLE_TEAMS_INBOUND,)
+                    self.assertEqual(want, credential_proxy.required_roles(path), (armed, path))
+                self.assertEqual(
+                    (credential_proxy.CALLER_ROLE_CHAT,),
+                    credential_proxy.required_roles("/v1/chat/slack/events"),
+                )
 
     def test_a_route_belonging_to_neither(self):
         self.assertEqual((), credential_proxy.required_roles("/healthz"))
@@ -13936,6 +14808,65 @@ class RouteRolesTableTest(unittest.TestCase):
             )
 
 
+class DialRouteTest(unittest.TestCase):
+    """`POST /v1/dial`: the agent pod's chat role reports the dial's level; nobody else may."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        self.addCleanup(setattr, vcs_broker, "_dial_reported", False)
+        vcs_broker._dial_level = None
+        for patcher in (
+            mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "on", vcs_broker.WRITE_MODE_ENV: ""}),
+            mock.patch.object(vcs_broker, "DIAL_STATE_FILE", os.path.join(scratch.name, "dial")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _post(self, body, role=credential_proxy.CALLER_ROLE_CHAT):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        encoded = body if isinstance(body, bytes) else json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.path = credential_proxy.DIAL_PATH
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        principal = credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role)
+        handler._handle_dial_post(principal)
+        return replies[0]
+
+    def test_the_route_is_the_chat_roles_alone(self):
+        self.assertIn((credential_proxy.DIAL_PATH, (credential_proxy.CALLER_ROLE_CHAT,)), credential_proxy.ROUTE_ROLES)
+
+    def test_a_report_applies_to_the_next_write_at_once(self):
+        status, payload = self._post({"level": "explain"})
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual({"level": "explain", "writeMode": "none", "automerge": False}, payload)
+        self.assertEqual("none", vcs_broker.write_mode()[0])
+        status, payload = self._post({"level": "automerge"})
+        self.assertEqual((HTTPStatus.OK, "propose", True), (status, payload["writeMode"], payload["automerge"]))
+
+    def test_any_role_but_chat_is_refused_even_with_no_role(self):
+        for role in ("", credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP):
+            with self.subTest(role=role), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, payload = self._post({"level": "propose"}, role=role)
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        self.assertEqual("explain", vcs_broker.dial_level())
+
+    def test_a_bad_body_is_refused_and_stores_nothing(self):
+        for body in ({"level": "none"}, {"level": 1}, ["explain"], b"{", b"x" * 2048):
+            with self.subTest(body=body):
+                self.assertEqual(HTTPStatus.BAD_REQUEST, self._post(body)[0])
+        self.assertIsNone(vcs_broker._dial_level)
+
+    def test_with_the_switch_off_nothing_is_stored(self):
+        with mock.patch.dict(os.environ, {vcs_broker.DIAL_ENV: "off"}):
+            status, payload = self._post({"level": "explain"})
+        self.assertEqual((HTTPStatus.CONFLICT, "DIAL_OFF"), (status, payload["code"]))
+        self.assertIsNone(vcs_broker._dial_level)
+
+
 class RolePermitsTest(unittest.TestCase):
     """The 403 that keeps each caller on its own routes."""
 
@@ -13948,6 +14879,37 @@ class RolePermitsTest(unittest.TestCase):
             workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
         )
         return handler, principal
+
+    def test_the_teams_inbound_receiver_reaches_the_intake_by_post_alone(self):
+        """ROUTE_ROLES admits the receiver under the intake's prefix, which also
+        covers the pull (GET on the same path) and the receipts under it; the
+        guard above the table holds it to POST on the exact path."""
+        intake = credential_proxy.TEAMS_INBOUND_ROUTE
+        role = credential_proxy.CALLER_ROLE_TEAMS_INBOUND
+        handler, principal = self._handler(intake, role)
+        handler.command = "POST"
+        self.assertTrue(handler._role_permits(principal))
+        self.assertEqual([], handler.replies)
+        for command, path in (
+            ("GET", intake),
+            ("POST", intake + "/ack"),
+            ("POST", intake + "/nack"),
+            ("POST", "/v1/chat/api"),
+            ("POST", "/v1/chat/teams/api"),
+            ("GET", "/v1/exec"),
+        ):
+            with self.subTest(command=command, path=path):
+                handler, principal = self._handler(path, role)
+                handler.command = command
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    self.assertFalse(handler._role_permits(principal))
+                status, payload = handler.replies[0]
+                self.assertEqual((HTTPStatus.FORBIDDEN, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        # The chat role's own reach of the intake and the pull is unchanged.
+        for command in ("GET", "POST"):
+            handler, principal = self._handler(intake, credential_proxy.CALLER_ROLE_CHAT)
+            handler.command = command
+            self.assertTrue(handler._role_permits(principal))
 
     def test_the_shell_cannot_reach_a_chat_route(self):
         handler, principal = self._handler(
@@ -14400,6 +15362,34 @@ class BuildAuthenticatorTest(unittest.TestCase):
         self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
 
 
+class A2AChatCallerEnvironmentTest(unittest.TestCase):
+    """CREDENTIAL_PROXY_A2A_CHAT_CALLERS reaches the authenticator, and its absence says so."""
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent,system:serviceaccount:ns:agent-a2a-gateway",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+        "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a-chat",
+    }
+
+    def test_the_a2a_chat_callers_are_read_from_the_environment(self):
+        environment = dict(self.BASE, CREDENTIAL_PROXY_A2A_CHAT_CALLERS=" system:serviceaccount:ns:agent-a2a-gateway , ")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent-a2a-gateway"}),
+            authenticator.a2a_chat_callers,
+        )
+
+    def test_an_a2a_chat_audience_without_a2a_chat_callers_warns(self):
+        with mock.patch.dict(os.environ, dict(self.BASE), clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.a2a_chat_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_CALLERS" in line for line in logs.output))
+
+
 class MCPCallerBindingTest(unittest.TestCase):
     """The mcp role is bound to the MCP pod's ServiceAccount in both directions.
 
@@ -14646,7 +15636,12 @@ class MCPRouteAdmissionTest(unittest.TestCase):
         self.assertTrue(permitted)
         self.assertEqual([], replies)
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP),
+            (
+                credential_proxy.CALLER_ROLE_SHELL,
+                credential_proxy.CALLER_ROLE_MCP,
+                credential_proxy.CALLER_ROLE_PROFILE,
+                credential_proxy.CALLER_ROLE_CURATOR,
+            ),
             credential_proxy.required_roles("/v1/vcs/proposal-view"),
         )
 
@@ -14794,6 +15789,32 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
         route.assert_not_called()
+
+    def test_curator_reaches_snapshot_only_on_a_managed_repository(self):
+        route = mock.Mock(return_value={"archiveBase64": ""})
+        handler = self._handler("snapshot", credential_proxy.CALLER_ROLE_CURATOR, {"repository": "acme/infra", "paths": ["knowledge"]})
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"snapshot": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            handler._handle_vcs_post()
+        self.assertEqual(HTTPStatus.OK, handler.replies[0][0])
+        route.assert_called_once()
+
+        unmanaged = self._handler("snapshot", credential_proxy.CALLER_ROLE_CURATOR, {"repository": "acme/infra", "paths": ["knowledge"]})
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"snapshot": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=False), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            unmanaged._handle_vcs_post()
+        self.assertEqual(HTTPStatus.FORBIDDEN, unmanaged.replies[0][0])
+        self.assertEqual("REPOSITORY_NOT_MANAGED", unmanaged.replies[0][1]["code"])
+
+        for verb in ("publish", "proposal-create", "proposal-view", "clone"):
+            refused = self._handler(verb, credential_proxy.CALLER_ROLE_CURATOR)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                refused._handle_vcs_post()
+            self.assertEqual(HTTPStatus.FORBIDDEN, refused.replies[0][0])
+            self.assertEqual("CALLER_VERB_FORBIDDEN", refused.replies[0][1]["code"])
 
     def test_the_shell_and_the_roleless_principal_still_reach_every_verb(self):
         for role in (credential_proxy.CALLER_ROLE_SHELL, ""):
@@ -18663,6 +19684,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
     def setUp(self):
         owner = self
         self.upstream_requests = []
+        self.upstream_bodies = []
         self.reply = {"status": 200, "content_type": "application/json; charset=UTF-8",
                       "body": b'{"timeSeries":[]}', "headers": {}, "delay": 0.0,
                       # (pieces, seconds between them): send the body a piece at
@@ -18710,6 +19732,10 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
                 except OSError:
                     # The broker gave up on us (the deadline test); nothing to report.
                     pass
+
+            def do_POST(self):  # noqa: N802
+                owner.upstream_bodies.append(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                self.do_GET()
 
             def log_message(self, _message, *_args):
                 return
@@ -18857,6 +19883,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"))
         self.assertEqual(200, status)
         self.assertEqual(1, len(self.upstream_requests))
+
+    def test_the_get_credentials_check_is_refused_for_a_held_cluster(self):
+        # spec.hold answers on the same route, under its own rule, and
+        # the cluster's describe without the header stays a control-plane read.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "scope.json").write_text("{}", encoding="utf-8")
+        (directory / "hold.json").write_text(json.dumps({"clusters": [
+            {"projectId": "acme-prod", "location": "us-central1", "clusterName": "paused"}], "reason": "INC-9"}),
+            encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(directory / "scope.json"),
+            holds=scope_exclude.Holds(path=lambda: str(directory / "hold.json")),
+        )
+        self.reply["body"] = b'{"name":"paused","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="paused"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, body["rule"])
+        self.assertIn("INC-9", body["message"])
+        self.assertEqual([], self.upstream_requests)
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="paused"))
+        self.assertEqual(200, status)
 
     def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
         self._exclude("acme-prod", "us-central1", "secret-cluster")
@@ -19244,7 +20296,10 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
              "gcp.api.host-refused"),
             ("GET", "/v1/gcp/metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
              "gcp.api.host-refused"),
-            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.host"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries", "gcp.api.path"),
+            ("GET", "/v1/gcp/logging.googleapis.com/v2/entries:list", "gcp.api.path"),
+            ("POST", "/v1/gcp/logging.googleapis.com/v2/entries:write", "gcp.api.method"),
+            ("POST", "/v1/gcp/logging.googleapis.com/v2/projects/kagents-dev/sinks", "gcp.api.method"),
             ("GET", "/v1/gcp/evil.example.com/anything", "gcp.api.host"),
             ("POST", self.ALLOWED, "gcp.api.method"),
             ("POST", "/v1/gcp/monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries:query", "gcp.api.method"),
@@ -19437,7 +20492,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertTrue(lines[1].endswith(" rule=gcp.api.monitoring.timeseries-list"))
         # The policy still answers first: a refusal reads as a refusal, not an outage.
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-            status, _, payload = self._json_request("/v1/gcp/logging.googleapis.com/v2/entries")
+            status, _, payload = self._json_request("/v1/gcp/compute.googleapis.com/compute/v1/projects/p/regions")
         self.assertEqual(403, status)
         self.assertEqual("gcp.api.host", payload["rule"])
 
@@ -19639,9 +20694,459 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         # The design doc and the site's observability page list these words: a
         # new routed host adds one, and both pages then need it.
         self.assertEqual(
-            {"monitoring", "cloudtrace", "container"}, set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values())
+            {"monitoring", "cloudtrace", "container", "logging"},
+            set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values()),
         )
         self.assertNotIn(credential_proxy.API_RELAY_AUDIT_TOOL, CommandExecutor.ALLOWED_EXECUTABLES)
+
+    def test_in_a_custom_universe_the_audit_subcommand_is_still_the_service_word(self):
+        universe = "apis-tpczero.example"
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = universe
+        in_universe = self.ALLOWED.replace("monitoring.googleapis.com", f"monitoring.{universe}")
+        cases = (
+            (in_universe, 200, "monitoring"),
+            # Not in normal form, on a host a route names: still that host's word.
+            (in_universe.replace("kagents-dev", ".."), 400, "monitoring"),
+            # No route names these hosts in this universe: the commercial host
+            # is another universe's, and the third is in no table at all.
+            (self.ALLOWED, 403, "other"),
+            (f"/v1/gcp/evil.{universe}/anything", 403, "other"),
+        )
+        for path, expected, subcommand in cases:
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, _ = self._request(path)
+                self.assertEqual(expected, status)
+                self.assertEqual(
+                    [("gcp-api", subcommand)] * 2,
+                    [(a["tool"], a["subcommand"]) for a in self._audits(logs)],
+                )
+
+    def test_a_malformed_universe_domain_gives_every_host_the_other_word(self):
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = "not a domain"
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(403, status)
+        self.assertEqual(["other", "other"], [a["subcommand"] for a in self._audits(logs)])
+
+    # -- the one read with a body: Logging entries:list --------------------
+
+    ENTRIES_LIST = "/v1/gcp/logging.googleapis.com/v2/entries:list"
+    ENTRIES_BODY = {
+        "resourceNames": ["projects/kagents-dev"],
+        "filter": 'resource.type="k8s_cluster" AND timestamp>="2026-11-06T00:00:00Z"',
+        "orderBy": "timestamp desc",
+        "pageSize": 1000,
+    }
+
+    def _entries_list(self, body, token="shell-token", path=None, headers=None):
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return self._json_request(
+            path or self.ENTRIES_LIST, token=token, method="POST", body=raw,
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+
+    def test_an_entries_list_filter_drops_an_excluded_clusters_entries(self):
+        # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+        # ANDed onto the caller's filter, never parsed, so whatever it says the
+        # excluded cluster's entries don't come back.
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
+        for caller_filter, sent_filter in (
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
+            (None, clause),
+        ):
+            with self.subTest(filter=caller_filter):
+                self.upstream_bodies.clear()
+                body = dict(self.ENTRIES_BODY)
+                if caller_filter is None:
+                    body.pop("filter")
+                else:
+                    body["filter"] = caller_filter
+                status, _, _ = self._entries_list(body)
+                self.assertEqual(200, status)
+                [sent] = self.upstream_bodies
+                self.assertEqual(sent_filter, json.loads(sent)["filter"])
+
+    def test_an_entries_list_filter_that_could_swallow_the_clause_is_refused(self):
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": 'x="open'})
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, payload["rule"])
+        self.assertEqual([], self.upstream_bodies)
+
+    def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
+        self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list(
+                self.ENTRIES_BODY, headers={"X-Goog-User-Project": "other-project", "X-HTTP-Method-Override": "DELETE"}
+            )
+        self.assertEqual(200, status)
+        self.assertEqual({"entries": [{"insertId": "a"}], "nextPageToken": "t"}, payload)
+        self.assertEqual(["logging.googleapis.com"], self.relay.hosts)
+        [(path, upstream_headers)] = self.upstream_requests
+        self.assertEqual("/v2/entries:list", path)
+        self.assertEqual(
+            {"Host", "Authorization", "Accept", "Content-Type", "Content-Length"},
+            set(upstream_headers),
+            "the broker's headers and Host, and none of the caller's",
+        )
+        self.assertEqual("Bearer broker-token", upstream_headers["Authorization"])
+        self.assertEqual("application/json", upstream_headers["Content-Type"])
+        [sent] = self.upstream_bodies
+        self.assertEqual(self.ENTRIES_BODY, json.loads(sent))
+        started, completed = self._audits(logs)
+        self.assertEqual(("gcp-api", "logging", "started"), (started["tool"], started["subcommand"], started["status"]))
+        self.assertEqual(("completed", 200), (completed["status"], completed["upstream_status"]))
+        # The filter is in no log line and in no audit field.
+        self.assertNotIn("k8s_cluster", "\n".join(r.getMessage() for r in logs.records))
+        self.assertNotIn("k8s_cluster", json.dumps(self._audits(logs)))
+
+    def test_a_forwarded_entries_list_names_its_project_in_the_forwarded_line(self):
+        # The path of this read is `v2/entries:list` for every project, so the line that
+        # says the read was forwarded carries the one resource the body check passed.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertTrue(forwarded.endswith(" resource=projects/kagents-dev"), forwarded)
+        # Beside the line at the check, no other line names it, and the audit fields
+        # stay identifiers and outcomes.
+        named = ("api forwarded request_id=", "api body checked request_id=")
+        others = [r.getMessage() for r in logs.records if not r.getMessage().startswith(named)]
+        self.assertNotIn("kagents-dev", "\n".join(others))
+        self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_checked_body_names_its_project_before_each_verdict(self):
+        # A read whose body passed the check and then failed still asked Google for
+        # that project's entries, and over the cap Google served them. So the project
+        # is on a line of its own at the check, and the verdict of the request follows
+        # it under the same request id, whatever the verdict is.
+        cap = 4096
+
+        def forwarded():
+            pass
+
+        def over_the_cap():
+            self.reply.update(body=b"x" * (cap + 1))
+
+        def no_relay():
+            CredentialProxyHandler.api_relay = None
+
+        def no_credential():
+            def failing():
+                raise RuntimeError("no credential")
+
+            self.relay.authorization_header = failing
+
+        def unreachable():
+            spare = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            self.relay.port = spare.server_address[1]
+            spare.server_close()
+
+        cases = (
+            ("forwarded", forwarded, 200, "api forwarded"),
+            ("over the cap", over_the_cap, 502, "api response too large"),
+            ("no relay", no_relay, 503, "api disabled"),
+            ("no credential", no_credential, 503, "api credential unavailable"),
+            ("unreachable", unreachable, 502, "api upstream unreachable"),
+        )
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", cap):
+            for name, arrange, expected, verdict in cases:
+                with self.subTest(name):
+                    arrange()
+                    try:
+                        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                            status, _, _ = self._entries_list(self.ENTRIES_BODY)
+                    finally:
+                        # Each case leaves the handler as the next one expects it.
+                        CredentialProxyHandler.api_relay = self.relay
+                        self.relay.__dict__.pop("authorization_header", None)
+                        self.relay.port = self.upstream.server_address[1]
+                        self.reply.update(status=200, content_type="application/json; charset=UTF-8",
+                                          body=b'{"timeSeries":[]}', headers={})
+                    self.assertEqual(expected, status)
+                    lines = [r.getMessage() for r in logs.records if r.getMessage().startswith("api ")]
+                    [checked] = [line for line in lines if line.startswith("api body checked request_id=")]
+                    self.assertTrue(checked.endswith(" resource=projects/kagents-dev"), checked)
+                    request_id = checked.split("request_id=")[1].split(" ")[0]
+                    # The verdict is the last line of the request, after the check line.
+                    self.assertGreater(len(lines) - 1, lines.index(checked))
+                    self.assertTrue(lines[-1].startswith(f"{verdict} request_id={request_id}"), lines[-1])
+                    # The check line carries no audit mapping: the audit fields stay identifiers and outcomes.
+                    self.assertNotIn("kagents-dev", json.dumps(self._audits(logs)))
+
+    def test_a_forwarded_get_names_no_resource_in_the_forwarded_line(self):
+        # A GET's project is in its path, which the first line of the request carries.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, _ = self._request(self.ALLOWED)
+        self.assertEqual(200, status)
+        [forwarded] = [r.getMessage() for r in logs.records if r.getMessage().startswith("api forwarded request_id=")]
+        self.assertNotIn("resource=", forwarded)
+
+    def test_a_refused_body_leaves_its_project_out_of_every_log_line(self):
+        # A project the check did not pass is caller text. No line carried it before
+        # the forwarded line named a project, and this holds that. Each body here
+        # names the project and is refused.
+        project = "refused-project-1"
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}", "projects/kagents-dev"]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "projectIds": [project]},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "orderBy": "severity desc"},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}"], "pageSize": 100000},
+            {**self.ENTRIES_BODY, "resourceNames": [f"projects/{project}/logs/syslog"]},
+            {**self.ENTRIES_BODY, "resourceNames": f"projects/{project}"},
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual("gcp.api.body", payload["rule"])
+                self.assertNotIn(project, "\n".join(r.getMessage() for r in logs.records))
+                self.assertNotIn(project, json.dumps(self._audits(logs)))
+        self.assertEqual([], self.upstream_requests)
+
+    def test_the_upstream_gets_the_brokers_serialisation_not_the_callers_bytes(self):
+        # A duplicate key: the parser keeps the last, the check reads the last,
+        # and the upstream is sent one key with that value. Nothing of the
+        # caller's spelling (the first value, the spacing) leaves the broker.
+        raw = (
+            b'{ "resourceNames": ["projects/first-project"],\n'
+            b'  "resourceNames" : ["projects/kagents-dev"], "pageSize": 5 }'
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(raw)
+        self.assertEqual(200, status)
+        [sent] = self.upstream_bodies
+        self.assertEqual(b'{"resourceNames":["projects/kagents-dev"],"pageSize":5}', sent)
+
+    def test_the_collectors_helper_reads_through_the_client_and_this_handler(self):
+        """`logging_reads.read_json` over `ApiSession.post`, this handler and the
+        fake upstream: the whole chain, with no seam stood in for."""
+        try:
+            import requests  # noqa: F401, PLC0415 -- ApiSession's transport, absent from a bare checkout
+        except ImportError:
+            self.skipTest("requests is not installed")
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "token").write_text("shell-token\n", encoding="utf-8")
+        logged = [{"insertId": "a", "timestamp": "2026-11-13T00:00:02Z"}, {"insertId": "b", "timestamp": "2026-11-13T00:00:01Z"}]
+        self.reply.update(body=json.dumps({"entries": logged}).encode())
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_TOKEN_FILE": str(directory / "token")}):
+            session = credential_proxy_client.ApiSession(f"http://127.0.0.1:{self.server.server_address[1]}")
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+                text = logging_reads.read_json(
+                    "kagents-dev", 'resource.type="k8s_cluster"', 1000, timeout_s=10, session=session
+                )
+        self.assertEqual(logged, json.loads(text))
+        [sent] = self.upstream_bodies
+        self.assertEqual(
+            {
+                "resourceNames": ["projects/kagents-dev"],
+                "filter": 'resource.type="k8s_cluster"',
+                "orderBy": "timestamp desc",
+                "pageSize": 1000,
+            },
+            json.loads(sent),
+        )
+
+    def test_in_a_custom_universe_the_entries_list_goes_to_that_universes_host(self):
+        universe = "apis-tpczero.example"
+        self.addCleanup(
+            self._restore, "universe_domain", "universe_domain" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("universe_domain"),
+        )
+        CredentialProxyHandler.universe_domain = universe
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(
+                self.ENTRIES_BODY, path=f"/v1/gcp/logging.{universe}/v2/entries:list"
+            )
+        self.assertEqual(200, status)
+        self.assertEqual([f"logging.{universe}"], self.relay.hosts)
+        self.assertEqual(self.ENTRIES_BODY, json.loads(self.upstream_bodies[0]))
+        # The commercial host is another universe's: refused, and nothing is sent.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.method", payload["rule"])
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_a_body_the_policy_refuses_never_reaches_the_upstream(self):
+        cases = (
+            {**self.ENTRIES_BODY, "resourceNames": ["projects/kagents-dev", "projects/other-project"]},
+            {**self.ENTRIES_BODY, "resourceNames": ["folders/123456789012"]},
+            {**self.ENTRIES_BODY, "resourceNames": ["billingAccounts/0X0X0X-0X0X0X-0X0X0X"]},
+            {**self.ENTRIES_BODY, "projectIds": ["other-project"]},
+            {**self.ENTRIES_BODY, "pageSize": 100000},
+            {"filter": "x"},
+            [self.ENTRIES_BODY],
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._entries_list(body)
+                self.assertEqual(403, status)
+                self.assertEqual(
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.body"},
+                    {key: payload[key] for key in ("status", "code", "rule")},
+                )
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual([], self.relay.hosts, "a refused body never opens a connection")
+                started, blocked = self._audits(logs)
+                self.assertEqual(("blocked", "gcp.api.body", "logging"),
+                                 (blocked["status"], blocked["rule"], blocked["subcommand"]))
+
+    def test_a_query_on_the_entries_list_route_is_refused(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY, path=self.ENTRIES_LIST + "?fields=entries")
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.api.body", payload["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_a_body_that_is_not_json_is_400(self):
+        for raw in (b"not json", b'{"resourceNames": ', b"\xff\xfe", b"[" * 5000):
+            with self.subTest(raw=raw[:12]):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, _, payload = self._entries_list(raw)
+                self.assertEqual(400, status)
+                self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_body_over_the_cap_is_413_and_is_not_read_into_the_policy(self):
+        filler = "x" * credential_proxy.API_RELAY_MAX_BODY_BYTES
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": filler})
+        self.assertEqual(413, status)
+        self.assertEqual("API_RELAY_BODY_TOO_LARGE", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+        # One larger than the socket buffers still receives its answer.
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(b"x" * _BODY_LARGER_THAN_SOCKET_BUFFERS)
+        self.assertEqual(413, status)
+
+    def test_a_body_exactly_at_the_cap_is_read(self):
+        room = credential_proxy.API_RELAY_MAX_BODY_BYTES - len(json.dumps({**self.ENTRIES_BODY, "pageToken": ""}))
+        body = json.dumps({**self.ENTRIES_BODY, "pageToken": "t" * room}).encode()
+        self.assertEqual(credential_proxy.API_RELAY_MAX_BODY_BYTES, len(body))
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, _ = self._entries_list(body)
+        self.assertEqual(200, status)
+
+    def test_a_post_without_a_content_length_is_400(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer shell-token\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            payload = json.loads(response.read())
+        self.assertEqual(400, response.status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+
+    def _raw_entries_list(self, head: bytes, body: bytes = b"", read_timeout=10):
+        """An entries:list POST with the framing headers as written; (status, payload) or None on a close."""
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=read_timeout) as sock:
+            sock.sendall(
+                b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer shell-token\r\n" + head + b"\r\n" + body
+            )
+            response = http.client.HTTPResponse(sock)
+            try:
+                response.begin()
+            except (http.client.HTTPException, OSError):
+                return None
+            return response.status, json.loads(response.read())
+
+    def test_a_request_that_cannot_be_framed_is_400_and_is_not_forwarded(self):
+        body = json.dumps(self.ENTRIES_BODY).encode()
+        length = str(len(body)).encode()
+        for head in (
+            b"Transfer-Encoding: chunked\r\nContent-Length: " + length + b"\r\n",
+            b"Content-Length: " + length + b"\r\nContent-Length: 0\r\n",
+            b"Content-Length: -1\r\n",
+            b"Content-Length: many\r\n",
+        ):
+            with self.subTest(head=head):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    status, payload = self._raw_entries_list(head, body)
+                self.assertEqual(400, status)
+                self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+                self.assertEqual([], self.upstream_requests)
+                self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_body_shorter_than_its_content_length_did_not_arrive(self):
+        # The part that arrived is a whole JSON object the policy would allow:
+        # it is still not the request the caller announced.
+        sent = json.dumps({"resourceNames": ["projects/kagents-dev"]}).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                sock.sendall(
+                    b"POST " + self.ENTRIES_LIST.encode() + b" HTTP/1.1\r\nHost: broker\r\n"
+                    b"Authorization: Bearer shell-token\r\nContent-Length: "
+                    + str(len(sent) + 40).encode() + b"\r\n\r\n" + sent
+                )
+                sock.shutdown(socket.SHUT_WR)
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                payload = json.loads(response.read())
+        self.assertEqual(400, response.status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual("the request body did not arrive", payload["error"])
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+
+    def test_a_post_with_no_body_at_all_is_400(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, payload = self._raw_entries_list(b"")
+        self.assertEqual(400, status)
+        self.assertEqual("API_RELAY_BAD_BODY", payload["code"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_a_body_that_stalls_still_leaves_a_verdict_in_the_audit_trail(self):
+        # The window a request has to arrive in full, shortened for the test.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                answer = self._raw_entries_list(b"Content-Length: 100\r\n", b'{"resourceNames":')
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        self.assertIsNone(answer, "a request whose body never arrived gets no relayed answer")
+        self.assertEqual([], self.upstream_requests)
+        self.assertEqual(["started", "rejected"], [a["status"] for a in self._audits(logs)])
+        self.assertTrue(any("the request body did not arrive" in r.getMessage() for r in logs.records))
+
+    def test_the_entries_list_route_refuses_the_chat_and_session_roles(self):
+        for token in ("chat-token", "session-token"):
+            with self.subTest(token=token):
+                status, _, _ = self._entries_list(self.ENTRIES_BODY, token=token)
+                self.assertEqual(403, status)
+                self.assertEqual([], self.upstream_requests)
+
+    def test_an_upstream_refusal_of_an_entries_list_passes_through(self):
+        self.reply.update(status=403, body=b'{"error":{"code":403,"status":"PERMISSION_DENIED"}}')
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(403, status)
+        self.assertEqual({"error": {"code": 403, "status": "PERMISSION_DENIED"}}, payload)
+        self.assertEqual(("completed", 403), (self._audits(logs)[-1]["status"], self._audits(logs)[-1]["upstream_status"]))
+
+    def test_no_relay_armed_answers_an_entries_list_503_after_the_body_is_read(self):
+        CredentialProxyHandler.api_relay = None
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            status, _, payload = self._entries_list(self.ENTRIES_BODY)
+        self.assertEqual(503, status)
+        self.assertEqual("API_RELAY_DISABLED", payload["code"])
 
 
 class ApiRelayAuditLineCannotBeForgedTest(unittest.TestCase):
@@ -19765,6 +21270,24 @@ class GoogleApiRelayCredentialTest(unittest.TestCase):
         self.assertEqual("monitoring.googleapis.com", connection.host)
         self.assertEqual(credential_proxy.API_RELAY_UPSTREAM_PORT, connection.port)
         self.assertEqual(credential_proxy.API_RELAY_CONNECT_TIMEOUT_S, connection.timeout)
+
+
+class ApiRelayAuditSubcommandTest(unittest.TestCase):
+    """The audit word reads a host the way the policy does, in every universe."""
+
+    def test_a_host_has_its_service_word_exactly_when_the_policy_routes_it(self):
+        services = set(credential_proxy.API_RELAY_AUDIT_SUBCOMMANDS.values())
+        for universe in ("googleapis.com", "apis-tpczero.example", "not a domain"):
+            domains = {"googleapis.com", "apis-tpczero.example", "example.com"}
+            hosts = {f"{service}.{domain}" for service in services | {"evil"} for domain in domains}
+            for host in sorted(hosts):
+                with self.subTest(universe=universe, host=host):
+                    # A path no route has: the policy answers gcp.api.path for
+                    # a host it routes, and a host rule for every other host.
+                    decision = api_policy.evaluate("GET", host, "no/such/path", "", universe_domain=universe)
+                    routed = decision.rule_id == api_policy.RULE_PATH
+                    word = credential_proxy.api_relay_audit_subcommand(host, universe)
+                    self.assertEqual(host.partition(".")[0] if routed else "other", word)
 
 
 class ApiRelayQueryStrippingTest(unittest.TestCase):
@@ -20490,6 +22013,30 @@ class ScopeExecRouteTest(unittest.TestCase):
         self.assertEqual("c1 us-central1\n", body["stdout"])
         self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
 
+    def test_the_management_project_variable_opens_the_probe_for_that_project_alone(self):
+        mgmt_probe = [*SCOPE_PROBE[:5], "mgmt-proj", SCOPE_PROBE[6]]
+        self.refused({"argv": mgmt_probe}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        with mock.patch.dict(os.environ, {credential_proxy.scope_policy.MANAGEMENT_PROJECT_ENV: " mgmt-proj \n"}):
+            status, body = self.scope({"argv": mgmt_probe})
+            self.assertEqual(200, status, body)
+            self.assertEqual("c1 us-central1\n", body["stdout"])
+            # Only the clusters list takes it, and it opens nothing else.
+            self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+            self.refused({"argv": ["gcloud", "compute", "shared-vpc", "list-associated-resources", "mgmt-proj",
+                                   "--format=json(id,type)"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertEqual(["container clusters list --project mgmt-proj --format=value(name,location)"],
+                         self.calls.read_text(encoding="utf-8").splitlines())
+
+    def test_a_declared_project_opens_the_probe_unless_excluded(self):
+        declaration = json.loads(self.scope_file.read_text(encoding="utf-8"))
+        declaration["projects"] = ["team-a", "legacy-1"]
+        declaration["exclude"]["projects"] = ["legacy-*"]
+        self.scope_file.write_text(json.dumps(declaration), encoding="utf-8")
+        status, body = self.scope({"argv": [*SCOPE_PROBE[:5], "team-a", SCOPE_PROBE[6]]})
+        self.assertEqual(200, status, body)
+        self.refused({"argv": [*SCOPE_PROBE[:5], "legacy-1", SCOPE_PROBE[6]]},
+                     credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+
     def test_a_failed_lookup_records_nothing(self):
         self.exit_file.write_text("1", encoding="utf-8")
         status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
@@ -20590,6 +22137,60 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertTrue(relay.settle(receipt, acknowledge=True))
         # Settle again is False because receipt is deleted
         self.assertFalse(relay.settle(receipt, acknowledge=True))
+
+    def test_teams_pull_failure_is_counted_and_answers_503(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/chat/teams/events"
+        handler._authenticated = lambda: object()
+        handler.metrics = mock.Mock()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+
+        def pull():
+            raise RuntimeError("queue gone")
+
+        handler.teams_relay = types.SimpleNamespace(pull=pull)
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler.do_GET()
+
+        self.assertEqual(captured["status"], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(captured["payload"], {"error": "Teams event pull failed"})
+        handler.metrics.record_failure.assert_called_once_with(
+            credential_proxy.BROKER_FAILURE_CHAT_PULL_FAILED
+        )
+
+    def test_teams_upstream_error_reads_a_json_null_as_absent(self):
+        import io
+
+        def converted(status, answer):
+            body = json.dumps(answer).encode("utf-8")
+            err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/", status, "x", {}, io.BytesIO(body))
+            return credential_proxy._teams_upstream_error(err)
+
+        bot = converted(400, {"error": {"code": None, "message": "boom"}})
+        self.assertEqual(str(bot), "HTTP 400: boom")
+        self.assertEqual(bot.fields, {"status": 400, "code": "", "message": "boom"})
+        entra = converted(401, {"error": "invalid_client", "error_description": None})
+        self.assertEqual(str(entra), "HTTP 401: invalid_client")
+        self.assertEqual(entra.fields["message"], "")
+
+    def test_teams_nack_against_a_full_queue_drops_the_activity_and_its_attempts(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._events = queue.Queue(maxsize=1)
+        activity = {"type": "message", "text": "first"}
+        relay._receipts["receipt"] = activity
+        relay._attempts[id(activity)] = 2
+        relay._events.put_nowait({"type": "message", "text": "existing"})
+
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertTrue(relay.settle("receipt", acknowledge=False))
+
+        self.assertIn("dropped, not requeued", logs.output[0])
+        self.assertEqual(relay._receipts, {})
+        self.assertEqual(relay._attempts, {})
+        self.assertFalse(relay.settle("receipt", acknowledge=False))
+        self.assertEqual(relay._events.get_nowait()["text"], "existing")
+        self.assertTrue(relay._events.empty())
 
     def test_teams_relay_token_acquisition_and_caching(self):
         relay = TeamsRelay(
@@ -20746,6 +22347,39 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(result, {"id": "act-1"})
         posted = opened.call_args.args[0].data.decode("utf-8")
         self.assertIn("ok ? done", posted)
+
+    def test_teams_relay_admits_put_on_one_activity_only(self):
+        """The gateway's status line edits its own activity: a PUT at the
+        activity's id goes through with its method kept; a PUT on the
+        collection, on history, or any other verb is refused before the
+        token is minted."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+            relay._get_access_token()
+            mock_resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+            res = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/19:abc@thread.tacv2;messageid=1/activities/act-1",
+                method="put",
+                payload={"type": "message", "id": "act-1", "text": "done"},
+            )
+            self.assertEqual(res, {"id": "act-1"})
+            sent = mock_open.call_args[0][0]
+            self.assertEqual(sent.get_method(), "PUT")
+            self.assertTrue(sent.full_url.endswith("/activities/act-1"))
+        for path, method in (
+            ("v3/conversations/19:abc/activities", "PUT"),
+            ("v3/conversations/19:abc/activities/history", "PUT"),
+            ("v3/conversations/19:abc/activities/act-1", "DELETE"),
+            ("v3/conversations/19:abc/activities/act-1", "PATCH"),
+        ):
+            with self.subTest(path=path, method=method):
+                with self.assertRaises(ValueError):
+                    relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=path, method=method, payload={})
 
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
@@ -22040,6 +23674,44 @@ class ExcludedClusterPathTest(unittest.TestCase):
                 result = executor.execute(["kubectl", "get", "pods"])
                 self.assertNotIn("ExcludedCluster", result.stderr)
 
+    def hold(self, document):
+        """Rewrite hold.json, as an edit to spec.hold lands in its ConfigMap mount."""
+        text = json.dumps(document)
+        self.hold_file.write_text(text, encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000 * len(text)
+        os.utime(self.hold_file, ns=(stamp, stamp))
+
+    def held_executor(self):
+        import scope_exclude
+
+        self.hold_file = Path(self.temp_dir.name) / "hold.json"
+        executor = self.executor()
+        executor.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(self.scope_file), holds=scope_exclude.Holds(path=lambda: str(self.hold_file)))
+        return executor
+
+    def test_a_held_cluster_is_refused_until_the_hold_is_lifted_and_its_describe_stays_allowed(self):
+        import scope_exclude
+
+        executor = self.held_executor()
+        self.hold({"clusters": [{"projectId": self.PROJECT, "location": self.LOCATION, "clusterName": self.EXCLUDED}],
+                   "reason": "INC-7"})
+        for call in (
+            lambda: executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED)),
+            lambda: executor.execute(self.get_credentials(self.EXCLUDED), wants_kubeconfig=True),
+        ):
+            with self.assertRaises(scope_exclude.HeldCluster) as caught:
+                call()
+            self.assertEqual(scope_exclude.RULE_HELD_CLUSTER, caught.exception.rule)
+            self.assertIn("INC-7", str(caught.exception))
+        self.assertEqual([], self.gke_calls())
+        result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
+                                   f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.hold({})
+        result = executor.execute(["kubectl", "get", "pods"], kubeconfig_context=self.context(self.EXCLUDED))
+        self.assertEqual(0, result.exit_code, result.stderr)
+
     def test_a_gcloud_metadata_read_of_an_excluded_cluster_is_allowed(self):
         """Control-plane reads are the project's, and stay allowed."""
         self.exclude(self.EXCLUDED)
@@ -22047,6 +23719,372 @@ class ExcludedClusterPathTest(unittest.TestCase):
         result = executor.execute(["gcloud", "container", "clusters", "describe", self.EXCLUDED,
                                    f"--project={self.PROJECT}", f"--location={self.LOCATION}"])
         self.assertEqual(0, result.exit_code, result.stderr)
+
+
+class DecisionMemoryChecksMetricTest(unittest.TestCase):
+    """`build_vcs_broker(..., metrics=...)` records Stage B OKF verdicts only for repos with knowledge."""
+
+    REPOSITORY = "https://local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        self.bare = self.base / "remotes" / "acme" / "infra"
+        self.bare.parent.mkdir(parents=True, exist_ok=True)
+        self._git(self.base, "init", "--bare", "--initial-branch=main", str(self.bare))
+        self.seed = self.base / "seed"
+        self._git(self.base, "clone", "--quiet", str(self.bare), str(self.seed))
+        self._git(self.seed, "checkout", "-B", "main")
+        (self.seed / "README.md").write_text("seed\n", encoding="utf-8")
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "initial commit")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+    def _git(self, cwd: Path, *args: str, env_override: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = {**self.git_env, **(env_override or {})}
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def _make_broker(self, metrics: credential_proxy.ProxyMetrics, *, pinned_bases=None):
+        state_dir = self.base / f"state-{len(pinned_bases or {})}"
+        executor = CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        with mock.patch.object(credential_proxy, "warn_on_credential_reach"):
+            broker = credential_proxy.build_vcs_broker(
+                executor,
+                pinned_bases=pinned_bases,
+                metrics=metrics,
+            )
+
+        class _LocalForge(providers.Forge):
+            name = "local"
+            hosts = ("local.test",)
+
+            def __init__(self, remote_root: Path):
+                super().__init__()
+                self.remote_root = remote_root
+                self.credential = mock.Mock()
+                self.credential.git_config.return_value = ()
+                self.credential.headers.return_value = {}
+
+            @classmethod
+            def for_config(cls, config):
+                return ()
+
+            def parse(self, url: str) -> str:
+                return "/".join(providers.repo_segments(url, self.hosts))
+
+            def clone_url(self, repo: str) -> str:
+                return str(self.remote_root / repo)
+
+        broker.registry.hosts["local.test"] = _LocalForge(self.base / "remotes")
+        return broker
+
+    def _bundle_change(self, broker, name: str, branch: str, files: dict[str, str], *, commit_email: str = "kube-agents@users.noreply.invalid"):
+        cloned = broker.clone({"repository": self.REPOSITORY})
+        work = self.base / name
+        bundle_in = self.base / f"{name}-in.bundle"
+        bundle_in.write_bytes(base64.b64decode(cloned["bundleBase64"]))
+        self._git(self.base, "clone", "--quiet", "--branch", cloned["branch"], str(bundle_in), str(work))
+        self._git(work, "checkout", "--quiet", "-b", branch)
+        for rel, content in files.items():
+            dest = work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        self._git(work, "add", "-A")
+        self._git(
+            work,
+            "commit",
+            "--quiet",
+            "-m",
+            f"change {name}",
+            env_override={"GIT_AUTHOR_EMAIL": commit_email, "GIT_COMMITTER_EMAIL": commit_email},
+        )
+        out_bundle = self.base / f"{name}-out.bundle"
+        self._git(work, "bundle", "create", str(out_bundle), f"{cloned['revision']}..refs/heads/{branch}")
+        return {
+            "repository": self.REPOSITORY,
+            "branch": branch,
+            "target": "main",
+            "baseRevision": cloned["revision"],
+            "bundleBase64": base64.b64encode(out_bundle.read_bytes()).decode("ascii"),
+        }
+
+    def _post_publish(self, broker, metrics: credential_proxy.ProxyMetrics, payload: dict):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/publish"
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:shell", uid="u", groups=(), role=credential_proxy.CALLER_ROLE_SHELL
+        )
+        handler.metrics = metrics
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, body: handler.replies.append((status, body))
+        handler._request_slot = contextlib.nullcontext
+        handler._repository_is_permitted = lambda repository, forge: True
+        handler.vcs = broker
+        encoded = json.dumps(payload).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        with mock.patch.object(vcs_broker, "write_mode", return_value=("propose", "propose")):
+            handler._handle_vcs_post()
+        return handler.replies[0]
+
+    def test_publish_records_allow_warn_block_and_error_verdicts_only_when_knowledge_exists(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+
+        # 0. Repo without knowledge/ or .kube-agents/intent.yaml -> allow stays 0.
+        payload_nok = self._bundle_change(broker, "nok", "platform-agent/nok", {"docs.txt": "plain\n"})
+        status0, body0 = self._post_publish(broker, metrics, payload_nok)
+        self.assertEqual(status0, HTTPStatus.OK, body0)
+        self.assertNotIn(f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{', metrics.render())
+
+        # Seed knowledge/ decisions (active block + proposed warn) on main.
+        dec_dir = self.seed / "knowledge" / "decisions"
+        dec_dir.mkdir(parents=True, exist_ok=True)
+        (dec_dir / "DEC-2026-001.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-001\n"
+            "title: Keep checkout memory >= 1Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/prod/*.yaml\n"
+            "guard:\n  rule: memory >= 1Gi\n  severity: block\n  expect:\n"
+            "    file: clusters/prod/*.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: \">=\"\n"
+            "    value: 1Gi\n"
+            "---\n\nKeep memory >= 1Gi.\n",
+            encoding="utf-8",
+        )
+        (dec_dir / "DEC-2026-002.md").write_text(
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-002\n"
+            "title: Keep staging replicas >= 2\n"
+            "status: proposed\n"
+            "date: 2026-11-01\n"
+            "scope:\n  paths:\n    - clusters/staging/*.yaml\n"
+            "guard:\n  rule: replicas >= 2\n  severity: warn\n  expect:\n"
+            "    file: clusters/staging/*.yaml\n"
+            "    path: spec.replicas\n"
+            "    op: \">=\"\n"
+            "    value: 2\n"
+            "---\n\nKeep staging replicas >= 2.\n",
+            encoding="utf-8",
+        )
+        self._git(self.seed, "add", "-A")
+        self._git(self.seed, "commit", "--quiet", "-m", "seed knowledge rules")
+        self._git(self.seed, "push", "--quiet", "origin", "main")
+
+        # 1. Clean publish on repo with knowledge/ -> allow
+        payload_allow = self._bundle_change(broker, "allow", "platform-agent/allow", {"notes.txt": "ok\n"})
+        status1, _ = self._post_publish(broker, metrics, payload_allow)
+        self.assertEqual(status1, HTTPStatus.OK)
+
+        # 2. Proposed rule warning -> warn
+        payload_warn = self._bundle_change(
+            broker,
+            "warn",
+            "platform-agent/warn",
+            {"clusters/staging/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 1\n"},
+        )
+        status2, body2 = self._post_publish(broker, metrics, payload_warn)
+        self.assertEqual(status2, HTTPStatus.OK)
+        self.assertIn("DEC-2026-002", body2.get("decisionMemoryMarkdown", ""))
+
+        # 3. Active block rule -> block (409)
+        payload_block = self._bundle_change(
+            broker,
+            "block",
+            "platform-agent/block",
+            {
+                "clusters/prod/checkout.yaml": (
+                    "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n"
+                    "      containers:\n      - name: checkout\n        resources:\n          requests:\n            memory: 256Mi\n"
+                )
+            },
+        )
+        status3, body3 = self._post_publish(broker, metrics, payload_block)
+        self.assertEqual(status3, HTTPStatus.CONFLICT)
+        self.assertEqual(body3.get("code"), vcs_broker.DECISION_MEMORY_BLOCKED)
+
+        # 4. Unresolvable base branch for Decision Memory guard -> error (502)
+        payload_err = self._bundle_change(broker, "err", "platform-agent/err", {"notes2.txt": "err\n"})
+        bad_broker = self._make_broker(metrics)
+        bad_broker._default_branch_of_remote = lambda *_a, **_kw: ""
+        status4, body4 = self._post_publish(bad_broker, metrics, payload_err)
+        self.assertEqual(status4, HTTPStatus.BAD_GATEWAY, body4)
+        self.assertEqual(body4.get("code"), vcs_broker.DECISION_MEMORY_CHECK_FAILED)
+
+        # 5. Non-DM error (NOT_FAST_FORWARD) -> does not change counters
+        bad_ff = dict(payload_allow, baseRevision="0" * 40)
+        status5, body5 = self._post_publish(broker, metrics, bad_ff)
+        self.assertEqual(status5, HTTPStatus.CONFLICT)
+        self.assertEqual(body5.get("code"), "NOT_FAST_FORWARD")
+
+        rendered = metrics.render()
+        for verdict in ("allow", "warn", "block", "error"):
+            self.assertIn(
+                f'{credential_proxy.DECISION_MEMORY_CHECKS_METRIC}{{verdict="{verdict}"}} 1',
+                rendered,
+            )
+
+    def test_build_vcs_broker_refuses_spoofed_commit_email_over_http(self):
+        metrics = credential_proxy.ProxyMetrics()
+        broker = self._make_broker(metrics)
+        spoofed = self._bundle_change(
+            broker,
+            "spoof",
+            "platform-agent/spoof",
+            {"notes.txt": "spoofed\n"},
+            commit_email="reviewer@company.com",
+        )
+        status, body = self._post_publish(broker, metrics, spoofed)
+        self.assertEqual(status, HTTPStatus.FORBIDDEN, body)
+        self.assertEqual(body.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+        self.assertIn("reviewer@company.com", body.get("error", ""))
+
+
+class TeamsInboundCallerBindingTest(unittest.TestCase):
+    """The teams-inbound role is bound to the inbound receiver's ServiceAccount in
+    both directions, with the mcp binding's meaning: no callers named means the
+    audience confers nothing. The receiver is the one component the internet
+    reaches, so it holds no other audience and nobody else holds its role.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    TEAMS_INBOUND = "kubeagents-credential-proxy-teams-inbound"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    RECEIVER_SA = "system:serviceaccount:kubeagents-system:agent-teams-inbound"
+
+    def _authenticator(self, teams_inbound_callers=frozenset({RECEIVER_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.TEAMS_INBOUND: credential_proxy.CALLER_ROLE_TEAMS_INBOUND,
+            },
+            allowed_callers=frozenset({self.AGENT, self.RECEIVER_SA}),
+            teams_inbound_callers=teams_inbound_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_the_receiver_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the teams-inbound audience"
+                ):
+                    self._authenticator()._principal_from(self._review(self.RECEIVER_SA, audience))
+
+    def test_the_receiver_presenting_its_audience_is_the_teams_inbound_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.RECEIVER_SA, self.TEAMS_INBOUND))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+
+    def test_another_caller_presenting_the_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.TEAMS_INBOUND))
+
+    def test_with_no_callers_named_the_audience_confers_nothing(self):
+        for caller in (self.AGENT, self.RECEIVER_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for the Teams inbound receiver"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.TEAMS_INBOUND))
+
+    def test_the_callers_and_audience_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: f" {self.RECEIVER_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.RECEIVER_SA}), authenticator.teams_inbound_callers)
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles["aud-teams-inbound"]
+        )
+        principal = authenticator._principal_from(self._review(self.RECEIVER_SA, "aud-teams-inbound"))
+        self.assertEqual(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, principal.role)
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.RECEIVER_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_the_audience_without_callers_warns_and_confers_nothing(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-teams-inbound",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.teams_inbound_callers)
+        self.assertTrue(any(credential_proxy.TEAMS_INBOUND_CALLERS_ENV in line for line in logs.output))
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-teams-inbound"))
+
+    def test_a_colliding_audience_is_not_conferred(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.RECEIVER_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            credential_proxy.TEAMS_INBOUND_AUDIENCE_ENV: "aud-chat",
+            credential_proxy.TEAMS_INBOUND_CALLERS_ENV: self.RECEIVER_SA,
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles.values())
 
 
 if __name__ == "__main__":

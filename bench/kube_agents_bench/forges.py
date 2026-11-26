@@ -46,6 +46,7 @@ import functools
 import os
 import re
 import ssl
+import stat
 import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
@@ -56,6 +57,7 @@ __all__ = [
     "FORGE_ENV_VAR",
     "FORGE_GITHUB",
     "FORGE_GITLAB",
+    "FORGE_SAFEGUARD_MARKER",
     "FORGE_UNAVAILABLE_MARKER",
     "GITHUB_API_ROOT",
     "GITHUB_API_ROOT_ENV_VAR",
@@ -99,6 +101,12 @@ FORGES = (FORGE_GITHUB, FORGE_GITLAB)
 #: repetition whose every errored check carries it, with no check failed and
 #: no catastrophic safeguard errored, as infrastructure.
 FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
+#: What a rung-2 reason starts with when that repetition would have been
+#: graded infrastructure under FORGE_UNAVAILABLE_MARKER but for an errored
+#: catastrophic safeguard, which keeps it on rung 2. The verdict stands; the
+#: dashboard's health bot and run page read the marker to name the forge as
+#: the cause.
+FORGE_SAFEGUARD_MARKER = "KUBE_AGENTS_FORGE_SAFEGUARD"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: The GitHub host the reply's URLs are on: github.com, or a GitHub
@@ -209,7 +217,9 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     printable ASCII with no whitespace inside falls back to the variables,
     which hold the token the unit started with: such a file cannot be a
     token, and an embedded newline or a non-Latin-1 character would otherwise
-    raise out of the HTTP request's header instead of grading."""
+    raise out of the HTTP request's header instead of grading. So does a path
+    that is not a regular file: a FIFO with no writer would otherwise block
+    the read, and the check with it, for good."""
     env = _env(environ)
     token = file_token(forge, env)
     if token:
@@ -223,6 +233,9 @@ def file_token(forge: str, env: Mapping[str, str]) -> str | None:
     if forge == FORGE_GITLAB or not token_file:
         return None
     try:
+        # Checked before the open: opening a FIFO blocks until it has a writer.
+        if not stat.S_ISREG(os.stat(token_file).st_mode):
+            return None
         token = Path(token_file).read_text(encoding="utf-8").strip()
     except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
         return None
@@ -252,7 +265,7 @@ def missing_token_hint(forge: str, environ: Mapping[str, str] | None = None) -> 
     if forge != FORGE_GITLAB and token_file:
         hint += (
             f" ({GITHUB_TOKEN_FILE_ENV_VAR} names {token_file}, which was refused: "
-            "unreadable, empty, or not one line of printable ASCII)"
+            "not a regular file, unreadable, empty, or not one line of printable ASCII)"
         )
     return hint
 

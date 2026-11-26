@@ -263,6 +263,10 @@ NUMBER_WORDS = {
             "twenty-two",
             "twenty-three",
             "twenty-four",
+            "twenty-five",
+            "twenty-six",
+            "twenty-seven",
+            "twenty-eight",
         )
     )
 }
@@ -561,6 +565,11 @@ BROKER_GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "test@example.com",
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull,
+    # The default from Git 3.0, on every git the broker runs here: a call that
+    # takes a bare repository from its working directory fails.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.bareRepository",
+    "GIT_CONFIG_VALUE_0": "explicit",
 }
 
 
@@ -2913,6 +2922,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "stall-watch",
+                "post-merge-check",
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
@@ -3775,7 +3785,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("thirteen §4 facets marked _Standard cohorts only_", text)
         self.assertIn("reads as complete at eight of eight", text)
         self.assertIn("logging-components", text)
         self.assertIn("monitoring-components", text)
@@ -3817,6 +3827,8 @@ class TestAuditCatalogue(unittest.TestCase):
                 "managed-prometheus",
                 "logging-components",
                 "monitoring-components",
+                "boot-disk",
+                "kubelet-config",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
@@ -5173,12 +5185,16 @@ class TestNewMarker(HarnessTestCase):
         def cost(f):
             return len("\n".join(audit_report.render_finding(f))) + 2 + len(str(f["id"])) + 3
 
-        # Room for both unmarked; marking the first leaves no room for the second.
+        # Room for both unmarked; marking the first demotes the second from full.
         budget = sum(cost(f) for f in both)
-        _, omitted = audit_report.select_rendered_findings(both, budget)
-        self.assertEqual(omitted, [])
-        _, omitted = audit_report.select_rendered_findings(both, budget, new_ids={str(finding["id"])})
-        self.assertEqual(len(omitted), 1)
+        full, listed, omitted = audit_report.split_findings_for_body(both, budget)
+        self.assertEqual(len(full), 2)
+        self.assertEqual(listed + omitted, [])
+        full, listed, omitted = audit_report.split_findings_for_body(
+            both, budget, new_ids={str(finding["id"])}
+        )
+        self.assertEqual(len(full), 1)
+        self.assertEqual(len(listed) + len(omitted), 1)
 
 
 class TestFinishClean(HarnessTestCase):
@@ -6804,7 +6820,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Four streams have no declared-intent step. A worker on one of them that writes a
+        # The streams with no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6816,7 +6832,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 7)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -8106,6 +8122,220 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         self.assertEqual(rc, 2, self.err)
         self.assertIn("declared[]: NodePool/zonal-full", self.err)
         self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
+
+
+class TestComputeDeclaredShapes(HarnessTestCase):
+    """The compute stream's one posture: a snapshot kept after its source disk is gone. One arm, one object kind."""
+
+    COMPUTE = "gce-compute-fleet-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.5 (compute_fleet_audit.py
+    # check_orphaned_snapshot): the snapshot, its gone source disk and the
+    # server-set timestamp.
+    SNAPSHOT_EXCERPT = '{"name": "legal-hold-2025", "sourceDisk": "ledger-disk", "creationTimestamp": "2025-01-10T09:00:00.000-08:00"}'
+
+    def _snapshot_finding(self, fid="snap", obj="Snapshot/legal-hold-2025", namespace=""):
+        return make_finding(fid=fid, check="orphaned-snapshots", severity="minor", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.SNAPSHOT_EXCERPT, command="gcloud compute snapshots list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _startup_finding(self):
+        return make_finding(fid="boot", check="gce-startup-script-status", severity="critical", cluster=self.PROJECT, namespace="", obj="ComputeInstance/us-central1-a/vm-1", excerpt="startup-script exit status 1", command="gcloud compute instances get-serial-port-output vm-1 --zone=us-central1-a --project=acme-prod --port=1", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "global", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.COMPUTE, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.COMPUTE, clusters=clusters), self.COMPUTE)
+
+    def _declaration(self, obj, check="orphaned-snapshots", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/legal-hold.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_orphaned_snapshot(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.COMPUTE), frozenset({"orphaned-snapshots"}))
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.COMPUTE))
+
+    def test_a_declaration_moves_the_snapshot_and_leaves_the_failed_startup_script(self):
+        # One note names the snapshot and the instance. The snapshot moves;
+        # the failed boot is a fault and is never looked up, whatever the
+        # note says.
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        declarations = [self._declaration("Snapshot/legal-hold-2025"), self._declaration("ComputeInstance/us-central1-a/vm-1", check="gce-startup-script-status")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/legal-hold.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's snapshot a finding.
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Snapshot/legal-hold-2025"])
+        doc = self._doc([self._snapshot_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "orphaned-snapshots", "cluster": self.PROJECT, "namespace": "", "object": "Snapshot/legal-hold-2025", "severity": "minor", "excerpt": self.SNAPSHOT_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("Snapshot/legal-hold-2025")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Snapshot/legal-hold-2025"])
+
+    def test_an_incomplete_search_withholds_the_snapshot_and_publishes_the_faults(self):
+        doc = self._doc([self._snapshot_finding(), self._startup_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["Snapshot/legal-hold-2025"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ComputeInstance/us-central1-a/vm-1"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_snapshot(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="orphaned-snapshots", cluster=self.PROJECT, namespace="", obj="Snapshot/legal-hold-2025", title="legal-hold-2025 is kept under a legal hold by design", repo="acme/fleet", path="knowledge/legal-hold.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+        for fault in ("gce-startup-script-status", "mig-convergence-stalled", "sole-tenant-headroom"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "orphaned-snapshots"
+        for obj in ("Disk/ledger-disk", "Project/acme-prod", "ComputeInstance/us-central1-a/vm-1"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.COMPUTE)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("snapshot", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_snapshot_is_folded_before_the_join(self):
+        # The collector files the snapshot with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the snapshot a second identity, so the validator empties
+        # it (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._snapshot_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.snapshot-legal-hold-2025", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("Snapshot/legal-hold-2025")])
+        self.assertEqual([f["object"] for f in moved], ["Snapshot/legal-hold-2025"])
+
+
+class TestNetworkingDeclaredShapes(HarnessTestCase):
+    """The networking stream's one posture: two peered networks kept at different MTUs. One arm, one object kind."""
+
+    NETWORKING = "gcp-networking-fabric-audit"
+    PROJECT = "project/acme-prod"
+    # The collector's excerpt for 2.4 (networking_audit.py check_mtu_mismatch),
+    # the pair sorted so `default` leads.
+    MTU_EXCERPT = "default mtu=1460 peered with jumbo-storage mtu=8896"
+
+    def _mtu_finding(self, fid="mtu", obj="NetworkPeering/default--jumbo-storage", namespace=""):
+        return make_finding(fid=fid, check="mtu-packet-fragmentation", severity="major", cluster=self.PROJECT, namespace=namespace, obj=obj, excerpt=self.MTU_EXCERPT, command="gcloud compute networks list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "align the MTUs"})
+
+    def _world_open_finding(self):
+        return make_finding(fid="open", check="firewall-world-open-ingress", severity="critical", cluster=self.PROJECT, namespace="", obj="FirewallRule/allow-etcd-anywhere", excerpt="tcp:2379 from 0.0.0.0/0 reaches 1 RUNNING instance with an external address", command="gcloud compute firewall-rules list --project=acme-prod --format=json", remediation={"kind": "manual", "note": "narrow the source range"})
+
+    def _doc(self, findings):
+        clusters = [{"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.NETWORKING, self.PROJECT))}]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.NETWORKING, clusters=clusters), self.NETWORKING)
+
+    def _declaration(self, obj, check="mtu-packet-fragmentation", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/jumbo-peering.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_mtu_mismatch(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.NETWORKING), frozenset({"mtu-packet-fragmentation"}))
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.NETWORKING))
+
+    def test_a_declaration_moves_the_peering_and_leaves_the_world_open_rule(self):
+        # One note names the peering and the firewall rule. The peering moves;
+        # the rule is a fault and is never looked up, whatever the note says.
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        declarations = [self._declaration("NetworkPeering/default--jumbo-storage"), self._declaration("FirewallRule/allow-etcd-anywhere", check="firewall-world-open-ingress")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual(doc["declared"][0]["declaration"]["path"], "knowledge/jumbo-peering.md")
+        self.assertNotIn("DECLARATION NOT APPLIED", err.getvalue())
+
+    def test_a_scoped_declaration_covers_its_project_alone(self):
+        # `cluster` on the item is the finding's `project/<id>`; a note scoped
+        # to another project leaves this one's peering a finding.
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster="project/other-prod")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPeering/default--jumbo-storage"])
+        doc = self._doc([self._mtu_finding()])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage", cluster=self.PROJECT)])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_the_manifest_route_declares_a_covered_candidate(self):
+        candidate = {"check": "mtu-packet-fragmentation", "cluster": self.PROJECT, "namespace": "", "object": "NetworkPeering/default--jumbo-storage", "severity": "major", "excerpt": self.MTU_EXCERPT}
+        manifest = {"clusters": [{"name": self.PROJECT, "candidates": [candidate]}]}
+        doc = self._doc([])
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, [self._declaration("NetworkPeering/default--jumbo-storage")], manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(candidate))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NetworkPeering/default--jumbo-storage"])
+
+    def test_an_incomplete_search_withholds_the_peering_and_publishes_the_faults(self):
+        doc = self._doc([self._mtu_finding(), self._world_open_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["NetworkPeering/default--jumbo-storage"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["FirewallRule/allow-etcd-anywhere"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_peering(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="mtu-packet-fragmentation", cluster=self.PROJECT, namespace="", obj="NetworkPeering/default--jumbo-storage", title="jumbo-storage stays at 8896 beside default by design", repo="acme/fleet", path="knowledge/jumbo-peering.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+        for fault in ("subnet-ip-exhaustion", "cloud-nat-exhaustion", "psc-routing-deadlock", "cloud-armor-false-positive", "firewall-world-open-ingress"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "mtu-packet-fragmentation"
+        for obj in ("Network/jumbo-storage", "Project/acme-prod", "Subnet/jumbo-a"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.NETWORKING)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("networkpeering", str(cm.exception))
+
+    def test_a_namespace_a_worker_wrote_onto_the_peering_is_folded_before_the_join(self):
+        # The collector files the peering with no namespace on a project
+        # target and the note writes `namespace: ""`; a worker's namespace
+        # would give the pair a second identity, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        doc = self._doc([self._mtu_finding(namespace="default")])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.networkpeering-default-jumbo-storage", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NetworkPeering/default--jumbo-storage")])
+        self.assertEqual([f["object"] for f in moved], ["NetworkPeering/default--jumbo-storage"])
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -10756,17 +10986,235 @@ class TestRenderBudget(BaseTestCase):
             listed_seen = listed_seen or bool(rendered.listed)
         self.assertTrue(listed_seen, "the sweep never reached a listed body")
 
-    def test_criticals_keep_their_full_blocks_over_names_of_minors(self):
+    def test_criticals_give_up_full_blocks_so_lower_bands_are_named(self):
+        # When every finding can be named alongside all critical full blocks,
+        # criticals keep their full blocks; when not, critical full blocks past
+        # the first yield to one-line names so lower bands stay visible.
+        fits = bulk_findings(5, severity="critical", prefix="c") + bulk_findings(
+            100, prefix="m"
+        )
+        whole = audit_report.render_issue_body(make_doc(findings=fits), generated_at=NOW)
+        self.assertEqual(whole.omitted, [])
+        self.assertEqual({f["severity"] for f in whole.listed}, {"minor"})
+
         criticals = bulk_findings(20, severity="critical", prefix="c")
         minors = bulk_findings(380, prefix="m")
         rendered = audit_report.render_issue_body(
             make_doc(findings=criticals + minors), generated_at=NOW
         )
-        for finding in criticals:
-            self.assertIn(finding["id"], rendered.rendered_ids)
-        self.assertTrue(rendered.listed)
-        self.assertEqual({f["severity"] for f in rendered.listed + rendered.omitted}, {"minor"})
+        self.assertEqual(rendered.omitted, [])
+        self.assertEqual(len(rendered.rendered_ids), len(criticals) + len(minors))
+        self.assertIn(f"<!-- finding:{criticals[0]['id']} -->", rendered.body)
+        self.assertEqual({f["severity"] for f in rendered.listed}, {"critical", "minor"})
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        overflow = audit_report.render_issue_body(
+            make_doc(findings=criticals + bulk_findings(600, prefix="m")), generated_at=NOW
+        )
+        for finding in criticals:
+            self.assertIn(finding["id"], overflow.rendered_ids)
+        self.assertEqual({f["severity"] for f in overflow.omitted}, {"minor"})
+        self.assertLessEqual(len(overflow.body), GITHUB_BODY_LIMIT)
+
+    def test_compliance_boundaries_at_80_120_and_300_findings_with_states(self):
+        # Realistic compliance shape (#5052): eight clusters, ~100-char derived
+        # ids, multi-line excerpts, and `states` populated for every finding as
+        # `handle_finish` passes it.
+        clusters = [
+            {
+                "name": f"seeded-cluster-{i}",
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    {
+                        "check": slug,
+                        "command": f"kubectl --context seeded-cluster-{i} get pods -A -o json",
+                    }
+                    for slug in audit_report.AUDITS[AUDIT].checks
+                ],
+            }
+            for i in range(8)
+        ]
+
+        def compliance_doc(n_crit: int, n_maj: int, n_min: int) -> dict:
+            raw: list[dict] = []
+            idx = 0
+            bands = (
+                ("critical", n_crit, "privileged-container"),
+                ("major", n_maj, "default-sa-automount"),
+                ("minor", n_min, "image-floating-tag"),
+            )
+            for sev, count, check in bands:
+                for _ in range(count):
+                    cluster = clusters[idx % len(clusters)]["name"]
+                    ns = f"seeded-workload-ns-{idx:03d}"
+                    obj = f"Deployment/metrics-agent-deploy-{idx:03d}"
+                    raw.append(
+                        make_finding(
+                            fid=f"placeholder-{idx:04d}",
+                            severity=sev,
+                            check=check,
+                            title=f"{obj} in {ns} deviates from the {check} posture baseline",
+                            cluster=cluster,
+                            namespace=ns,
+                            obj=obj,
+                            command=(
+                                f"kubectl --context {cluster} -n {ns} get deployment "
+                                f"metrics-agent-deploy-{idx:03d} -o jsonpath='{{.spec.template.spec}}'"
+                            ),
+                            excerpt="\n".join(
+                                f"container[{k}]: securityContext.privileged=true"
+                                for k in range(18)
+                            ),
+                            remediation={
+                                "kind": "manual",
+                                "path": "",
+                                "note": "Update the workload pod template in the owning manifest.",
+                            },
+                        )
+                    )
+                    idx += 1
+            return audit_report.validate_findings(
+                {"audit": AUDIT, "scope": {"clusters": clusters, "skipped": []}, "findings": raw},
+                AUDIT,
+            )
+
+        for total, counts in ((80, (20, 35, 25)), (120, (30, 50, 40))):
+            with self.subTest(total=total):
+                doc = compliance_doc(*counts)
+                findings = doc["findings"]
+                states = {f["id"]: audit_report.STATE_OPEN for f in findings}
+                rendered = audit_report.render_issue_body(
+                    doc, generated_at=NOW, audit_id=AUDIT, states=states
+                )
+                self.assertEqual(rendered.omitted, [])
+                self.assertEqual(len(rendered.rendered_ids), total)
+                self.assertEqual(
+                    {f["severity"] for f in rendered.listed},
+                    {"critical", "major", "minor"},
+                )
+                locations = audit_report.parse_finding_locations(rendered.body)
+                self.assertEqual(
+                    {fid: loc["object"] for fid, loc in locations.items()},
+                    {f["id"]: f["object"] for f in findings},
+                )
+                if "</details>" not in rendered.body:
+                    self.assertRegex(
+                        rendered.body,
+                        r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+                    )
+                self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        doc_300 = compliance_doc(50, 120, 130)
+        findings_300 = doc_300["findings"]
+        states_300 = {f["id"]: audit_report.STATE_OPEN for f in findings_300}
+        rendered_300 = audit_report.render_issue_body(
+            doc_300, generated_at=NOW, audit_id=AUDIT, states=states_300
+        )
+        self.assertTrue(rendered_300.omitted)
+        crit_ids = {f["id"] for f in findings_300 if f["severity"] == "critical"}
+        self.assertLessEqual(crit_ids, set(rendered_300.rendered_ids))
+        self.assertIn("major", {f["severity"] for f in rendered_300.listed})
+        self.assertNotIn("critical", {f["severity"] for f in rendered_300.omitted})
+        locations_300 = audit_report.parse_finding_locations(rendered_300.body)
+        self.assertEqual(set(locations_300), set(rendered_300.rendered_ids))
+        self.assertRegex(
+            rendered_300.body,
+            r"omitted findings \(\d+ major, \d+ minor\) are the least severe",
+        )
+        self.assertNotIn("</details>", rendered_300.body)
+        self.assertRegex(
+            rendered_300.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered_300.body), GITHUB_BODY_LIMIT)
+
+    def test_dropped_check_evidence_notice_survives_omission_and_held_sections(self):
+        # Even when omitted findings AND collector-held rows compete for the
+        # remaining body budget, reserving the dropped-table notice up front
+        # guarantees the notice is never silently dropped.
+        doc = make_doc(findings=bulk_findings(500, severity="minor", prefix="m"))
+        held = [
+            {
+                "id": f"held.prod-us-east.ns.deploy-{i}",
+                "title": f"Held finding {i}",
+                "cluster": "prod-us-east",
+                "namespace": "ns",
+                "object": f"Deployment/held-{i}",
+                "check": "netpol-missing",
+                "commands": ["kubectl get netpol -A"],
+            }
+            for i in range(15)
+        ]
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=AUDIT, held=held
+        )
+        self.assertTrue(rendered.omitted)
+        self.assertNotIn("</details>", rendered.body)
+        self.assertRegex(
+            rendered.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+        # Even if the guaranteed first finding pushes `spent` past BODY_BUDGET
+        # (while still fitting under MAX_BODY_CHARS), the dropped-table notice
+        # is still emitted.
+        one_finding_doc = make_doc(findings=[bulk_findings(1, severity="critical", prefix="c")[0]])
+        with mock.patch.object(audit_report, "BODY_BUDGET", 1000):
+            squeezed = audit_report.render_issue_body(
+                one_finding_doc, generated_at=NOW, audit_id=AUDIT
+            )
+        self.assertNotIn("</details>", squeezed.body)
+        self.assertRegex(
+            squeezed.body,
+            r"The commands behind this run's \d+ check\(s\).*omitted here.*stored report",
+        )
+        self.assertLessEqual(len(squeezed.body), GITHUB_BODY_LIMIT)
+
+    def test_listed_finding_marks_new_and_charges_it_against_budget(self):
+        self.assertEqual(audit_report.split_findings_for_body([], 1000), ([], [], []))
+        finding = make_finding(fid="f-0001", severity="critical", title="Critical listed finding")
+        plain = audit_report.render_listed_finding(finding)
+        marked = audit_report.render_listed_finding(finding, new=True)
+        self.assertEqual(
+            marked,
+            f"{plain}\n{audit_report.LISTED_CONTINUATION_INDENT}{audit_report.NEW_MARKER}",
+        )
+        body = (
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n"
+            f"{marked}\n{audit_report.LISTED_SECTION_END}\n"
+        )
+        self.assertEqual(
+            audit_report._listed_locations(body)["f-0001"]["title"],
+            "Critical listed finding",
+        )
+        # Charging `NEW_MARKER` on listed rows keeps the last row out when
+        # marking it pushes it past the remaining budget.
+        items = bulk_findings(3, severity="critical", prefix="c")
+        header = len("\n".join(audit_report._listed_header(len(items)))) + len(
+            "\n" + audit_report.LISTED_SECTION_END
+        )
+        line_cost = lambda f, is_new=False: (
+            len(audit_report.render_listed_finding(f, new=is_new))
+            + 1
+            + len(f["id"])
+            + audit_report.DELTA_SLOT_CHARS
+        )
+        budget = (
+            audit_report._full_row_cost(items[0])
+            + header
+            + line_cost(items[1])
+            + line_cost(items[2])
+        )
+        _, listed_plain, omitted_plain = audit_report.split_findings_for_body(items, budget)
+        self.assertEqual(len(listed_plain), 2)
+        self.assertEqual(omitted_plain, [])
+        _, listed_new, omitted_new = audit_report.split_findings_for_body(
+            items, budget, new_ids={items[1]["id"]}
+        )
+        self.assertEqual(len(listed_new), 1)
+        self.assertEqual(len(omitted_new), 1)
 
     def test_majors_give_up_full_blocks_so_every_minor_is_named(self):
         # The live shape that left 49 minors as a count: the major band's full
@@ -11019,13 +11467,14 @@ class TestRenderBudget(BaseTestCase):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
-        rendered, omitted = audit_report.select_rendered_findings(findings, 1)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, 1)
         self.assertEqual(len(rendered), 1)
         self.assertEqual(rendered[0]["severity"], "critical")
+        self.assertEqual(listed, [])
         self.assertEqual(len(omitted), 4)
 
     def test_at_least_one_finding_always_renders(self):
-        rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
+        rendered, _, _ = audit_report.split_findings_for_body(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
 
     def test_a_target_late_in_the_alphabet_keeps_a_row_when_the_body_truncates(self):
@@ -11037,13 +11486,15 @@ class TestRenderBudget(BaseTestCase):
         late = [{**f, "cluster": "zulu"} for f in bulk_findings(2, prefix="zulu")]
         findings = early + late
         one = len("\n".join(audit_report.render_finding(early[0]))) + 2 + len(early[0]["id"]) + 3
-        rendered, omitted = audit_report.select_rendered_findings(findings, one * 4)
+        rendered, listed, omitted = audit_report.split_findings_for_body(findings, one * 6)
         clusters = [f["cluster"] for f in rendered]
         self.assertIn("zulu", clusters)
-        self.assertEqual(len(rendered) + len(omitted), len(findings))
-        # The fair-share order decides membership only. Both lists keep the
-        # display order.
+        self.assertLess(len(rendered), len(findings))
+        self.assertEqual(len(rendered) + len(listed) + len(omitted), len(findings))
+        # The fair-share order decides membership only. Every partition keeps
+        # the display order.
         self.assertEqual(rendered, audit_report.sort_findings(rendered))
+        self.assertEqual(listed, audit_report.sort_findings(listed))
         self.assertEqual(omitted, audit_report.sort_findings(omitted))
 
     def test_fair_share_never_moves_a_finding_across_a_severity_band(self):
@@ -11281,12 +11732,13 @@ class TestScopePhrase(BaseTestCase):
 
 
 class TestIndexOverhead(BaseTestCase):
-    """The index is reserved out of the budget, not charged to a finding.
+    """The state index is charged per full-row prefix via `_index_prefix_costs`.
 
-    It replaced a flat per-row allowance of 160 characters that a real id had
-    already outgrown: ids run to 100 characters and the state cell can carry a
-    full pull request URL. Under-reserving spends budget the findings were
-    promised, and the body only fails once it crosses GitHub's hard limit.
+    It replaced both a flat 160-character per-row allowance (outgrown by
+    100-character ids with pull-request URLs) and a worst-case 50-row upfront
+    reservation (which starved overflowing bodies that show only a few full
+    rows). Under-charging spends budget the findings were promised; gating on a
+    truthy state keeps stateless prefixes at zero.
     """
 
     def rendered_table(self, body):
@@ -11305,7 +11757,7 @@ class TestIndexOverhead(BaseTestCase):
             rows.append(line)
         return "\n".join(rows)
 
-    def test_the_reservation_covers_what_the_table_actually_costs(self):
+    def test_prefix_cost_covers_what_the_table_actually_costs_and_gates_on_state(self):
         # Worst realistic row: a 100-character id (the charset ceiling) and a
         # state cell carrying a pull request URL.
         fid = "f" + "-long" * 19 + "-end"
@@ -11314,6 +11766,15 @@ class TestIndexOverhead(BaseTestCase):
             make_finding(fid=f"{fid[:95]}-{i:03d}", severity="critical")
             for i in range(10)
         ]
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, None, None),
+            [0] * (len(order) + 1),
+        )
+        self.assertEqual(
+            audit_report._index_prefix_costs(order, {order[-1]["id"]: audit_report.STATE_OPEN}, None)[:-1],
+            [0] * len(order),
+        )
         states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
         urls = {
             f["id"]: "https://github.com/an-org/a-repository/pull/12345"
@@ -11325,44 +11786,101 @@ class TestIndexOverhead(BaseTestCase):
             states=states,
             pr_urls=urls,
         )
-        reserved = audit_report.index_overhead(findings, states, urls)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        costs = audit_report._index_prefix_costs(order, states, urls)
+        self.assertGreaterEqual(costs[len(order)], len(self.rendered_table(body)))
 
-    def test_the_reservation_bounds_the_table_of_a_fair_share_selection(self):
+    def test_prefix_costs_bound_every_fair_share_selection_including_past_cap(self):
         # A rendered set is a prefix of the fair-share order, not of the
-        # display order. Here the display order puts the short `alpha` rows
-        # first, but a truncated selection alternates alpha and zulu, so the
-        # table shows the wide zulu rows too. The reservation must cover each
-        # table that a selection can show.
+        # display order. Check both display orders — narrow `alpha` ahead of
+        # wide `zulu`, and wide `alpha` ahead of narrow `zulu` — across
+        # selections below, at, and past `MAX_DELTA_ROWS` (`cap + 10 > 50`) so
+        # past-cap eviction (`shown.pop()`) and the overflow row are exercised.
         cap = audit_report.MAX_DELTA_ROWS
-        wide = "z" + "-wide" * 18
-        alpha = [{**f, "cluster": "alpha"} for f in bulk_findings(cap + 10, prefix="a")]
-        zulu = [
-            {**f, "id": f"{wide}-{i:03d}", "cluster": "zulu"}
-            for i, f in enumerate(bulk_findings(cap + 10, prefix="z"))
-        ]
-        findings = alpha + zulu
-        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
-        urls = {f["id"]: "https://github.com/an-org/a-repository/pull/12345" for f in zulu}
-        reserved = audit_report.index_overhead(findings, states, urls)
-        one = len("\n".join(audit_report.render_finding(alpha[0], state=audit_report.STATE_PR_OPEN)))
-        for count in (cap // 2, cap, cap + cap // 2):
-            with self.subTest(count=count):
-                rendered, _ = audit_report.select_rendered_findings(
-                    findings, one * count, states=states, pr_urls=urls
+        for wide_cluster in ("zulu", "alpha"):
+            alpha_base = bulk_findings(cap + 10, prefix="a")
+            zulu_base = bulk_findings(cap + 10, prefix="z")
+            alpha = [
+                {
+                    **f,
+                    "id": f"{'a' + '-wide' * 18}-{i:03d}" if wide_cluster == "alpha" else f["id"],
+                    "cluster": "alpha",
+                }
+                for i, f in enumerate(alpha_base)
+            ]
+            zulu = [
+                {
+                    **f,
+                    "id": f"{'z' + '-wide' * 18}-{i:03d}" if wide_cluster == "zulu" else f["id"],
+                    "cluster": "zulu",
+                }
+                for i, f in enumerate(zulu_base)
+            ]
+            findings = alpha + zulu
+            order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+            states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+            wide_rows = alpha if wide_cluster == "alpha" else zulu
+            urls = {
+                f["id"]: "https://github.com/an-org/a-repository/pull/12345"
+                for f in wide_rows
+            }
+            costs = audit_report._index_prefix_costs(order, states, urls)
+            full_costs = [
+                audit_report._full_row_cost(f, states=states, pr_urls=urls) for f in order
+            ]
+            line_costs = [
+                len(
+                    audit_report.render_listed_finding(
+                        f, state=states.get(f["id"]), pr_url=urls.get(f["id"])
+                    )
                 )
-                table = sum(
-                    len(audit_report._index_row(f, states[f["id"]], urls.get(f["id"]))) + 1
-                    for f in rendered[:cap]
+                + 1
+                + len(f["id"])
+                + audit_report.DELTA_SLOT_CHARS
+                for f in order
+            ]
+            header = len("\n".join(audit_report._listed_header(len(order)))) + len(
+                "\n" + audit_report.LISTED_SECTION_END
+            )
+            for target_full in (cap // 2, cap, cap + 10):
+                budget = (
+                    sum(full_costs[:target_full])
+                    + costs[target_full]
+                    + header
+                    + sum(line_costs[target_full:])
                 )
-                self.assertGreaterEqual(reserved, table)
+                with self.subTest(wide_cluster=wide_cluster, target_full=target_full):
+                    lines, listed, omitted = audit_report._render_findings(
+                        findings, budget, states=states, pr_urls=urls
+                    )
+                    full_count = len(findings) - len(listed) - len(omitted)
+                    self.assertEqual(full_count, target_full)
+                    self.assertEqual(omitted, [])
+                    rendered_table = self.rendered_table("\n".join(lines))
+                    if target_full > cap:
+                        self.assertIn(f"…and {target_full - cap} more below", rendered_table)
+                    self.assertGreaterEqual(costs[full_count], len(rendered_table))
+                    without_states, _, _ = audit_report.split_findings_for_body(
+                        findings, budget
+                    )
+                    self.assertGreaterEqual(len(without_states), full_count)
 
-    def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
-        findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
+    def test_prefix_cost_bounds_a_table_that_hits_the_row_cap(self):
+        cap = audit_report.MAX_DELTA_ROWS
+        findings = bulk_findings(cap + 20)
         states = {f["id"]: audit_report.STATE_OPEN for f in findings}
-        reserved = audit_report.index_overhead(findings, states, {})
-        body = render_body(make_doc(findings=findings), generated_at=NOW, states=states)
-        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        costs = audit_report._index_prefix_costs(order, states, {})
+        all_full_budget = (
+            sum(audit_report._full_row_cost(f, states=states) for f in order)
+            + costs[len(order)]
+        )
+        lines, listed, omitted = audit_report._render_findings(
+            findings, all_full_budget, states=states
+        )
+        self.assertEqual(listed + omitted, [])
+        table = self.rendered_table("\n".join(lines))
+        self.assertIn("…and 20 more below", table)
+        self.assertGreaterEqual(costs[len(order)], len(table))
 
 
 # --------------------------------------------------------------------------- #
@@ -12501,6 +13019,23 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
         self.assertEqual(
             audit_report.pending_remediate_targets([collaborator_bot]), []
         )
+
+    def test_request_times_keep_each_ids_newest_authorized_request(self):
+        """What `plan_generated_fixes` weighs against a closed pull request: the
+        same requests `start` reports, each with its newest time."""
+        comments = [
+            comment("/remediate a", node_id="IC_1", created_at="2026-10-01T00:00:00Z"),
+            comment("/remediate a\n/remediate b", node_id="IC_2", created_at="2026-10-03T00:00:00Z"),
+            comment("/remediate a", node_id="IC_3", created_at="2026-10-02T00:00:00Z"),
+            comment("/remediate c", association="NONE", login="drive-by", node_id="IC_4"),
+            self.bot("/remediate d", association="MEMBER"),
+            comment("/remediate all", node_id="IC_5"),
+        ]
+        self.assertEqual(
+            audit_report.remediate_request_times(comments),
+            {"a": "2026-10-03T00:00:00Z", "b": "2026-10-03T00:00:00Z"},
+        )
+        self.assertEqual(audit_report.pending_remediate_targets(comments), ["a", "b"])
 
     def test_a_collaborator_bot_is_still_refused_promotion(self):
         collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
@@ -16834,6 +17369,18 @@ class TestFindExistingIssue(HarnessTestCase):
         self.err = err.getvalue()
         return result
 
+    def test_a_ledger_body_that_is_not_a_text_is_a_body_that_did_not_arrive(self):
+        """The broker's GitHub translation gives None for a body that is not a text. The read
+        gives None for it too, which is "the body did not arrive": a run leaves that ledger's
+        body alone. The empty text is a real empty body, which a run can write over."""
+        url = "https://github.com/acme/fleet/issues/42"
+        for body in (None, [["nested"]], {"a": 1}, 7):
+            with self.subTest(body=body):
+                self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": body}])}
+                self.assertIsNone(self.find()[2])
+        self.harness.replies = {"issue-list": issues_view([{"number": 42, "url": url, "body": ""}])}
+        self.assertEqual("", self.find()[2])
+
     def test_the_highest_number_wins_so_the_choice_converges(self):
         # Duplicates exist because some run created one — and that run wrote
         # this stream's state into the higher number and linked it from every
@@ -18213,6 +18760,160 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(ids, [])
 
 
+class TestCarryRules(unittest.TestCase):
+    """A carried remediation that fails a `CARRY_RULES` rule gives way to this
+    run's, and one that no rule can judge stays."""
+
+    CLUSTER = "acme-prod/us-east4/seeded-c"
+    FLAGS = "--enable-master-authorized-networks --master-authorized-networks"
+    RIGHT = f"gcloud container clusters update seeded-c --location=us-east4 {FLAGS}=<ranges>"
+    REWORDED = f"gcloud container clusters update seeded-c --region us-east4 {FLAGS}=<owner-ranges>"
+
+    def finding(self, note, check="authorized-networks", cluster=CLUSTER, kind="gcloud", **overrides):
+        finding = {
+            "id": f"{check}.c._.cluster-seeded-c",
+            "check": check,
+            "cluster": cluster,
+            "title": "seeded-c has no authorized networks",
+            "impact": "The control plane answers every address.",
+            "recommendation": {"action": "Enable authorized networks.", "risk": "None."},
+            "remediation": {"kind": kind, "note": note},
+            "evidence": {"command": "gcloud container clusters list", "excerpt": "a"},
+            "severity": "critical",
+        }
+        finding.update(overrides)
+        return finding
+
+    def carry(self, before, now):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            ids = audit_report.carry_unchanged_findings([now], {"findings": [before]})
+        return ids, now, err.getvalue()
+
+    def assert_kept(self, note, **kwargs):
+        """The previous note stays, and the run log does not name a rule."""
+        before = self.finding(note, title="previous title", **kwargs)
+        _, out, err = self.carry(before, self.finding(self.REWORDED, **kwargs))
+        self.assertEqual(out["remediation"]["note"], note)
+        self.assertEqual(out["title"], "previous title")
+        self.assertNotIn("not carried forward", err)
+
+    def assert_replaced(self, note, rule, **kwargs):
+        """This run's pair is published; title and impact still carry."""
+        before = self.finding(
+            note, title="previous title", recommendation={"action": "Previous action."}, **kwargs
+        )
+        now = self.finding(self.REWORDED, **kwargs)
+        ids, out, err = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], self.REWORDED)
+        self.assertEqual(out["recommendation"]["action"], "Enable authorized networks.")
+        self.assertEqual(out["title"], "previous title")
+        self.assertEqual(ids, [now["id"]])
+        self.assertIn(f"{now['id']}: the previous run's remediation is not carried forward ({rule}).", err)
+        self.assertNotIn("gcloud", err)
+
+    def test_a_right_command_for_the_same_cluster_is_kept(self):
+        self.assert_kept(self.RIGHT)
+        self.assert_kept(self.RIGHT.replace("--location=us-east4", "--location us-east4 --project=acme-prod"))
+
+    def test_a_command_for_another_cluster_is_replaced(self):
+        for wrong in (
+            self.RIGHT.replace("seeded-c", "seeded-a"),
+            self.RIGHT.replace("us-east4", "us-west1"),
+            self.RIGHT + " --project=acme-dev",
+            f"{self.RIGHT}\n{self.RIGHT.replace('seeded-c', 'seeded-a')}",
+            f"# Close the endpoint.\n$ {self.RIGHT.replace('seeded-c', 'seeded-a')}",
+        ):
+            with self.subTest(wrong=wrong):
+                self.assert_replaced(wrong, audit_report.CARRY_RULE_OTHER_CLUSTER, check="release-channel")
+
+    def test_a_wrong_command_in_a_manual_note_or_the_recommendation_is_replaced(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding(f"Run `{wrong}` in a change window.", kind="manual", check="release-channel")
+        now = self.finding("Ask the owner.", kind="manual", check="release-channel")
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(out["remediation"]["note"], "Ask the owner.")
+        for field in audit_report.COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            with self.subTest(field=field):
+                before = self.finding(self.RIGHT, recommendation={field: f"Run `{wrong}`."})
+                _, out, _ = self.carry(before, self.finding(self.REWORDED))
+                self.assertEqual(out["remediation"]["note"], self.REWORDED)
+
+    def test_the_note_before_the_route_cut_is_read(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        before = self.finding("See the route note.", check="release-channel")
+        before["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD] = wrong
+        _, out, _ = self.carry(before, self.finding(self.REWORDED, check="release-channel"))
+        self.assertEqual(out["remediation"], {"kind": "gcloud", "note": self.REWORDED})
+
+    def test_a_command_the_rule_cannot_judge_is_kept(self):
+        update = "gcloud container clusters update"
+        for note in (
+            f"{update} <C> --location=<L> --project=<PROJECT> {self.FLAGS}=<CIDR>",
+            f"{update} $CLUSTER --location $LOCATION {self.FLAGS}=${{RANGES}}",
+            f"{update} seeded-c --location=us-east4 --project=123456789012 {self.FLAGS}=<ranges>",
+            f"{update} seeded-a {self.FLAGS}=<ranges>",
+            f"{update} projects/acme-prod/locations/us-east4/clusters/seeded-c --location=us-east4",
+            f"{update} SEEDED-C --location=US-EAST4 --project=Acme-Prod",
+            f"{update} seeded-a --location=us-west1 {self.FLAGS}=<ranges the cluster's own owner approves>",
+            "gcloud container node-pools update pool-1 --cluster=seeded-a --location=us-west1",
+            "Update seeded-a in us-west1 with gcloud container clusters update.",
+        ):
+            with self.subTest(note=note):
+                self.assert_kept(note)
+
+    def test_a_scope_that_is_not_one_cluster_is_kept(self):
+        wrong = self.RIGHT.replace("seeded-c", "seeded-a")
+        for cluster in ("project/acme-prod", "seeded-c", ""):
+            with self.subTest(cluster=cluster):
+                self.assert_kept(wrong, cluster=cluster, check="release-channel")
+
+    def test_a_literal_range_where_the_sop_leaves_it_to_the_owner_is_replaced(self):
+        for value in (
+            "=203.0.113.0/24",
+            " 203.0.113.0/24",
+            "=<ranges>,203.0.113.7",
+            '="198.51.100.0/24,203.0.113.0/24"',
+            "=2001:db8::/32",
+        ):
+            with self.subTest(value=value):
+                note = self.RIGHT.replace("=<ranges>", value)
+                self.assert_replaced(note, audit_report.CARRY_RULE_OWNER_VALUE)
+
+    def test_a_range_the_owner_rule_does_not_cover_is_kept(self):
+        literal = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        self.assert_kept(literal, check="release-channel")
+        # `public-control-plane` has no row; its carried command still gets its repair.
+        before = self.finding(literal, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        now = self.finding(self.REWORDED, check=audit_report.PUBLIC_CONTROL_PLANE_CHECK)
+        _, out, _ = self.carry(before, now)
+        self.assertEqual(
+            out["remediation"]["note"], f"{literal} {audit_report.GOOGLE_CLOUD_ACCESS_FLAG}"
+        )
+        self.assert_kept(self.RIGHT.replace("<ranges>", "<CIDR/len>,<X>/32"))
+        self.assert_kept(f"{self.RIGHT}  # not 203.0.113.0/24, which is a peer's")
+        self.assert_kept(f"{self.RIGHT} --cluster-ipv4-cidr=10.0.0.0/14")
+
+    def test_the_previous_pair_stays_when_this_runs_pair_fails_too(self):
+        previous = self.RIGHT.replace("<ranges>", "203.0.113.0/24")
+        mine = self.RIGHT.replace("<ranges>", "198.51.100.0/24")
+        _, out, err = self.carry(self.finding(previous), self.finding(mine))
+        self.assertEqual(out["remediation"]["note"], previous)
+        self.assertNotIn("not carried forward", err)
+
+    def test_a_previous_remediation_validation_would_refuse_is_not_carried(self):
+        for remediation in ({"kind": "script", "note": "x"}, {"note": "x"}, {"kind": "manual", "note": 7}):
+            with self.subTest(remediation=remediation):
+                before = self.finding("x", title="previous title", remediation=remediation)
+                _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+                self.assertEqual(out["remediation"], {"kind": "manual", "note": "Ask the owner."})
+                self.assertEqual(out["title"], "previous title")
+
+    def test_a_previous_remediation_with_no_note_is_still_carried(self):
+        before = self.finding("x", remediation={"kind": "manual"})
+        _, out, _ = self.carry(before, self.finding("Ask the owner.", kind="manual"))
+        self.assertEqual(out["remediation"], {"kind": "manual", "note": ""})
+
+
 class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
     """`finish` reads the previous run's document and keeps its wording, in a
     dry run and in the real run alike."""
@@ -18302,6 +19003,25 @@ class TestCarryUnchangedFindingsInFinish(HarnessTestCase):
         body = self.harness.forge_calls("issue-create")[0]["body"]
         self.assertIn(self.OLD_TITLE, body)
         self.assertNotIn(self.NEW_TITLE, body)
+
+    def test_a_previous_command_for_another_cluster_is_not_published(self):
+        cluster = "acme-prod/us-east4/prod-us-east"
+        update = "gcloud container clusters update {} --location=us-east4 --enable-network-policy"
+
+        def finding(title, name):
+            return make_finding(
+                title=title, cluster=cluster, remediation={"kind": "gcloud", "note": update.format(name)}
+            )
+
+        before = finding(self.OLD_TITLE, "prod-us-west")
+        before["id"] = derived_id(cluster=cluster)
+        self.store({"findings": [before]})
+        rc = self.run_finish(make_doc(findings=[finding(self.NEW_TITLE, "prod-us-east")]), ["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn(self.OLD_TITLE, self.out)
+        self.assertIn(update.format("prod-us-east"), self.out)
+        self.assertNotIn("prod-us-west", self.out)
+        self.assertIn(f"not carried forward ({audit_report.CARRY_RULE_OTHER_CLUSTER})", self.err)
 
     def test_changed_evidence_publishes_the_new_wording(self):
         self.store(self.previous(excerpt="an older excerpt"))
@@ -22484,6 +23204,116 @@ class TestDraftFindings(BaseTestCase):
         )
         self.assertEqual(json.loads(out.read_text())["findings"][0]["check"], "netpol-missing")
 
+    def draft(self, *extra):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        self.out = self.err = ""
+        return self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), *extra])
+
+    def test_the_draft_goes_to_the_findings_path_and_not_through_the_worker(self):
+        """With no --out the document is on disk where `finish` reads it, and the
+        output is a status line: a document printed to stdout enters the worker's
+        context and has to be sent back through one tool call to become a file."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.draft(), 0, self.err)
+        written = json.loads(Path(audit_report.findings_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(written["findings"][0]["check"], "netpol-missing")
+        said = self.out + self.err
+        self.assertNotIn('"findings"', said)
+        self.assertIn(f"wrote {audit_report.findings_path_for(AUDIT)}", said)
+        self.assertIn("in place", said)
+        self.assertIn("Never send the document, or a block of its findings, through a tool call", said)
+        self.assertIn("one `patch` for one finding's fields", said)
+        # The card gate reads a JSON line with these key pairs as a `start` or a `finish`.
+        for line in said.splitlines():
+            self.assertFalse(line.lstrip().startswith("{"), line)
+
+    def test_a_dash_prints_the_draft_for_a_person(self):
+        self.assertEqual(self.draft("--out", audit_report.DRAFT_STDOUT), 0, self.err)
+        self.assertEqual(json.loads(self.out)["findings"][0]["check"], "netpol-missing")
+        self.assertFalse(Path(audit_report.findings_path_for(AUDIT)).exists())
+
+    def test_a_second_draft_does_not_erase_filled_findings(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+        self.assertEqual(self.draft(), 0, self.err)
+        self.assertEqual(self.draft(), 0, "an unfilled draft is replaced: " + self.err)
+        document = json.loads(target.read_text(encoding="utf-8"))
+        document["findings"][0]["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        target.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit) as refused:
+            self.draft()
+        self.assertIn("a second draft would erase", str(refused.exception))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "a")
+        self.assertEqual(self.draft("--overwrite"), 0, self.err)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "")
+
+    def test_a_second_draft_keeps_an_edit_to_any_field(self):
+        """The worker fills more than recommendations in place, and a run with no finding has no
+        recommendation at all, so the guard reads the whole document."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+
+        def remediation_only(document):
+            document["findings"][0]["remediation"] = {"kind": "manual", "note": "narrow the rule"}
+
+        def resolved_because(document):
+            document["resolved_because"] = {"some.finding.id": "the workload is gone"}
+
+        def declared(document):
+            document["declared"] = {"some.finding.id": "accepted by the owner"}
+
+        def scope_note(document):
+            document["scope"]["clusters"][0]["limitations"] = ["one read failed"]
+
+        for edit in (remediation_only, resolved_because, declared, scope_note):
+            with self.subTest(edit=edit.__name__):
+                self.assertEqual(self.draft("--overwrite"), 0, self.err)
+                document = json.loads(target.read_text(encoding="utf-8"))
+                edit(document)
+                kept = json.dumps(document)
+                target.write_text(kept, encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    self.draft()
+                self.assertEqual(target.read_text(encoding="utf-8"), kept)
+        with self.subTest(edit="a file that no longer parses"):
+            target.write_text('{"audit": "half an edit', encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.draft()
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"audit": "half an edit')
+        with self.subTest(edit="an empty file is not work"):
+            target.write_text("", encoding="utf-8")
+            self.assertEqual(self.draft(), 0, self.err)
+            self.assertIn("findings", json.loads(target.read_text(encoding="utf-8")))
+
+    def test_the_fill_step_bounds_a_tool_call_under_half_the_stale_bound(self):
+        """A tool call's arguments arrive only when complete, so the call must be written well
+        inside the runtime's stale bound: by the fill step an audit's prompt is large, which is the
+        300 s tier (the configured base when that is higher), and a slow writer produces 25 tokens a
+        second at about 3.5 characters each."""
+        large_prompt_stale_seconds = 300
+        slow_chars_per_second = 25 * 3.5
+        config = (Path(__file__).resolve().parents[3] / "config.yaml").read_text(encoding="utf-8")
+        base = int(re.search(r"^\s*stale_timeout_seconds:\s*(\d+)\s*$", config, re.M).group(1))
+        bound = max(base, large_prompt_stale_seconds)
+        self.assertLessEqual(audit_report.DRAFT_FILL_CALL_CHARS / slow_chars_per_second, bound / 2)
+        self.assertIn(str(audit_report.DRAFT_FILL_CALL_CHARS), audit_report.DRAFT_FILL_HINT)
+        skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(f"about {audit_report.DRAFT_FILL_CALL_CHARS:,} characters", skill)
+
+    def test_no_procedure_orders_the_document_through_one_call(self):
+        """Three procedures said "in one shot"; a worker that obeys writes the whole
+        document as one tool call, which is the call the runtime drops."""
+        governance = Path(__file__).resolve().parents[3] / "governance"
+        skill = Path(__file__).resolve().parents[1]
+        texts = list(governance.glob("*_sop.md")) + [skill / "SKILL.md"] + list((skill / "references").glob("*.md"))
+        self.assertTrue(texts)
+        for text in texts:
+            with self.subTest(file=text.name):
+                body = text.read_text(encoding="utf-8")
+                self.assertNotIn("in one shot", body)
+                self.assertNotIn("Write the whole document", body)
+
 
 class TestUnwrittenSweepFixes(HarnessTestCase):
     """`finish` refuses a fix the sweep would open and nobody wrote, until it is
@@ -22513,7 +23343,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
 
-    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False):
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False, requested_at=None):
         manifest = self.manifest()
         manifest["clusters"][0]["candidates"][0].update(
             {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
@@ -22529,7 +23359,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 # As the Config Connector scan does before planning.
                 probe.broker()
             planned, self.answered = audit_report.plan_generated_fixes(
-                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT,
+                requested_at=requested_at,
             )
             probe.close()
             audit_report.write_generated_fixes(findings, planned, self.workspace)
@@ -22610,6 +23441,35 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(written, [])
                 # Answered, so `finish` does not refuse over it either.
                 self.assertEqual(self.answered, {"a"})
+
+    def test_a_request_after_the_carrying_pull_request_closed_plans_the_budget_again(self):
+        """#7013: a budget's pull request merged, a person later removed the file, and every
+        `/remediate` on the finding was refused as not a `manifest`. A request newer than the
+        merge or close sets that pull request aside; an older or untimed one leaves it answering,
+        so an old comment never re-proposes a budget a person removed."""
+        delta = audit_report.delta_block(["a"])
+        for state, fields in {
+            "merged": {"state": "MERGED", "mergedAt": "2026-10-01T00:00:00Z", "closedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            carrying = {**fields, "headRefName": "x", "body": delta}
+            for asked, planned in {
+                "2026-10-02T00:00:00Z": ["a"],
+                "2026-09-30T00:00:00Z": [],
+                "": [],
+            }.items():
+                with self.subTest(state, asked=asked or "untimed"):
+                    self.unclone()
+                    self.workspace.mkdir(parents=True, exist_ok=True)
+                    written, finding = self.generate(prs=[carrying], requested_at={"a": asked})
+                    self.assertEqual(written, planned)
+                    self.assertEqual(self.answered, set() if planned else {"a"})
+                    self.assertEqual(finding["remediation"]["kind"], "manifest" if planned else "manual")
+        # An open pull request is live work, whenever the request came.
+        live = {"state": "OPEN", "headRefName": "x", "body": delta}
+        written, _ = self.generate(prs=[live], requested_at={"a": "2026-10-02T00:00:00Z"})
+        self.assertEqual(written, [])
+        self.assertEqual(self.answered, {"a"})
 
     def test_a_pull_request_carrying_a_fix_finish_cannot_build_answers_it(self):
         """No usable selector, so the worker wrote it by hand once; its pull
@@ -26016,6 +26876,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             "namespace-token",
             "service-selector",
             "hard-spread",
+            "reserved-pool",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
@@ -31220,27 +32081,46 @@ class TestReportStore(HarnessTestCase):
     def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
         """Mode cannot let uid 1000 write into a root-owned directory; root
         hands every directory and file it creates to the nearest existing
-        directory's owner, so the next scheduled run can write."""
+        directory's owner, so the next scheduled run can write. Always
+        through a descriptor: a chown by name could follow a swapped link."""
         self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
         owner = self.reports_dir.parent.stat()
         chowned = []
         with (
             patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(audit_report.os, "chown", side_effect=AssertionError("chown by name")),
             patch.object(
-                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
-                    (Path(path), uid, gid)
+                audit_report.os, "fchown", side_effect=lambda fd, uid, gid: chowned.append(
+                    (os.fstat(fd).st_ino, stat.S_ISDIR(os.fstat(fd).st_mode), uid, gid)
                 )
             ),
         ):
             audit_report.write_report(AUDIT, self.envelope(), NOW)
-        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        self.assertEqual({(uid, gid) for _, _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
         directory = self.store_dir()
-        paths = {path for path, _, _ in chowned}
+        inodes = {ino for ino, _, _, _ in chowned}
         for created in (self.reports_dir, directory, directory / "runs"):
             with self.subTest(created=created):
-                self.assertIn(created, paths)
+                self.assertIn(created.stat().st_ino, inodes)
         # One temp file per write: the ring entry and latest.json.
-        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+        self.assertEqual(len([1 for _, is_dir, _, _ in chowned if not is_dir]), 2)
+
+    def test_a_new_directory_swapped_for_a_link_is_left_alone(self):
+        """The store's directories are its owner's, so a directory root just
+        made can be swapped for a link before its mode and owner are set;
+        neither may land on what the link points at."""
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "elsewhere"
+        target.mkdir(mode=0o700)
+        link = Path(self.enterContext(tempfile.TemporaryDirectory())) / "swapped"
+        link.symlink_to(target)
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(audit_report.os, "fchown") as fchown,
+            self.assertRaises(OSError),
+        ):
+            audit_report._settle_new_dir(link, link.parent.stat())
+        fchown.assert_not_called()
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
     def test_another_uids_store_is_named_when_it_is_denied(self):
         """What a root hand-run from before the handover left behind: the
@@ -32768,7 +33648,7 @@ class TestManifestRemediationLinks(HarnessTestCase):
         ).body
         self.assertIn(f"[`{self.PATH}`]({self.PATH})", body)
 
-    def test_select_rendered_findings_charges_the_expanded_url_against_the_budget(self):
+    def test_split_findings_for_body_charges_the_expanded_url_against_the_budget(self):
         findings = [
             make_finding(
                 fid=f"netpol-missing.prod-us-east.payments.namespace-p{i}",
@@ -32777,14 +33657,17 @@ class TestManifestRemediationLinks(HarnessTestCase):
             )
             for i in range(25)
         ]
-        bare_rendered, _ = audit_report.select_rendered_findings(findings, 8000)
-        expanded_rendered, _ = audit_report.select_rendered_findings(
-            findings,
-            8000,
-            file_url=self.GITHUB_TEMPLATE,
-            file_ref=self.SHA,
-        )
-        self.assertLess(len(expanded_rendered), len(bare_rendered))
+        bare_total = sum(audit_report._full_row_cost(f) for f in findings)
+        for budget in (bare_total, bare_total // 2):
+            with self.subTest(budget=budget):
+                bare_rendered, _, _ = audit_report.split_findings_for_body(findings, budget)
+                expanded_rendered, _, _ = audit_report.split_findings_for_body(
+                    findings,
+                    budget,
+                    file_url=self.GITHUB_TEMPLATE,
+                    file_ref=self.SHA,
+                )
+                self.assertLess(len(expanded_rendered), len(bare_rendered))
 
     def test_finish_reads_capabilities_once_and_fills_links_including_relink(self):
         self.touch(self.PATH)
@@ -34359,6 +35242,299 @@ GITHUB_LIKE = {
 GITLAB_LIKE = {**GITHUB_LIKE, "forge": "gitlab"}
 
 
+class TestShadowRun(BaseTestCase):
+    """A shadow run (#5623): the report goes to the store's shadow stream and nowhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        # Any git or forge call is recorded: a shadow run makes none, even with
+        # a repository registered.
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]),
+            patch("gitops_workspace._read_state_text", lambda key: "acme/gitops"),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The real in-flight claim: the recorded mode is trusted only for the
+        # run now in flight (`run_is_shadow`).
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        # The declared-intent search reads each owed repository completely, so
+        # a run's delta isn't held over a search gap the stub clone would leave.
+        self.patch_attr(
+            "discover_declarations",
+            lambda audit_id, repo, root, entries: ([], [f"{entry['repo']}@0123abc" for entry in entries], []),
+        )
+        for name in ("open_chat_report", "append_chat_report", "save_chat_verdict"):
+            stub = mock.MagicMock(name=name)
+            self.patch_attr(name, stub)
+            setattr(self, name, stub)
+        self.env = {audit_report.SHADOW_TASK_ENV: "true"}
+        patcher = patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(audit_report.SHADOW_TRIGGER_STREAM_ENV, None)
+
+    def only_search_clones(self):
+        """Every recorded call that isn't the declared-intent search's read-only clone."""
+        return [
+            call for call in self.recorder.calls
+            if not (any(str(arg).endswith("inspect_repository.py") for arg in call) and "clone" in call)
+        ]
+
+    def shadow_store(self, stream=None, repo="acme/gitops"):
+        # Under the install's own key, which the broker requires of a profile's write.
+        return Path(audit_report.reports_dir_for(stream or AUDIT + audit_report.SHADOW_STREAM_SUFFIX, repo))
+
+    def start(self, *extra):
+        code = self.run_main(["start", "--audit", AUDIT, *extra])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc, scheduled=True, extra=(audit_report.STORE_ONLY_FLAG,)):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, *extra]
+            + (["--scheduled"] if scheduled else [])
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_it_writes_the_shadow_stream_alone_and_asks_nothing_of_forge_or_chat(self):
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], AUDIT + audit_report.SHADOW_STREAM_SUFFIX)
+        latest = json.loads((self.shadow_store() / "latest.json").read_text())
+        self.assertTrue(latest[audit_report.SHADOW_KEY])
+        self.assertEqual(latest["audit_id"], AUDIT)
+        self.assertIn("summary", out)
+        self.assertEqual(latest[audit_report.SHADOW_SUMMARY_KEY].splitlines()[0], out["summary"].splitlines()[0])
+        # The live stream is untouched: no store, no chat, no forge write
+        # (the declared-intent search, stubbed here, is the one read).
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+        self.open_chat_report.assert_not_called()
+        self.append_chat_report.assert_not_called()
+        self.save_chat_verdict.assert_not_called()
+
+    def test_its_delta_is_against_its_own_previous_run(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+        unchanged = self.finish(doc)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
+    def test_the_schedule_the_runtime_names_is_the_stream(self):
+        with patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: "compliance-audit-canary"}):
+            out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertEqual(out[audit_report.SHADOW_STREAM_KEY], "compliance-audit-canary")
+        self.assertTrue((self.shadow_store("compliance-audit-canary") / "latest.json").exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_schedule_name_that_is_a_live_stream_or_ill_formed_is_refused(self):
+        for bad in (AUDIT, "Not_A_Label"):
+            with self.subTest(bad=bad), patch.dict(os.environ, {audit_report.SHADOW_TRIGGER_STREAM_ENV: bad}):
+                code = self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG])
+                self.assertNotEqual(code, 0)
+                self.assertIn(audit_report.SHADOW_TRIGGER_STREAM_ENV, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_the_runtime_and_the_flag_must_agree(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # A shadow task that leaves the flag out is refused, on start and finish.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # A live task that passes it is refused.
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "false"}):
+            self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG]), 0)
+        # The flag with --dry-run is refused.
+        self.assertNotEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run", audit_report.STORE_ONLY_FLAG]),
+            0,
+        )
+        # --repo means nothing to a shadow run.
+        self.assertNotEqual(self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG, "--repo", "acme/gitops"]), 0)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_a_dry_run_preview_passes_in_a_shadow_task(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
+        self.assertFalse(self.shadow_store().exists())
+
+    def test_with_no_repository_registered_it_writes_under_no_forge(self):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch(
+            "gitops_workspace._read_state_text", lambda key: ""
+        ):
+            self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue((self.shadow_store(repo=audit_report.NO_FORGE_REPO) / "latest.json").exists())
+
+    def test_a_run_started_as_a_shadow_run_ends_as_one_with_no_runtime_word(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        # `finish` without the flag would publish live: refused.
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        # And from `_finish` directly, as precheck's close calls it.
+        close = argparse.Namespace(audit=AUDIT, findings_file=path, repo=None, dry_run=False, scheduled=True)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report._finish(close, AUDIT)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_live_record_doesnt_refuse_a_store_only_finish(self):
+        # Store-only writes nothing live, so a live run's record doesn't refuse it.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.record_run(audit=AUDIT)
+        self.assertFalse(audit_report.run_is_shadow(AUDIT))
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+
+    def test_the_runtime_word_fails_closed(self):
+        for value, want in (("true", True), ("1", True), ("yes", True), ("TRUE", True), ("false", False), ("0", False), ("", None)):
+            with self.subTest(value=value), patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: value}):
+                self.assertIs(audit_report.task_is_shadow(), want)
+
+    def test_a_shadow_runs_record_still_blocks_a_live_publish_after_its_note_is_gone(self):
+        # A shadow finish that died released its in-flight note; the retry
+        # without the flag must not publish live. Only a new `start` replaces the record.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        audit_report.release_in_flight(AUDIT)
+        self.assertTrue(audit_report.run_is_shadow(AUDIT))
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertNotEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_remediate_refuses_in_a_run_started_as_a_shadow_run(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        code = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", "x"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("shadow run", self.err)
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_shadow_start_doesnt_honour_a_pin_on_the_gitops_repository(self):
+        # As a live run reads the GitOps repository at its default branch,
+        # whatever `ref` a context entry naming it carries, so does a shadow
+        # run, under any spelling of the entry.
+        for pinned in ({"repo": "ACME/GitOps", "ref": "curated", audit_report.REFUSED_REF_KEY: None},
+                       {"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: "bad ref"}):
+            with self.subTest(pinned=pinned):
+                seen = []
+
+                def capture(audit_id, repo, root, entries):
+                    seen.append(list(entries))
+                    return [], [], []
+
+                with patch.object(audit_report, "context_repo_entries", return_value=[pinned]), patch.object(
+                    audit_report, "discover_declarations", side_effect=capture
+                ):
+                    self.start(audit_report.STORE_ONLY_FLAG)
+                audit_report.release_in_flight(AUDIT)  # the next subtest's start
+                gitops = [e for e in seen[-1] if e["repo"].lower() == "acme/gitops"]
+                self.assertEqual(gitops, [{"repo": "acme/gitops", "ref": None, audit_report.REFUSED_REF_KEY: None}])
+
+    def test_an_explicit_live_runtime_outranks_a_leftover_shadow_record(self):
+        # A run record a shadow run left blocks a live publish only while the
+        # runtime is silent: a task the runtime marks live is live.
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+        os.environ[audit_report.SHADOW_TASK_ENV] = "false"
+        self.assertFalse(audit_report.run_shadow(AUDIT))
+        args = argparse.Namespace(store_only=False)
+        audit_report.refuse_remediate_in_shadow(args, AUDIT)  # raises nothing
+        os.environ[audit_report.SHADOW_TASK_ENV] = "true"
+        self.assertTrue(audit_report.run_shadow(AUDIT))
+
+    def test_a_shadow_starts_next_steps_finish_with_the_flag(self):
+        out = self.start(audit_report.STORE_ONLY_FLAG)
+        finish_step = out[audit_report.NEXT_STEPS_KEY][-1]
+        self.assertIn(" finish ", finish_step)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, finish_step)
+        self.assertNotIn(audit_report.STORE_ONLY_FLAG, audit_report.next_steps(AUDIT, "/tmp/f.json")[-1])
+
+    def test_an_unreadable_repository_list_fails_the_run_instead_of_writing_under_no_forge(self):
+        with patch("gitops_workspace.get_managed_repos", side_effect=RuntimeError("ConfigMap unreadable")), patch(
+            "gitops_workspace._read_state_text", side_effect=RuntimeError("ConfigMap unreadable")
+        ):
+            code = self.run_main(["start", "--audit", AUDIT, audit_report.STORE_ONLY_FLAG])
+        self.assertNotEqual(code, 0)
+        self.assertFalse(self.shadow_store(repo=audit_report.NO_FORGE_REPO).exists())
+
+    def test_several_repositories_with_none_chosen_write_under_no_forge(self):
+        with patch.object(audit_report, "resolve_repo_or_no_forge", side_effect=audit_report.NoGitOpsRepo("several")):
+            self.assertEqual(audit_report.shadow_store_repo(AUDIT), audit_report.NO_FORGE_REPO)
+
+    def test_a_shadow_start_owes_the_gitops_repositorys_declared_intent_search(self):
+        out = self.start(audit_report.STORE_ONLY_FLAG)
+        self.assertIn("acme/gitops", out[audit_report.DECLARED_INTENT_REPOS_KEY])
+
+    def test_a_shadow_finish_reads_no_earlier_finish_from_the_live_chat_record(self):
+        with patch.object(audit_report, "earlier_finish", return_value={"news": True}) as earlier:
+            out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        earlier.assert_not_called()
+        self.assertNotIn(audit_report.REFINISH_KEY, out)
+
+    def test_a_shadow_preview_carries_wording_from_the_shadow_stream(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        with patch.object(audit_report, "previous_run_document", return_value=None) as previous:
+            self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--dry-run"]), 0, self.err)
+        previous.assert_called_once_with(AUDIT + audit_report.SHADOW_STREAM_SUFFIX, "acme/gitops")
+
+    def test_a_flag_without_the_runtime_is_a_shadow_run_started_by_hand(self):
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        self.assertTrue(out[audit_report.SHADOW_KEY])
+        self.assertTrue((self.shadow_store() / "latest.json").exists())
+
+    def test_remediate_refuses(self):
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        args = ["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", "x", "--dry-run"]
+        self.assertNotEqual(self.run_main(args), 0)
+        self.assertIn("shadow run", self.err)
+        os.environ.pop(audit_report.SHADOW_TASK_ENV)
+        self.assertNotEqual(self.run_main(args + [audit_report.STORE_ONLY_FLAG]), 0)
+        self.assertIn("shadow run", self.err)
+        self.assertEqual(self.only_search_clones(), [])
+
+    def test_a_store_write_that_fails_fails_the_run(self):
+        self.start(audit_report.STORE_ONLY_FLAG)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        with patch.object(audit_report, "write_report", return_value=False):
+            code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG])
+        self.assertNotEqual(code, 0)
+        self.assertIn("shadow run", self.err)
+
+
 class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
     """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
 
@@ -35219,6 +36395,46 @@ class TestPlainChatLines(unittest.TestCase):
     def test_a_row_names_the_object_the_check_judged(self):
         finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
         self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a/payments: payments-api runs a privileged container")
+
+    def test_ingress_gateway_healthcheck_mismatch_is_rostered_and_phrased(self):
+        self.assertIn(
+            "ingress-gateway-healthcheck-mismatch",
+            audit_report.AUDITS["obtainability-audit"].checks,
+        )
+        finding = make_finding(
+            check="ingress-gateway-healthcheck-mismatch",
+            severity="major",
+            cluster="proj/us-central1/host",
+            namespace="seeded-networking",
+            obj="Service/backend-api-svc",
+        )
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` host/seeded-networking: backend-api-svc routes or health-checks a port no pod exposes",
+        )
+
+    def test_network_daemonset_missing_toleration_is_rostered_and_phrased(self):
+        self.assertIn(
+            "network-daemonset-missing-ccc-toleration",
+            audit_report.AUDITS["obtainability-audit"].checks,
+        )
+        finding = make_finding(
+            check="network-daemonset-missing-ccc-toleration",
+            severity="major",
+            cluster="proj/us-central1-a/seeded-a",
+            namespace="seeded-shapes",
+            obj="DaemonSet/cni-shaped-agent",
+        )
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` seeded-a/seeded-shapes: cni-shaped-agent can't start on one or more node pools",
+        )
+        # The one obtainability check that files in a system namespace.
+        finding["namespace"], finding["object"] = "kube-system", "DaemonSet/ip-masq-agent"
+        self.assertEqual(
+            audit_report.summary_row(finding),
+            "`major` seeded-a/kube-system: ip-masq-agent can't start on one or more node pools",
+        )
 
     def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
         finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
@@ -37387,6 +38603,46 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         """The record `start` leaves on an install whose harness search read the GitOps repository."""
         audit_report.write_run_record(AUDIT, "acme/fleet", [], searched=["acme/fleet@abc123"])
 
+    def test_a_shadow_task_closes_nothing_from_the_live_stream(self):
+        # The same unchanged run as below, but the task is a shadow run: the
+        # stored document is the live stream's, so precheck closes nothing and
+        # the live store is left as the live run wrote it.
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        rc = self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])])
+        self.assertEqual(rc, 0, self.err)
+        before = (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+
+        self.searched_this_run()
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertIs(out[audit_report.PRECHECK_CLOSED_KEY], False)
+        self.assertIn(audit_report.PRECHECK_SHADOW_REASON, out[audit_report.PRECHECK_REASON_KEY])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), before)
+
+    def test_finish_refuses_a_live_publish_in_a_shadow_task_from_any_caller(self):
+        # The gate is in `_finish`, which precheck's close calls directly.
+        close = argparse.Namespace(audit=AUDIT, findings_file="unused.json", repo=None, dry_run=False, scheduled=True)
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "true"}):
+            with self.assertRaises(audit_report.ValidationError) as raised:
+                audit_report._finish(close, AUDIT)
+        self.assertIn(audit_report.STORE_ONLY_FLAG, str(raised.exception))
+
     def test_an_unchanged_scheduled_run_closes_with_the_ledger_untouched(self):
         a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
         body = published_body(make_doc(findings=[a]), generated_at=NOW)
@@ -38858,6 +40114,50 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["superseded"], [])
         self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def finish_over_a_merged_budget(self, asked_at):
+        """`finish` on the finding whose budget merged on 2026-07-15 and is gone
+        again, with a ledger `/remediate` for it written at `asked_at` (#7013)."""
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        merged = {
+            **pr(8, branch, state="MERGED", body=audit_report.delta_block([self.fid()])),
+            "closedAt": "2026-07-15T00:00:00Z",
+            "mergedAt": "2026-07-15T00:00:00Z",
+            "labels": [],
+        }
+        request = comment(f"/remediate {self.fid()}", created_at=asked_at)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": proposals_view([merged]),
+            "*-view comments": comments_view({"comments": [request]}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/11"),
+        }
+        self.record_run(context=["acme/fleet"], audit=self.STREAM)
+        return self.run_finish(
+            searched_doc(findings=[self.finding()]),
+            ["--manifest-file", self.manifest_file()],
+            audit=self.STREAM,
+        )
+
+    def test_a_ledger_request_after_the_budget_merged_opens_it_again(self):
+        """The budget's pull request merged, a person removed the file, and a
+        `/remediate` written after the merge was refused as not a `manifest`
+        on every run. Written after the merge, it now plans and opens the budget."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-20T00:00:00Z"), 0, self.err)
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1, self.err)
+        for body in self.harness.bodies_for("issue-comment"):
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+
+    def test_a_ledger_request_older_than_the_merge_leaves_it_answered(self):
+        """An old comment never re-proposes a budget a person merged and then removed."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-10T00:00:00Z"), 0, self.err)
+        self.assertNotIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        refusals = [b for b in self.harness.bodies_for("issue-comment") if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1)
 
     def test_a_withheld_selector_is_not_planned(self):
         manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())

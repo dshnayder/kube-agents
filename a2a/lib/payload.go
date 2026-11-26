@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -288,6 +289,15 @@ func validateDelegateText(text string) error {
 // these message fields authoritative. They never ride the authority block.
 type TaskParameters struct {
 	Parameters map[string]string `json:"parameters"`
+	// ChangeRequested says the requester asked for a change (a pull
+	// request) rather than an answer, and so whether the dispatcher grants
+	// the worker the permit to open one. Only the gateway sets it, and only
+	// true for a turn that arrived as a structured confirm action, never
+	// from free text or from a delegation's arguments, which are the
+	// model's; a child carries its parent's value from the gateway's own
+	// record. Both rules are the gateway's to keep (#4457): the dispatcher
+	// can't tell a parent's value from a raised one. Absent means false.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 
 // The bounds ValidateTaskParameters holds a parameter set to. A name is a
@@ -399,11 +409,36 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 // (the gateway's A2A_DELEGATION_WIDTH_MAX). Absent means one: the single
 // shape only, which is all a gateway built before batches takes, so the
 // session's tool offers a batch only when the part says more (Width).
+//
+// RoundsMax is how many delegate requests this turn's task may make (the
+// gateway's A2A_DELEGATION_ROUNDS_MAX), at most DelegateRoundsCeiling. Absent
+// means one, which is all a gateway built before rounds takes (Rounds).
 type DelegateTargets struct {
 	Targets   []DelegateTarget `json:"targets"`
 	Truncated bool             `json:"truncated,omitempty"`
 	WidthMax  int              `json:"widthMax,omitempty"`
+	RoundsMax int              `json:"roundsMax,omitempty"`
 }
+
+// DelegateRoundsCeiling bounds a task's delegation rounds: the most
+// A2A_DELEGATION_ROUNDS_MAX may be set to, the most a delegateTargets part
+// may advertise, and the highest Round a childResult or delegationRefused part
+// may carry, so a forged part cannot put an arbitrary round into a reader's
+// dedupe map.
+const DelegateRoundsCeiling = 16
+
+// Rounds is the delegation rounds the part advertises: RoundsMax, or one when
+// unset.
+func (t DelegateTargets) Rounds() int {
+	if t.RoundsMax < 1 {
+		return 1
+	}
+	return t.RoundsMax
+}
+
+// validRound: a round as a part carries it, 1-based, with 0 (omitted) read as
+// one, and at most DelegateRoundsCeiling.
+func validRound(r int) bool { return r >= 0 && r <= DelegateRoundsCeiling }
 
 // Width is the batch width the part advertises: WidthMax, or one when unset.
 func (t DelegateTargets) Width() int {
@@ -465,6 +500,9 @@ func validateDelegateTargets(t DelegateTargets) error {
 	}
 	if t.WidthMax < 0 || t.WidthMax > DelegateBatchMax {
 		return fmt.Errorf("delegate targets: width %d, want 1 to %d", t.WidthMax, DelegateBatchMax)
+	}
+	if !validRound(t.RoundsMax) {
+		return fmt.Errorf("delegate targets: rounds %d, want 1 to %d", t.RoundsMax, DelegateRoundsCeiling)
 	}
 	for _, d := range t.Targets {
 		if !ValidSubjectToken(d.Name) {
@@ -534,6 +572,284 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 	return *found, true, nil
 }
 
+// ScopeClusters is the scopeClusters data part a delegating profile
+// parent's submission carries beside delegateTargets: one bounded page of
+// the install's in-scope clusters, each one a `cluster` child delegation
+// would be accepted for, in (project, location, cluster) order. Count is
+// how many clusters are in scope in all, so Truncated is Count past the
+// page. Cursor is reserved for a later paging contract and is always empty
+// for now; a reader ignores it.
+//
+// Three fields say what the page can't. Unknown is set when the gateway has
+// no full cluster list to count (the resolved scope carries none, or dropped
+// it for size): Count is then only the clusters it knows of, a lower bound,
+// and Truncated is always set. UnlistedProjects names projects in scope
+// whose clusters no list the gateway reads carries (an explicitly declared
+// project, the management project, a member not yet listed), sorted and cut
+// at ScopeClustersUnlistedMax, with UnlistedCount the total; their clusters
+// are listed elsewhere, and a delegation to one is still checked as it
+// arrives. OldestListing is when the oldest listing the counted clusters
+// came from was read (RFC 3339), so a reader can tell a stale one; it is
+// left out when that age is unknown (a stamp ahead of the gateway's clock),
+// so clusters counted with no OldestListing have an unknown age.
+//
+// ParentScoped says the parent is scoped to one cluster, so the page is that
+// cluster or nothing and Count is 0 or 1. Unbounded says the install's scope
+// declares no boundary, so any project not excluded is in scope: Unknown is
+// set and no project is named as listed elsewhere.
+//
+// Every one of these is left out when unset, so a part without them is the
+// shape first written.
+type ScopeClusters struct {
+	Count            int            `json:"count"`
+	Clusters         []ScopeCluster `json:"clusters"`
+	Truncated        bool           `json:"truncated"`
+	Cursor           string         `json:"cursor"`
+	Unknown          bool           `json:"unknown,omitempty"`
+	UnlistedProjects []string       `json:"unlistedProjects,omitempty"`
+	UnlistedCount    int            `json:"unlistedCount,omitempty"`
+	OldestListing    string         `json:"oldestListing,omitempty"`
+	ParentScoped     bool           `json:"parentScoped,omitempty"`
+	Unbounded        bool           `json:"unbounded,omitempty"`
+}
+
+// ScopeCluster is one cluster on a scopeClusters page: the target a
+// `cluster` delegation names it by.
+type ScopeCluster struct {
+	Project  string `json:"project"`
+	Location string `json:"location"`
+	Cluster  string `json:"cluster"`
+}
+
+// ScopeClustersPageMax is the most clusters one scopeClusters page carries:
+// the widest batch any gateway accepts (DelegateBatchMax). A gateway caps its
+// page at its own delegation width under this bound, so the page is one
+// batch's worth of targets. ScopeClustersUnlistedMax is the most projects
+// UnlistedProjects names. ScopeClustersMaxBytes bounds the encoded part,
+// which the session pod hands its tool server in one environment variable;
+// the widest page and unlisted list of the longest labels fit under it.
+const (
+	ScopeClustersPageMax     = DelegateBatchMax
+	ScopeClustersUnlistedMax = 16
+	ScopeClustersMaxBytes    = 8 * 1024
+)
+
+const scopeClustersKey = "scopeClusters"
+
+func validateScopeClusters(s ScopeClusters) error {
+	if len(s.Clusters) > ScopeClustersPageMax {
+		return fmt.Errorf("scope clusters: a page of %d, at most %d", len(s.Clusters), ScopeClustersPageMax)
+	}
+	if s.Count < len(s.Clusters) {
+		return fmt.Errorf("scope clusters: count %d is under the page's %d", s.Count, len(s.Clusters))
+	}
+	if s.Unknown && !s.Truncated {
+		return errors.New("scope clusters: an unknown count is always truncated")
+	}
+	if s.Unbounded && (!s.Unknown || len(s.UnlistedProjects) > 0 || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: an unbounded scope is unknown and names no unlisted projects")
+	}
+	if s.ParentScoped && (s.Count > 1 || s.Unknown || s.Unbounded || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: a parent scoped to one cluster has a known count of at most one and nothing unlisted")
+	}
+	if !s.Unknown && s.Truncated != (s.Count > len(s.Clusters)) {
+		return fmt.Errorf("scope clusters: truncated is %t with count %d and a page of %d", s.Truncated, s.Count, len(s.Clusters))
+	}
+	if s.Cursor != "" {
+		return errors.New("scope clusters: the cursor is reserved and must be empty")
+	}
+	for _, c := range s.Clusters {
+		if !validDNS1123Label(c.Project) || !validDNS1123Label(c.Location) || !validDNS1123Label(c.Cluster) {
+			return fmt.Errorf("scope clusters: %q/%q/%q is not a cluster target", c.Project, c.Location, c.Cluster)
+		}
+	}
+	if len(s.UnlistedProjects) > ScopeClustersUnlistedMax {
+		return fmt.Errorf("scope clusters: %d unlisted projects, at most %d", len(s.UnlistedProjects), ScopeClustersUnlistedMax)
+	}
+	if s.UnlistedCount < len(s.UnlistedProjects) {
+		return fmt.Errorf("scope clusters: unlisted count %d is under the %d named", s.UnlistedCount, len(s.UnlistedProjects))
+	}
+	for _, p := range s.UnlistedProjects {
+		if !validDNS1123Label(p) {
+			return fmt.Errorf("scope clusters: unlisted %q is not a project", p)
+		}
+	}
+	if s.OldestListing != "" {
+		if _, err := time.Parse(time.RFC3339, s.OldestListing); err != nil {
+			return fmt.Errorf("scope clusters: oldest listing %q is not a time", s.OldestListing)
+		}
+	}
+	if raw, err := json.Marshal(s); err != nil || len(raw) > ScopeClustersMaxBytes {
+		return fmt.Errorf("scope clusters: encoded past %d bytes", ScopeClustersMaxBytes)
+	}
+	return nil
+}
+
+// ScopeClustersPart is s as a data part, refused when s breaks the bounds.
+func ScopeClustersPart(s ScopeClusters) (Part, error) {
+	if s.Clusters == nil {
+		s.Clusters = []ScopeCluster{}
+	}
+	if err := validateScopeClusters(s); err != nil {
+		return Part{}, err
+	}
+	data, err := json.Marshal(map[string]ScopeClusters{scopeClustersKey: s})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ScopeClustersOf finds the scopeClusters part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader shows no
+// page.
+func ScopeClustersOf(parts []Part) (ScopeClusters, bool, error) {
+	var found *ScopeClusters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, scopeClustersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: more than one scopeClusters part")
+		}
+		var s ScopeClusters
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return ScopeClusters{}, true, fmt.Errorf("scope clusters: %w", err)
+		}
+		if s.Clusters == nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: the part carries no clusters list")
+		}
+		if err := validateScopeClusters(s); err != nil {
+			return ScopeClusters{}, true, err
+		}
+		found = &s
+	}
+	if found == nil {
+		return ScopeClusters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// ReplyTo is the replyTo data part: the task whose stored report this turn
+// answers (spec-a2a-payloads.md, "Task parameters and child results");
+// written by the gateway only.
+type ReplyTo struct {
+	TaskID string `json:"taskId"`
+}
+
+const replyToKey = "replyTo"
+
+// ReplyToPart is r as a data part, refused when its task id is not a
+// subject token.
+func ReplyToPart(r ReplyTo) (Part, error) {
+	if !ValidSubjectToken(r.TaskID) {
+		return Part{}, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+	}
+	data, err := json.Marshal(map[string]ReplyTo{replyToKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ReplyToOf finds the replyTo part among parts. A part whose task id is not
+// a subject token, or a second one, is an error, and the reader goes on as
+// though the turn named no report.
+func ReplyToOf(parts []Part) (ReplyTo, bool, error) {
+	var found *ReplyTo
+	for _, p := range parts {
+		raw, ok := wrappedData(p, replyToKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ReplyTo{}, true, errors.New("reply to: more than one replyTo part")
+		}
+		var r ReplyTo
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %w", err)
+		}
+		if !ValidSubjectToken(r.TaskID) {
+			return ReplyTo{}, true, fmt.Errorf("reply to: %q is not a task id", r.TaskID)
+		}
+		found = &r
+	}
+	if found == nil {
+		return ReplyTo{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// PushedReport is the pushedReport data part: a report the gateway's notify
+// route posted into the conversation, put ahead of a reply under it, with
+// the task the report was on when its sender named one; written by the
+// gateway only (spec-a2a-payloads.md, "Task parameters and child results").
+type PushedReport struct {
+	TaskID string `json:"taskId,omitempty"`
+	Text   string `json:"text"`
+}
+
+// PushedReportTextCap bounds PushedReport.Text in bytes; the gateway cuts a
+// longer report and says so (ChildResultTextCap's value).
+const PushedReportTextCap = 64 * 1024
+
+const pushedReportKey = "pushedReport"
+
+// PushedReportPart is r as a data part, refused with no text, text past
+// PushedReportTextCap, or a task id that is not a subject token.
+func PushedReportPart(r PushedReport) (Part, error) {
+	if err := validatePushedReport(r); err != nil {
+		return Part{}, err
+	}
+	data, err := json.Marshal(map[string]PushedReport{pushedReportKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+func validatePushedReport(r PushedReport) error {
+	if r.Text == "" {
+		return errors.New("pushed report: no text")
+	}
+	if len(r.Text) > PushedReportTextCap {
+		return fmt.Errorf("pushed report: %d bytes of text, at most %d", len(r.Text), PushedReportTextCap)
+	}
+	if r.TaskID != "" && !ValidSubjectToken(r.TaskID) {
+		return fmt.Errorf("pushed report: %q is not a task id", r.TaskID)
+	}
+	return nil
+}
+
+// PushedReportOf finds the pushedReport part among parts. A part breaking
+// the bounds, or a second one, is an error, and the reader goes on as
+// though the turn carried none.
+func PushedReportOf(parts []Part) (PushedReport, bool, error) {
+	var found *PushedReport
+	for _, p := range parts {
+		raw, ok := wrappedData(p, pushedReportKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return PushedReport{}, true, errors.New("pushed report: more than one pushedReport part")
+		}
+		var r PushedReport
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return PushedReport{}, true, fmt.Errorf("pushed report: %w", err)
+		}
+		if err := validatePushedReport(r); err != nil {
+			return PushedReport{}, true, err
+		}
+		found = &r
+	}
+	if found == nil {
+		return PushedReport{}, false, nil
+	}
+	return *found, true, nil
+}
+
 // ChildResult is the childResult data part: a child task's end, which the
 // gateway delivers on its parent's .in as a message, for a parent that waits
 // by staying open (a profile task under the dispatcher). A chat session's
@@ -547,6 +863,31 @@ type ChildResult struct {
 	// Text is the child's deliverable when it completed, and the reason it
 	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
 	Text string `json:"text,omitempty"`
+	// Entry is the 1-based index of the batch entry this result ends, on
+	// every end of a batch, and 0 for a single delegation (a tasks list of
+	// one included). The gateway sends each entry of a batch one end, which
+	// can arrive twice or, across a restart, be lost: a parent waiting on a
+	// batch dedupes its ends on Entry and counts them to the batch's size,
+	// with its own deadline bounding the wait, and dedupes a single
+	// delegation's on ChildTaskID. An entry that never got a child (its
+	// batch was cut short and withdrawn) ends failed with no ChildTaskID.
+	Entry int `json:"entry,omitempty"`
+	// Round is the 1-based delegation round whose request minted the child,
+	// omitted for round one, at most DelegateRoundsCeiling. A parent dedupes
+	// a batch's ends on (Round, Entry), 0 read as one.
+	Round int `json:"round,omitempty"`
+}
+
+// validChildResult: a terminal end, with text in the cap, that names its
+// child, or a batch entry that never got one and so ended failed.
+func validChildResult(c ChildResult) bool {
+	if !c.State.Terminal() || len(c.Text) > ChildResultTextCap || c.Entry < 0 || c.Entry > DelegateBatchMax || !validRound(c.Round) {
+		return false
+	}
+	if c.ChildTaskID == "" {
+		return c.Entry >= 1 && c.State == StateFailed
+	}
+	return ValidSubjectToken(c.ChildTaskID)
 }
 
 // ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
@@ -556,11 +897,12 @@ const ChildResultTextCap = 64 * 1024
 
 const childResultKey = "childResult"
 
-// ChildResultPart is c as a data part, refused without a child task id or a
-// terminal state, or with text past ChildResultTextCap.
+// ChildResultPart is c as a data part, refused without a terminal state,
+// with text past ChildResultTextCap, or without a child task id unless it
+// ends a batch entry that never got a child (validChildResult).
 func ChildResultPart(c ChildResult) (Part, error) {
-	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
-		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	if !validChildResult(c) {
+		return Part{}, fmt.Errorf("child result: needs a terminal state, at most %d bytes of text, and a task id or a not-started batch entry", ChildResultTextCap)
 	}
 	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
 	if err != nil {
@@ -570,8 +912,8 @@ func ChildResultPart(c ChildResult) (Part, error) {
 }
 
 // ChildResultOf finds the childResult part among parts. A data part that is
-// not one, or one without a task id or a terminal state or with text past
-// the cap, is skipped: a malformed child result is no event, where a
+// not one, or one ChildResultPart would refuse, is skipped: a malformed
+// child result is no event, where a
 // malformed parameter set (TaskParametersOf) would change what runs.
 func ChildResultOf(parts []Part) (ChildResult, bool) {
 	for _, p := range parts {
@@ -580,13 +922,68 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 			continue
 		}
 		var c ChildResult
-		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
-			len(c.Text) > ChildResultTextCap {
+		if json.Unmarshal(raw, &c) != nil || !validChildResult(c) {
 			continue
 		}
 		return c, true
 	}
 	return ChildResult{}, false
+}
+
+// DelegationRefusal is the delegationRefused data part: the gateway's word
+// to a profile parent, on its .in, that its delegate request minted no child
+// (#4860). A refused request mints nothing, so there is no child to end and no
+// childResult to send; without this the parent waits to its deadline. Text is
+// the notice the room sees, at most ChildResultTextCap bytes. A parent that
+// waits on children reads a first refusal as the end of the whole wait.
+//
+// Round is the 1-based delegation round the refused request would have been,
+// omitted for round one, at most DelegateRoundsCeiling. A parent ends its wait
+// only on a refusal for the round it waits on: a refusal of a request made
+// after the task had used its rounds carries a later round, and ends nothing,
+// so the children of the earlier request are still the task's to wait for.
+// Any other JSON type there, or a round out of bounds, makes the part no
+// refusal at all (DelegationRefusalOf).
+type DelegationRefusal struct {
+	Text  string `json:"text"`
+	Round int    `json:"round,omitempty"`
+}
+
+func validDelegationRefusal(r DelegationRefusal) bool {
+	return r.Text != "" && len(r.Text) <= ChildResultTextCap && validRound(r.Round)
+}
+
+const delegationRefusedKey = "delegationRefused"
+
+// DelegationRefusalPart wraps r as the delegationRefused data part. A refusal
+// with no text, or text over the cap, is refused: the parent's model reads it.
+// So is a round out of bounds.
+func DelegationRefusalPart(r DelegationRefusal) (Part, error) {
+	if !validDelegationRefusal(r) {
+		return Part{}, fmt.Errorf("delegation refusal: needs text of at most %d bytes and a round of at most %d", ChildResultTextCap, DelegateRoundsCeiling)
+	}
+	data, err := json.Marshal(map[string]DelegationRefusal{delegationRefusedKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegationRefusalOf finds the delegationRefused part among parts, skipping
+// one DelegationRefusalPart would refuse.
+func DelegationRefusalOf(parts []Part) (DelegationRefusal, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegationRefusedKey)
+		if !ok {
+			continue
+		}
+		var r DelegationRefusal
+		if json.Unmarshal(raw, &r) != nil || !validDelegationRefusal(r) {
+			continue
+		}
+		return r, true
+	}
+	return DelegationRefusal{}, false
 }
 
 // wrappedData is a data part's payload under key, when p is a data part
@@ -605,10 +1002,13 @@ func wrappedData(p Part, key string) (json.RawMessage, bool) {
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
-// receives on a running task: one per follow-up envelope, either queued or
-// refused with a reason. The gateway's relay reads it to word its posts
-// and to count what it promised the room; a reader that does not know it
-// sees the text part beside it.
+// receives on a running task: one when the follow-up arrives, either queued
+// or refused with a reason, and a second, refused, for a queued follow-up
+// that does not get its turn. Neither is guaranteed: for example, a
+// follow-up that arrives after the terminal gets none, and an executor that
+// crashes sends none for its queue. The gateway's relay reads it to word
+// its posts and to count what it promised the room; a reader that does not
+// know it sees the text part beside it.
 type SteerNotice struct {
 	Steer      string `json:"steer"`
 	EnvelopeID string `json:"envelopeId"`
@@ -876,6 +1276,11 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// Delegates says the profile's tasks may delegate (AgentProfile
+	// spec.delegates, #6789). The gateway refuses a delegate request from a
+	// task of a profile whose card doesn't say so; a card from an operator
+	// that predates the field doesn't, so it fails closed.
+	Delegates bool `json:"delegates,omitempty"`
 	// YieldToPinned hands a task addressed to this profile to the profile
 	// pinned to its target cluster, when there is one: the generic cluster
 	// agent sets it, and a specialist addressed by name keeps the task.

@@ -86,18 +86,16 @@ PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret pla
 Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
 still needs the judge even though only the deterministic checks decide.
 
-The blocking presubmit grades a `spec.mode: next` install through the A2A gateway's inject door,
-so that is the lane a case on its matrix goes red or green on. Against a next install, add the
-two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
-from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
-`hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
-the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
-reverse: it runs only with them, and without them its run errors rather than going red. The
-card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
-`token` key of the `platform-agent-a2a-door` Secret, on an install with the A2A door on; without
-it the run is infrastructure. The lane also appends the GitHub-write safeguard in
-`hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
-it in CI.
+Every CI lane, the blocking presubmit and the nightlies, grades the install through the A2A
+gateway's inject door, so that is the lane a case goes red or green on. Add the two exports
+`hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN` from the
+`token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
+`hack/eval/inject-lane-exclusions.txt` runs on no CI lane until it is moved off that list; run it
+over the agent API, without the two exports, and say so in the pull request. The card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
+`token` key of the `platform-agent-a2a-door` Secret, which the lane turns on; without it the run is
+infrastructure. The lane also appends
+the GitHub-write safeguard in `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that
+passes here can still trip it in CI.
 
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
@@ -126,8 +124,8 @@ run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request: in that file's sorted section, at its place in case-id order, with its reason as the
-`#` lines above it (a case with the bare line `suite: certification` in its task file is registered by that
-line and sits in no roster file: [`bench/README.md`](../../bench/README.md#certification-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+`#` lines above it (a case with the bare line `suite: validated-capabilities` in its task file is registered by that
+line and sits in no roster file: [`bench/README.md`](../../bench/README.md#validated-capabilities-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
 owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
 the case's bugs reach you before the domain owner
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a
@@ -144,6 +142,31 @@ where it is. That seat is the admission, earned on the case's record
 ([`docs/eval-gate-roster.md`](../../docs/eval-gate-roster.md),
 [`bench/baselines/README.md`](../../bench/baselines/README.md)); never add a new case to
 the roster in the pull request that makes it pass.
+
+## Check the world, not the words
+
+When a case asks the agent to act or to hold back, its check reads the state the run left (the
+cluster, the repository), because the agent's report only says what it claims happened. Which check
+fits which question is in
+[`bench-case-format.md`](../../docs/designs/bench-case-format.md#exact-check-or-judged-score), and
+[the check types](../../docs/designs/bench-case-format.md#the-check-types) say which read the
+world.
+
+Two ways a check ends up grading the report:
+
+- A safeguard keyed on a tool name waits for a call no tool may ever make: under another name, or
+  through a worker the check cannot see, the write happens and the check never fails. Reading the
+  cluster after the run (`op: absent` on the object the agent must not create) catches the write
+  whichever tool made it.
+- A check satisfied by the agent saying it opened a pull request. One night the reply linked
+  `kube-agentss`, a URL that went nowhere, and the objective that asked for the proposal still
+  passed on the text alone (#3048); that case now requires the linked pull request to resolve
+  (#3053).
+
+Before trusting a green, ask whether the check could fail at all: if the agent did the opposite of
+what the case asks — nothing, where it should have acted; the write, where it should have held
+back — and wrote a confident report, would the case still pass? If so, the check is grading the
+report.
 
 ## When the fix is not yours
 

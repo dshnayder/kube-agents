@@ -164,7 +164,10 @@ func TestReconcileReportsAMissingRoleBindingInTheProfileNamespace(t *testing.T) 
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reasonRBACIncomplete {
 		t.Fatalf("expected Degraded=True/%s naming the profile namespace, got %+v", reasonRBACIncomplete, degraded)
 	}
-	for _, want := range []string{"create deployments.apps (in namespace " + profileNamespaceName(agent) + ")", "RoleBinding"} {
+	// The profile namespace is one the chart and make deploy render into, so the
+	// message sends the reader to the upgrade, after removing a hand-made copy,
+	// not to writing the Role by hand.
+	for _, want := range []string{"create deployments.apps (in namespace " + profileNamespaceName(agent) + ")", "RoleBinding", "run helm upgrade or make deploy", "delete any hand-made copy"} {
 		if !strings.Contains(degraded.Message, want) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}
@@ -267,8 +270,10 @@ func TestDeniedForFiltersByAgentNamespaceAndForgetDropsIt(t *testing.T) {
 	if len(got) == 0 || !strings.Contains(got[0], "(in namespace team-a)") {
 		t.Fatalf("the team-a agent must see its own denials; got %v", got)
 	}
-	if all := checker.Denied(); len(all) != len(got) {
-		t.Errorf("Denied() = %v, want the same %d team-a denials", all, len(got))
+	// Denied() lists everything; DeniedFor leaves out the built-in
+	// renderer's schedule writes, which the renderer reports itself.
+	if all := checker.Denied(); len(all) != len(got)+len(agentScheduleWriteVerbs) {
+		t.Errorf("Denied() = %v, want the %d team-a denials plus the renderer's %d schedule writes", all, len(got), len(agentScheduleWriteVerbs))
 	}
 
 	checker.Forget("team-a")
@@ -336,7 +341,9 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reasonRBACIncomplete {
 		t.Fatalf("expected Degraded=True/%s on the CR, got %+v", reasonRBACIncomplete, degraded)
 	}
-	for _, want := range []string{"create secrets (in namespace team-a)", "RoleBinding"} {
+	// team-a is a namespace neither install path renders into, so the message
+	// keeps the hand-made Role and RoleBinding as that namespace's remedy.
+	for _, want := range []string{"create secrets (in namespace team-a)", "RoleBinding", "gets both by hand"} {
 		if !strings.Contains(degraded.Message, want) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}

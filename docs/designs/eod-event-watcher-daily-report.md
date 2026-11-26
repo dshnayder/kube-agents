@@ -55,12 +55,12 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 ```
 
 The home channel is the CR field (`spec.integration.googleChat.homeChannel` or
-`spec.integration.slack.homeChannel`) or, for Slack, a channel the gateway learned from a mention.
+`spec.integration.slack.homeChannel`) or a channel or space the gateway learned from a mention.
 `/sethome` does not reach the gateway. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
 `A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
-`A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway learned a channel, and with no
+`A2A_NOTIFY_PLATFORM`; the agent adds a platform whose home the gateway learned, and with no
 home anywhere, every armed platform keeps the posts for its digest. So an
 install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
@@ -104,6 +104,14 @@ without a session; they are counted on a line of their own and in no other numbe
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
 drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
+
+The same rows answer a question on demand. The Platform Agent's `get_alert_history` tool
+([`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py)) reads one page
+of `GET /v1/intercepted-events` over a window (its `since`), and the
+[`alert-history`](../../agents/platform/skills/alert-history/SKILL.md) skill is how "what alerts
+fired overnight?" reaches it from any door. The tool is the worker's only route: the sandbox shell
+reaches neither the loopback port nor the file. It excludes nothing, so unlike the recap it also
+returns the drift and stall rows.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage
 report each alerted incident produced, and the recap does not read it: nothing it lists was alerted,
@@ -245,12 +253,19 @@ informational churn. Each is **counted**, on its own line above the body:
   them out (see [Where the numbers come from](#where-the-numbers-come-from)).
   `clean_workload_name` in
   [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) sets the workload
-  name. It changes only Pod names, with two rules, and keeps all other names as they are:
+  name. It changes only Pod names, with three rules, and keeps all other names as they are:
   - A Pod name that ends in a segment of eight to ten hexadecimal characters and then a segment of
     five characters loses both segments. Thus, the pods of one Deployment fold into one workload.
     The pods of all the runs of one CronJob also fold into one workload, because the run minute
     has eight digits.
-  - If the first rule does not apply, a Pod name that ends in a segment of five lowercase letters
+  - Kubernetes cuts a generated Pod name at 63 characters. With a hash of ten characters, the pod
+    of a Deployment with a name of 47 to 56 characters ends in what is left of the hash and then
+    the five characters, with no hyphen between them. A Pod name of exactly 63 characters with
+    that ending loses it when four or more characters of the hash are left (a Deployment name of
+    up to 53 characters). With fewer, the start of a name segment can pass for a hash, and the Pod
+    name stays as it is. The rule reads only the name, so a last segment that starts with four or
+    more characters that a hash can hold also loses its end.
+  - If no rule above applies, a Pod name that ends in a segment of five lowercase letters
     or digits loses that segment. Thus, the pods of one DaemonSet (`fluentd-x7k2p`) fold into one
     workload, and the pod of a one-off Job folds to the Job name. The rule also removes a word of
     five letters, so the pods `ingest-batch` and `ingest-queue` both become `ingest` and count as

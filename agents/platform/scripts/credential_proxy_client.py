@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -83,11 +84,25 @@ _GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
 MAX_KUBECONFIG_BYTES = 1 << 20
 
 # The broker's read-only Cloud API relay: `GET {broker}/v1/gcp/<host>/<path>`
-# forwards a permitted Google API read on the broker's credential. Declared
+# forwards a permitted Google API read on the broker's credential (a `POST`
+# for the one read whose arguments are a JSON body). Declared
 # here rather than in the broker because both sides spell it and this is the
 # module both import; `credential_proxy` re-exports it. `ApiSession` below is
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
+
+# Google Cloud universe domain (`googleapis.com` in commercial GCP, or a
+# partner/sovereign domain such as Google Cloud Dedicated). Kept in this module
+# because `gke_cluster_reads.py` and the sandbox collectors import it from the
+# root-owned `/opt/vcs/libexec/platform` closure.
+DEFAULT_UNIVERSE_DOMAIN = "googleapis.com"
+GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+CLOUDSDK_UNIVERSE_DOMAIN_ENV = "CLOUDSDK_CORE_UNIVERSE_DOMAIN"
+MAX_UNIVERSE_DOMAIN_LENGTH = 253
+_GOOGLE_API_SUFFIX = "." + DEFAULT_UNIVERSE_DOMAIN
+_UNIVERSE_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z"
+)
 
 # The exec tier's shared names, here for the same reason as the relay prefix:
 # the broker and the shim both spell them, and this is the module both import.
@@ -118,6 +133,9 @@ RETRYABLE_BUSY_BOUNDS = frozenset(
 # resource watermark gate answers at once past its hard watermark, with the
 # interval to wait in the Retry-After header and the body's `retry_after`.
 BUSY_CODE = "CREDENTIAL_PROXY_BUSY"
+# credential_proxy.BUSY_BEFORE_ADMISSION_KEY: a busy answer the broker gave
+# before admitting the request, when nothing it asked for has run.
+BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
 # Envoy's mark on a 503 it answered itself, under its own overload manager,
 # without forwarding the request. Any other non-JSON 503 may be an upstream
@@ -175,9 +193,27 @@ RETRY_JITTER_FLOOR = 0.5
 BROKER_ADMISSION_WAIT_SECONDS = 60.0
 RETRY_DEADLINE_SECONDS = 170.0
 RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
-# What a refusal with no JSON body is reported as; the broker's own text is
-# used when it sent one.
+# What an answer with no JSON body is reported as, a refusal or a 2xx; the
+# broker's own text is used when a refusal sent one.
 NON_JSON_RESPONSE_TEXT = "non-JSON response"
+# How deep a `/v1/vcs/*` body can nest lists and objects. `vcs_call` refuses a
+# 2xx answer over the bound and takes the parts that are too deep out of a
+# refusal. A broker answer is a few levels deep. Python 3.14 parses a body of
+# 100,000 levels, and `json.dumps` and `repr` then raise RecursionError on the
+# result, in whatever caller uses it. The bound is under the limit of each of
+# them, and it is the bound of the version-control skill's print step. The
+# shim holds a `/v1/exec` refusal and a relayed API refusal to the same bound
+# (`_refusal_payload`, `ApiSession._json_body`), with the same trim.
+MAX_VCS_BODY_DEPTH = 500
+# The message of the error for a 2xx body over that bound. It names no value:
+# `vcs_client` gives the caller a text of its own.
+_VCS_ANSWER_TOO_DEEP_TEXT = "the broker's answer is JSON nested too deep to read"
+# A refusal over the bound keeps its keys, and each value that is too deep
+# becomes this text. Its `error`, when that is one of them, becomes the status,
+# as for a body that is no refusal document.
+_REFUSAL_PART_TOO_DEEP_TEXT = "left out: nested too deep to read"
+_REFUSAL_ERROR_FIELD = "error"
+_REFUSAL_STATUS_TEXT = "HTTP {status}"
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
 CLASS_LABEL = "class"
@@ -218,6 +254,37 @@ SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
 SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
 LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
 POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
+# A profile worker's out-of-band record of a definitive write refusal. The
+# broker marks such a refusal's body (credential_proxy.WRITE_REFUSAL_KEY): a
+# policy rule (the read-only rule, or a profile caller's flag rule) refusing a
+# mutating kubectl verb. Version-control refusals are never marked or recorded.
+# On a 403
+# carrying that mark, the client appends one JSON line to the file the worker
+# adapter names in REFUSAL_FILE_ENV (a file on the task's tmpfs, beside the
+# task token), and the adapter stops the task at the first record
+# (a2a/worker-adapter/refusal.go). The record carries the task (REFUSAL_TASK_ENV,
+# when set), the rule, the verb, the route and the time, all from the broker's
+# answer and this call, never from a command's output. The file is opened
+# append-only, without following a symlink and without creating it: the adapter
+# makes it for each task, so a missing or unwritable file is a line on stderr
+# and the call's result is unchanged.
+WRITE_REFUSAL_KEY = "write_refusal"
+REFUSAL_FILE_ENV = "CREDENTIAL_PROXY_REFUSAL_FILE"
+REFUSAL_TASK_ENV = "CREDENTIAL_PROXY_REFUSAL_TASK"
+# The write-refusal record's fields and its timestamp form.
+REFUSAL_RECORD_RULE = "rule"
+REFUSAL_RECORD_VERB = "verb"
+REFUSAL_RECORD_ROUTE = "route"
+REFUSAL_RECORD_TIME = "time"
+REFUSAL_RECORD_TASK = "task"
+REFUSAL_RECORD_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A session pod's kubectl write attempt (record_kubectl_write_attempt): its rule,
+# its route, and the env naming the kube-proxy mode the gateway passes the pod.
+WRITE_ATTEMPT_RULE = "kube-proxy.write-attempt"
+KUBE_PROXY_ROUTE = "kube-proxy"
+KUBE_PROXY_MODE_ENV = "KUBE_PROXY_MODE"
+_REFUSAL_RULE_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
+_REFUSAL_VERB_WORDS = 3
 # The line a malformed exec URL writes, once per process, when the stateful
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
@@ -227,6 +294,30 @@ _exec_url_notice_written = False
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
 _DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# A 2xx answer on `/v1/exec` that cannot be read. The broker ran the command
+# before it answered, so the line ends as the dropped connection's does, and
+# the command is never sent again. `{what}` names the shape: the body can be
+# a command's output and is never printed.
+_UNREADABLE_ANSWER_LINE = "credential proxy error (HTTP {status}): {what}; the command may have run"
+_NOT_AN_OBJECT_TEXT = "the response is JSON of type {type}, not an object"
+# The fields of that answer that `execute` writes or returns. A field of another
+# type makes the whole answer unreadable: the line names the field and the
+# type, never a value, and nothing of the answer is printed.
+_EXEC_OUTPUT_FIELDS = ("stdout", "stderr")
+_EXEC_KUBECONFIG_FIELD = "kubeconfig"
+_EXEC_EXIT_CODE_FIELD = "exitCode"
+_FIELD_NOT_A_STRING_TEXT = "the response's {field} is of type {type}, not a string"
+_EXIT_CODE_NOT_AN_INTEGER_TEXT = "the response's exitCode is of type {type}, not an integer"
+_NO_EXIT_CODE_TEXT = "the response has no exitCode"
+# The broker sends the command's return code as `exitCode`. A process status is
+# 0 to 255. A command that a signal ended has the signal's negative number
+# there, and a shell reports that death as 128 plus the number, so the least
+# value with a status is 128 - 255. A value outside the two bounds is no
+# command's result, and `sys.exit` would wrap it: 256 would read as success.
+_MAX_EXIT_STATUS = 255
+_SIGNAL_EXIT_BASE = 128
+_MIN_EXIT_CODE = _SIGNAL_EXIT_BASE - _MAX_EXIT_STATUS
+_EXIT_CODE_OUT_OF_RANGE_TEXT = f"the response's exitCode is outside {_MIN_EXIT_CODE} to {_MAX_EXIT_STATUS}"
 # The least read time a relay fallback is worth sending with; less, and the
 # caller's budget is already spent, so the error is raised instead.
 RELAY_FALLBACK_MIN_SECONDS = 1.0
@@ -292,6 +383,15 @@ KUBECONFIG_LOCK_UNOPENABLE_NOTICE = (
     "context {context} was not checked or registered in {kubeconfig}"
 )
 KUBECONFIG_LOCK_OWNER_NOTE = " (owned by uid {uid})"
+ROOT_UID = 0
+# What a caller is told when `.kubeconfigs` is not its own. The per-target file and the shell's pin
+# are written only by the folder's owner.
+NOT_THE_CALLERS_FOLDER_NOTICE = "{folder} belongs to uid {owner}, not to this caller (uid {caller})"
+# The way to the cluster for a caller that the rule refuses: a kubeconfig that it names itself.
+OWN_KUBECONFIG_ADVICE_LINES = (
+    "    KUBECONFIG=<a file of your own> gcloud container clusters get-credentials ...",
+    "    KUBECONFIG=<the same file> kubectl ...",
+)
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -352,6 +452,66 @@ _SHELL_CONTEXT_FILE = re.compile(r"^([0-9]+)-([0-9]+)\.context\Z")
 END_OF_FLAGS = "--"
 CONTEXT_FLAG = "--context"
 KUBECONFIG_FLAG = "--kubeconfig"
+
+
+def normalize_universe_domain(raw: str | None) -> str:
+    """Validate and canonicalise a Google Cloud universe domain, defaulting to `googleapis.com` when unset/blank.
+
+    Refuses a domain under `googleapis.com`: such a value names hosts of the commercial universe.
+    """
+    trimmed = (raw or "").strip()
+    if not trimmed:
+        return DEFAULT_UNIVERSE_DOMAIN
+    cleaned = trimmed.removesuffix(".").lower()
+    if (
+        not cleaned
+        or len(cleaned) > MAX_UNIVERSE_DOMAIN_LENGTH
+        or not _UNIVERSE_DOMAIN_RE.fullmatch(cleaned)
+    ):
+        raise ValueError(
+            f"universe domain {raw!r} must be a lowercase DNS domain with at least two labels"
+        )
+    if cleaned.endswith(_GOOGLE_API_SUFFIX):
+        # `<service>.mtls.googleapis.com` and the like are hosts of the commercial
+        # universe. As a universe domain such a value would pass the rule that a
+        # custom universe refuses the commercial hosts, and stay in the commercial one.
+        raise ValueError(
+            f"universe domain {raw!r} is under {DEFAULT_UNIVERSE_DOMAIN}, which is the "
+            f"commercial universe and not another one; use {DEFAULT_UNIVERSE_DOMAIN}"
+        )
+    return cleaned
+
+
+def google_universe_domain(environ=os.environ) -> str:
+    """Return the active Google Cloud universe domain from the process environment."""
+    for name in (GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV, CLOUDSDK_UNIVERSE_DOMAIN_ENV):
+        raw = environ.get(name, "").strip()
+        if raw:
+            return normalize_universe_domain(raw)
+    return DEFAULT_UNIVERSE_DOMAIN
+
+
+def google_api_host(service: str, universe_domain: str | None = None) -> str:
+    """Return `<service>.<universe_domain>` for the active or explicit universe domain."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    return f"{service}.{domain}"
+
+
+def rewrite_google_api_host(host: str, universe_domain: str | None = None) -> str:
+    """Rewrite `<service>.googleapis.com` to `<service>.<universe_domain>` when custom."""
+    domain = (
+        normalize_universe_domain(universe_domain)
+        if universe_domain is not None
+        else google_universe_domain()
+    )
+    lowered = host.lower()
+    if domain != DEFAULT_UNIVERSE_DOMAIN and lowered.endswith(_GOOGLE_API_SUFFIX):
+        return lowered[: -len(_GOOGLE_API_SUFFIX)] + "." + domain
+    return host
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -549,9 +709,11 @@ def authorization_headers() -> dict[str, str]:
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
-# the task's end. Sent in this header on every exec, re-read on every call, so a
-# warm pod's next task presents its own. The broker confines the call to the
-# cluster the credential names (credential_proxy.TASK_CREDENTIAL_HEADER).
+# the task's end. Sent in this header on every exec and version-control call
+# (a report credential only on the audit-report routes), re-read on every call,
+# so a warm pod's next task presents its own. The broker confines an exec to the
+# cluster the credential names, and admits a version-control write only under
+# its permit (credential_proxy.TASK_CREDENTIAL_HEADER).
 TASK_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TASK_TOKEN_FILE"
 TASK_CREDENTIAL_HEADER = "X-Kube-Agents-Task-Credential"
 # The broker's own ceiling on the value (task_credential.MAX_TOKEN_BYTES).
@@ -586,8 +748,43 @@ def task_mode() -> bool:
     return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
 
 
-def task_credential_headers() -> dict[str, str]:
-    """The task credential header, or nothing when there is no task.
+# The broker routes a report credential (one naming no target cluster:
+# task_credential.REPORT_TIER) is admitted on, and refused on every other,
+# /v1/exec included (credential_proxy.REPORT_CREDENTIAL_ROUTES).
+AUDIT_REPORTS_ROUTE = "/v1/audit-reports"
+
+
+def _is_report_credential(token: str) -> bool:
+    """Whether a task credential names no target cluster, read unverified.
+
+    This only decides whether to send it; the broker verifies whatever is
+    sent. A token whose claims can't be read is not called a report
+    credential, so it is sent as before and the broker refuses it loudly.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    segment = parts[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, RecursionError):
+        return False
+    nats = claims.get("nats") if isinstance(claims, dict) else None
+    return isinstance(nats, dict) and "target" not in nats
+
+
+def _audit_reports_path(path: str) -> bool:
+    path = urllib.parse.urlsplit(path).path
+    return path == AUDIT_REPORTS_ROUTE or path.startswith(AUDIT_REPORTS_ROUTE + "/")
+
+
+def task_credential_headers(path: str) -> dict[str, str]:
+    """The task credential header for a broker request to `path`, or nothing.
+
+    A report credential is sent only on the audit-report routes, the only
+    ones the broker admits it on: on any other call the task goes without
+    it and keeps the local-only commands a task with no credential gets.
+    A credential that names a target is sent on every call.
 
     Read per call. A missing file is no task, not an error: the adapter
     removes it when the task ends, and the broker then runs local-only
@@ -609,6 +806,8 @@ def task_credential_headers() -> dict[str, str]:
         return {}
     if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
         raise TokenUnavailable(f"{token_file} does not hold a task credential")
+    if _is_report_credential(token) and not _audit_reports_path(path):
+        return {}
     return {TASK_CREDENTIAL_HEADER: token}
 
 
@@ -758,13 +957,17 @@ def read_current_context(text: str) -> str | None:
 
     Anything else — a syntax error, several documents, a top level that is not a
     mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
+    turns that into a rejection. So does a scalar that PyYAML cannot build. For
+    that it raises a plain exception, not a `yaml.YAMLError`: a `ValueError`
+    for a date that does not exist or an `!!int` tag on text, a `KeyError` for
+    an `!!bool` tag on text, an `IndexError` for an `!!int` tag on nothing, an
+    `AttributeError` for an `!!timestamp` tag on text.
     """
     import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
 
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
+    except (yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
         return None
     if not isinstance(document, dict):
         return None
@@ -1015,7 +1218,8 @@ def record_shell_context(context: str) -> bool:
     context-less kubectl there reads the host cluster exactly as #1852 left it.
 
     Returns whether the pin was recorded. Failing to record it costs the
-    convenience, not the command, so it is reported and not raised.
+    convenience, not the command, so it is reported and not raised. The pin is
+    recorded only in a folder that the caller owns (`_claim_callers_folder`).
     """
     keys = _shell_keys()
     if not keys:
@@ -1023,6 +1227,9 @@ def record_shell_context(context: str) -> bool:
     directory = _shell_context_dir()
     path = directory / f"{keys[0]}{SHELL_CONTEXT_SUFFIX}"
     try:
+        # `.kubeconfigs` first: root as the owner counts only for the folder above it.
+        _claim_callers_folder(kubeconfig_dir())
+        _claim_callers_folder(directory)
         _replace_file(path, context)
     except OSError as exc:
         print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=sys.stderr)
@@ -1172,12 +1379,54 @@ def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
     return Path(path) in _default_kubeconfig_candidates()
 
 
+def _caller_owns_folder(folder: Path) -> bool:
+    """Whether the caller owns `folder`. A default kubeconfig is created only in a folder that its
+    caller owns. Only a kubeconfig's owner registers a context in it, so the agent can never add a
+    cluster to a file that root made in the agent's folder. The question is about the folder that
+    holds the file, not the one above it. A worker's home can be a mount that root owns, and the
+    worker makes `.kube` in it."""
+    return folder.stat().st_uid == os.geteuid()
+
+
+class NotTheCallersFolder(PermissionError):
+    """The folder for a per-target kubeconfig or a shell's pin is not the caller's."""
+
+
+def _claim_callers_folder(folder: Path) -> None:
+    """Make `folder` when it is missing, and raise `NotTheCallersFolder` unless the caller owns it.
+
+    The per-target kubeconfig and the shell's pin are written only in a folder that the caller
+    owns. Root in the shell pod has the agent's home as its default: a `.kubeconfigs` that root
+    made there was one the agent could not write its file in.
+
+    A missing folder is made only below a folder that belongs to the caller or to root. A session
+    pod's home can be a mount that root made for the pod's user, and that user makes
+    `.kubeconfigs` in it. Another user's home gets no new folder.
+    """
+    caller = os.geteuid()
+    existing = folder
+    while not existing.exists():
+        existing = existing.parent
+    if existing != folder:
+        owner = existing.stat().st_uid
+        if owner not in (caller, ROOT_UID):
+            raise NotTheCallersFolder(
+                NOT_THE_CALLERS_FOLDER_NOTICE.format(folder=existing, owner=owner, caller=caller)
+            )
+        folder.mkdir(parents=True, exist_ok=True)
+    if not _caller_owns_folder(folder):
+        raise NotTheCallersFolder(
+            NOT_THE_CALLERS_FOLDER_NOTICE.format(folder=folder, owner=folder.stat().st_uid, caller=caller)
+        )
+
+
 def _ensure_host_kubeconfig_initialized(
     proxy_url: str,
     ca_file: str,
     token_file: str,
 ) -> None:
-    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent."""
+    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent, in a
+    folder that the caller owns."""
     host_context = os.environ.get("KUBE_PROXY_HOST_CONTEXT", "").strip()
     if not host_context:
         return
@@ -1188,6 +1437,8 @@ def _ensure_host_kubeconfig_initialized(
         return
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not _caller_owns_folder(path.parent):
+            return
         content = build_kube_proxy_kubeconfig(
             host_context,
             proxy_url=proxy_url,
@@ -1257,6 +1508,8 @@ def _merge_context_into_kubeconfig_file(
             else:
                 return
         if not path.exists() and not path.is_symlink() and path == _caller_default_kubeconfig_path():
+            if not _caller_owns_folder(path.parent):
+                return
             _replace_file(
                 path,
                 build_kube_proxy_kubeconfig(
@@ -1291,7 +1544,9 @@ def _merge_context_into_kubeconfig_file(
                 return
             content = path.read_bytes()
             doc = yaml.safe_load(content.decode("utf-8", errors="replace"))
-        except (OSError, yaml.YAMLError, RecursionError):
+        except (OSError, yaml.YAMLError, ValueError, LookupError, AttributeError, RecursionError):
+            # The plain exceptions are PyYAML's for a scalar that it cannot
+            # build (`read_current_context` lists them). The file stays as it is.
             return
         if not isinstance(doc, dict):
             return
@@ -1461,8 +1716,11 @@ def land_implicit_kubeconfig(generated: str) -> None:
     resolves an omitted `--project` or a `--zone`/`--region` spelling itself,
     and the file is the only place the answer is written down.
 
-    Never changes the exit code. gcloud succeeded, and `--context` reaches the
-    cluster whether or not the file could be written here.
+    The file is written only in a `.kubeconfigs` that the caller owns
+    (`_claim_callers_folder`). A caller that this rule refuses is told to name
+    a file of its own on both commands.
+
+    Never changes the exit code: gcloud succeeded.
     """
     context = read_current_context(generated)
     target = parse_gke_context(context) if context else None
@@ -1470,10 +1728,13 @@ def land_implicit_kubeconfig(generated: str) -> None:
         return
     path = per_target_kubeconfig_path(target)
     written = True
+    refused = False
     try:
+        _claim_callers_folder(path.parent)
         _replace_file(path, generated)
     except OSError as exc:
         written = False
+        refused = isinstance(exc, NotTheCallersFolder)
         print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
     pinned = False
     if not os.environ.get("KUBE_PROXY_URL", "").strip():
@@ -1494,7 +1755,10 @@ def land_implicit_kubeconfig(generated: str) -> None:
         )
     if written:
         lines.append(f"    export KUBECONFIG={path}")
-    lines.append(f"    kubectl --context={target.context_name} ...")
+    if refused:
+        lines.extend(OWN_KUBECONFIG_ADVICE_LINES)
+    else:
+        lines.append(f"    kubectl --context={target.context_name} ...")
     print("\n".join(lines), file=sys.stderr)
 
 
@@ -1727,20 +1991,144 @@ def _refusal_payload(exc: urllib.error.HTTPError) -> dict | None:
     with an HTML body. The body is read once and kept on the error, because
     the retry decision and the message printed after it both need it; a body
     that is not a JSON object counts as none. `exc.shim_dropped` says the
-    connection closed while the body was read.
+    connection closed while the body was read. The error is closed here, on
+    every way out: nothing reads the response again, and the status and the
+    headers stay on it.
+
+    A top-level value that puts the refusal over MAX_VCS_BODY_DEPTH gets a text
+    in its place (`_refusal_without_deep_parts`). The parser takes a deeper body
+    than `str` and `print` do, and each reader of a refusal prints its values.
     """
     exc.shim_dropped = False
     exc.shim_payload = None
     try:
         payload = json.load(exc)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a body nested deeper than the parser goes.
         return None
     except (http.client.HTTPException, OSError):
         # The connection closed while the refusal's body was read.
         exc.shim_dropped = True
         return None
-    exc.shim_payload = payload if isinstance(payload, dict) else None
+    finally:
+        exc.close()
+    exc.shim_payload = _refusal_without_deep_parts(payload, exc.code) if isinstance(payload, dict) else None
     return exc.shim_payload
+
+
+def _unusable_exec_answer(payload: dict) -> str | None:
+    """What is wrong with the fields of a 2xx answer from `/v1/exec`, or None.
+
+    `stdout` and `stderr` are strings when present, and `kubeconfig` is a string
+    or null. `exitCode` is an integer and is not optional: without it the
+    command's result is not known. A boolean is not an integer here, and a
+    number in a string is not one either. An integer that is no command's
+    result, above the greatest status or below the least signal's number, is
+    not usable either.
+    """
+    for field in _EXEC_OUTPUT_FIELDS:
+        if field in payload and not isinstance(payload[field], str):
+            return _FIELD_NOT_A_STRING_TEXT.format(field=field, type=type(payload[field]).__name__)
+    kubeconfig = payload.get(_EXEC_KUBECONFIG_FIELD)
+    if kubeconfig is not None and not isinstance(kubeconfig, str):
+        return _FIELD_NOT_A_STRING_TEXT.format(field=_EXEC_KUBECONFIG_FIELD, type=type(kubeconfig).__name__)
+    if _EXEC_EXIT_CODE_FIELD not in payload:
+        return _NO_EXIT_CODE_TEXT
+    exit_code = payload[_EXEC_EXIT_CODE_FIELD]
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return _EXIT_CODE_NOT_AN_INTEGER_TEXT.format(type=type(exit_code).__name__)
+    if not _MIN_EXIT_CODE <= exit_code <= _MAX_EXIT_STATUS:
+        return _EXIT_CODE_OUT_OF_RANGE_TEXT
+    return None
+
+
+def _exit_status(exit_code: int) -> int:
+    """The status to exit with for a command's return code from the broker.
+
+    A negative code is the number of the signal that ended the command; the
+    status is 128 plus that number, as a shell reports it.
+    """
+    return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
+
+
+def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
+    """Append the worker's record of a definitive write refusal, when this answer is one.
+
+    Only a 403 whose body carries the broker's ``write_refusal`` mark as true
+    is recorded; every other answer, and a call with REFUSAL_FILE_ENV unset,
+    writes nothing. ``verb_words`` is the verb the broker resolved (an exec
+    refusal's ``verb``). Never
+    raises: the record is the worker's signal, not the call's outcome.
+    """
+    if status != 403 or not isinstance(payload, dict) or payload.get(WRITE_REFUSAL_KEY) is not True:
+        return
+    rule = payload.get(REFUSAL_RECORD_RULE)
+    if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
+        return
+    _append_refusal_record(rule, verb_words, route)
+
+
+def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
+    """Record a session pod's kubectl call that tried a change and failed.
+
+    A session pod's kubectl reaches the cluster through kube-proxy, not the
+    broker, so no broker answer marks its refusal. The kubectl wrapper calls
+    this after a non-zero exit. The record is written when KUBE_PROXY_MODE_ENV,
+    which the gateway sets from the mode the operator gives kube-proxy, is a
+    read-only mode and the argv tries a change that mode refuses
+    (command_policy.kubectl_write_attempt). It reads the argv and the exit
+    code, never what kubectl printed, and a failure before kubectl reached the
+    proxy records the same: a change was attempted and not made. Never raises.
+    """
+    if exit_code == 0 or not os.environ.get(REFUSAL_FILE_ENV, "").strip():
+        return
+    try:
+        import command_policy  # shipped beside this module in the worker image
+    except ImportError:
+        return
+    verb = command_policy.kubectl_write_attempt(argv, os.environ.get(KUBE_PROXY_MODE_ENV, "").strip())
+    if verb is None:
+        return
+    _append_refusal_record(WRITE_ATTEMPT_RULE, list(verb), KUBE_PROXY_ROUTE)
+
+
+def _append_refusal_record(rule: str, verb_words, route: str) -> None:
+    """Append one write-refusal record to the file REFUSAL_FILE_ENV names, if set."""
+    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
+    if not target:
+        return
+    words = verb_words if isinstance(verb_words, list) else []
+    verb = " ".join(_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in words[:_REFUSAL_VERB_WORDS] if str(w))
+    record = {
+        WRITE_REFUSAL_KEY: True,
+        REFUSAL_RECORD_RULE: rule,
+        REFUSAL_RECORD_VERB: verb,
+        REFUSAL_RECORD_ROUTE: _VERB_WORD_SAFE_RE.sub("_", route)[:_VERB_WORD_MAX],
+        REFUSAL_RECORD_TIME: time.strftime(REFUSAL_RECORD_TIME_FORMAT, time.gmtime()),
+    }
+    task = os.environ.get(REFUSAL_TASK_ENV, "").strip()
+    if task and CALLER_LABEL_RE.match(task):
+        record[REFUSAL_RECORD_TASK] = task
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+    # No O_CREAT: the adapter makes the file. O_NONBLOCK so a FIFO put in its
+    # place cannot hold the call; the fstat below then refuses anything but a
+    # regular file.
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            print("credential proxy: the write refusal was not recorded (not a regular file)", file=sys.stderr)
+            return
+        # One write of one short line: an O_APPEND write lands whole.
+        os.write(fd, line)
+    except OSError as exc:
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+    finally:
+        os.close(fd)
 
 
 def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
@@ -1756,6 +2144,7 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
     # The far side composes the payload: a `code` that is not a string (a
     # list, an object) is not a refusal code, and must not raise out of here.
     if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
+        record_write_refusal(exc.code, payload, EXEC_ROUTE, payload.get("verb"))
         print(
             payload.get("message", "Command blocked for security reasons."),
             file=sys.stderr,
@@ -1763,9 +2152,11 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
         print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
         # The verb the policy resolved and whether this was a local render:
         # the agent runtime's refusal stop reads these two lines.
-        if payload.get("verb"):
+        if isinstance(payload.get("verb"), list) and payload["verb"]:
             # Each word is an argv token the agent chose; keep it to one line
-            # and to the characters a verb or resource name is made of.
+            # and to the characters a verb or resource name is made of. A
+            # `verb` that is not a list has no words (a text would give its
+            # letters, one for each word).
             words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
             print(f"policy verb: {' '.join(words)}", file=sys.stderr)
         if payload.get("local_render"):
@@ -1889,6 +2280,33 @@ def exec_refusal_retryable(status: int, headers, payload) -> bool:
     return headers is not None and ENVOY_OVERLOADED_HEADER in headers
 
 
+def vcs_refusal_retryable(status: int, headers, payload) -> bool:
+    """Whether a `/v1/vcs/` refusal ran nothing, so `vcs_call` may send it again.
+
+    Stricter than `exec_refusal_retryable`, because a vcs verb can write to a
+    forge and a busy answer can come from inside its route: only a broker
+    admission refusal that says it came before admission
+    (BUSY_BEFORE_ADMISSION_KEY) and is otherwise one the shim retries
+    (`busy_reply_retryable`), or a 503 Envoy answered itself under overload
+    without forwarding. Not a forge's own 429 or 503, which the broker relays
+    after the forge was called, and not a busy answer from an older broker
+    that does not say when it refused.
+    """
+    if payload is None:
+        return (
+            status == http.HTTPStatus.SERVICE_UNAVAILABLE
+            and headers is not None
+            and ENVOY_OVERLOADED_HEADER in headers
+        )
+    if status not in (http.HTTPStatus.TOO_MANY_REQUESTS, http.HTTPStatus.SERVICE_UNAVAILABLE):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get(BUSY_BEFORE_ADMISSION_KEY) is True
+        and busy_reply_retryable(payload)
+    )
+
+
 def refusal_text(payload) -> str:
     """The broker's own words for a refusal, for the stderr line."""
     if isinstance(payload, dict):
@@ -2010,7 +2428,7 @@ def execute(
     headers = {"Content-Type": "application/json"}
     try:
         headers.update(authorization_headers())
-        headers.update(task_credential_headers())
+        headers.update(task_credential_headers(EXEC_ROUTE))
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
@@ -2045,7 +2463,26 @@ def execute(
             return 1
         try:
             with open_broker_request(request) as response:
-                payload = json.load(response)
+                # Only the parse and the answer's shape are guarded: a read
+                # that breaks is a dropped connection, below. RecursionError:
+                # a body nested deeper than the parser goes.
+                try:
+                    payload = json.load(response)
+                except (ValueError, RecursionError):
+                    print(
+                        _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not isinstance(payload, dict):
+                    shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    return 1
+                # Before anything of the answer is written.
+                unusable = _unusable_exec_answer(payload)
+                if unusable is not None:
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=unusable), file=sys.stderr)
+                    return 1
             break
         except urllib.error.HTTPError as exc:
             payload = _refusal_payload(exc)
@@ -2068,7 +2505,6 @@ def execute(
                     report_throttled(exc.code, text, attempts_made)
                     return 1
                 report_retry(exc.code, text, attempts_made, delay)
-                exc.close()
                 sleep_fn(delay)
                 continue
             return _exec_refused(exc, payload)
@@ -2127,7 +2563,7 @@ def execute(
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
-    return int(payload.get("exitCode", 1))
+    return _exit_status(payload[_EXEC_EXIT_CODE_FIELD])
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
@@ -2166,6 +2602,30 @@ class BrokerDisconnected(RuntimeError):
     """
 
 
+class VcsAnswerTooDeep(ValueError):
+    """A 2xx `/v1/vcs/*` body that nests deeper than MAX_VCS_BODY_DEPTH, or deeper than the parser goes.
+
+    The request reached the broker, so the verb can have taken effect. A
+    ValueError, as for a body that is not JSON, so a caller with an arm for
+    that one still takes this one.
+    """
+
+
+def nests_deeper_than(document: object, bound: int) -> bool:
+    """Whether `document` nests lists and objects more than `bound` levels. A loop, with no recursion."""
+    layer = [document]
+    for _ in range(bound):
+        layer = [
+            child
+            for node in layer
+            if isinstance(node, (dict, list))
+            for child in (node.values() if isinstance(node, dict) else node)
+        ]
+        if not layer:
+            return False
+    return any(isinstance(node, (dict, list)) for node in layer)
+
+
 class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
@@ -2183,6 +2643,10 @@ class WorkspaceRequestError(RuntimeError):
         )
         self.status = status
         self.payload = payload
+        # What `vcs_call` decides a retry on: the reply's headers (Retry-After,
+        # Envoy's overload mark) and its JSON body, or None when it sent none.
+        self.headers: object = {}
+        self.json_body: object = None
 
 
 def default_caller_label() -> str:
@@ -2202,13 +2666,55 @@ def default_caller_label() -> str:
     return ""
 
 
-def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
-    """One `POST /v1/vcs/<verb>`.
+def vcs_call(
+    endpoint: str,
+    verb: str,
+    payload: dict,
+    *,
+    sleep_fn=time.sleep,
+    clock=time.monotonic,
+    rng=random,
+) -> dict:
+    """One `POST /v1/vcs/<verb>`, sent again after an admission refusal.
 
     Every `/v1/vcs/*` call stands alone and holds nothing across a session.
     Public, because the version-control skill is the caller and it lives
     outside this module.
+
+    A refusal the broker makes before it admits the request -- a 503 at a slot,
+    budget, background or profile cap, or a 429 under memory pressure, each
+    marked as given before admission -- or an Envoy overload 503 ran nothing,
+    so it is sent again on the exec shim's schedule (`vcs_refusal_retryable`,
+    `retry_wait`) with a line on stderr per wait. A refusal after the request
+    reached the forge is never sent again. Without it, a profile worker at its slot
+    share could publish a branch and then fail the `proposal-create` that
+    follows at once, leaving a branch with no proposal (#6247). Every other
+    refusal, and the last admission refusal once the retries are spent, is
+    raised as before.
     """
+    started = clock()
+    deadline = retry_deadline_seconds()
+    attempts_made = 0
+    while True:
+        try:
+            return _vcs_call_once(endpoint, verb, payload)
+        except WorkspaceRequestError as exc:
+            if not vcs_refusal_retryable(exc.status, exc.headers, exc.json_body):
+                raise
+            attempts_made += 1
+            text = refusal_text(exc.payload)
+            delay = retry_wait(
+                attempts_made, started, exc.headers.get(RETRY_AFTER_HEADER), rng, clock, deadline=deadline
+            )
+            if delay is None:
+                report_throttled(exc.status, text, attempts_made)
+                raise
+            report_retry(exc.status, text, attempts_made, delay)
+            sleep_fn(delay)
+
+
+def _vcs_call_once(endpoint: str, verb: str, payload: dict) -> dict:
+    """One attempt of `vcs_call`."""
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     # Same credential and same opener as `execute`: these routes spend the
@@ -2216,22 +2722,42 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     # 401, and the stock opener would put a total socket timeout on a clone
     # that legitimately runs for minutes.
     headers.update(authorization_headers())
+    # A profile worker's task credential, as `execute` sends it: the broker
+    # refuses a profile caller's version-control verbs without one, and its
+    # permit is what admits the writes (#3993). Nothing outside task mode.
+    route = f"/v1/vcs/{verb}"
+    headers.update(task_credential_headers(route))
     request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        endpoint.rstrip("/") + route,
         data=body,
         headers=headers,
         method="POST",
     )
     try:
         with open_broker_request(request) as response:
-            return json.load(response)
+            try:
+                answer = json.load(response)
+            except RecursionError as exc:
+                # A body nested deeper than the parser goes. A RuntimeError by
+                # type, so no clause for a body that is not JSON sees it.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT) from exc
+            if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+                # The parser took it; an encoder or `repr` of a caller may not.
+                raise VcsAnswerTooDeep(_VCS_ANSWER_TOO_DEEP_TEXT)
+            if not isinstance(answer, dict):
+                # Valid JSON, but not an object, and every consumer reads the
+                # answer as one. A ValueError, as for a body that is not JSON:
+                # `vcs_client.call` has an arm for it. The type's name only,
+                # never the body.
+                raise ValueError(f"the broker's answer is JSON of type {type(answer).__name__}, not an object")
+            return answer
     except urllib.error.HTTPError as exc:
         try:
             answer = json.load(exc)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # RecursionError: a body nested too deep to parse
             # The status arrived but the body is not a refusal document. The
             # status is the whole answer.
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+            raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
         except (http.client.HTTPException, OSError) as broke:
             # The body ran out mid-read instead: an `IncompleteRead`, or a
             # `RemoteDisconnected`, or a reset socket. None of those is a
@@ -2242,12 +2768,25 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
             # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
             # has no arm for and every consumer is built on it having one.
             raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
+        finally:
+            # The body is read, or lost: nothing reads the response again. The
+            # status stays on the error.
+            exc.close()
+        if not isinstance(answer, dict):
+            # Valid JSON, but not an object, so no refusal document either.
+            # The status is the whole answer, as above.
+            raise _vcs_refusal(exc, {"error": f"HTTP {exc.code}"}, None) from exc
+        if nests_deeper_than(answer, MAX_VCS_BODY_DEPTH):
+            answer = _refusal_without_deep_parts(answer, exc.code)
         if answer.get("code") == "VCS_UNAVAILABLE":
             # A broker too old to have these routes at all. Distinguished from
             # every other refusal because it is the one a caller cannot fix by
             # asking differently.
             raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
-        raise WorkspaceRequestError(exc.code, answer) from exc
+        # No write-refusal record: a version-control refusal never stops the
+        # task. The permit refusal's answer is the patch the version-control
+        # skill tells the agent to give.
+        raise _vcs_refusal(exc, answer, answer) from exc
     except urllib.error.URLError:
         # Out untouched: the send never landed, and `vcs_client.call` has an
         # arm that says so. Named before the clause below only because
@@ -2258,8 +2797,37 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
 
 
+def _refusal_without_deep_parts(refusal: dict, status: int) -> dict:
+    """`refusal` with a text in place of each top-level value that puts it over MAX_VCS_BODY_DEPTH.
+
+    The other values stay, so a caller still reads the refusal's `code` and its
+    text. The key of a value that is too deep stays too: a reader then sees a
+    mark that it does not know, and not a mark that is absent, which can have a
+    meaning of its own (a busy refusal with no `bound` is sent again). An
+    `error` that is too deep becomes the status.
+    """
+    trimmed = {}
+    for name, value in refusal.items():
+        # The refusal object is one level; a value has the rest of the bound.
+        if not nests_deeper_than(value, MAX_VCS_BODY_DEPTH - 1):
+            trimmed[name] = value
+        elif name == _REFUSAL_ERROR_FIELD:
+            trimmed[name] = _REFUSAL_STATUS_TEXT.format(status=status)
+        else:
+            trimmed[name] = _REFUSAL_PART_TOO_DEEP_TEXT
+    return trimmed
+
+
+def _vcs_refusal(exc: urllib.error.HTTPError, payload: dict, json_body: object) -> WorkspaceRequestError:
+    """The error `vcs_call` raises for a refusal, with what its retry reads."""
+    error = WorkspaceRequestError(exc.code, payload)
+    error.headers = exc.headers if exc.headers is not None else {}
+    error.json_body = json_body
+    return error
+
+
 class ApiSession:
-    """A requests-shaped session whose GETs to a Google API go through the broker.
+    """A requests-shaped session whose reads of a Google API go through the broker.
 
     The sandbox holds no Google credential, so a script that needs a Cloud
     Monitoring read cannot call `monitoring.googleapis.com` itself. This
@@ -2271,11 +2839,13 @@ class ApiSession:
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 
-    The URL a caller writes stays the real endpoint, so a collector's evidence
-    label still names it, and `.get(url, params=, timeout=)` is what a
+    The URL a caller writes stays as written, so a collector's evidence label
+    still names the Google endpoint it reads, in its commercial form: when the
+    caller's environment names a custom universe domain, `relay_url` puts the
+    host in that domain. `.get(url, params=, timeout=)` is what a
     `requests.Session` offers, so code written against one runs against this
-    unchanged. `requests` is imported here and not at module scope: it is in the
-    sandbox image, where this class runs, and nowhere else this module is
+    unchanged. `requests` is imported here and not at module scope: it is in
+    the sandbox image, where this class runs, and nowhere else this module is
     imported needs it. `http` is injectable for tests and for a caller that
     already holds a configured session.
     """
@@ -2315,7 +2885,8 @@ class ApiSession:
     def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        host = rewrite_google_api_host(parsed.netloc)
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{host}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed
@@ -2334,11 +2905,23 @@ class ApiSession:
         the collectors that make hundreds of these calls own their own pacing
         for a quota refusal.
         """
+        return self._send(url, params=params, timeout=timeout)
+
+    def post(self, url: str, *, json, timeout=None):
+        """One relayed POST of a JSON body, on the same schedule as `get`.
+
+        For a read whose arguments travel in a body, which the broker's table
+        names with a body check (Logging `entries:list`). The broker reads the
+        body, holds it to that check, and forwards its own copy of it.
+        """
+        return self._send(url, timeout=timeout, json_body=json)
+
+    def _send(self, url: str, **kwargs):
         attempts_made = 0
         started = self._clock()
         deadline = retry_deadline_seconds()
         while True:
-            response = self._get_once(url, params=params, timeout=timeout)
+            response = self._get_once(url, **kwargs)
             attempts_made += 1
             if not self._refused_admission(response):
                 return response
@@ -2364,9 +2947,15 @@ class ApiSession:
     @staticmethod
     def _json_body(response):
         try:
-            return response.json()
-        except (ValueError, AttributeError):
+            body = response.json()
+        except (ValueError, AttributeError, RecursionError):
+            # RecursionError: a body nested deeper than the parser goes.
             return None
+        if isinstance(body, dict):
+            # The retry line prints the refusal's text: as for a `/v1/exec`
+            # refusal, a value that is too deep gets a text in its place.
+            return _refusal_without_deep_parts(body, getattr(response, "status_code", None))
+        return body
 
     def _refused_admission(self, response) -> bool:
         status = getattr(response, "status_code", None)
@@ -2374,11 +2963,12 @@ class ApiSession:
             return False
         return busy_reply_retryable(self._json_body(response))
 
-    def _get_once(self, url: str, *, params=None, timeout=None, headers=None):
+    def _get_once(self, url: str, *, params=None, timeout=None, headers=None, json_body=None):
         """One relayed GET, moved to the stateful broker when the exec tier cannot be reached.
 
         `headers` are sent beside the caller's credential (the get-credentials
-        check's GET_CREDENTIALS_CHECK_HEADER)."""
+        check's GET_CREDENTIALS_CHECK_HEADER). With `json_body` the request is
+        a POST of that body, for `post`."""
         caller_timeout = timeout
         started = time.monotonic()
         with self._lock:
@@ -2390,6 +2980,13 @@ class ApiSession:
             # refusing it.
             timeout = _exec_connect_bound(timeout)
         try:
+            if json_body is not None:
+                return self._http.post(
+                    self.relay_url(url, endpoint),
+                    json=json_body,
+                    headers={**authorization_headers(), **(headers or {})},
+                    timeout=timeout,
+                )
             return self._http.get(
                 self.relay_url(url, endpoint),
                 params=params,
@@ -2400,7 +2997,7 @@ class ApiSession:
             with self._lock:
                 if self._endpoint == endpoint and self._fallback is not None:
                     # The first reader to fail moves the session. Every relay
-                    # call is a GET, so sending it again is safe even when the
+                    # call is a read, so sending it again is safe even when the
                     # error came after the request left, and the rest of the
                     # session stays on the stateful broker: a missing exec
                     # Service would otherwise cost each read its connect bound.
@@ -2414,7 +3011,7 @@ class ApiSession:
             left = _time_left(caller_timeout, time.monotonic() - started)
             if left is False:
                 raise
-            return self._get_once(url, params=params, timeout=left, headers=headers)
+            return self._get_once(url, params=params, timeout=left, headers=headers, json_body=json_body)
 
 
 def _exec_connect_bound(timeout):
@@ -2501,6 +3098,14 @@ def main():
     form, and `--ensure-kubectl-context`. Ends with SystemExit. The
     images' launcher imports this module, so its precompiled bytecode
     is used, and calls this."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--record-kubectl-write-attempt":
+        # The session kubectl wrapper: <exit code> then kubectl's own arguments.
+        try:
+            code = int(sys.argv[2])
+        except ValueError:
+            raise SystemExit(0) from None
+        record_kubectl_write_attempt(["kubectl", *sys.argv[3:]], code)
+        raise SystemExit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
         try:
             ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])

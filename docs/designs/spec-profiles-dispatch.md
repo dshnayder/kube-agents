@@ -179,8 +179,9 @@ its budget function; until it exists, a fixed conservative default behind a knob
 3. **Fan-out with a wait.** A profile can start several child tasks and wait on their
    results. **Each child gets a fresh root grant, minted by the gateway** for the child's
    profile. It is not an attenuated copy of the parent's grant. The gateway enforces the
-   narrowing when it mints: the child's tier equals the parent's (and the child's profile must
-   allow it), and the child's scope must lie inside the parent's. The gateway stays the only
+   narrowing when it mints: the child's tier equals the parent's, or is `read` with no trigger below an `unattended`
+   parent, whose child's profile must also list `unattended` (#6744) (and the child's profile must
+   allow its tier), and the child's scope must lie inside the parent's. The gateway stays the only
    publisher of submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
    ancestor-chain rule in [Scale rules](#scale-rules) applies (only a chain's head nests its own
    profile, once; no profile repeats otherwise). Entries a broker adds to a grant chain never change
@@ -283,6 +284,16 @@ publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so
 a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
 is #4173.
 
+**Re-creating a durable.** The operator re-creates a profile durable only when it is really
+gone. A re-created durable starts from the stream's first message with a fresh ack floor, and a
+new stream leader can answer "not found" before a durable's assignment reaches it, as after a
+replica change. So a durable whose tier is in the profile's `status.durableTiers` (written only
+by a pass whose durable sync succeeded, and kept through passes the bus refuses) is re-created
+only if it is still missing a pass later (`durableRecreateDelay`, 30s), with the card reading
+`DurableRecheck` meanwhile. A new profile, or a tier new to it, gets its durables at once.
+`lib.EnsureHeldConsumer` offers the refusal as a primitive (`HeldConsumerConfig.Existed`) and
+leaves the timing to its caller (#6283).
+
 ### Admission and holding
 
 **The dispatcher is the only fetcher and holder** (decided 2026-10-22), on both execution
@@ -337,7 +348,8 @@ leave open:
 - **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
   `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
   dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
-  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  concurrency, queue timeout and deadline (the dispatcher derives each profile's durables from
+  its tiers and draining tiers, and the config is written compact; #5479), and four intervals: `leaseSeconds`
   (default 90), `renewSeconds` (20; a lease is at least three renewals),
   `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
   offers. A task already handed out keeps the intervals its offer carried.
@@ -363,9 +375,35 @@ leave open:
   mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. When an unattended trigger submitted the
+  admission. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream, script}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
+  found equal to the grant's at admission (added 11/11, #4685). A `script` must also be one
+  the profile allowlists in `spec.scripts`, which the operator renders into the dispatch config with
+  each script's path and timeout. A script-run task's path comes from that render, never from the
+  task. Every path lies under `/opt/kube-agents/scripts/`, the one place helper scripts ship in the
+  worker image. The CRD and the dispatcher's config check both hold paths to it, and
+  `deploy/docker/test_script_root_ownership.py` keeps what a Dockerfile puts there root-owned and not
+  group- or world-writable (#5622). A task that names no cluster gets
+  no `proxyToken`, except an `unattended` task a trigger started: it gets a report credential, a
+  `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
+  the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
+  only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  The [unattended write permit](unattended-write-permit.md) design proposes named version-control
+  routes on both lists for a run that holds its permit; the lists are as stated here until then.
+  Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
+  trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
+  binds a trigger at. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod, at
+  whatever tier it was admitted at and of either kind (a confirmed chain's children and wakes
+  inherit the flag, so each of them runs on a Job too): one whose tier has no Job runner is
+  refused at admission (`change-needs-job`), and the permit is minted only for a task on a Job
+  (#5646). Under Job mode every profile has a Job template at each of its live tiers for
+  this, so the refusal is what an install without Job mode, or a profile without a
+  template, gets. Otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -376,6 +414,67 @@ leave open:
   pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
   or holds another key type stops the dispatcher at startup. The dispatcher logs a
   credential's `jti`, never the token.
+- **Script-run tasks.** A script must run in Job mode: admission refuses `script-not-allowed` where the
+  profile has no Job template at an unattended tier. The dispatcher resolves the script from the config
+  snapshot it admitted the task on, and the confirm carries `script` (`{name, path, timeoutSeconds}`).
+  Only the dispatcher may publish on a dispatch subject (`TestOnlyTheDispatcherPublishesAConfirm`). The
+  one-shot worker runs the script in place of the harness when all of these hold:
+  - its task credential verifies against `A2A_TASK_SIGNING_PUBLIC_KEYS`, which the operator renders into
+    each Job template from the key the callout and the proxy use;
+  - the credential names this task and pod, and a trigger whose `script` is the confirm's;
+  - the path resolves to a regular file under the script root, owned by root, writable by no group
+    or other, and neither setuid nor setgid, in directories that are the same on both the named path
+    and the resolved one, and the worker isn't its owner. The file itself may be one symlink within
+    the root whose target, as written, is where it resolves: a link to another link, or through a
+    symlinked directory that changes where it leads, is refused. No directory on the named path may be a symlink.
+
+  The script runs with no shell and a cleared environment. It gets the worker's `PATH`, `HOME` and three
+  broker hand-off variables (`CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`,
+  `CREDENTIAL_PROXY_TASK_TOKEN_FILE`), plus the task's parameters as `KA_PARAM_<NAME>`. (A model
+  turn's harness, unlike a script, also gets a triggered task's stream and origin as
+  `PROFILE_TRIGGER_STREAM` and `PROFILE_TRIGGER_ORIGIN`, read from the submission's authority block,
+  which the dispatcher held to the grant; the broker still decides any report write from the signed
+  credential's trigger.) Its bound is
+  its `timeoutSeconds` within the task's deadline. It starts in a session of its own, and its kill (at
+  the bound, on a cancel, abandon or SIGTERM, and once more after it exits) SIGKILLs its process group
+  and every process `/proc` lists in its session; where the worker is the container's pid 1, as the
+  worker image's entrypoint is, it also kills every other process in the pod's pid namespace, which
+  reaches a process that started a session of its own, and reaps them. Its
+  stdout, capped at 64 KiB, is the text result. Its stderr is read, capped at 16 KiB, and only its size is logged: a script can print a credential, and the log is not where a redactor's misses should land. Exit 0
+  completes the task, and anything else fails it as `script-failed`, or `script-timeout` at the bound.
+  A check that fails rejects the task as `script-refused`, and nothing runs. So does a parameter whose
+  name can't be a `KA_PARAM_<NAME>` (upper case, at most 32 characters, where a task parameter may have
+  63), and a confirm with no `script` whose credential or submission's trigger names one, or whose
+  submission's authority block can't be read: a script task never runs as a model turn. A cancel on the task's `.in` kills the script and ends it `canceled`, and other messages there are
+  refused. An abandon kills it and publishes nothing, since the dispatcher writes that terminal. A
+  SIGTERM ends it as `worker-evicted`.
+
+- **Write refusals.** A model-turn task's worker stops at the first write refusal the broker
+  marked definitive, and reads no tool output to find it. The broker marks its 403 body
+  `write_refusal: true` when a policy rule refuses a mutating kubectl verb that is not a local
+  render: the `kubernetes.read-only` rule, or the profile caller's flag rule
+  (`caller.kubectl-flag`), which reads a profile write's flags first. A busy, rate or timeout
+  answer is never marked, and neither is a version-control refusal: the version-control skill's
+  answer to a missing permit is the patch, which the task still gives. On such a refusal the in-pod broker client
+  appends one JSON record (task, rule, verb, route, time) to the file the worker names in
+  `CREDENTIAL_PROXY_REFUSAL_FILE`: `write-refusals` on the task token's tmpfs, made empty before
+  the harness starts and removed after. The client opens it append-only, without following a
+  symlink and without creating it, and a missing or unwritable file is a line on stderr. After
+  each tool-result line the worker reads the file. At the first record it stops the harness
+  (closed stdin, SIGTERM to its process group, SIGKILL after the kill grace) and ends the task
+  `failed` (work ran first, so not `rejected`) with `reason: write-refused`, whose detail names
+  the record's rule and verb and carries no other output. Only a record naming one of those two
+  rules, with a verb of one or two lowercase words, counts. The gateway shows that detail in chat
+  after the failed notice. A session pod's turn stops the same way at its first kubectl write
+  attempt ([the subagent spec](spec-subagent-profiles.md), "Stopped at a write refusal"). A `gcp.read-only` refusal, a refused read spelling, a local render, an
+  MCP relay refusal and an API 403 don't stop the task. The broker refuses the write whether or
+  not the task stops, so a lost record only lets the task run on. Every route a definitive write
+  refusal can take to the model runs through the client: `kubectl` and `gcloud` on a profile
+  worker are the broker shim. The
+  routes that don't (the MCP relay, the stock kubectl binary run directly, a direct HTTP call to
+  the broker or the cluster API, local git, the harness's file and web tools) carry no definitive
+  write refusal; `a2a/worker-adapter/refusal.go` lists them.
+
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -453,7 +552,43 @@ leave open:
   Ready. With bucketed grants, the dispatcher's entry is a fixed size whatever the profile count,
   so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
-  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
+  the dispatch config's `profileSupervisorForm` is `profile`; readers read both, until a reader
+  given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
+  terminal when the server stored it after that time; contract addendum 6, #5301). The operator
+  renders that env on the gateway and the MCP server once the `ProfileSupervisorForm` condition
+  has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC (on
+  an install that latched earlier, that time may already be in the past at the upgrade); an
+  unlatched install renders none, so its readers take both forms and nothing rolls. The gate
+  holds against the gateway, whose grant still reaches the five-token form, so both its inputs
+  are the operator's: which addressees are profiles comes only from the profile names file it
+  renders beside the env (`A2A_PROFILE_NAMES_FILE`, the `<agent>-a2a-profile-names` ConfigMap:
+  the admitted and draining profiles, the same names nats.conf denies the gateway the
+  supervisor subjects of), never from the gateway's session record, `.in` traffic, the
+  console's status lines or the directory. The gateway's Role writes no ConfigMap but its
+  home-channel record and cannot write its own Deployment, and the MCP server has no API
+  access. A reader whose names file has never been read takes every addressee as a profile;
+  the file is re-read every 30 seconds, and a later read that fails keeps the names last read.
+  The gateway's relay doesn't settle a refusal it made before the names were read, since the
+  names may take it: it gives the event back to the stream for 30 seconds, up to 20 times, then
+  settles it with an Error and counts the drop once. The 20 counts only these holds, by stream
+  sequence in the gateway's memory, not the message's deliveries: a give-back after a failed
+  KV write, a rollout's give-back or a lapsed ack wait doesn't spend it. A held event the names then take renders
+  when it comes back, so it can render after later events of the same task; that ordering
+  effect is known and accepted.
+  The stored time is the server's, and only where the server alone writes it: a consumer
+  delivery's metadata, or the API's JSON reply to a message get on a stream without
+  `allow_direct`. Never a direct get's headers: the server appends its `Nats-Time-Stamp` after
+  the publisher's own header block, and a blank line inside that block ends it for the
+  client's parse, hiding the server's stamp behind a forged one. A direct get therefore gives
+  no time; the gateway's busy count and empty read re-read a profile task's five-token subject
+  on a short `DeliverLastPerSubject` consumer for its time, and a time that can't be read is
+  unknown and refused where it would decide. The replay's horizon is the stream's last
+  sequence from `STREAM.INFO`, never a direct get's `Nats-Sequence`, which sits in the same
+  header block. A cutoff that doesn't parse is taken as the Unix
+  epoch, so every five-token terminal on a profile task is refused; it is logged at Error and
+  shown on the gateway's `profile_supervisor_cutoff_timestamp_seconds` series and the MCP
+  server's `/healthz`. The terminal never goes on `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -461,15 +596,48 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `tier-withdrawn` (queued at a tier its profile now drains, #3659),
   `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid`, `queue-timeout`, and for a child of an AgentProfile task
+  `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`, `parameters-invalid`,
+  `queue-timeout`, `script-not-allowed` (the trigger names a script its profile's `spec.scripts` doesn't list, or one
+  where the profile has no Job mode at an unattended tier, #5622), and for a child of an AgentProfile task
   `parent-unchecked`, `parent-cycle` and `outside-parent-scope` (the dispatcher's re-check of the
   gateway's chain and scope rules, from the parent's chain and scope in the child's `via`) at
   admission, and `lease-expired`
-  and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
-  profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
+  and `deadline-exceeded` while it holds, and on a `canceled` terminal `stopped` (the
+  conversation's stop) and `tier-ended` (an administrator ended its tier's drain, #5850). A terminal is retried until it lands, except for a
+  profile that has left the install config, and on a latched install a refused terminal (below). A dropped profile's `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
   an error (#5074).
+  On a latched install (`profileSupervisorForm: profile`) a refused six-token terminal is never
+  written on the five-token form instead: readers past the cutoff don't take that form as a
+  profile task's terminal, so it would free the slot while the requester never saw the end. The
+  terminal is retried, a refusal at admission as well as a held task's. Only a permission refusal
+  counts toward the bound: an attempt during which the server refused the six-token publish for
+  the connection's permissions (nats.go's async `Permissions Violation for Publish to` that
+  subject). Any other failure, such as a disconnect, no responders, a timeout with no refusal or a
+  JetStream API error, restarts the bound, so a NATS or `TASKS` outage of any length is retried and
+  the terminal lands after it. Once refusals have run for `DroppedTerminalGiveUp`, the task is
+  settled without one: tombstoned, its slot freed,
+  its submission settled, an error logged under the reason `terminal-unpublished`, and the
+  dispatcher health line's `supervisorGiveUps` counted. The requester sees no terminal: the
+  gateway ends a task with no events as never started, and holds one with executor events until
+  the user's stop. A refusal needs a grant that never reached the dispatcher's connection; the
+  regrant normally clears that in seconds, well inside the bound. A profile that has left the
+  install config keeps its own give-up and log line above, not `terminal-unpublished`. An
+  unlatched install keeps retrying, as before.
+  On the five-token form a terminal's envelope id is fixed per task, so a retry after a lost ack
+  is a duplicate the stream drops. The duplicate window is keyed on the id alone, whatever the
+  subject, so a fixed id is one another writer could store a message under first. On the
+  six-token form the id is therefore 128 random bits from crypto/rand, kept in the dispatcher's
+  memory while sends succeed and drawn again after any that fails (#6883): no other writer can
+  predict it, or plant one it saw on a send that reached subscribers without being stored, so a
+  duplicate ack is always the terminal's own earlier send. There is no read-back and no grant for
+  one. The cost: a send stored but whose ack was lost, or a dispatcher that restarts between the
+  publish and the settle of a held task, writes the terminal again under a new id, so the subject
+  can hold two identical final statuses. Every reader takes the first final status as the task's
+  end; a later one is a post-final drop (`PostFinalDropped`), counted and logged on each read. The
+  five-token form keeps the fixed id, and with it the planting gap this closes on the six-token
+  form: on an unlatched install readers take any supervisor terminal anyway.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for
@@ -486,7 +654,10 @@ leave open:
   grace is never shorter than a renewal and two ticks, so one silent since before the stop is
   always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
-  task isn't told it is held yet (#4362).
+  task isn't told it is held yet (#4362). The breaker guards the tier's runner: at an
+  unattended tier that is Job mode, and at any other tier the warm pool. A permit-carrying
+  task's own Job at a pool's tier (#5646) stays clear of that breaker: it doesn't wait on it,
+  is never its probe, and its finish or lost worker neither opens nor closes it.
 - **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
   the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
   Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
@@ -494,12 +665,35 @@ leave open:
   it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
-  re-adopts the task.
-  The dispatch config doesn't carry the Job's pod template. It names the profile's own
-  `DispatchJobTemplate` in the profile namespace, the param the Job admission policy holds each
-  Job to, and the hash of the rendering it means (`jobTemplateRef`). The dispatcher reads that
-  object when it launches the Job, with `get` alone on those objects, and uses it only while
-  the object's `kubeagents.x-k8s.io/dispatch-template-hash` annotation matches. Any mismatch, a
+  re-adopts the task; the lease record says the task ran on a Job (`onJob`), so the Job of a
+  task re-adopted at any tier goes when it ends. A Job's name is a hash of the task's whole
+  key, its kind included, and a Job pod already holding a task is never offered another.
+  A read-tier task with no permit stays on the warm pool, and a Job an earlier pass launched
+  for it, while its submission (replaced under the same subject) still carried a permit,
+  goes first. Isolating the credential this way leaves the task's bus traffic where it was:
+  the Job's pod shares the bus with every other worker (#3889).
+  The dispatch config doesn't carry the Job's pod template. It carries one hash for the
+  renderings of the profile's `DispatchJobTemplate`s in the profile namespace, the params the
+  Job admission policy holds each Job to (`jobTemplateRef`), and `perTier: true` (#5646):
+  the profile has one per live tier, each under its tier's ServiceAccount. The
+  unattended-mode tier's param is the profile's own, `kube-agents-dispatch-job-profile-<profile>`,
+  and any other tier's is `kube-agents-dispatch-job-tier-<profile>.<tier>`, where only
+  permit-carrying tasks run. The dispatcher derives each name from the task's (profile,
+  tier), never from the config (#5479), and holds the template's own profile and tier labels
+  to the task's. It reads that object when it launches the Job, with `get` alone on those
+  objects, and uses it only while the object's `kubeagents.x-k8s.io/dispatch-template-hash`
+  annotation matches. The one hash covers every tier's rendering, so a change to any of them
+  moves it on every param of the profile, and the config's entry stays one hash wide however
+  many tiers the profile has. A reference without `perTier` is the unattended-mode tier's
+  template alone, as an operator from before #5646 sends it. The admission policy is
+  unchanged: it holds a Job to the template of the ServiceAccount it runs as, and those are
+  unique per (profile, tier). It reads every param on each Job, so admitting one takes
+  longer as params grow: about 1.3s at 2,500 one-tier profiles and 2.5s at 2,500 two-tier
+  ones, against a Job's cold start of 30 to 90s. Those are measurements, not a gate:
+  `TestTheJobPolicyAtTwentyFiveHundredTwoTierProfiles` (envtest) logs them only when
+  `KUBE_AGENTS_JOB_POLICY_SCALE` is set, and asserts no bound. A param whose rendering,
+  labels, template and defaulting API server are all current isn't defaulted or applied
+  again on the next pass. Any mismatch, a
   missing param, or one with no containers keeps that profile's task queued, shows on the
   dispatcher's health as a Job admission error, and leaves every other profile alone. The
   operator writes params before the config, so the usual transient is a param ahead of the

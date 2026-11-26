@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """hack/ci_pause_scheduled_audits.py, run as scheduled_audits runs it: `python3 - <home> [--resume] < script`.
+All runs but one get the script with a short gap between two read-backs (script_text).
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
 already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
@@ -42,6 +43,27 @@ SCRIPT = REPO / "hack" / "ci_pause_scheduled_audits.py"
 RUNNER = REPO / "hack" / "ci-eval-pr.sh"
 STAGE = REPO / "agents" / "chat" / "scripts" / "oobe.py"
 ROSTER_SOURCE = REPO / "agents" / "platform" / "cron" / "jobs.json"
+# The line of the script that sets the gap between two read-backs of the store, and
+# the line most runs here get in its place. Each run that pauses a job sleeps one
+# gap or more. A run reads the script from stdin, so it can get the text with this
+# one line changed and nothing else.
+ROUND_SLEEP_LINE_RE = re.compile(r"^PAUSE_ROUND_SLEEP_SECONDS = .+$", re.M)
+SHORT_ROUND_SLEEP_LINE = "PAUSE_ROUND_SLEEP_SECONDS = 0.01"
+
+
+def script_text(real_round_sleep=False):
+    """The script as a run gets it on stdin: its own text, or that text with the
+    gap between two read-backs made short."""
+    text = SCRIPT.read_text()
+    if real_round_sleep:
+        return text
+    text, lines = ROUND_SLEEP_LINE_RE.subn(SHORT_ROUND_SLEEP_LINE, text)
+    assert lines == 1, (
+        f"{SCRIPT} has {lines} lines that set PAUSE_ROUND_SLEEP_SECONDS; script_text() makes the gap short "
+        "in exactly one. If the script names the gap in another way, change ROUND_SLEEP_LINE_RE to match."
+    )
+    return text
+
 
 # A stand-in for `hermes -p platform cron pause <id>` that writes what Hermes' pause_job writes.
 # FAKE_HERMES_MODE=noop exits 0 and writes nothing; =fail exits 1.
@@ -82,6 +104,48 @@ FAKE_HERMES = textwrap.dedent('''\
             if str(job["id"]) == late:
                 job.update(enabled=False, state="paused", paused_at="2026-10-14T00:00:00+00:00")
         json.dump(store, open(os.environ["FAKE_ROSTER"], "w"))
+    if mode.startswith("trigger-after-pause:") or mode.startswith("trigger-before-pause:"):
+        # A case's stack marks this job due with Hermes' trigger_job, which lifts a pause
+        # as it sets the mark: once, either while an earlier job's pause is in flight
+        # (before this job's own), or while a later job's is (after this job's own).
+        when, fired = mode.split(":", 1)
+        store = json.load(open(os.environ["FAKE_ROSTER"]))
+        mine = next(job for job in store["jobs"] if str(job["id"]) == fired)
+        flag = os.environ["FAKE_ROSTER"] + ".triggered"
+        is_paused = mine.get("state") == "paused"
+        ready = is_paused if when == "trigger-after-pause" else not is_paused
+        if sys.argv[4] == "pause" and sys.argv[5] != fired and ready and not os.path.exists(flag):
+            open(flag, "w").close()
+            from datetime import datetime, timezone
+            mark = datetime.now(timezone.utc).isoformat()
+            mine.update(enabled=True, state="scheduled", paused_at=None, next_run_at=mark, manual_run_at=mark)
+            json.dump(store, open(os.environ["FAKE_ROSTER"], "w"))
+    if mode.startswith("claim-before-pause:") and sys.argv[4] == "pause" and sys.argv[5] != mode.split(":", 1)[1]:
+        # The tick claims a case's mark on this job while an earlier job's pause is
+        # in flight: the mark is gone from the roster and a run row is under way.
+        import sqlite3
+        from datetime import datetime, timezone
+        flag = os.environ["FAKE_ROSTER"] + ".claimed"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            ledger = os.path.join(os.path.dirname(os.environ["FAKE_ROSTER"]), "executions.db")
+            conn = sqlite3.connect(ledger)
+            conn.execute("CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT)")
+            conn.execute(
+                "INSERT INTO executions VALUES (?, ?, ?)",
+                (mode.split(":", 1)[1], "running", datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            conn.close()
+    if mode == "break-ledger-on-first" and sys.argv[4] == "pause":
+        # The runs' ledger stops being readable while the first pause is in flight.
+        ledger = os.path.join(os.path.dirname(os.environ["FAKE_ROSTER"]), "executions.db")
+        flag = os.environ["FAKE_ROSTER"] + ".broken"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            if os.path.exists(ledger):
+                os.remove(ledger)
+            os.mkdir(ledger)
     if mode == "arm-on-first":
         # The oobe-first-run-audits stack arms while this pause is in flight: the pause still
         # lands, and the state file is there for every later one.
@@ -120,7 +184,7 @@ class PauseTest(unittest.TestCase):
         self.roster.write_text(json.dumps({"jobs": jobs}))
         self.shipped.write_text(json.dumps({"jobs": jobs if shipped is None else shipped}))
 
-    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False):
+    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False, real_round_sleep=False):
         env = {
             **os.environ,
             "HERMES_BIN": str(self.hermes),
@@ -131,7 +195,7 @@ class PauseTest(unittest.TestCase):
         }
         result = subprocess.run(
             [sys.executable, "-", str(self.home), *(["--resume"] if resume else []), *(["--chain"] if chain else [])],
-            input=SCRIPT.read_text(),
+            input=script_text(real_round_sleep),
             capture_output=True, text=True, env=env, timeout=60,
         )
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -304,7 +368,8 @@ class PauseTest(unittest.TestCase):
 
         writer = threading.Thread(target=late_writer)
         writer.start()
-        result, _ = self.run_script()
+        # The script's own text: its gap must outlast the second the writer waits.
+        result, _ = self.run_script(real_round_sleep=True)
         writer.join()
         # Read after the writer is done: the store the run left is what the cases get.
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -393,6 +458,78 @@ class ChainTest(unittest.TestCase):
         result, store = self.run_script()
         self.assertTrue(store[first]["enabled"])
         self.assertIn(f"{first} (oobe stage)", result.stdout)
+
+    def test_a_due_mark_set_after_the_decision_is_left_too(self):
+        # The stack's trigger_job lands while the pause of an earlier audit is in
+        # flight: the decision read this audit as idle, and its pause would drop the run.
+        # In the watch's pass and in the lease-time one alike.
+        first, second = STAGE_FIVE[:2]
+        for chain in (True, False):
+            with self.subTest(chain=chain):
+                self.write_roster(self.five())
+                self.write_stage(fired=STAGE_FIVE, done=True)
+                triggered = pathlib.Path(f"{self.roster}.triggered")
+                if triggered.exists():
+                    triggered.unlink()
+                result, store = self.run_script(mode=f"trigger-before-pause:{second}", chain=chain)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(store[second]["enabled"])
+                self.assertNotEqual(store[second].get("state"), "paused")
+                self.assertIn(f"{second} (due or under way since the decision)", result.stdout)
+                for audit in (first, *STAGE_FIVE[2:]):
+                    self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_due_mark_that_lifts_a_pause_just_made_is_not_paused_away(self):
+        # The stack fires a job this pass has just paused: trigger_job lifts the
+        # pause and marks it due, the read-back finds it un-paused, and the next
+        # round would pause it again, before the tick claims the run.
+        first, second = STAGE_FIVE[:2]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode=f"trigger-after-pause:{first}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(store[first]["enabled"])
+        self.assertNotEqual(store[first].get("state"), "paused")
+        self.assertIn(f"{first} (due or under way since the decision)", result.stdout)
+        for audit in STAGE_FIVE[1:]:
+            self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_run_the_tick_claimed_after_the_decision_is_left_too(self):
+        # The mark is gone from the roster by then: only the ledger shows the run.
+        first, second = STAGE_FIVE[:2]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        self.write_runs([(first, "completed", PAST)])
+        result, store = self.run_script(mode=f"claim-before-pause:{second}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(store[second]["enabled"])
+        self.assertIn(f"{second} (due or under way since the decision)", result.stdout)
+        for audit in (first, *STAGE_FIVE[2:]):
+            self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_second_read_that_fails_pauses_on_the_decision_and_says_so(self):
+        # The decision read the stage as past all five. A ledger that cannot be
+        # read again is no reason to leave an audit on for the rest of the run.
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        self.write_runs([(STAGE_FIVE[0], "completed", PAST)])
+        result, store = self.run_script(mode="break-ledger-on-first", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for audit in STAGE_FIVE:
+            self.assertEqual(store[audit]["state"], "paused", audit)
+        self.assertIn("not read again before the pause of", result.stdout)
+        self.assertIn(STAGE_FIVE[1], result.stdout.split("not read again before the pause of", 1)[1])
+
+    def test_a_marker_dropped_by_a_stale_writer_is_still_paused_again(self):
+        # The read before each pause must not undo what the rounds are for: a
+        # job un-paused by a stale rewrite has no due mark, so it is paused again.
+        first = STAGE_FIVE[0]
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode=f"lose-first:{first}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for audit in STAGE_FIVE:
+            self.assertEqual(store[audit]["state"], "paused", audit)
 
     def test_every_audit_is_paused_once_the_chain_is_done(self):
         self.write_roster(self.five())
@@ -785,14 +922,33 @@ class ChainWatchTest(unittest.TestCase):
 
     def test_a_second_stop_still_waits_for_a_pass_the_first_outwaited(self):
         # The fan-out's stop times out; the EXIT trap's stop, with no pid file left, waits on.
-        calls = self.run_watch(1, 'echo started >> "$LOG"; sleep 5; echo landed >> "$LOG"', [
-            "sleep 2",
-            "stop_chain_audits_watch 2>/dev/null",
+        # The pass ends on a gate file, not on a clock. The first stop cannot see the pass
+        # land, because the gate is shut. The gate opens 1s into the second stop, whose
+        # bound is 5s. A fixed 5s pass against sleep 2 and two 2s bounds had both sides
+        # land on the same sixth second (#6435).
+        gate = '"${STATE_DIR}/gate"'
+        # 100 polls of 0.2s: a pass whose gate never comes ends by itself after 20s, so a
+        # run that is cut leaves no watch that polls for ever.
+        pass_stub = (
+            f'echo started >> "$LOG"; n=0; until [ -e {gate} ] || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done;'
+            ' echo landed >> "$LOG"'
+        )
+        calls = self.run_watch(1, pass_stub, [
+            # A step that fails opens the gate on the way out, so the pass ends at once
+            # and the failure is the step's, not a timeout.
+            "trap ': > \"{tmp}/gate\"' EXIT",
+            # The pass is under way before the first stop.
+            'n=0; until grep -qx started "$LOG" 2>/dev/null || [ "$n" -ge 100 ]; do sleep 0.2; n=$((n + 1)); done',
+            'grep -qx started "$LOG"',
+            'stop_chain_audits_watch 2> "{tmp}/first-stop.err"',
+            # The first stop gave up at its bound, and the pass had not landed.
+            'grep -q "still running after 5s" "{tmp}/first-stop.err"',
             'tail -1 "$LOG" | grep -qx started',
             '[ ! -e "{tmp}/watch.pid" ]',
+            '( sleep 1; : > "{tmp}/gate" ) &',
             "stop_chain_audits_watch",
             'tail -1 "$LOG" | grep -qx landed || { echo "the second stop did not wait" >&2; exit 9; }',
-        ], stop_wait=2)
+        ], stop_wait=5)
         self.assertEqual(calls, ["started", "landed"])
 
     def test_a_stop_waits_for_a_pass_under_way(self):

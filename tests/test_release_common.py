@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.testing.common import (
     FALSY_BOOLEAN_INPUTS,
@@ -39,6 +40,10 @@ from tests.testing.release import (
     REQUIRED_RELEASE_IMAGES_PATH,
     commit_required_release_images,
     create_mock_docker_binary,
+    MOCK_AR_ACCESS_TOKEN,
+    MOCK_AR_REGISTRY_PREFIX,
+    create_mock_ar_curl_binary,
+    create_mock_gcloud_token_binary,
     create_mock_ghcr_curl_binary,
     parse_required_release_images,
     write_required_release_images,
@@ -949,25 +954,41 @@ source "{_COMMON_SH}"
     def test_release_fetch_tags_is_a_no_op_outside_ci(self):
         """It must not reach the network on a developer machine.
 
-        The CI arm cannot be exercised hermetically — it fetches a real URL — so
-        what is pinned here is the guard in front of it. Without the guard, every
-        script that calls this would try to hit github.com from a unit test.
+        What is pinned here is the guard in front of the fetch. Without the guard,
+        every script that calls this would try to hit github.com from a unit test.
+        The function is silent either way, so git's own trace says whether a fetch
+        ran. The release repository's https URL is rewritten onto a path that does
+        not exist, so neither arm can leave the machine.
         """
-        temp_dir, repo_dir, _ = create_mock_git_repo()
+        temp_dir, repo_dir, git = create_mock_git_repo()
         try:
-            proc = self._run_common_func("release_fetch_tags", env={"CI": ""}, cwd=repo_dir)
+            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+            git(
+                "config",
+                f"url.{unreachable}.insteadOf",
+                f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+            )
+            outside_ci = pathlib.Path(repo_dir).parent / "outside-ci.trace"
+            proc = self._run_common_func(
+                "release_fetch_tags",
+                env={"CI": "", "GIT_TRACE": str(outside_ci), **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "")
+            self.assertNotIn("fetch", outside_ci.read_text() if outside_ci.exists() else "", "a fetch ran outside CI")
 
             # And it stays quiet rather than failing when the fetch cannot work:
             # a fetch that could not run is not itself the error, the caller's
             # own lookup afterwards is.
+            in_ci = pathlib.Path(repo_dir).parent / "in-ci.trace"
             proc = self._run_common_func(
                 "release_fetch_tags",
-                env={"CI": "true", "GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"},
+                env={"CI": "true", "GIT_TRACE": str(in_ci), **self._FAKE_RELEASE_REPO},
                 cwd=repo_dir,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("fetch", in_ci.read_text())
         finally:
             temp_dir.cleanup()
 
@@ -996,6 +1017,19 @@ source "{_COMMON_SH}"
         # Explicit REGISTRY_PREFIX
         proc = self._run_common_func('get_registry_prefix', env={"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX})
         self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
+
+    def test_get_candidate_registry_prefix(self):
+        """Unset or empty, a release reads commit images where it is published."""
+        registry = {"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX}
+        for unset in ({}, {"CANDIDATE_REGISTRY_PREFIX": ""}):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, **unset})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
+
+        for value in (MOCK_AR_REGISTRY_PREFIX, MOCK_AR_REGISTRY_PREFIX + "/"):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, "CANDIDATE_REGISTRY_PREFIX": value})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_AR_REGISTRY_PREFIX)
 
     def test_required_release_images_registry(self):
         cmd = 'echo "IMAGES=${REQUIRED_RELEASE_IMAGES[*]}"'
@@ -1281,6 +1315,37 @@ source "{_COMMON_SH}"
         self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", proc.stdout)
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
         self.assertEqual(git("--git-dir", str(bare_dir), "rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip(), head)
+
+    def test_ensure_ga_release_refs_ignores_the_developers_push_rewrite(self):
+        """A developer's global `pushInsteadOf` must not take the push off the local stand-in.
+
+        Git applies `pushInsteadOf` to a push before `insteadOf`, so a global rule for
+        https://github.com/ (a common way to push over SSH) would send this push to GitHub
+        with the developer's key. The rule planted here, once as the global file and once as
+        the system file, points at a second local repository: a child that reads it pushes
+        there, and no host is asked either way.
+        """
+        for planted_as in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            with self.subTest(planted_as=planted_as):
+                temp_dir, repo_dir, git = create_mock_git_repo()
+                self.addCleanup(temp_dir.cleanup)
+                bare_dir = self._bare_remote_for(git, repo_dir)
+                decoy_root = pathlib.Path(repo_dir).parent / "decoy"
+                decoy_dir = decoy_root / self._FAKE_RELEASE_REPO["GH_ORG"] / f"{self._FAKE_RELEASE_REPO['GH_REPO']}.git"
+                git("init", "--bare", str(decoy_dir))
+                developer_config = pathlib.Path(repo_dir).parent / "developer.gitconfig"
+                developer_config.write_text(f'[url "{decoy_root}/"]\n\tpushInsteadOf = https://github.com/\n')
+                head = git("rev-parse", "HEAD").stdout.strip()
+
+                with mock.patch.dict(os.environ, {planted_as: str(developer_config)}):
+                    proc = self._run_common_func(
+                        f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+                        env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                        cwd=repo_dir,
+                    )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(git("--git-dir", str(decoy_dir), "tag", "--list").stdout.strip(), "", "the push followed the planted rule")
+                self.assertEqual(git("--git-dir", str(bare_dir), "rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip(), head)
 
     def test_ensure_ga_release_refs_in_ci_skips_when_the_remote_already_has_it(self):
         """A re-run of the release job must find its first attempt's branch on the remote.
@@ -2058,8 +2123,9 @@ class RegistryImageProbeTest(unittest.TestCase):
     """
 
     _IMAGE = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
-    # Deliberately not ghcr.io: the curl fallback speaks one registry's API.
-    _FOREIGN_IMAGE = f"us-central1-docker.pkg.dev/p/r/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+    # Deliberately neither ghcr.io nor Artifact Registry: the curl fallbacks
+    # speak those two registries' APIs and no other.
+    _FOREIGN_IMAGE = f"quay.io/p/r/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
     _REPOSITORY_PATH = "gke-labs/kube-agents/platform-agent"
     _DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
@@ -2201,6 +2267,187 @@ class RegistryImageProbeTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+
+class ArtifactRegistryImageProbeTest(unittest.TestCase):
+    """The docker-free probe for Artifact Registry.
+
+    REGISTRY_PREFIX may name a private Artifact Registry repository. The Prow
+    job image has no docker, and the GHCR fallback is anonymous, so without
+    this probe every image there reads as missing. It asks the registry API
+    with the caller's `gcloud` access token and tells present, absent and
+    "could not ask" apart.
+    """
+
+    _IMAGE = f"{MOCK_AR_REGISTRY_PREFIX}/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+    _REPOSITORY_PATH = "mock-project/mock-candidates/platform-agent"
+    _HOST = "us-docker.pkg.dev"
+    _DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    _GHCR_IMAGE = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+    _FOREIGN_IMAGE = f"quay.io/p/r/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+
+    def _bin(self, tmp, http_status=200, curl_exit=0, gcloud=True, token=MOCK_AR_ACCESS_TOKEN, gcloud_exit=0):
+        """A PATH with no docker, a mock curl, and (unless told otherwise) a mock gcloud."""
+        bin_dir = create_minimal_tools_bin(tmp)
+        _, log_path, stdin_log_path = create_mock_ar_curl_binary(bin_dir, manifest_http_status=http_status, curl_exit=curl_exit)
+        if gcloud:
+            create_mock_gcloud_token_binary(bin_dir, token=token, exit_code=gcloud_exit)
+        return bin_dir, pathlib.Path(log_path), pathlib.Path(stdin_log_path)
+
+    def _run(self, func_call, bin_dir, env=None):
+        overrides = {"PATH": str(bin_dir)}
+        overrides.update(env or {})
+        return subprocess.run(
+            ["bash", "-c", f'source "{_COMMON_SH}"\n{func_call}'],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides=overrides),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def _status(self, image, bin_dir):
+        proc = self._run(f'ar_image_status "{image}"', bin_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_the_three_answers(self):
+        """200 is present and 404 absent; a refusal or an outage is neither."""
+        for http_status, want in ((200, "present"), (404, "absent"), (401, "error"), (403, "error"), (503, "error")):
+            with self.subTest(http_status=http_status), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, _, _ = self._bin(tmp, http_status=http_status)
+                self.assertEqual(self._status(self._IMAGE, bin_dir), want)
+
+    def test_a_registry_that_cannot_be_reached_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, _, _ = self._bin(tmp, curl_exit=7)
+            self.assertEqual(self._status(self._IMAGE, bin_dir), "error")
+
+    def test_no_credential_is_an_error_and_asks_nothing(self):
+        """No gcloud, a gcloud that fails, and a gcloud with no token to give:
+        none of them is "absent", and none reaches the registry."""
+        for name, kwargs in (
+            ("no gcloud", {"gcloud": False}),
+            ("gcloud fails", {"token": "", "gcloud_exit": 1}),
+            ("no token", {"token": ""}),
+        ):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, log_path, _ = self._bin(tmp, **kwargs)
+                self.assertEqual(self._status(self._IMAGE, bin_dir), "error")
+                self.assertFalse(log_path.exists(), "the registry was asked with no token")
+
+    def test_another_registry_is_an_error_and_asks_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, log_path, _ = self._bin(tmp)
+            self.assertEqual(self._status(self._GHCR_IMAGE, bin_dir), "error")
+            self.assertFalse(log_path.exists())
+
+    def test_a_host_that_only_ends_like_artifact_registry_gets_no_token(self):
+        """The probe sends a Google access token to the host it is given, so the
+        host has to be an Artifact Registry one whole, not a string that ends
+        the way one does. None of these reaches curl or is called present."""
+        for host in (
+            "evil.example?x-docker.pkg.dev",
+            "evil.example#-docker.pkg.dev",
+            "user@evil.example:443?-docker.pkg.dev",
+            "evil.example/-docker.pkg.dev",
+            "US-docker.pkg.dev.evil.example",
+            "-docker.pkg.dev",
+        ):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, log_path, stdin_log_path = self._bin(tmp)
+                image = f"{host}/p/r/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+                self.assertEqual(self._status(image, bin_dir), "error")
+                self.assertFalse(log_path.exists(), "the registry was asked")
+                self.assertFalse(stdin_log_path.exists(), "a token was sent")
+                proc = self._run(f'registry_image_status "{image}"', bin_dir)
+                self.assertEqual(proc.stdout.strip(), "error", proc.stderr)
+                proc = self._run(f'registry_image_exists "{image}"', bin_dir)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertFalse(log_path.exists(), "the registry was asked")
+
+    def test_the_probe_asks_the_images_own_host_with_the_token_on_stdin(self):
+        """The URL, the media types, and where the credential travels. The mock
+        refuses a call whose argv carries a bearer token, so a pass here is the
+        token on stdin and nowhere else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, log_path, stdin_log_path = self._bin(tmp)
+            self.assertEqual(self._status(self._IMAGE, bin_dir), "present")
+
+            calls = log_path.read_text().splitlines()
+            self.assertEqual(len(calls), 1, calls)
+            self.assertIn(f"https://{self._HOST}/v2/{self._REPOSITORY_PATH}/manifests/{MOCK_SAMPLE_COMMIT_SHA}", calls[0])
+            for media_type in (
+                "application/vnd.oci.image.index.v1+json",
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.list.v2+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ):
+                self.assertIn(media_type, calls[0])
+            self.assertNotIn(MOCK_AR_ACCESS_TOKEN, calls[0])
+            self.assertEqual(stdin_log_path.read_text().strip(), f"Authorization: Bearer {MOCK_AR_ACCESS_TOKEN}")
+
+    def test_a_digest_and_a_reference_less_image_are_split_as_the_registry_does(self):
+        for image, reference in (
+            (f"{MOCK_AR_REGISTRY_PREFIX}/platform-agent@{self._DIGEST}", self._DIGEST),
+            (f"{MOCK_AR_REGISTRY_PREFIX}/platform-agent", "latest"),
+        ):
+            with self.subTest(image=image), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, log_path, _ = self._bin(tmp)
+                self.assertEqual(self._status(image, bin_dir), "present")
+                url = f"https://{self._HOST}/v2/{self._REPOSITORY_PATH}/manifests/{reference}"
+                self.assertTrue(log_path.read_text().strip().endswith(url), log_path.read_text())
+
+    def test_registry_image_exists_falls_back_to_it_without_docker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, _, _ = self._bin(tmp)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_missing_image_is_missing_without_a_warning(self):
+        """404 is an answer, not a probe failure: nothing to warn about."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, _, _ = self._bin(tmp, http_status=404)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertNotIn("cannot probe", proc.stderr)
+
+    def test_a_probe_that_could_not_ask_is_missing_and_says_why(self):
+        for name, kwargs in (("refused", {"http_status": 403}), ("no gcloud", {"gcloud": False})):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, _, _ = self._bin(tmp, **kwargs)
+                proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("Artifact Registry could not be asked", proc.stderr)
+
+    def test_registry_image_status_picks_the_probe_by_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, _, _ = self._bin(tmp)
+            proc = self._run(f'registry_image_status "{self._IMAGE}"', bin_dir)
+            self.assertEqual(proc.stdout.strip(), "present", proc.stderr)
+            proc = self._run(f'registry_image_status "{self._FOREIGN_IMAGE}"', bin_dir)
+            self.assertEqual(proc.stdout.strip(), "error", proc.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = create_minimal_tools_bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir, manifest_status=1)
+            proc = self._run(f'registry_image_status "{self._GHCR_IMAGE}"', bin_dir)
+            self.assertEqual(proc.stdout.strip(), "absent", proc.stderr)
+
+    def test_the_commit_check_asks_artifact_registry_without_docker(self):
+        """At the level callers use: with REGISTRY_PREFIX on Artifact Registry
+        and no docker, every required image is asked for there, once each."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, log_path, _ = self._bin(tmp)
+            proc = self._run(
+                f'check_commit_images_exist "{MOCK_SAMPLE_COMMIT_SHA}"',
+                bin_dir,
+                env={"REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            calls = log_path.read_text().splitlines()
+            self.assertEqual(len(calls), len(MOCK_REQUIRED_RELEASE_IMAGES), calls)
+            for call in calls:
+                self.assertIn(f"https://{self._HOST}/v2/mock-project/mock-candidates/", call)
+
+
 class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
     """The required image list is the candidate's, not this checkout's (#2211).
 
@@ -2240,6 +2487,25 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
             existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{sha}" for img in images],
         )
         return str(bin_dir)
+
+    def test_the_gate_looks_in_the_registry_it_is_given(self):
+        """A second argument names the registry; without one it is the registry
+        prefix. CANDIDATE_REGISTRY_PREFIX alone moves no check: only a release's
+        own reads pass it, so a caller that installs from the registry prefix
+        keeps checking there."""
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+        )
+        env = {**self._REGISTRY, "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX}
+
+        given = self._run(f'check_commit_images_exist "{candidate}" "{MOCK_AR_REGISTRY_PREFIX}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(given.returncode, 0, given.stderr)
+        default = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(default.returncode, 1, default.stderr)
 
     def test_the_gate_accepts_a_candidate_with_every_image_its_own_list_names(self):
         """Red before the fix: the gate asked for this checkout's longer list."""

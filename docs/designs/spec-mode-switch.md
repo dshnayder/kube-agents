@@ -3,6 +3,7 @@
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
 - **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented; `next` is the default for a first `install.sh` install, and `today` is supported as a rollback for one release
+- **Status (2026-11-18):** retired, 2026-11-14 to 2026-11-18, part by part (operator #5752 as 8b67a1e36 on 11-14, installer #5815 on 11-16, agent image #5753 on 11-17, eval lane #5755 on 11-18). Stage 4 is done: `today` is retired and every install runs the A2A stack. The installer and the chart pass no mode (#5815), the operator defaults `spec.mode` to `next`, migrates a stored `today` and renders the stack on every install (#5752), and the agent image no longer reads `KUBEAGENTS_MODE` (#5753). `spec.mode` stays on the CRD as a deprecated, ignored field (enum still `today;next`, so a stored object carrying `today` stays valid; `+kubebuilder:default=next`, so an absent field reads `next`). The migration has three legs: the CRD default for an absent field, the mutating webhook's rewrite of nil or `today` to `next` on create and update, and the operator's one-time patch of a stored `today` to `next` on its first pass (log line and an Event with reason `ModeMigrated`), so an object nobody writes again still agrees with what runs. The helper pair, the skew path, `ModeNotRecognized`, the agent-side reader (`runtime_mode.py`) and the installer's `--mode` / `PLATFORM_AGENT_MODE` / `platformAgent.mode` / `platform_agent_mode` surfaces are gone; the operator still pins `KUBEAGENTS_MODE=next` into the managed `.env` until no supported agent image predates the removal. The gateway holds Google Chat and Slack, either or both (nothing renders the Hermes Slack platform or a broker Slack relay, `a2aSlackArmed`); the user-facing account is [the ChatOps page](../site/src/content/docs/concepts/chatops.md). The body below is the history of the switch and stays as written.
 
 ## Purpose
 
@@ -95,11 +96,12 @@ A deliberate flip back to `today` is the other half, and it does clean up: the A
 is torn down, with two objects kept so a later flip forward reuses them. The bus creds
 Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
 credentials. The JetStream PVCs `data-<agent>-a2a-nats-<n>`, one per bus server, stay, because flipping a mode
-is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
-against a live install: it flips `next` to `today` and back, asserts the two keep their
-UIDs and the agent answers on each side. A next-mode eval run on `main` runs it after its
-matrix, and the today lane runs it before its own with `ROLLBACK_END_MODE=today`, which flips
-back to `today` once more and grades `today`'s matrix on the rolled-back install.
+is not license to destroy the file store. `hack/rollback-roundtrip.sh` (retired with the
+flip) checked both against a live install: it flipped `next` to `today` and back, asserted
+the two kept their UIDs and the agent answered on each side. The eval run on `main` ran it after its
+matrix, and the today lane ran it before its own with `ROLLBACK_END_MODE=today`, which flipped
+back to `today` once more and graded `today`'s matrix on the rolled-back install; #5755 deleted the
+script with the lane.
 
 ## What the operator renders
 
@@ -143,13 +145,14 @@ today's path until something happens to kill its pods.
 
 ## Agent-side rule
 
-Agent-side code asks one helper in the shared settings module - `runtime_mode.is_next()`
-or equivalent - and that helper reads the managed key. No component reads its own env
-var. A grep for `KUBEAGENTS_MODE` should hit exactly two places: the operator builder
-that writes it and the helper that reads it. A third hit is a review comment.
+Agent-side code asked one helper in the shared settings module, `runtime_mode.is_next()`,
+which read the managed key. No component read its own env var, and a grep for
+`KUBEAGENTS_MODE` hit exactly two places: the operator builder that writes it and the helper
+that read it. The reader went with the switch: today a grep hits the operator writer alone,
+which `tests/test_mode_grep.py` pins until the pin itself goes.
 
-"What mode am I in" gets one answer per agent, computed in one place. This also means the
-delivery mechanism can change later without touching call sites.
+"What mode am I in" got one answer per agent, computed in one place, so the delivery
+mechanism could have changed without touching call sites.
 
 ## Choosing it at install
 
@@ -192,7 +195,8 @@ through the chart value, so the merge-blocking presubmit exercises that route.
 ## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next` (the same flag
+renders the gateway's `A2A_INJECT_CONFIRM=true`, which lets the door take a confirm), and its A2A
 door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
 `A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the
@@ -203,9 +207,7 @@ image overrides are already decided. The operator's render tests check that the 
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
 
-A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
-`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
-clusters. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
+The session pods the gateway spawns get a temporary read-only view of the clusters: on by default when the install's route is `session` (since 2026-11-20, #6538 and #6987), and otherwise with `A2A_SESSION_CLUSTER_VIEW=true` on the operator, a switch of the same kind as the one above. The flag overrides the default either way: `"true"` turns the view on on any route, and `"false"` turns it off on the session route too. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
 session audience (`CREDENTIAL_PROXY_SESSION_AUDIENCE`) on both `<agent>-kube-proxy` and the
 credential broker, where the broker's `session` role reaches `/v1/exec` for `gcloud` only and no
 other caller may present that audience. It opens ingress and session egress to `<agent>-kube-proxy`
@@ -215,21 +217,18 @@ other caller may present that audience. It opens ingress and session egress to `
 either state; `kubectl` routes through `<agent>-kube-proxy` under its `read-only-dry-run` policy
 (`get`, `list`, `watch`, and `?dryRun=All` validation) with `Secret` value redaction, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
-describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
-widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
-between a person and that read is the gateway's ingress allowlist. That differs from the design of
-record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
-[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
-`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
-child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
-built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
-that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
-no longer admit the same people. The view retires on the default flip (#2371); until then, on an
-install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
-a person the gateway refuses a delegation to `platform` can still read its clusters through a
-session's view. The flag stays off by default for that reason. An install with a single user, or
-whose allowed users are the same people the platform agent admits, can turn it on, and gets
-sessions that answer cluster questions themselves instead of delegating each one.
+describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Who controls the view changed with the default. Before 2026-11-20 it was operator-level, for the reason above: the pod executes model output, and widening its fence was left to whoever deployed the operator. Now whoever can set `spec.harness.tuning.defaultRoute: session` on the PlatformAgent turns the view on with the route, and whoever runs the operator can still turn it off for every install with `A2A_SESSION_CLUSTER_VIEW=false`. bnaylor made that call on 2026-11-20 (#6538), so that the session route answers cluster questions as the platform route does.
+
+Under the view a session reads clusters with the platform agent's broker scope, and the only gate between a person and that read is the gateway's ingress allowlist. That differs from the design of record ([architecture 02](../architecture/02-agent-personas.md) §2.4, [03](../architecture/03-security-model.md) §4a, and "Sessions by default" in `spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted child task and the gateway checks the target agent's `AllowedUsers` against the requester first. That is built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view skips that check, so on an install whose CR narrows the platform agent's allowlist the two gates no longer admit the same people. With the view on, a person the gateway refuses a delegation to `platform` can still read its clusters through a session.
+
+Skipping that check is accepted, for now, because what it opens is bounded:
+
+- every `kubectl` call goes through `<agent>-kube-proxy`'s `read-only-dry-run` policy with `Secret` values redacted;
+- `gcloud` goes through the broker's `session` role, reads only;
+- the gateway's ingress allowlist still decides who reaches a session at all;
+- where the CR sets no allowlist for the platform agent, which is the default, a chat requester the ingress admits is admitted to a `platform` delegation too, so the two gates already agree.
+
+An install whose CR narrows the platform agent's allowlist below the gateway's ingress should set `A2A_SESSION_CLUSTER_VIEW=false` until the view is replaced by the profile path (#6483), which restores the per-agent check by reading clusters through a child task. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with the view on or off.
 
 ## Per-feature overrides - sketched, not built
 

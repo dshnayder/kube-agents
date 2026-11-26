@@ -57,7 +57,7 @@ const (
 	// tries again: loud, bounded, never a reconnect loop.
 	DefaultRegrantCooldown = 2 * time.Minute
 	// DefaultBindRetryBase and DefaultBindRetryMax pace the retries of a
-	// durable the config lists that the bus doesn't have yet (the operator
+	// durable the config derives that the bus doesn't have yet (the operator
 	// creates durables asynchronously): not a failure, just not yet.
 	DefaultBindRetryBase = time.Second
 	DefaultBindRetryMax  = time.Minute
@@ -79,6 +79,10 @@ const (
 	// hold its slot for good. It is well past the regrant cooldown and an
 	// operator reconcile, so a profile that drops out of the config briefly
 	// (its identity not rendered for a moment) is back before it fires.
+	// On a latched install (the six-token supervisor form, #5301) it also
+	// bounds a terminal the server refuses for its permissions for a profile
+	// still listed (an outage doesn't count): past it the task is settled
+	// without one, as ReasonTerminalUnpublished.
 	DefaultDroppedTerminalGiveUp = 15 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
@@ -119,7 +123,9 @@ type Config struct {
 	SweepInterval time.Duration
 	SweepAfter    time.Duration
 	// DroppedTerminalGiveUp bounds the retries of a terminal whose profile
-	// the install config no longer lists (DefaultDroppedTerminalGiveUp).
+	// the install config no longer lists, and on a latched install of any
+	// terminal the server refuses for its permissions
+	// (DefaultDroppedTerminalGiveUp).
 	DroppedTerminalGiveUp time.Duration
 	Submitter             string
 	Stream                string
@@ -128,8 +134,9 @@ type Config struct {
 	UnattendedTiers []string
 	// TaskSigningKey, set, is the task-signing key (#3889, a2a/taskcred) the
 	// dispatcher mints each confirmed task's credentials with: a task
-	// credential for the bus and, for a task that names a cluster, a token
-	// for the credential proxy, both on the confirm. Unset, confirms carry
+	// credential for the bus and, for a task that names a cluster or an
+	// unattended task a trigger started (a report credential, #5619), a
+	// token for the credential proxy, both on the confirm. Unset, confirms carry
 	// neither and workers keep their pod-level grants.
 	TaskSigningKey nkeys.KeyPair
 	// TaskCredentialMaxLifetime caps those credentials' expiry from the time

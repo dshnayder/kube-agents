@@ -51,9 +51,11 @@ const (
 	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
 	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
-	// spawn.go), and the image has no git to clone with. Twice that floor
-	// keeps the worker's whole ephemeral request inside Autopilot's 10Gi
-	// per pod with up to profileWorkerAutopilotToolLimit tools.
+	// spawn.go). A persona's version-control skill keeps its working copies
+	// here too (KUBE_AGENTS_VCS_ROOT in a2a/Dockerfile.worker); the broker
+	// refuses a clone over 256 MiB by default. Twice that floor keeps
+	// the worker's whole ephemeral request inside Autopilot's 10Gi per pod
+	// with up to profileWorkerAutopilotToolLimit tools.
 	profileWorkerScratchSizeLimit = "2Gi"
 	// profileWorkerAutopilotToolLimit is how many tools a profile can carry
 	// before the worker's ephemeral-storage request passes Autopilot's 10Gi
@@ -96,11 +98,6 @@ const (
 	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
 	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-	// profileWorkerModelKey only satisfies the harness's "an API key exists"
-	// check: the install's inference gateway runs keyless (the session
-	// worker's default, a2a/cmd/worker-adapter).
-	profileWorkerModelKey = "a2a-playground" // #nosec G101 -- placeholder, not a credential
 )
 
 // profileWorkerLabels are a worker pod's labels: the agent's, the worker
@@ -137,9 +134,16 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
-		// doesn't resolve.
+		// doesn't resolve. Set whether or not the worker sends its tier's
+		// key: worker-adapter's default base URL applies only while
+		// ANTHROPIC_API_KEY is unset too (harnessEnv), and the key is added
+		// by the reconcile step, once the gateway serves it
+		// (withInferenceKeyEnv), as a Secret reference. Never set a literal
+		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
+		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
+		// a placeholder. worker-adapter adds the placeholder to the harness
+		// env while the pod sets none.
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
-		{Name: "ANTHROPIC_API_KEY", Value: profileWorkerModelKey},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
 		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},
@@ -149,11 +153,27 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	if credentialProxyExecTierEnabled(agent) {
 		env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+	}
 	if m := profile.Spec.Harness.Model; m != "" {
 		env = append(env, corev1.EnvVar{Name: "A2A_MODEL", Value: m})
 	}
 	if n := profile.Spec.Harness.MaxTurns; n > 0 {
 		env = append(env, corev1.EnvVar{Name: "A2A_MAX_TURNS", Value: strconv.Itoa(int(n))})
+	}
+	// Only when set: a profile without a type renders as before the field
+	// existed, so an operator upgrade rolls no warm pool. The worker reads
+	// unset as Claude Code. Beside it, A2A_HARNESS_UNISOLATED rendered empty:
+	// it is the worker adapter's waiver for running a harness without its
+	// isolation, and pod env overrides the image's ENV, so a worker image
+	// can't set it for a type the profile names. It goes when that isolation
+	// lands (#6710).
+	if h := profile.Spec.Harness.Type; h != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "A2A_HARNESS", Value: h},
+			corev1.EnvVar{Name: "A2A_HARNESS_UNISOLATED", Value: ""},
+		)
 	}
 	if rendered.PathPrefix != "" {
 		env = append(env, corev1.EnvVar{Name: "PATH", Value: rendered.PathPrefix + ":" + profileWorkerImagePath})
@@ -228,7 +248,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		Containers: []corev1.Container{{
 			Name:         profileWorkerContainer,
 			Image:        profile.Spec.Harness.Image,
-			Env:          env,
+			Env:          withToolWithheldList(env),
 			VolumeMounts: mounts,
 			Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: profileWorkerStatusPort}},
 			// Ready only once the worker is listening on its dispatch
@@ -382,6 +402,7 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 // pass (before publishing Job templates), so it isn't copied again.
 func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, bundleCopied, keepBundle bool) error {
 	imageVolumes := r.imageVolumeSupported(agent)
+	callers := inferenceKeyCallersFrom(ctx)
 	var pools []*appsv1.Deployment
 	var errs []error
 	want := map[string]bool{}
@@ -395,6 +416,10 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 				continue
 			}
 			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)
+			// The tier's inference gateway key, once the gateway serves it
+			// (inference_key_callers.go), from its Secret in the profile
+			// namespace, where the pool runs.
+			withInferenceKeyEnv(&pool.Spec.Template.Spec, profileWorkerContainer, callers, tierInferenceKeyClassName(id.tier), workerInferenceKeyEnv)
 			want[pool.Name] = true
 			// Past the tool limit with image volumes off, the worker's
 			// ephemeral request passes Autopilot's 10Gi and its pods would
@@ -495,4 +520,24 @@ func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, age
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, bundle))
+}
+
+// envToolWithheld is the worker adapter's lib.EnvToolWithheld: the worker
+// withholds each variable it names from the processes a turn's tools start.
+const envToolWithheld = "A2A_TOOL_WITHHELD_ENV"
+
+// withToolWithheldList is env with envToolWithheld naming every entry sourced
+// from a Secret (secretKeyRef); env as it was when there is none. A worker
+// container takes no envFrom Secret: its keys aren't known here.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: envToolWithheld, Value: strings.Join(names, ",")})
 }

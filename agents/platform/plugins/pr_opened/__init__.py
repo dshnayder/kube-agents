@@ -17,7 +17,7 @@ record's token is presented to the broker's ``proposal-claim`` verb
 (:func:`claim`), addressed to the record's ``repo`` whatever shape the forge
 gives its url (``…/pull/7``, ``…/pulls/7``, ``…/pull-requests/7``,
 ``…/-/merge_requests/7``). The broker burns the token, checks with the forge
-that the proposal the token was minted for is open, recent and authored by the
+that the proposal the token was minted for is open or merged, recent and authored by the
 broker's own account, and answers the forge's ``url``, ``number`` and ``title``. Only a claimed
 proposal counts: it is written to the Session KV ledger
 (``POST /v1/proposals/opened``) with the origin of this process
@@ -48,7 +48,7 @@ the sandbox hop outlasts the hook, and a claim that times out is an unanswered
 hop. The claim is one broker call through the sandbox
 (``forge.call``), made in line rather than on a thread because a worker leaves
 through ``os._exit``, which would drop a thread still
-waiting on the broker. A claim or a write that fails is logged: the PR is open
+waiting on the broker. A claim or a write that fails is logged: the PR exists
 either way, and it counts as missed. Background processes are not covered,
 since this hook runs on foreground output only. Design:
 ``docs/designs/proposal-origin.md`` §2.2.
@@ -239,9 +239,9 @@ LEDGER_TIMEOUT_SECONDS = 2.0
 #: the opener's word (the claim proves the url, not the target), so the check
 #: re-checks the workload rather than trusting the row. The record is written only for a claimed proposal whose finding is of a known kind
 #: while the switch is not ``off``; the check still verifies the fix itself.
-#: ``session_kv_server.POST_MERGE_KINDS`` is the server's copy; a test pins them.
+#: The kinds are the fix recipes' (``fix_recipes/registry.py`` beside the shared
+#: scripts), which ``session_kv_server.POST_MERGE_KINDS`` reads too.
 POST_MERGE_PATH = "/v1/post-merge/records"
-POST_MERGE_KINDS = frozenset({"no-pdb"})
 POST_MERGE_SWITCH = "POST_MERGE_CHECK"
 #: What the record costs at most: the card's thread read and the write, plus
 #: half a second of margin. Skipped when less than this is left before the claim
@@ -490,11 +490,23 @@ def card_thread(task_id):
     return tuple(str(value or "") for value in row) if row else NO_THREAD
 
 
+def post_merge_kinds():
+    """The kinds of fix the post-merge check records, from the fix recipes. Empty, logged, when unreadable."""
+    try:
+        _on_scripts_path()
+        from fix_recipes import registry
+
+        return registry.kinds()
+    except Exception as exc:  # noqa: BLE001 — no record rather than a failed claim
+        logger.warning("pr_opened: the fix recipes are unreadable: %r", exc)
+        return frozenset()
+
+
 def post_merge_target(target):
     """``target``'s :data:`TARGET_KEYS` when it names a finding of a kind the check knows, else None."""
     if not isinstance(target, dict) or not all(isinstance(target.get(key), str) for key in TARGET_KEYS):
         return None
-    if target["finding_id"].split(".", 1)[0] not in POST_MERGE_KINDS or not target["object"]:
+    if target["finding_id"].split(".", 1)[0] not in post_merge_kinds() or not target["object"]:
         return None
     return {key: target[key] for key in TARGET_KEYS}
 

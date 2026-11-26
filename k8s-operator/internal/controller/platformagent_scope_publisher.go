@@ -98,8 +98,8 @@ const (
 	scopePublisherBrokerURLEnvVar       = "CREDENTIAL_PROXY_URL"
 	scopePublisherBrokerTokenFileEnvVar = "CREDENTIAL_PROXY_TOKEN_FILE" // #nosec G101 -- Environment variable name, not a credential
 	// The install's own project, spec.harness.projectId, which the
-	// publisher counts against maxProjects as the reconcile does and never
-	// probes.
+	// publisher counts against maxProjects as the reconcile does, writes no
+	// row for, and lists only for the resolved scope's clusters map.
 	scopePublisherManagementProjectEnvVar = "KUBEAGENTS_MANAGEMENT_PROJECT"
 
 	// The publisher's broker token: projected for an audience of its own,
@@ -117,6 +117,10 @@ const (
 	credentialProxyScopeAudienceEnvVar = "CREDENTIAL_PROXY_SCOPE_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
 	credentialProxyScopeCallersEnvVar  = "CREDENTIAL_PROXY_SCOPE_CALLERS"  // #nosec G101 -- Environment variable name, not a credential
 	credentialProxyScopeFileEnvVar     = "CREDENTIAL_PROXY_SCOPE_FILE"     // #nosec G101 -- Environment variable name, not a credential
+	// The install's management project, spec.harness.projectId, on the
+	// broker: the scope role's read-only `clusters list` takes it as it
+	// takes a declared project (scope_policy.MANAGEMENT_PROJECT_ENV).
+	credentialProxyScopeManagementProjectEnvVar = "CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT" // #nosec G101 -- Environment variable name, not a credential
 	// brokerScopeDir is where the broker mounts the declaration: a directory
 	// of its own beside forgeCADir rather than scopeDir, because the forge CA
 	// Secrets mount under scopeDir in the broker, and the runtime cannot
@@ -422,6 +426,23 @@ func scopePublisherPodLabels(agent *agentv1alpha1.PlatformAgent) map[string]stri
 	return a2aLabels(agent, scopePublisherComponent)
 }
 
+func scopePublisherContainerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: scopeFileEnvKey, Value: path.Join(scopeDir, scopeFileName)},
+		{Name: scopePublisherConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)},
+		{Name: scopePublisherNamespaceEnvVar, ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		}},
+		{Name: scopePublisherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+		{Name: scopePublisherBrokerTokenFileEnvVar, Value: path.Join(scopePublisherBrokerTokenMountDir, scopePublisherBrokerTokenKey)},
+		{Name: scopePublisherManagementProjectEnvVar, Value: scopeManagementProject(agent)},
+	}
+	if universe := effectiveUniverseDomain(agent); isCustomUniverseDomain(universe) {
+		env = append(env, corev1.EnvVar{Name: agentv1alpha1.GoogleCloudUniverseDomainEnv, Value: universe})
+	}
+	return env
+}
+
 // buildScopePublisherNetworkPolicy fences the publisher's egress to the three
 // things it talks to: cluster DNS, the credential broker's port, and the API
 // server (for the merge patch), on the ports the agent's own policy allows
@@ -566,16 +587,7 @@ func buildScopePublisherJob(agent *agentv1alpha1.PlatformAgent, start time.Time,
 						Image:           resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage()),
 						ImagePullPolicy: scopePublisherPullPolicy(agent),
 						Command:         []string{scopePublisherPython, scopePublisherScript},
-						Env: []corev1.EnvVar{
-							{Name: scopeFileEnvKey, Value: path.Join(scopeDir, scopeFileName)},
-							{Name: scopePublisherConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)},
-							{Name: scopePublisherNamespaceEnvVar, ValueFrom: &corev1.EnvVarSource{
-								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-							}},
-							{Name: scopePublisherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
-							{Name: scopePublisherBrokerTokenFileEnvVar, Value: path.Join(scopePublisherBrokerTokenMountDir, scopePublisherBrokerTokenKey)},
-							{Name: scopePublisherManagementProjectEnvVar, Value: scopeManagementProject(agent)},
-						},
+						Env:             scopePublisherContainerEnv(agent),
 						VolumeMounts: []corev1.VolumeMount{
 							scopeConfigMount(scopeDir),
 							{Name: buildEventWatcherTokenVolume().Name, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
@@ -773,14 +785,23 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 // every caller and which the scope role reads to bound every argument;
 // while a publisher may run (scopePublisherMayRun), the audience and the
 // publisher's username bound to it both ways, as a2aMCPBrokerEnv binds the mcp role. Without the
-// pair the broker confers the scope role to nobody.
+// pair the broker confers the scope role to nobody. With them, the management
+// project (spec.harness.projectId) when there is one, the project the
+// publisher's KUBEAGENTS_MANAGEMENT_PROJECT names, which the scope role's
+// `clusters list` then takes; nothing else does.
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
-	env := []corev1.EnvVar{{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)}}
+	env := []corev1.EnvVar{
+		{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)},
+		{Name: credentialProxyHoldFileEnvVar, Value: holdFilePath()},
+	}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,
 			corev1.EnvVar{Name: credentialProxyScopeAudienceEnvVar, Value: credentialProxyScopeAudience},
 			corev1.EnvVar{Name: credentialProxyScopeCallersEnvVar, Value: scopePublisherBrokerCaller(agent)},
 		)
+		if project := scopeManagementProject(agent); project != "" {
+			env = append(env, corev1.EnvVar{Name: credentialProxyScopeManagementProjectEnvVar, Value: project})
+		}
 	}
 	return env
 }

@@ -90,12 +90,20 @@ const (
 	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image; " +
 		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
 	// rbacAgentNamespaceCause follows RBACIncompleteCause on a condition whose
-	// denials include a PlatformAgent's own namespace: that one is not skew but
-	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
-	// a Role in its own namespace only, so the Role is copied, not referenced.
+	// denials include a PlatformAgent's own namespace or its profile namespace:
+	// that one is not skew but a missing Role and RoleBinding. Both install
+	// paths render them in the install namespace and its profile namespace, so
+	// the fix there is the upgrade, not a hand-made Role: Helm refuses to adopt
+	// one on the next upgrade, so a hand-made copy goes first. A namespace
+	// neither path renders into (an agent created elsewhere; a profile
+	// namespace made by hand under a chart with platformAgent.enabled false)
+	// gets them by hand. A RoleBinding can name a Role in its own namespace
+	// only, so the Role is copied, not referenced.
 	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
-		"operator's namespaced Role and no RoleBinding to it; create both there (the chart and make deploy " +
-		"render them in the install namespace and in its profile namespace)"
+		"operator's namespaced Role and no RoleBinding to it; for the install namespace's profile namespace " +
+		"(<install namespace>-profiles), which the chart and make deploy render into, delete any hand-made copy " +
+		"and run helm upgrade or make deploy; a namespace neither path renders into (an agent's namespace " +
+		"elsewhere, or a profile namespace made by hand with platformAgent.enabled false) gets both by hand"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -117,7 +125,7 @@ const (
 	// "create secrets (in namespace team-a)", "create deployments.apps (in
 	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
 	// the install namespace and the profile namespace by both install paths
-	// (the chart under mode next, make deploy in every mode); those two
+	// (the chart and make deploy alike, in every mode); those two
 	// namespaces, and an agent elsewhere, are what the operator-namespace
 	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
@@ -171,6 +179,10 @@ var (
 // necessity; TestRequiredPermissionsMatchTheGeneratedRole parses role.yaml and
 // fails on any difference in either direction, so a marker change that forgets
 // this list does not build green.
+// agentScheduleWriteVerbs are the built-in schedule renderer's writes on
+// agentschedules.
+var agentScheduleWriteVerbs = rbacNamespacedWriteVerbs
+
 var requiredPermissions = []requiredPermission{
 	// The custom resources, each verb with a caller (the markers above
 	// Reconcile and tests/test_operator_secrets_grant.py name them): no
@@ -196,6 +208,14 @@ var requiredPermissions = []requiredPermission{
 	// write.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
+	// agentschedules: the AgentSchedule reconciler reads each schedule and
+	// writes its run state (gke-labs/kube-agents#5617), and the PlatformAgent
+	// reconciler renders the built-in schedules: create, rewrite, delete
+	// (platformagent_builtin_schedules.go). Only the operator and, later, the
+	// broker write schedules: no agent ServiceAccount does.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: rbacReadVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules"}, Verbs: agentScheduleWriteVerbs, Namespaced: true},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentschedules/status"}, Verbs: []string{"get", "update"}},
 	// Every rendered kind is two tuples: the reads cluster-wide, for the
 	// informers and for escalation prevention, and the writes namespaced, in
 	// the Role document (the markers carry `namespace=`), which both install
@@ -205,7 +225,7 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	// The bus StatefulSet's revisions: which profiles every server has
-	// loaded (a2aClusterLoadedProfiles).
+	// loaded (a2aRevisionLoadedProfiles).
 	{Group: "apps", Resources: []string{"controllerrevisions"}, Verbs: []string{"get"}},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
@@ -316,6 +336,17 @@ type permissionTuple struct {
 type deniedPermission struct {
 	label     string
 	namespace string
+	// builtinScheduleWrite marks the built-in renderer's writes on
+	// agentschedules: the renderer reports their refusal itself
+	// (WritesForbidden), so DeniedFor leaves them out and an older Role
+	// doesn't degrade the agent.
+	builtinScheduleWrite bool
+}
+
+// isBuiltinScheduleWrite is a tuple the built-in schedule renderer writes with.
+func isBuiltinScheduleWrite(t permissionTuple) bool {
+	return t.group == "kubeagents.x-k8s.io" && t.resource == "agentschedules" && t.subresource == "" &&
+		slices.Contains(agentScheduleWriteVerbs, t.verb)
 }
 
 func flattenRequiredPermissions() []permissionTuple {
@@ -448,7 +479,8 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 			if p.namespace != namespace {
 				deniedNamespace = p.namespace
 			}
-			out = append(out, deniedPermission{label: p.label, namespace: deniedNamespace})
+			out = append(out, deniedPermission{label: p.label, namespace: deniedNamespace,
+				builtinScheduleWrite: isBuiltinScheduleWrite(p.tuple)})
 		}
 	}
 	return out, nil
@@ -621,6 +653,9 @@ func (c *RBACChecker) DeniedFor(namespaces ...string) []string {
 	defer c.mu.Unlock()
 	var out []string
 	for _, d := range c.denied {
+		if d.builtinScheduleWrite {
+			continue
+		}
 		if d.namespace == "" || slices.Contains(namespaces, d.namespace) {
 			out = append(out, d.label)
 		}
@@ -659,6 +694,32 @@ func TierAccessDenied(c *RBACChecker) []string {
 	var out []string
 	for _, tuple := range flattenRequiredPermissions() {
 		if tuple.resource == "tiers" && slices.Contains(denied, tuple.label) {
+			out = append(out, tuple.label)
+		}
+	}
+	return out
+}
+
+// AgentScheduleAccessDenied returns the boot probe's denials on
+// agentschedules, as TierAccessDenied does for tiers: an operator image
+// deployed ahead of its ClusterRole skips the AgentSchedule controller rather
+// than crashloop.
+//
+// Only the reads and the status write count: the built-in renderer's writes
+// (agentScheduleWriteVerbs, on the namespaced Role) don't, so an older Role that lacks them
+// keeps the schedule controller running, and the renderer reports the
+// refusal itself (reconcileBuiltinSchedules).
+func AgentScheduleAccessDenied(c *RBACChecker) []string {
+	denied := c.Denied()
+	if len(denied) == 0 {
+		return nil
+	}
+	var out []string
+	for _, tuple := range flattenRequiredPermissions() {
+		if isBuiltinScheduleWrite(tuple) {
+			continue
+		}
+		if tuple.resource == "agentschedules" && slices.Contains(denied, tuple.label) {
 			out = append(out, tuple.label)
 		}
 	}

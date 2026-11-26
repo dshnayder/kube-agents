@@ -399,6 +399,50 @@ class TestRedactText(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(AuditRedactor.redact_text(text), expected)
 
+    def test_a_url_password_printed_inside_json_is_masked(self):
+        # JSON escapes, whole, may sit in the user and the password: Go writes
+        # `&`, `<` and `>` as \u0026, \u003c and \u003e, and every encoder a
+        # quote or a backslash as \" or \\. A scheme right after an escape
+        # starts there, so the escape's letters don't count toward its cap.
+        for text, expected in (
+            (
+                r'{"DATABASE_URL": "postgres://admin:synth\u0026Example\"Pw@db:5432/orders"}',
+                r'{"DATABASE_URL": "postgres://admin:[REDACTED_SECRET]@db:5432/orders"}',
+            ),
+            (
+                r'"url": "amqp://svc\u003cx\u003e:Synth\\Example@mq/vhost"',
+                r'"url": "amqp://svc\u003cx\u003e:[REDACTED_SECRET]@mq/vhost"',
+            ),
+            # A dotted host: decoded, the line after the `\"` would read as an
+            # email address, so the password is masked before decoding.
+            (
+                r'{"DATABASE_URL": "postgres://admin:synth\u0026Example\"Pw@db.shop.svc.cluster.local:5432/o"}',
+                r'{"DATABASE_URL": "postgres://admin:[REDACTED_SECRET]@db.shop.svc.cluster.local:5432/o"}',
+            ),
+            (
+                r'"a": "x\u0026' + "s" * 30 + r'://u:SynthExamplePw@h"',
+                r'"a": "x\u0026' + "s" * 30 + r'://u:[REDACTED_SECRET]@h"',
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(AuditRedactor.redact_text(text), expected)
+
+    def test_an_escaped_url_match_stops_at_a_line_and_a_closing_quote(self):
+        # Escaped JSON: a `host:port` URL with no path must not run across an
+        # escaped line break, or across a closing quote and a key's colon, to
+        # a later `@`. That would mask the key the credential rule needs and
+        # leave what follows the `@` in the clear.
+        line_break = r'{"data": {"app.env": "UPSTREAM=http://payments:8443\nDB_PASSWORD=p@ssword_synth_tail\n"}}'
+        out = AuditRedactor.redact_text(line_break)
+        self.assertNotIn("ssword_synth_tail", out)
+        self.assertIn("http://payments:8443", out)
+        contact = r'{"data": {"app.env": "UPSTREAM=http://payments:8443\nCONTACT=alice@example.com\n"}}'
+        self.assertNotIn("@example.com", AuditRedactor.redact_text(contact))
+        compact = r'"{\"https://gcr.io\":\"alice@example.com\"}"'
+        out = AuditRedactor.redact_text(compact)
+        self.assertNotIn("@example.com", out)
+        self.assertIsInstance(json.loads(json.loads(out)), dict, "the inner JSON stays valid")
+
     def test_urls_without_a_password_are_untouched(self):
         for text in (
             "http://example.com:8080/path?a=b",
@@ -582,6 +626,161 @@ class TestRedactText(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertRedacted(text, address)
+
+
+class TestMaskPrivateKeys(unittest.TestCase):
+    """`PRIVATE_KEY_PATTERN.sub` read to the end of the text from each BEGIN
+    line that no END line follows, so a text that repeats a key header cost
+    quadratic time (#6072). `mask_private_keys` reads the text once and must
+    mask exactly what the pattern's `sub` masked."""
+
+    # The texts of the pattern and of its two halves before #6072. The class
+    # must keep them, and a pattern compiled from the whole text here is the
+    # reference for equal output, so that the reference is not the code
+    # under test.
+    OLD_BEGIN_TEXT = r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----"
+    OLD_END_TEXT = r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----"
+    OLD_PATTERN_TEXT = OLD_BEGIN_TEXT + r"[\s\S]*?" + OLD_END_TEXT
+    MARKER = "[REDACTED_PRIVATE_KEY]"
+    # BEGIN and END lines: each kind of the pattern on each side, other cases,
+    # blanks of other kinds and more than one blank between the words, and
+    # lines that only look like a key line.
+    LINE_UNITS = [
+        "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----", "-----BEGIN OPENSSH PRIVATE KEY-----", "-----END OPENSSH PRIVATE KEY-----",
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----", "-----END PGP PRIVATE KEY BLOCK-----", "-----begin openssh private key-----", "-----End\tPrivate\nKey-----",
+        "-----BEGIN\xa0PRIVATE\x0bKEY-----", "-----END  PRIVATE\xa0KEY-----", "-----BEGIN  PRIVATE\tKEY-----", "-----END\nPRIVATE  KEY-----",
+        "-----BEGIN PRIVATE KEY", "END PRIVATE KEY-----", "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", "-----BEGIN DSA PRIVATE KEY-----", "-----END DSA PRIVATE KEY-----",
+    ]
+    PIECE_UNITS = ["-----", "----", "-", "BEGIN PRIVATE KEY-----", "-----END", " ", "\n", "\r\n", "MIIE", "x"]
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+
+        cls.old_pattern = re.compile(cls.OLD_PATTERN_TEXT, re.IGNORECASE)
+
+    def _old(self, text):
+        return self.old_pattern.sub(self.MARKER, text)
+
+    def _strings(self, short, count, seed):
+        """Every string of up to `short` units; every string of four of the
+        first sixteen lines with gaps between them (five kinds of first gap,
+        two of each later one); then `count` random ones, half of them of
+        lines and pieces with fill between, half of smaller pieces."""
+        import itertools
+        import random
+
+        units = self.LINE_UNITS + self.PIECE_UNITS
+        for length in range(short + 1):
+            for combo in itertools.product(units, repeat=length):
+                yield "".join(combo)
+        lines = self.LINE_UNITS[:16]
+        for combo in itertools.product(lines, ["", "\n", " x ", "-----", "\nMIIE\n"], lines, ["", "\n"], lines[:8], ["\n", "x"], lines[:8]):
+            yield "".join(combo)
+        rng = random.Random(seed)
+        pieces = ["-----", "----", "------", "-", "BEGIN", "END", "begin", "End", " ", "  ", "\n", "\t", "\xa0", "RSA", "EC", "OPENSSH", "PGP", "DSA", "PRIVATE", "private", "KEY", "BLOCK", "PUBLIC", "MIIE", "x", "+/=", "\r\n"]
+        for index in range(count):
+            if index % 2:
+                yield "".join(rng.choice(units) + rng.choice(["", "", " ", "\n", "x", "-----"]) for _ in range(rng.randint(1, 12)))
+            else:
+                yield "".join(rng.choice(pieces) for _ in range(rng.randint(3, 40)))
+
+    def test_the_pattern_and_its_halves_keep_their_text_and_flags(self):
+        import re
+
+        pattern = AuditRedactor.PRIVATE_KEY_PATTERN
+        # Other code searches with the pattern and needs a compiled one.
+        self.assertIsInstance(pattern, re.Pattern)
+        self.assertEqual(pattern.pattern, self.OLD_PATTERN_TEXT)
+        self.assertEqual(AuditRedactor.PRIVATE_KEY_BEGIN_PATTERN.pattern, self.OLD_BEGIN_TEXT)
+        self.assertEqual(AuditRedactor.PRIVATE_KEY_END_PATTERN.pattern, self.OLD_END_TEXT)
+        # The mask uses the halves: a flag on one of them changes what is masked.
+        for compiled in (pattern, AuditRedactor.PRIVATE_KEY_BEGIN_PATTERN, AuditRedactor.PRIVATE_KEY_END_PATTERN):
+            self.assertEqual(compiled.flags, self.old_pattern.flags)
+        self.assertEqual(redactor_module.REDACTED_PRIVATE_KEY_MARKER, self.MARKER)
+
+    def test_the_one_pass_mask_masks_what_the_pattern_masked(self):
+        masked = 0
+        for text in self._strings(short=3, count=20000, seed=6072):
+            want = self._old(text)
+            self.assertEqual(AuditRedactor.mask_private_keys(text), want, repr(text))
+            masked += want != text
+        # The strings must reach the mask: many of them hold a key block.
+        self.assertGreater(masked, 20000)
+
+    def test_the_mask_keeps_the_cases_that_shaped_it(self):
+        begin, end = "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"
+        marker = self.MARKER
+        for text, want in (
+            (begin + "\nMIIE\n" + end, marker),
+            ("a " + begin + end + " b", "a " + marker + " b"),
+            # No END line behind the first BEGIN line: nothing is masked, also behind a later BEGIN line.
+            (begin + "\nMIIE\n", begin + "\nMIIE\n"),
+            (begin + "\n" + begin + "\n" + begin, begin + "\n" + begin + "\n" + begin),
+            # The block runs from the first BEGIN line to the first END line behind it.
+            (begin + " x " + begin + " y " + end + " z " + end, marker + " z " + end),
+            (end + " x " + begin + " y " + end, end + " x " + marker),
+            # Two blocks, then a BEGIN line with no END line.
+            (begin + "1" + end + " and " + begin + "2" + end + " and " + begin, marker + " and " + marker + " and " + begin),
+            # The END line does not share its dashes with the BEGIN line.
+            ("-----BEGIN PRIVATE KEY-----END PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----END PRIVATE KEY-----"),
+            ("-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----", marker),
+            # The kinds of the two lines may differ; the case and the blanks may be any.
+            ("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END EC PRIVATE KEY-----", marker),
+            ("-----begin  pgp\tprivate\nkey block-----x-----END PRIVATE KEY-----", marker),
+            ("k: -----BEGIN\xa0PRIVATE KEY-----\nMIIE\n-----END\x0bPRIVATE KEY----- ok", "k: " + marker + " ok"),
+            ("-----BEGIN DSA PRIVATE KEY-----\nMIIE\n-----END DSA PRIVATE KEY-----", "-----BEGIN DSA PRIVATE KEY-----\nMIIE\n-----END DSA PRIVATE KEY-----"),
+            # The END line is found however far behind the BEGIN line it stands.
+            ("key: " + begin + "\n" + "MIIEow" * 20000 + "\n" + end + " done", "key: " + marker + " done"),
+            ("", ""),
+            ("no key here", "no key here"),
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self._old(text), want)
+                self.assertEqual(AuditRedactor.mask_private_keys(text), want)
+
+    def test_each_entry_point_masks_a_key_block(self):
+        block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"
+        open_header = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow"
+        self.assertEqual(AuditRedactor.redact_text("key: " + block + " then " + open_header), "key: " + self.MARKER + " then " + open_header)
+        self.assertEqual(AuditRedactor.redact_text_counted("a " + block + " b " + block), ("a " + self.MARKER + " b " + self.MARKER, {"credential": 2}))
+        self.assertEqual(AuditRedactor.redact({"note": ["x " + block]}), {"note": ["x " + self.MARKER]})
+        # A JSON string that holds the block with escaped line ends.
+        self.assertEqual(AuditRedactor.redact_text(json.dumps({"pem": block})), json.dumps({"pem": self.MARKER}))
+
+    def test_key_headers_with_no_end_line_redact_in_linear_time(self):
+        # 300 KB of key headers with no END line, as a bare run and inside
+        # log lines. The pattern's `sub` needs 9 s and 4 s of CPU time on
+        # them; the one-pass mask leaves the redactor at 0.03 s, the time of
+        # a text of this size with no header. The bound is on CPU time. The
+        # coverage job in CI runs about 5 times slower than a developer's
+        # machine, which leaves the 1 s bound a margin of about 5.
+        for text in (
+            "-----BEGIN PRIVATE KEY-----\n" * 11000,
+            "2026-11-17 error: -----BEGIN RSA PRIVATE KEY----- in file\n" * 5200,
+        ):
+            with self.subTest(text=text[:40]):
+                start = time.process_time()
+                out = AuditRedactor.redact_text(text)
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(out, text)
+
+    def test_key_headers_with_no_end_line_mask_in_linear_time(self):
+        # The mask alone, on 840 KB and 870 KB of the same two shapes: 0.001 s
+        # of CPU time. A form that looks for the END line again from each
+        # BEGIN line gives the same output with a smaller quadratic cost
+        # than `sub`; it needs 4 s or more here, and only about 1.4 s on the
+        # shorter texts of the test above.
+        for text in (
+            "-----BEGIN PRIVATE KEY-----\n" * 30000,
+            "2026-11-17 error: -----BEGIN RSA PRIVATE KEY----- in file\n" * 15000,
+        ):
+            with self.subTest(text=text[:40]):
+                start = time.process_time()
+                out = AuditRedactor.mask_private_keys(text)
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(out, text)
 
 
 class TestRedactStructures(unittest.TestCase):

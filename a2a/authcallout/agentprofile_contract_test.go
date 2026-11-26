@@ -61,6 +61,8 @@ func TestTheOperatorsProfilesMapParses(t *testing.T) {
 		// The AgentProfile dispatcher, rendered by default, with its
 		// per-profile grants bucketed by default (#5381).
 		"dispatcher": NarrowingDispatcher,
+		// The gateway's token entry (#5301), beside its static user.
+		"gateway": "",
 	}
 	for _, id := range m.Identities {
 		narrowing, ok := want[id.User]
@@ -231,5 +233,8 @@ func TestTheOperatorsCardCarriesTheRoutingFieldsLibReads(t *testing.T) {
 	}
 	if !card.YieldToPinned {
 		t.Error("yieldToPinned didn't decode: the operator's JSON name and lib's differ")
+	}
+	if !card.Delegates {
+		t.Error("delegates didn't decode: the operator's JSON name and lib's differ")
 	}
 }

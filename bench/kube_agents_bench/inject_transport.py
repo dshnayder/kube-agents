@@ -75,6 +75,8 @@ __all__ = [
     "EVENT_ENTRY_TASK",
     "GRACE_MARGIN_SECONDS",
     "INFRASTRUCTURE_REASONS",
+    "INTENTS",
+    "INTENT_CONFIRM",
     "OUTCOME_DEADLINE",
     "OUTCOME_NEVER_STARTED",
     "OUTCOME_NOT_ACCEPTED",
@@ -87,12 +89,14 @@ __all__ = [
     "PROBES_PER_POLL",
     "PROBE_BOUND_SECONDS",
     "PROBE_PARAM",
+    "QUEUED_START_WAIT_SECONDS",
     "REASON_CANCELED_BEFORE_START",
     "REASON_PREFIX",
     "REFUSAL_NO_ANSWER",
     "REFUSAL_NO_CANCEL",
     "REFUSAL_NO_TASK",
     "REFUSAL_PUBLISH_FAILED",
+    "REFUSAL_QUEUED",
     "REFUSAL_UNVERIFIED_AUTHOR",
     "RETRYABLE_STATUSES",
     "STATE_COMPLETED",
@@ -159,6 +163,18 @@ KEY_SEPARATOR = "/"
 # Appended to the backend message id of a cancel, so the ingress log shows
 # which submission the cancel belongs to and still tells the two apart.
 CANCEL_MESSAGE_ID_SUFFIX = "-cancel"
+# The same for the cancel that takes a queued turn out of the session-cap
+# line (InjectTask.leave_line), so the door's dedupe never answers a later
+# cancel naming a task with it.
+LEAVE_LINE_MESSAGE_ID_SUFFIX = "-leave-line"
+
+# The submit body's ``intent`` (``injectRequest.Intent``): absent for a typed
+# message, or ``confirm``, which submits the turn as a confirmed change (the
+# task's ``changeRequested``). A door not armed for it (A2A_INJECT_CONFIRM)
+# answers 400; the gateway refuses every other value, and so does this side.
+INTENT_FIELD = "intent"
+INTENT_CONFIRM = "confirm"
+INTENTS = frozenset({INTENT_CONFIRM})
 
 
 # Transcript entry kinds, as the gateway spells them.
@@ -166,6 +182,12 @@ ENTRY_POST = "post"
 ENTRY_EDIT = "edit"
 ENTRY_TASK = "task"
 ENTRY_TERMINAL = "terminal"
+# A post or edit the door marks `report`: a relayed report (a kanban card's,
+# delivered over the inject notify route), not the turn's reply. It is kept
+# apart (`Fold.reports`) and never read into the deliverable, so a card report
+# landing between one task's marker and the next is not graded as the answer.
+ENTRY_REPORT_FIELD = "report"
+ENTRY_REPLY_TO_FIELD = "replyTo"
 
 # Trajectory entry names this transport records. The relay never posts
 # `activity` artifacts to a conversation (they are debug and audit views), so
@@ -200,7 +222,13 @@ ENTRY_STATUS_DONE = "completed"
 # whose ``input.calls[]`` names the tools it invoked (while its input fits
 # the executor's cap: :data:`ACTIVITY_INPUT_TRUNCATED_KEY`), which is the
 # shape the verifier already unwraps on the api path, so it is kept as one
-# entry rather than split. Whenever the probe body carried the key at all, even
+# entry rather than split. A part's ``callId``, when it is a non-empty
+# string, goes on its entry as ``call_id`` (:data:`ENTRY_CALL_ID_FIELD`),
+# beside ``args`` and never in it, so a ``tool_called`` argument pattern
+# reads the same input either way; it names the call for a reader joining
+# the trajectory to other records of the same call, such as the worker
+# adapter's log of a refused tool call. Whenever the probe body carried
+# the key at all, even
 # empty, the fold also writes one marker entry named ``a2a.activity`` with
 # ``args.calls`` (entries written) and ``args.dropped`` (calls the door or
 # the executor counted and did not carry). The marker states the DOOR's
@@ -242,6 +270,18 @@ PROBE_USAGE_PARTIAL_KEY = "usagePartial"
 # say", never as "delegated nothing" (``delegated_to`` errors on it).
 PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
 USAGE_READ_ATTEMPTS = 2
+# How the usage read went, on ``Fold.usage_read``, so a result with null
+# buckets can say why (``tokens_note`` on the harness's result): no read was made (the
+# exchange had no terminal from an executor); the read was skipped, the deadline
+# having passed; the read raised; the door's answer did not cover the task;
+# the door answered. ``USAGE_READ_CANCEL_UNCONFIRMED`` is the harness's: a
+# graded timeout whose cancel settle reached no terminal, so no read followed.
+USAGE_READ_NOT_MADE = "not-made"
+USAGE_READ_SKIPPED = "skipped"
+USAGE_READ_FAILED = "failed"
+USAGE_READ_UNANSWERED = "unanswered"
+USAGE_READ_ANSWERED = "answered"
+USAGE_READ_CANCEL_UNCONFIRMED = "cancel-unconfirmed"
 USAGE_INPUT_KEY = "inputTokens"
 USAGE_OUTPUT_KEY = "outputTokens"
 # The keys of one activity part, as the executors publish them, and the two
@@ -253,6 +293,9 @@ ACTIVITY_TOOL_KEY = "tool"
 ACTIVITY_INPUT_KEY = "input"
 ACTIVITY_STATUS_KEY = "status"
 ACTIVITY_DROPPED_KEY = "dropped"
+ACTIVITY_CALL_ID_KEY = "callId"
+# The trajectory entry's field for the part's ``callId`` (above).
+ENTRY_CALL_ID_FIELD = "call_id"
 ACTIVITY_STATUS_CALLED = "called"
 ACTIVITY_STATUS_TRUNCATED = "truncated"
 # The bridge caps one call's ``input`` and replaces an input over the cap
@@ -392,6 +435,9 @@ REASON_HERMES_API_REFUSED = "hermes-api-refused"
 # The task waited out its deadline behind an earlier turn in the same session
 # and was never sent: the persona never saw the prompt.
 REASON_SESSION_BUSY = "session-busy"
+# The bridge recovered a panic while handling the task and ended it failed
+# with no answer: the bridge's own fault, not the persona's.
+REASON_INTERNAL_PANIC = "internal-panic"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -405,6 +451,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_HERMES_API_UNREACHABLE,
         REASON_HERMES_API_REFUSED,
         REASON_SESSION_BUSY,
+        REASON_INTERNAL_PANIC,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
@@ -451,6 +498,12 @@ REFUSAL_UNVERIFIED_AUTHOR = "unverified-author"
 REFUSAL_PUBLISH_FAILED = "publish-failed"
 REFUSAL_NO_TASK = "no-task"
 REFUSAL_NO_ANSWER = "no-answer"
+# Not like the four above: the turn waits in the gateway's session-cap line
+# (#6882), with its queued notice in the reply's entries, and the task it
+# starts when a session worker frees lands on the same conversation later
+# (InjectTask.await_queued_start). It is infrastructure only when that never
+# happens inside the line's bound.
+REFUSAL_QUEUED = "queued"
 # The cancel route's own: the turn ended without a cancel reaching the bus.
 REFUSAL_NO_CANCEL = "cancel-not-published"
 # What each one means, in the words the run's record carries. The publish
@@ -469,6 +522,10 @@ _REFUSAL_DETAIL = {
         "the gateway answered the turn without starting a task (a steer, a status answer, or a stop)"
     ),
     REFUSAL_NO_ANSWER: "the gateway did not say what it did with the prompt inside its own bound",
+    REFUSAL_QUEUED: (
+        "every session worker was busy, and the turn the gateway queued did not start inside "
+        "the line's bound"
+    ),
     REFUSAL_NO_CANCEL: (
         "the gateway put no cancel on the bus: it refused the task or could not publish one, so whatever the task was doing it is still doing"
     ),
@@ -583,6 +640,20 @@ POLL_TIMEOUT_MARGIN_SECONDS = 30.0
 # dead tunnel and tear down a healthy port-forward.
 PROBE_BOUND_SECONDS = 60.0
 PROBES_PER_POLL = 2
+
+# How long a turn the gateway queued at the session cap is waited on for its
+# task to start: the gateway's bound on a wait in line (sessionCapWaitMax in
+# a2a/gateway/session_cap_queue.go, five minutes) plus a margin for the retry
+# that follows a freed slot. The gateway enforces its bound only when a
+# waiter reaches the head of the line and tries for a slot (capKeepOrGiveUp,
+# on retryCapHead's retry), so a waiter further back can wait longer than
+# five minutes; this bound is the harness's backstop, after which it takes
+# the turn out of the line itself (InjectTask.leave_line).
+QUEUED_START_WAIT_SECONDS = 5 * 60 + 60.0
+# What the gateway's queued notice carries, whatever its place in line
+# (sessionQueuedNotice in a2a/gateway/session_cap_queue.go). Read only to keep
+# the notice itself from passing for the gateway's refusal to start the turn.
+QUEUED_NOTICE_MARK = "**queued**"
 
 # How much of the conversation's last post a log line or an infrastructure
 # message quotes, so a stalled task's last words are on the record without
@@ -770,6 +841,8 @@ class Fold:
     task_id: str
     entries: list[dict[str, Any]] = field(default_factory=list)
     posts: list[dict[str, Any]] = field(default_factory=list)
+    # Relayed reports (ENTRY_REPORT_FIELD), in arrival order: never the reply.
+    reports: list[dict[str, Any]] = field(default_factory=list)
     edited: set[str] = field(default_factory=set)
     # The lifecycle and conversation entries, in the order they were folded.
     # :attr:`trajectory` is these plus the activity block.
@@ -794,6 +867,8 @@ class Fold:
     usage: dict[str, int | None] | None = None
     child_usage: dict[str, int | None] | None = None
     usage_partial: bool = False
+    # How that read went (:data:`USAGE_READ_NOT_MADE` and its siblings).
+    usage_read: str = USAGE_READ_NOT_MADE
     # Whom the chain delegated to (:data:`PROBE_CHILD_ADDRESSEES_KEY`), from
     # the latest read about this task that carried it, the polls' included
     # (:meth:`InjectTask._note`) and the read after the terminal last;
@@ -938,14 +1013,16 @@ class Fold:
             else:
                 args = {ACTIVITY_INPUT_KEY: raw_input}
             status = part.get(ACTIVITY_STATUS_KEY)
-            calls.append(
-                {
-                    "name": tool,
-                    "args": args,
-                    "result": None,
-                    "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": tool,
+                "args": args,
+                "result": None,
+                "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
+            }
+            call_id = part.get(ACTIVITY_CALL_ID_KEY)
+            if isinstance(call_id, str) and call_id:
+                entry[ENTRY_CALL_ID_FIELD] = call_id
+            calls.append(entry)
         marker_args: dict[str, Any] = {
             ACTIVITY_CALLS_ARG: len(calls),
             ACTIVITY_DROPPED_ARG: dropped,
@@ -988,6 +1065,10 @@ class Fold:
         every post otherwise. A post a later edit rewrote (the status
         placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
+        # A window that held only relayed reports is still this task's
+        # window: falling back to every post would grade an earlier task's.
+        if not windowed and any(report["inWindow"] for report in self.reports):
+            return []
         return windowed or self.posts
 
     @property
@@ -1091,7 +1172,20 @@ class Fold:
         text = str(entry.get("text") or "")
         entry_message_id = str(entry.get("messageId") or "")
 
-        if kind == ENTRY_POST:
+        if kind == ENTRY_EDIT and entry.get(ENTRY_REPORT_FIELD) is True and any(
+            post["messageId"] == entry_message_id for post in self.posts
+        ):
+            # An edit marked report on an ordinary post still rewrites it.
+            if entry_message_id:
+                self.edited.add(entry_message_id)
+        if kind in (ENTRY_POST, ENTRY_EDIT) and entry.get(ENTRY_REPORT_FIELD) is True:
+            self.reports.append({
+                "kind": kind, "messageId": entry_message_id, "text": text,
+                "replyTo": str(entry.get(ENTRY_REPLY_TO_FIELD) or ""), "inWindow": self.in_window,
+            })
+            self._record(EVENT_ENTRY_POST if kind == ENTRY_POST else EVENT_ENTRY_EDIT,
+                         {"messageId": entry_message_id, ENTRY_REPORT_FIELD: True}, text)
+        elif kind == ENTRY_POST:
             self.posts.append(
                 {"messageId": entry_message_id, "text": text, "inWindow": self.in_window}
             )
@@ -1460,10 +1554,27 @@ class InjectTask:
         token: str,
         author: str = DEFAULT_AUTHOR,
         message_id: str = "",
+        profile: str = "",
+        parameters: dict[str, str] | None = None,
+        intent: str = "",
     ) -> None:
+        # Refused here, before anything is sent: a typo would otherwise cost a
+        # lease to learn from the door's 400.
+        if intent and intent not in INTENTS:
+            raise ValueError(
+                f"inject intent {intent!r} is not one the door takes: empty or one of {sorted(INTENTS)}"
+            )
         self.base_url = base_url.rstrip("/")
         self.conversation = conversation
         self.prompt = prompt
+        # The submit's intent: empty sends a typed message, as every turn was
+        # sent before; "confirm" submits it as a confirmed change. Only the
+        # opening submit carries it, never a stop or a cancel.
+        self.intent = intent
+        # The AgentProfile the opening turn is addressed to, and its
+        # parameters (profile_hook, #5945); empty sends the turn as any other.
+        self.profile = profile
+        self.parameters = dict(parameters or {})
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -1494,6 +1605,18 @@ class InjectTask:
         # recover_task_id reads only then; a door that answered, with a task
         # or a refusal, has nothing to recover.
         self.unanswered_post = False
+        # For a turn the gateway queued at the session cap (REFUSAL_QUEUED):
+        # the sequence the POST's reply started at, so the wait for the
+        # queued turn's task reads the conversation from there, and the
+        # queued notice's text. ``line_refusal`` is the post the gateway
+        # made instead of starting it (the cap's refusal after the wait, a
+        # stop, a restart), when it made one.
+        self.queued_after = 0
+        self.queued_notice = ""
+        self.line_refusal = ""
+        # Whether the door answered the cancel that takes this turn out of
+        # the session-cap line (leave_line).
+        self.left_line = False
 
     def preflight(self) -> Probe:
         """Read the conversation before anything is started.
@@ -1547,6 +1670,12 @@ class InjectTask:
         }
         if self.message_id:
             payload["messageId"] = self.message_id
+        if self.profile:
+            payload["profile"] = self.profile
+            if self.parameters:
+                payload["parameters"] = self.parameters
+        if self.intent:
+            payload[INTENT_FIELD] = self.intent
         self.unanswered_post = True
         try:
             body = _request(
@@ -1569,6 +1698,19 @@ class InjectTask:
         self.note = str(body.get("note") or "")
         self.refusal = str(body.get("refusal") or "")
         self.task_id = str(body.get("taskId") or "")
+        if self.refusal == REFUSAL_QUEUED:
+            seqs, notice = [], ""
+            for entry in body.get("entries") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
+                    continue
+                seqs.append(entry["seq"])
+                if entry.get("kind") == ENTRY_POST and entry.get(ENTRY_REPORT_FIELD) is not True and not notice:
+                    notice = str(entry.get("text") or "")
+            # A retried POST the door deduped may carry no entries; the
+            # first reply's reading stands then.
+            if seqs:
+                self.queued_after = min(seqs) - 1
+                self.queued_notice = notice
         if self.task_id:
             self.submitted_at = time.monotonic()
             if body.get("deduplicated"):
@@ -1590,6 +1732,137 @@ class InjectTask:
                 self.note,
             )
         return self.task_id
+
+    def leave_line(self) -> bool:
+        """Take a turn the gateway queued at the session cap out of its line.
+
+        The cancel route naming no task, which on a conversation with a
+        parked turn is the stop that removes it (routeParked in
+        a2a/gateway/session_cap_queue.go). Sent for a queued turn this side
+        gave up on, which the gateway would otherwise start later with
+        nobody watching. Once: returns whether the door answered, and a
+        later call returns the same without sending again. Best effort; a
+        failure is logged.
+        """
+        if self.left_line:
+            return True
+        url = self.base_url + CONVERSATIONS_PATH + urllib.parse.quote(self.conversation, safe="") + CANCEL_SUFFIX
+        payload: dict[str, Any] = {"author": self.author}
+        if self.message_id:
+            payload["messageId"] = self.message_id + LEAVE_LINE_MESSAGE_ID_SUFFIX
+        try:
+            _request(url, SUBMIT_TIMEOUT_SECONDS, self.token, payload)
+        except InjectUnavailable as exc:
+            _log.warning("inject: could not take the queued turn on %s out of the line: %s", self.conversation, exc)
+            return False
+        self.left_line = True
+        _log.info("inject: took the queued turn on %s out of the line", self.conversation)
+        return True
+
+    def still_running(self, task_id: str) -> bool:
+        """One read: whether the record still holds ``task_id`` as its
+        active task and the stream shows it not ended.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        probe = Probe.from_body(self._poll(task_id, 0, 0))
+        return probe is not None and probe.could_look and probe.concerns(task_id) and not probe.final
+
+    def released(self, task_id: str) -> bool:
+        """One read: whether the gateway looked and ``task_id`` no longer
+        holds its record, or its stream shows it ended. A read that could not
+        look (no probe, or ``could_look`` false) is not released, so a caller
+        waiting for a worker to free stays on the safe side.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        probe = Probe.from_body(self._poll(task_id, 0, 0))
+        if probe is None or not probe.could_look:
+            return False
+        return probe.final or not probe.concerns(task_id)
+
+    def await_working(self, task_id: str, deadline: float) -> Fold:
+        """Read ``task_id``'s lifecycle until an executor has it working,
+        it ends, or ``deadline`` (``time.monotonic()``) passes.
+
+        Returns the fold of what the reads showed, whose trajectory carries
+        the task's ``a2a.status-update`` entries as any exchange's does:
+        :attr:`Fold.started` says whether it reached working (or ended), and
+        :attr:`Fold.final` whether it ended. Nothing is sent but reads.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        fold = Fold(task_id)
+        while True:
+            probe = Probe.from_body(self._poll(task_id, 0, 0))
+            if probe is not None:
+                self._note(fold, task_id, probe)
+                if probe.could_look and probe.task_id == task_id and probe.final:
+                    fold.mark_terminal(probe.executor_state, probe.terminal_source, probe.reason)
+            if fold.started or time.monotonic() >= deadline:
+                return fold
+            time.sleep(POLL_PAUSE_SECONDS)
+
+    @property
+    def refusal_text(self) -> str:
+        """Why this task started nothing, for a record: the gateway's own
+        post when it refused a queued turn (:attr:`line_refusal`), otherwise
+        the reason behind the refusal code (:func:`refusal_detail`), which
+        for a queued turn with no post is the line's bound running out."""
+        if self.refusal == REFUSAL_QUEUED and self.line_refusal:
+            return f"the gateway did not start the turn it had queued, and said so: {self.line_refusal!r}"
+        return refusal_detail(self.refusal)
+
+    def await_queued_start(self, deadline: float) -> str:
+        """The task a queued turn starts, or ``""`` when it never does.
+
+        For a submission the door answered with :data:`REFUSAL_QUEUED`: the
+        gateway parked the turn at the session cap, and when a worker frees
+        it runs the turn again, which starts a task on this conversation as a
+        chat user's queued turn would. That task is the first ``task`` entry
+        after the queued notice. A post with no task before it is the
+        gateway saying it will not start the turn (the cap's refusal after
+        the line's wait, a stop, a restart): it is kept in
+        :attr:`line_refusal` and the wait ends. So does ``deadline``
+        (``time.monotonic()``), with neither.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        if self.task_id:
+            return self.task_id
+        after = self.queued_after
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log.warning("inject: the queued turn on %s did not start in time", self.conversation)
+                return ""
+            body = self._poll("", after, remaining, probe=False)
+            for entry in body.get("entries") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
+                    continue
+                after = max(after, entry["seq"])
+                kind = entry.get("kind")
+                text = str(entry.get("text") or "")
+                if kind == ENTRY_TASK and entry.get("taskId"):
+                    self.task_id = str(entry["taskId"])
+                    self.submitted_at = time.monotonic()
+                    _log.info(
+                        "inject: the queued turn on %s started task %s", self.conversation, self.task_id
+                    )
+                    return self.task_id
+                if (kind == ENTRY_POST and entry.get(ENTRY_REPORT_FIELD) is not True
+                        and text != self.queued_notice and QUEUED_NOTICE_MARK not in text):
+                    self.line_refusal = text
+                    _log.warning(
+                        "inject: the queued turn on %s was not started: %s",
+                        self.conversation,
+                        text[:LAST_POST_EXCERPT_CHARS],
+                    )
+                    return ""
 
     def recover_task_id(self) -> str:
         """The conversation's active task id from one read, or ``""``.
@@ -1731,7 +2004,9 @@ class InjectTask:
         replaces it. Made only inside the wait's deadline and bounded by what
         is left of it, so a run already past its budget, or a cancel past its
         settle bound, spends no time on it. Best effort: a read that fails, or
-        a door that sends no usage, leaves the counts as they stand.
+        a door that sends no usage, leaves the counts as they stand. How the
+        read went is kept on ``fold.usage_read``; once the door has answered,
+        a later attempt that is skipped or fails does not replace that.
         """
         seqs = [e.get("seq") for e in fold.entries]
         after = max((seq for seq in seqs if isinstance(seq, int)), default=0)
@@ -1752,15 +2027,19 @@ class InjectTask:
         for _ in range(USAGE_READ_ATTEMPTS):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._note_usage_read(fold, USAGE_READ_SKIPPED)
                 return
             timeout = min(remaining, POLL_TIMEOUT_MARGIN_SECONDS + PROBES_PER_POLL * PROBE_BOUND_SECONDS)
             try:
                 answered = Probe.from_body(_request(url, timeout, self.token))
             except InjectUnavailable as exc:
                 _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
+                self._note_usage_read(fold, USAGE_READ_FAILED)
                 return
             if answered is None or not answered.could_look or answered.task_id != task_id:
+                self._note_usage_read(fold, USAGE_READ_UNANSWERED)
                 return
+            fold.usage_read = USAGE_READ_ANSWERED
             if answered.child_addressees is not None:
                 fold.child_addressees = answered.child_addressees
             if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
@@ -1771,6 +2050,12 @@ class InjectTask:
             if not answered.usage_partial:
                 return
             _log.info("inject: the usage of %s is partial; reading it once more", task_id)
+
+    @staticmethod
+    def _note_usage_read(fold: Fold, how: str) -> None:
+        """Record how the usage read went, unless the door has answered one."""
+        if fold.usage_read != USAGE_READ_ANSWERED:
+            fold.usage_read = how
 
     def _never_started(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The read showed nothing on the stream past the grace: nobody took it."""

@@ -247,6 +247,64 @@ class C1IsolationIsStructural(unittest.TestCase):
                 f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
             )
 
+    # The inference gateway's master key: the Secret the chart generates, the
+    # one workload and container allowed to read it, and the chart values that
+    # add workloads beside the gateway.
+    _GATEWAY_MASTER_KEY_SECRET = "litellm-master-key"
+    _GATEWAY_MASTER_KEY_READER = ("litellm", "litellm-container")
+    _GATEWAY_RENDER_SETS = ((), ("webConsole.enabled=true",), ("litellm.redaction.enabled=true",))
+    _POD_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job")
+
+    def _secret_readers(self, documents, secret: str) -> set:
+        """(workload, container) pairs that read `secret` by env, envFrom or a volume."""
+        readers = set()
+        workloads = [d for kind in self._POD_WORKLOAD_KINDS for d in h.objects_of_kind(documents, kind)]
+        for cron in h.objects_of_kind(documents, "CronJob"):
+            workloads.append({"metadata": cron["metadata"], "spec": cron["spec"]["jobTemplate"]["spec"]})
+        for workload in workloads:
+            spec = workload["spec"]["template"]["spec"]
+            volumes = set()
+            for volume in spec.get("volumes") or []:
+                if (volume.get("secret") or {}).get("secretName") == secret:
+                    volumes.add(volume["name"])
+                for source in (volume.get("projected") or {}).get("sources") or []:
+                    if (source.get("secret") or {}).get("name") == secret:
+                        volumes.add(volume["name"])
+            for container in h.containers_of(workload):
+                reads = any(m["name"] in volumes for m in container.get("volumeMounts") or [])
+                reads |= any(
+                    ((e.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name") == secret
+                    for e in container.get("env") or []
+                )
+                reads |= any((s.get("secretRef") or {}).get("name") == secret for s in container.get("envFrom") or [])
+                if reads:
+                    readers.add((workload["metadata"]["name"], container["name"]))
+        return readers
+
+    def test_C1_the_gateway_master_key_reaches_only_the_gateway_container(self) -> None:
+        """The master key makes its holder the gateway's admin: key management,
+        config and every route. Callers authenticate with their own keys, so the
+        Secret is read by the LiteLLM container alone, in every chart render
+        checked, and no operator-rendered workload names it at all. The
+        gateway's ConfigMap names the variable, never the value."""
+        for sets in self._GATEWAY_RENDER_SETS:
+            with self.subTest(sets=sets):
+                documents = h.helm_rendered(*sets)
+                self.assertEqual(
+                    self._secret_readers(documents, self._GATEWAY_MASTER_KEY_SECRET),
+                    {self._GATEWAY_MASTER_KEY_READER},
+                )
+                secret = next(
+                    d for d in h.objects_of_kind(documents, "Secret")
+                    if d["metadata"]["name"] == self._GATEWAY_MASTER_KEY_SECRET
+                )
+                value = next(iter(secret["stringData"].values()))
+                for configmap in h.objects_of_kind(documents, "ConfigMap"):
+                    self.assertNotIn(value, json.dumps(configmap), configmap["metadata"]["name"])
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self.assertNotIn(self._GATEWAY_MASTER_KEY_SECRET, json.dumps(documents))
+
     def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
         """A GKE clusters.get answer carries masterAuth's client certificate and key
         on a cluster with issuance on: a credential for that API server, wider
@@ -1040,11 +1098,188 @@ class C1IsolationIsStructural(unittest.TestCase):
                         "a peer is admitted to a port other than the metrics listener's",
                     )
 
+    # The audit-report store listener (#5619): its port and the name of it,
+    # which the Service targets.
+    _REPORT_STORE_PORT = 8700
+    _REPORT_STORE_PORT_NAME = "report-store"
+
+    @staticmethod
+    def _rule_reaches(rule: dict, port: int, port_name: str) -> bool:
+        """Whether an ingress rule admits TCP to `port` (or its name) at all.
+
+        No `ports` is every port, a port entry with no `port` is every port of
+        its protocol, an absent protocol is TCP, and `endPort` makes a range.
+        """
+        ports = rule.get("ports")
+        if not ports:
+            return True
+        for entry in ports:
+            if (entry.get("protocol") or "TCP") != "TCP":
+                continue
+            value = entry.get("port")
+            if value is None or value == port_name:
+                return True
+            if isinstance(value, int) and value <= port <= entry.get("endPort", value):
+                return True
+        return False
+
+    def test_C1_only_the_broker_reaches_the_audit_report_store_listener(self) -> None:
+        """The store's port on the gateway pod admits the broker's pods alone.
+
+        The listener reads and writes the fleet-audit report store, which is a
+        profile worker's memory of what the last run found. It checks the
+        broker's token as well, but on the pod network nothing but the broker
+        should reach it: a rule from any other peer that covers the port --
+        a port range that takes 8700 in, or a rule with no ports -- is the
+        store reachable from every pod beside it.
+
+        NetworkPolicies selecting one pod are additive, so this reads every
+        policy that selects the gateway pod and isolates it for ingress, and
+        every rule in them that reaches the port: each must admit exactly the
+        broker's pod selector. And at least one must, or the store is reached
+        by nobody, which is no listener. The rule lives in the gateway policy,
+        and no policy of the store's own is rendered: an operator rollback
+        rewrites the gateway policy without the rule, where a separate policy
+        would be left behind isolating the pod to the broker alone.
+
+        The store renders with the A2A stack, on every install, so this holds
+        on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            with self.subTest(fixture=fixture):
+                self._assert_only_the_broker_reaches_the_store(documents)
+
+    def _assert_only_the_broker_reaches_the_store(self, documents: tuple[dict, ...]) -> None:
+        port, port_name = self._REPORT_STORE_PORT, self._REPORT_STORE_PORT_NAME
+        services = [s for s in h.objects_of_kind(documents, "Service") if s["metadata"]["name"].endswith("-report-store")]
+        self.assertEqual(len(services), 1, "the golden renders no report-store Service")
+        selector = services[0]["spec"]["selector"]
+        self.assertTrue(selector, "the report-store Service selects every pod")
+        # The pod behind the Service: the Hermes gateway, not the A2A gateway.
+        gateways = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if selector == {k: d["spec"]["template"]["metadata"]["labels"].get(k) for k in selector}
+        ]
+        self.assertEqual(
+            [d["metadata"]["name"] for d in gateways], [services[0]["metadata"]["name"].removesuffix("-report-store") + "-gateway"],
+            "the report-store Service does not select the gateway pod alone",
+        )
+        gateway = gateways[0]
+        pod_labels = gateway["spec"]["template"]["metadata"]["labels"]
+        # Every port entry on the store's port or carrying its name: a second name
+        # on 8700 would let a rule admitting that name reach the store unseen.
+        declared = [
+            (c["name"], p.get("name"), p.get("containerPort"))
+            for c in h.containers_of(gateway)
+            for p in c.get("ports") or []
+            if p.get("name") == port_name or p.get("containerPort") == port
+        ]
+        self.assertEqual(
+            declared, [("agent-api-auth", port_name, port)], "the store's port is not agent-api-auth's alone"
+        )
+
+        brokers = [
+            d for d in h.objects_of_kind(documents, "Deployment")
+            if d["metadata"]["name"].endswith("-credential-proxy")
+        ]
+        self.assertEqual(len(brokers), 1, "the golden no longer renders one broker Deployment")
+        broker_labels = brokers[0]["spec"]["template"]["metadata"]["labels"]
+        broker_selector = {
+            "app": brokers[0]["metadata"]["name"],
+            "kubeagents.x-k8s.io/component": "credential-proxy",
+        }
+        self.assertEqual(broker_selector, {k: broker_labels.get(k) for k in broker_selector})
+
+        def selects_gateway(policy: dict) -> bool:
+            chosen = policy["spec"].get("podSelector") or {}
+            # Not evaluated, so refused outright: a policy selecting the gateway
+            # by matchExpressions could admit any peer to the store unseen.
+            self.assertFalse(
+                chosen.get("matchExpressions"),
+                f"{policy['metadata']['name']} uses matchExpressions, which this check does not evaluate",
+            )
+            labels = chosen.get("matchLabels") or {}
+            return labels == {k: pod_labels.get(k) for k in labels}
+
+        isolating = [
+            p for p in h.objects_of_kind(documents, "NetworkPolicy")
+            if selects_gateway(p) and "Ingress" in (p["spec"].get("policyTypes") or [])
+        ]
+        self.assertTrue(isolating, "nothing isolates the gateway pod for ingress, so every pod reaches the store")
+        reaching = []
+        for policy in isolating:
+            for rule in policy["spec"].get("ingress") or []:
+                if self._rule_reaches(rule, port, port_name):
+                    reaching.append((policy["metadata"]["name"], rule.get("from")))
+        self.assertTrue(reaching, "no rule admits anyone to the store, so the broker cannot reach it")
+        self.assertEqual(
+            {name for name, _ in reaching}, {gateway["metadata"]["name"] + "-netpol"},
+            "the store's rule is not in the gateway policy",
+        )
+        self.assertEqual(
+            [p["metadata"]["name"] for p in h.objects_of_kind(documents, "NetworkPolicy")
+             if p["metadata"]["name"].endswith("-report-store")],
+            [], "a NetworkPolicy of the store's own is rendered, which an operator rollback leaves behind",
+        )
+        for name, peers in reaching:
+            with self.subTest(policy=name):
+                self.assertEqual(
+                    peers, [{"podSelector": {"matchLabels": broker_selector}}],
+                    "a rule reaching the store's port admits a peer other than the broker's pods",
+                )
+
+    def test_C1_the_report_store_listener_reads_only_reserved_env(self) -> None:
+        """Every environment variable the store listener reads is one a CR cannot set.
+
+        agent-api-auth takes spec.deployment.env through
+        mergeCredentialProxyEnv, which drops only reserved names. A name the
+        listener reads that is not reserved is a CR choosing it: its subject
+        check, its root, or the API server it fetches the JWKS from with the
+        pod's own token, which would then vouch for any token the CR signs.
+        So the names the listener reads, each spelled through a module
+        constant, must all be in the operator's auditReportStoreEnvNames, and
+        the API server, the ServiceAccount directory and the root must come
+        from no environment variable at all.
+        """
+        listener = h.text("audit_report_store_listener")
+        tree = ast.parse(listener)
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        }
+        read = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "getenv")
+                and ast.unparse(node.func.value) in ("os.environ", "os") and node.args
+            ):
+                arg = node.args[0]
+                read.add(constants.get(arg.id) if isinstance(arg, ast.Name) else ast.unparse(arg))
+            if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                read.add(ast.unparse(node.slice))
+        self.assertTrue(read, "the listener reads no environment at all, so its subject check has no subject")
+        self.assertNotIn(None, read, "the listener reads an environment name not spelled through a module constant")
+
+        operator = h.text("audit_report_store_operator")
+        block = self._one_match(r"(?s)var auditReportStoreEnvNames = \[\]string\{(.*?)\n\}", operator, "auditReportStoreEnvNames")
+        go_constants = dict(re.findall(r"^\s*(auditReportStore\w+Env)\s*=\s*\"([^\"]+)\"", operator, re.MULTILINE))
+        reserved = set()
+        for line in re.sub(r"//[^\n]*", "", block).split(","):
+            item = line.strip()
+            if not item:
+                continue
+            reserved.add(item.strip('"') if item.startswith('"') else go_constants.get(item, item))
+        self.assertLessEqual(read, reserved, "the listener reads a name a CR can set through spec.deployment.env")
+        for name in ("FLEET_AUDIT_REPORTS_DIR", "AUDIT_REPORT_STORE_API_SERVER", "AUDIT_REPORT_STORE_SA_DIR"):
+            self.assertNotIn(name, read, f"the listener takes {name} from the environment")
+            self.assertIn(name, reserved, f"{name} is not reserved, so an image that read it would let a CR set it")
+
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
-        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
-        the operator's cluster-view flag, kube-proxy on 8443 and the credential
+        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under the session pods' cluster view, kube-proxy on 8443 and the credential
         broker on 8765) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
@@ -1060,8 +1295,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
-          that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          that is not the API server's: the bus, and, under the session pods'
+          cluster view (the session route's default, or the operator's
+          A2A_SESSION_CLUSTER_VIEW=true), the session audience accepted by
           kube-proxy and the credential broker. The API server refuses both for
           anything else, so neither is a cluster credential even though both
           are Kubernetes ones; TokenReview and each proxy's per-audience policy
@@ -1077,7 +1313,27 @@ class C1IsolationIsStructural(unittest.TestCase):
         other left empty.
         """
         spawner = h.text("a2a_spawner")
-        body = h.go_function_body(spawner, "Spawn")
+        # Every session pod's spec, a fresh spawn's and a warm pod's alike, is
+        # built by sessionPodSpec (#6533), so that is the body the identity
+        # checks read. The two creates must build through it, and neither may
+        # touch the token mount or the projections after it: otherwise a pod
+        # could leave with a token this test never saw.
+        for create in ("Spawn", "SpawnWarm"):
+            with self.subTest(create=create):
+                create_body = h.go_function_body(spawner, create)
+                self.assertIn(
+                    "s.sessionPodSpec(",
+                    create_body,
+                    f"{create} no longer builds its pod through sessionPodSpec, so the "
+                    "identity checks below no longer read the pod it creates",
+                )
+                for token_field in ("AutomountServiceAccountToken", "ServiceAccountToken", "ServiceAccountName"):
+                    self.assertNotIn(
+                        token_field,
+                        create_body,
+                        f"{create} sets {token_field} after sessionPodSpec, outside the body this test reads",
+                    )
+        body = h.go_function_body(spawner, "sessionPodSpec")
 
         self.assertIn(
             "AutomountServiceAccountToken: ptr.To(false)",
@@ -1101,7 +1357,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "bus credential moved, this test has to move with it",
         )
         # The audiences a session pod may hold, by constant name: the bus, and
-        # the broker's session audience that the cluster-view flag projects.
+        # the broker's session audience that the cluster view projects.
         # Anything else is a token for a destination the fence never admitted.
         permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
@@ -1664,6 +1920,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
@@ -1690,12 +1947,21 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "the shim no longer reads %s by that name" % name,
                 )
 
+        # KUBE_PROXY_MODE gates the session kubectl wrapper's write-attempt
+        # record: the spawner sets it, the wrapper and the client read it. A
+        # rename on either side records nothing, and no session turn stops.
+        with self.subTest(env="KUBE_PROXY_MODE"):
+            self._one_match(r'Name:\s*"KUBE_PROXY_MODE"', spawner, "the spawner's render of KUBE_PROXY_MODE")
+            self.assertRegex(shim, r'KUBE_PROXY_MODE_ENV\s*=\s*"KUBE_PROXY_MODE"', "the client no longer reads KUBE_PROXY_MODE")
+            wrapper = (h.REPO_ROOT / "deploy" / "sandbox" / "session-kubectl.sh").read_text(encoding="utf-8")
+            self.assertIn("${KUBE_PROXY_MODE:-}", wrapper, "the kubectl wrapper no longer reads KUBE_PROXY_MODE")
+
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
 
-        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
-        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
-        reads the same two names and checks a session's request to delegate to
+        The operator renders the CR's integration.{googleChat,slack,teams}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK,TEAMS}; the gateway
+        reads the same three names and checks a session's request to delegate to
         the platform agent against them. The gateway reads an absent variable
         as "all authenticated users", by design (an absent CR list means the
         same), so a rename on either side is not a refusal anyone sees: every
@@ -1709,6 +1975,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         for const, env in (
             ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
             ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+            ("a2aTargetAllowedUsersTeamsEnvVar", "EnvTargetAllowedUsersTeams"),
         ):
             with self.subTest(pair=const):
                 rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
@@ -1741,6 +2008,29 @@ class C1IsolationIsStructural(unittest.TestCase):
             "dropped blank-subject guard could admit a requester the "
             "compiled list does not name",
         )
+
+    def test_C1_the_tier_membership_env_name_agrees_across_the_module_boundary(self) -> None:
+        """Tier membership crosses the same boundary (#3659).
+
+        The operator renders spec.tiers.membership onto the gateway as
+        A2A_TIER_MEMBERSHIP, and the gateway reads it to pick the tier a
+        person's profile task runs at. A rename on either side leaves the
+        gateway with no membership, so everyone runs at read and both Go
+        suites stay green: a mapped person silently loses their tier. The two
+        spellings are pinned equal here.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        membership = h.text("a2a_gateway_tier_membership")
+        rendered = self._one_match(r'a2aTierMembershipEnvVar\s*=\s*"([^"]+)"', a2a_manifests, "the operator's a2aTierMembershipEnvVar")
+        read = self._one_match(r'EnvTierMembership\s*=\s*"([^"]+)"', membership, "the gateway's EnvTierMembership")
+        self.assertEqual(
+            rendered,
+            read,
+            "the operator renders %r and the gateway reads %r: every person runs at "
+            "read on an install whose Go suites are green" % (rendered, read),
+        )
+        self._one_match(r"Name:\s*a2aTierMembershipEnvVar,", a2a_manifests, "the operator's render of a2aTierMembershipEnvVar")
+        self._one_match(r"os\.(?:Getenv|LookupEnv)\(EnvTierMembership\)", h.text("a2a_gateway_config"), "the gateway's read of EnvTierMembership")
 
     def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
         """The reserved artifact name crosses a module boundary in two places.
@@ -1828,7 +2118,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
         # request lib.ValidateDelegateRequest refuses, and the validator caps
-        # the single task's text and every batch entry's.
+        # the single task's text and every batch entry's. The call is a
+        # disjunct of the malformed-request guard in its own right, straight
+        # after !parsed and followed only by another || or the block: the
+        # guard has other terms (a resumed batch's size check), and a call
+        # ANDed with one of them would still read "ValidateDelegateRequest(req)
+        # != nil" while checking only the requests that term selects.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
         # Followed only by `||` or the block: an `&&` after the call (a
         # condition on it) would validate only some requests and mint the rest.
@@ -2521,6 +2816,163 @@ class C2FailClosed(unittest.TestCase):
                 "present, so a missing key degrades to an unauthenticated request",
             )
 
+    def test_C2_custom_universe_refuses_commercial_googleapis_relays(self) -> None:
+        """A broker in a custom universe refuses every `*.googleapis.com` relay host.
+
+        A custom-universe bearer token sent to commercial `*.googleapis.com`
+        crosses a sovereign trust boundary. Each relay evaluator must admit
+        `<service>.<universe_domain>` and refuse `<service>.googleapis.com`
+        whenever `universe_domain` is not `googleapis.com`.
+        """
+        custom = "universe.example.test"
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            if not route.host.endswith(".googleapis.com"):
+                continue
+            with self.subTest(api_host=route.host, rule=route.rule_id):
+                decision = api.evaluate(
+                    "GET",
+                    route.host,
+                    "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                    "",
+                    universe_domain=custom,
+                )
+                self.assertFalse(
+                    decision.allowed,
+                    f"api_policy admitted commercial {route.host} under custom universe {custom}",
+                )
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+
+        sub = "projects/sample-project/subscriptions/drift-sub"
+        self.assertFalse(
+            h.watcher_policy.evaluate_gcp(
+                "GET",
+                "container.googleapis.com",
+                "v1/projects/sample-project/locations/us-central1/clusters/host-cluster",
+                b"",
+                sub,
+                universe_domain=custom,
+            ).allowed
+        )
+        self.assertFalse(
+            h.watcher_policy.evaluate_pubsub(
+                "POST",
+                "pubsub.googleapis.com",
+                f"v1/{sub}:pull",
+                b'{"maxMessages":1}',
+                frozenset({sub}),
+                universe_domain=custom,
+            ).allowed
+        )
+        for srv in h.mcp_policy.MCP_SERVERS:
+            resolved = h.mcp_policy.server(srv.name, universe_domain=custom)
+            self.assertIsNotNone(resolved)
+            assert resolved is not None
+            self.assertFalse(
+                resolved.host.endswith(".googleapis.com"),
+                f"mcp_policy resolved {srv.name} to commercial {resolved.host} under {custom}",
+            )
+
+    def test_C2_a_universe_domain_under_googleapis_com_is_refused(self) -> None:
+        """A universe domain under `googleapis.com` is refused, and no relay serves its hosts.
+
+        `<service>.mtls.googleapis.com` is a host of the commercial universe.
+        As a universe domain, `mtls.googleapis.com` would pass the rule that a
+        custom universe refuses the commercial hosts while every request stays
+        in the commercial universe under other host names. The value is refused
+        where every reader normalises it, so the broker does not start with it,
+        and the relay evaluators have no host for it.
+        """
+        under = "mtls.googleapis.com"
+        client = h.credential_proxy.credential_proxy_client
+        with self.assertRaises(ValueError):
+            client.normalize_universe_domain(under)
+        with self.assertRaises(ValueError):
+            h.credential_proxy.resolve_universe_domain(environ={client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV: under})
+
+        api = h.credential_proxy.api_policy
+        for route in api.API_READ_ROUTES:
+            host = route.host.replace(".googleapis.com", f".{under}")
+            with self.subTest(api_host=host, rule=route.rule_id):
+                decision = api.evaluate("GET", host, "no/such/path", "", universe_domain=under)
+                self.assertFalse(decision.allowed)
+                # gcp.api.path here would mean the policy has a route for this host.
+                self.assertEqual(api.RULE_HOST, decision.rule_id)
+        for srv in h.mcp_policy.MCP_SERVERS:
+            self.assertIsNone(
+                h.mcp_policy.server(srv.name, universe_domain=under),
+                f"mcp_policy resolved {srv.name} under {under}",
+            )
+        # The commercial domain itself is still the default universe.
+        self.assertEqual(client.DEFAULT_UNIVERSE_DOMAIN, client.normalize_universe_domain("googleapis.com"))
+
+    def test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts(self) -> None:
+        """A universe domain from the environment is held to the metadata server's answer.
+
+        The environment's value decides which hosts get the broker's credential.
+        A value that the host's metadata server contradicts would send that
+        credential to another universe, or to commercial hosts under other
+        names (`clients6.google.com` is well-formed and is not under
+        `googleapis.com`). The start check refuses it, in both directions; a
+        value the metadata server confirms, and a host with no universe route,
+        start as before.
+        """
+        proxy = h.credential_proxy
+
+        def check(configured, answer):
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answer
+            try:
+                proxy.check_universe_domain_against_metadata(configured, sleep=lambda _s: None)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                with self.assertRaises(RuntimeError):
+                    check(configured, (reported, True))
+        check("universe.example.test", ("universe.example.test", True))
+        check("universe.example.test", (None, True))
+
+    def test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts(self) -> None:
+        """A start with no answer from the metadata server does not leave the value unchecked.
+
+        With no answer at its start the broker serves with the environment's
+        value. It asks the metadata server again until it answers, and an
+        answer that differs stops the broker with the error of the start check:
+        the credential must not go on to that domain's hosts. An answer that
+        agrees, and a host with no universe route, stop nothing.
+        """
+        proxy = h.credential_proxy
+
+        def recheck(configured, later):
+            stopped: list[str] = []
+            answers = [(None, False), later]
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answers.pop(0)
+            try:
+                proxy.recheck_universe_domain(configured, sleep=lambda _s: None, stop=stopped.append)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+            return stopped
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                stopped = recheck(configured, (reported, True))
+                self.assertEqual(1, len(stopped))
+                self.assertIn(repr(configured), stopped[0])
+                self.assertIn(repr(reported), stopped[0])
+        self.assertEqual([], recheck("universe.example.test", ("universe.example.test", True)))
+        self.assertEqual([], recheck("universe.example.test", (None, True)))
+
 
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
@@ -2952,6 +3404,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("apps", "statefulsets"),
         ("batch", "jobs"),
         ("coordination.k8s.io", "leases"),
+        ("kubeagents.x-k8s.io", "agentschedules"),
         ("kubeagents.x-k8s.io", "dispatchjobtemplates"),
         ("networking.gke.io", "fqdnnetworkpolicies"),
         ("networking.k8s.io", "networkpolicies"),
@@ -2960,7 +3413,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("rbac.authorization.k8s.io", "roles"),
     })
     OPERATOR_NAMESPACED_READ_KINDS = frozenset()
-    # The two namespaces the chart binds the Role in under mode next: the
+    # The two namespaces the chart binds the Role in, in every mode: the
     # release namespace and its profile namespace.
     OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
     HELM_MODE_NEXT = "platformAgent.mode=next"

@@ -96,7 +96,8 @@ IPV6_CANDIDATE_PATTERN = re.compile(
 COUNT_NAME_CREDENTIAL = "credential"
 COUNT_NAME_EMAIL = "email"
 REDACTED_SECRET_MARKER = "[REDACTED_SECRET]"
-CREDENTIAL_MARKERS = (REDACTED_SECRET_MARKER, "[REDACTED_PRIVATE_KEY]")
+REDACTED_PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]"
+CREDENTIAL_MARKERS = (REDACTED_SECRET_MARKER, REDACTED_PRIVATE_KEY_MARKER)
 EMAIL_MARKER = "[REDACTED_EMAIL]"
 # Every built-in and rule mask marker starts with this. A value that already
 # holds one is left alone rather than masked again, which is what used to turn
@@ -215,10 +216,19 @@ class RedactionRule:
 class AuditRedactor:
     """Stateless regex and dictionary redactor for secrets and PII."""
 
+    # A private key block: its BEGIN line, any text, its END line. The END
+    # line names nothing of the BEGIN line: no group of one is read in the
+    # other, and the key kinds may differ. `mask_private_keys` relies on
+    # that. It masks with the two halves in one pass. The whole pattern takes
+    # its text from the halves, so the three texts cannot drift; the three
+    # must also keep the same flags, which the tests hold. The whole pattern
+    # stays a compiled pattern for the code that searches with it; a search
+    # with it has the quadratic cost that `mask_private_keys` avoids.
+    PRIVATE_KEY_LINE_REST = r"(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----"
+    PRIVATE_KEY_BEGIN_PATTERN = re.compile(r"-----BEGIN\s+" + PRIVATE_KEY_LINE_REST, re.IGNORECASE)
+    PRIVATE_KEY_END_PATTERN = re.compile(r"-----END\s+" + PRIVATE_KEY_LINE_REST, re.IGNORECASE)
     PRIVATE_KEY_PATTERN = re.compile(
-        r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----"
-        r"[\s\S]*?"
-        r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----",
+        PRIVATE_KEY_BEGIN_PATTERN.pattern + r"[\s\S]*?" + PRIVATE_KEY_END_PATTERN.pattern,
         re.IGNORECASE,
     )
     GCP_API_KEY_PATTERN = re.compile(r"AIza[0-9A-Za-z\-_]{35}")
@@ -254,9 +264,24 @@ class AuditRedactor:
     #   stay readable.
     # - The scheme is capped so a long alphanumeric run is not rescanned from
     #   every position.
+    # - Either part may also hold a JSON escape, whole: `\uXXXX`, `\\` and
+    #   `\/` in either, and `\"` in the password only. Go's encoder writes
+    #   `&`, `<` and `>` as `\u0026`, `\u003c` and `\u003e`, and any encoder
+    #   a `"` or a `\` in a password as `\"` or `\\`, so a password printed
+    #   inside JSON is still matched. The control escapes (`\n`, `\t` and the
+    #   rest) stop the match, as the whitespace they stand for does, so it
+    #   can't run from a `host:port` across a line to a later `@`; and a `\"`
+    #   can't sit in the user, so it can't run across a closing quote and a
+    #   key's `:` in escaped JSON.
+    #   The scheme may also start right after an escape: `\b` already holds
+    #   there, but it would count the escape's letters into the capped scheme
+    #   (`\u0026` plus a long scheme), so the escape itself is a boundary too.
+    #   This only widens the match; nothing the pattern took before is left.
     URL_PASSWORD_PATTERN = re.compile(
-        r"\b([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)"
-        r"([^\s/?#\[\]\"'<>{}\\|^`,;]+)@"
+        r"(?:\b|(?<=\\[ntrbf\"/\\])|(?<=\\u[0-9a-fA-F]{4}))"
+        r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://"
+        r"(?:[^\s:/?#@\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\\/]))*:)"
+        r"((?:[^\s/?#\[\]\"'<>{}\\|^`,;]|\\(?:u[0-9a-fA-F]{4}|[\"\\/]))+)@"
     )
     # The three token shapes this redactor was missing that `redact_secrets` in
     # agents/platform/skills/fleet-audit/scripts/audit_report.py already had.
@@ -569,7 +594,11 @@ class AuditRedactor:
             return text
 
         def redact_string(match: "re.Match[str]") -> str:
-            literal = match.group(0)
+            # A URL password first, on the literal itself, where it is still
+            # escaped: decoded, a `\"` in it is a raw quote the URL shape
+            # stops at, and the rest of the line would then read as an email
+            # address with part of the password left before it.
+            literal = cls.URL_PASSWORD_PATTERN.sub(cls._mask_url_password, match.group(0))
             if not any(escape in literal for escape in cls.JSON_NESTED_ESCAPES):
                 return literal
             try:
@@ -835,9 +864,37 @@ class AuditRedactor:
         return rules
 
     @classmethod
+    def mask_private_keys(cls, text: str) -> str:
+        """`text` with each private key block masked, as `PRIVATE_KEY_PATTERN.sub` masks it, in one pass.
+
+        The pattern's `sub` reads to the end of the text from each BEGIN line
+        that no END line follows, so its time is quadratic on a text that
+        repeats a key header. Here the END line is looked for once, from the
+        first BEGIN line behind the last masked block. With none, no later
+        BEGIN line has one either: an END line behind a later BEGIN line is
+        also behind this one, and the END pattern does not depend on what a
+        BEGIN line held. This function calls no Python function, so a caller
+        is one Python frame deeper than with `sub` and no more.
+        """
+        pieces: List[str] = []
+        done = 0
+        while True:
+            begin = cls.PRIVATE_KEY_BEGIN_PATTERN.search(text, done)
+            if begin is None:
+                break
+            end = cls.PRIVATE_KEY_END_PATTERN.search(text, begin.end())
+            if end is None:
+                break
+            pieces.append(text[done : begin.start()])
+            pieces.append(REDACTED_PRIVATE_KEY_MARKER)
+            done = end.end()
+        pieces.append(text[done:])
+        return "".join(pieces)
+
+    @classmethod
     def _redact_credentials(cls, text: str) -> str:
         text = cls._redact_nested_json_strings(text)
-        text = cls.PRIVATE_KEY_PATTERN.sub("[REDACTED_PRIVATE_KEY]", text)
+        text = cls.mask_private_keys(text)
         text = cls._redact_secret_blocks(text)
         text = cls._redact_json_credential_data(text)
         text = cls._redact_env_pairs(text)

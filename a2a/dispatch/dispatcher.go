@@ -52,6 +52,9 @@ const (
 	abandonWithdrawn    = "offer withdrawn: the accept came after the dispatcher stopped waiting"
 	abandonTimedOut     = "offer withdrawn: no accept within the accept window"
 	abandonLeaseExpired = "lease expired: the dispatcher heard no renewal in time"
+	// abandonTierEnded is the abandon reason sent a worker whose task's tier
+	// an administrator ended the drain of (#5850).
+	abandonTierEnded    = "the tier's drain was ended by an administrator"
 	abandonStopping     = "offer withdrawn: the dispatcher is stopping"
 	abandonUnrecorded   = "offer withdrawn: the dispatcher could not record the lease"
 	abandonNoCredential = "offer withdrawn: the dispatcher could not mint the task's credentials"
@@ -106,16 +109,29 @@ type holding struct {
 	// onJob is a task run on a Job of its own (job.go), whose Job endJob
 	// deletes; a pool task has none.
 	onJob bool
+	// permitJob is a permit-carrying task's own Job at a tier whose runner
+	// is its warm pool (#5646). That tier's breaker guards the pool, so this
+	// task never waits on it, is never its probe, and its end or lost worker
+	// never opens or closes it.
+	permitJob bool
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
 	// cluster is the cluster admission checked the task against, nil when
 	// it names none: the target of its credential-proxy token (#3889).
 	cluster *taskcred.Target
+	// changeRequested is the submission's ChangeRequested: whether its
+	// credential-proxy token carries the vcs:proposal-create permit (#3993).
+	changeRequested bool
 	// trigger is the trigger the verifier found equal to the grant's, nil
 	// when the submission names none: its credential-proxy token carries it
-	// (#4685).
+	// (#4685), and with no cluster at the unattended tier it is what makes
+	// that token a report credential (#5619).
 	trigger *taskcred.Trigger
+	// script is the helper script the task runs, resolved at admission from
+	// the profile's spec.scripts (#5622), nil for a model task. The confirm
+	// carries it.
+	script *lib.DispatchScript
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -135,6 +151,10 @@ type holding struct {
 	// when hold starts, wakes hold for it.
 	stopRequested bool
 	stopc         chan struct{}
+	// tierEnded is an administrator ending the drain of this task's tier
+	// (syncEndingTiers, #5850): the hold ends the task at once, and so does
+	// runJob for a task whose Job is still starting (#6134).
+	tierEnded bool
 
 	renewals chan renewal
 	done     chan struct{}
@@ -241,6 +261,16 @@ type Dispatcher struct {
 	bg sync.WaitGroup
 	// droppedAnswers counts answers dropped over a pod's budget.
 	droppedAnswers atomic.Int64
+	// supervisorGiveUps counts profile tasks settled without a terminal on a
+	// latched install (terminalGivenUp, #5301).
+	supervisorGiveUps atomic.Int64
+	// refusals hears the server refusing a terminal publish for the
+	// connection's permissions, the one failure terminalGivenUp's bound
+	// counts.
+	refusals publishRefusals
+	// publishAck, set (tests only), stands in for lib.Client.PublishAck on
+	// the terminal's publishes.
+	publishAck func(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error)
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
@@ -385,7 +415,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	// The connection was made against the config as it stands now.
 	for _, p := range d.src.Config().Profiles {
 		d.grantedProfiles[p.Name] = true
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			d.granted[dur.Name] = true
 		}
 	}
@@ -405,6 +435,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 	d.syncBindings(ctx)
 	d.syncStops()
+	d.syncEndingTiers()
 	defer d.stopAllStops()
 	refresh := time.NewTicker(d.cfg.RefreshInterval)
 	defer refresh.Stop()
@@ -421,6 +452,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-refresh.C:
 			d.syncBindings(ctx)
 			d.syncStops()
+			d.syncEndingTiers()
 			// The stream reads run off the loop, one pass at a time.
 			if rechecking.CompareAndSwap(false, true) {
 				d.bg.Add(1)
@@ -498,7 +530,7 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 		if !d.grantedProfiles[p.Name] {
 			addedProfiles[slot] = append(addedProfiles[slot], p.Name)
 		}
-		for _, dur := range p.Durables {
+		for _, dur := range p.DerivedDurables() {
 			want[dur.Name], durables[dur.Name] = p.Name, dur
 			if !d.granted[dur.Name] {
 				added[slot] = append(added[slot], dur.Name)
@@ -821,7 +853,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// as a probe: it is never stamped as one, so its end can't close the
 	// breaker while the probe runs.
 	family := d.probesChild(prof.Name, tier, kind, del.Envelope().CorrelationID)
-	h, why := d.reserve(snap, prof, tier, kind, taskID)
+	h, why := d.reserve(snap, prof, tier, kind, taskID, d.permitJobOffPool(prof, tier, adm.changeRequested, adm.cluster))
 	if h != nil {
 		// A stop heard since admission read the stream (onStop marks only
 		// the holdings it finds, and this one is new): mark it, so the
@@ -849,24 +881,39 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
-	h.cluster = adm.cluster
+	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 	h.trigger = adm.trigger
+	h.script = adm.script
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && prof.HasJobTemplate() {
+	// A permit-carrying task runs only in its own one-pod Job, at any tier
+	// and of any kind (#5646): admission refused one with no Job runner for
+	// its tier (change-needs-job), and the mint gives a pool pod no permit.
+	if (h.unattended || carriesPermit(h.changeRequested, h.cluster)) && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
-			// The Job path ended the task itself (no worker): it no
+			// The Job path ended the task itself (no worker, or its tier
+			// ended while the Job started): it no
 			// longer waits.
 			d.clearWaiting(hk)
 			return
 		}
 	} else {
+		// A submission is replaced under the same subject (admission reads
+		// changeRequested from each delivery), so an earlier pass may have
+		// launched a Job for this task while it carried a permit. That Job
+		// goes before the task is offered to a pool pod, or its pod would wait
+		// for an offer until its deadline, outside every cap. Attempted under
+		// Job mode (the config carries jobLabels) whatever the profile's
+		// template says now; without it the dispatcher has no Jobs Role.
+		if len(snap.JobLabels) > 0 {
+			d.dropUnstartedJob(ctx, log, hk)
+		}
 		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	}
 	if errors.Is(err, errStopped) {
@@ -942,8 +989,10 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 // written the refusal stands, so its terminal is owed even to a stop, for up
 // to reportAfterStop; one still unpublished then (or lost to a crash) stays
 // unpublished, since the redelivery finds the tombstone and is acked as a
-// replay. A repeat terminal is a duplicate the stream drops (its envelope id
-// is fixed).
+// replay. A repeat terminal after a lost ack is a duplicate the stream drops
+// on the five-token form (its envelope id is fixed per task); on the
+// six-token form, whose id is drawn again after a failed send, it can be a
+// second identical final status, which readers fold past.
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
 	d.endUnstarted(ctx, log, del, hk, lib.StateRejected, ref)
 }
@@ -960,9 +1009,13 @@ func (d *Dispatcher) endUnstarted(ctx context.Context, log *slog.Logger, del lib
 	defer cancel()
 	// A stop leaves the terminal reportAfterStop more to land.
 	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
+	var refused terminalRefusal
 	for {
-		err := d.publishTerminal(pctx, hk, del.Envelope(), state, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, &refused, hk, del.Envelope(), state, ref.reason, ref.detail)
 		if err == nil {
+			break
+		}
+		if d.terminalGivenUp(log, &refused, err, state, ref.reason) {
 			break
 		}
 		log.Warn("publish the rejection terminal; retrying", "err", err)
@@ -1001,7 +1054,7 @@ const capHeld = "already held here"
 // failed for it: it stays queued. A submission already held here (a second
 // delivery that raced the first past handle's check) is refused as capHeld,
 // never given a second holding.
-func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string) (*holding, string) {
+func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, tier, kind, taskID string, permitJob bool) (*holding, string) {
 	unattended := d.cfg.unattendedFor(prof, tier)
 	shared := snap.Ceiling - snap.ChildReserve - snap.InteractiveReserve
 
@@ -1045,8 +1098,10 @@ func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, 
 		return nil, "the free slots are reserved for other kinds"
 	}
 	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: taskID, unattended: unattended,
-		probe:    d.breakers.probeEpoch(prof.Name, tier, d.now()),
-		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+		permitJob: permitJob, renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+	if !permitJob {
+		h.probe = d.breakers.probeEpoch(prof.Name, tier, d.now())
+	}
 	d.active[hk] = h
 	return h, ""
 }
@@ -1234,7 +1289,7 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		// can't be minted (the pod's UID changed, or the signer failed)
 		// is an offer withdrawn, as a declined one is: nothing is
 		// written, and the next pod is tried.
-		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
+		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID, Script: h.script}
 		if d.mint != nil {
 			var err error
 			confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)
@@ -1248,7 +1303,8 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
 			ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
-			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
+			OnJob: h.onJob}
 		if err := d.putLease(ctx, key, rec); err != nil {
 			// Unrecorded, the task can't be confirmed: a restart
 			// would not know it had started.
@@ -1283,13 +1339,19 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 
 // taskCredentials mints the task credential (audience nats) and, when the
 // task names a cluster, the credential-proxy token for the pod being
-// confirmed (#3889). A checked trigger on a task with no cluster is logged
-// as dropped. Both name the task, its profile and tier, the pod and
-// the UID it had at the offer; a pod whose UID has changed since (deleted
+// confirmed (#3889). A task that names no cluster gets a credential-proxy
+// token only as a report credential (#5619): at the unattended tier with a
+// checked trigger, and then with no target, which the broker holds to the
+// audit-report routes. Any other checked trigger on a task with no cluster
+// is logged as dropped, and nothing is minted for it. Both name the task,
+// its profile and tier, the pod and the UID it had at the offer; a pod whose UID has changed since (deleted
 // and re-created under its name) is not the pod that accepted, and gets
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
-// refuses one as too long-lived. Each is read back with the key's public
+// refuses one as too long-lived. The proxy token carries the
+// vcs:proposal-create permit when the submission asked for a change and the
+// task runs on a Job of its own (#5646), and no permits claim at all
+// otherwise (#3993); the bus credential never carries one. Each is read back with the key's public
 // half before it is used, and only its jti is logged, never the token.
 func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
 	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
@@ -1306,15 +1368,37 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 		return "", "", err
 	}
 	if h.cluster != nil {
-		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
+		proxy := base
+		// The permit goes only on a Job's pod, the task's alone. A pool
+		// pod runs the next task too, so a permit task that reached one
+		// (admission refuses it) is minted no permit, and its writes are
+		// refused.
+		if carriesPermit(h.changeRequested, h.cluster) {
+			if h.onJob {
+				proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+			} else {
+				log.Error("a task with a confirmed change reached a pool pod; minting no write permit", "task", h.taskID, "profile", h.profile, "tier", h.tier)
+			}
+		}
+		proxyToken, err = d.mintOne(log, proxy, taskcred.AudienceCredentialProxy, h.cluster, h.trigger, now)
+		if err != nil {
+			return "", "", err
+		}
+	} else if h.trigger != nil && h.tier == taskcred.ReportTier {
+		// A report credential (#5619): an unattended task a trigger started,
+		// naming no cluster, so there is nothing to confine it to. The
+		// broker takes it on the audit-report routes alone. The tier is the
+		// literal one taskcred and the broker require, not any
+		// unattended-mode tier: a grant binds a trigger only at it.
+		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, nil, h.trigger, now)
 		if err != nil {
 			return "", "", err
 		}
 	} else if h.trigger != nil {
-		// Admission checked the trigger, but only the credential-proxy token
-		// carries one, and a task that names no cluster gets none. Said, not
-		// silent, until a cluster-less report credential exists (#5619).
-		log.Warn("trigger dropped: the task names no cluster, so no credential-proxy token carries it", "trigger", h.trigger.Name, "pod", pod)
+		// Admission checked the trigger, but a grant binds one only at the
+		// unattended tier, so this shouldn't happen. Said, not silent, and
+		// nothing is minted: a credential with no target confines nothing.
+		log.Warn("trigger dropped: the task names no cluster and is not at the unattended tier, so no credential-proxy token carries it", "trigger", h.trigger.Name, "tier", h.tier, "pod", pod)
 	}
 	return natsToken, proxyToken, nil
 }
@@ -1338,7 +1422,7 @@ func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.A
 	if err != nil {
 		return "", fmt.Errorf("the %s credential just minted does not verify: %w", aud, err)
 	}
-	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires)
+	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires, "permits", back.Permits)
 	return token, nil
 }
 
@@ -1374,8 +1458,16 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier), onJob: d.cfg.jobPossible(prof, hk.tier) && d.jobs != nil,
-		lease: lease, renew: renew, pod: pod, confirmed: true,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattendedFor(prof, hk.tier),
+		// The record says (#5646); one from an older dispatcher doesn't, and
+		// its task ran on a Job only at an unattended tier. A delete of a Job
+		// never made is no error.
+		onJob: d.jobs != nil && (rec.OnJob || d.cfg.jobPossible(prof, hk.tier)),
+		// A Job at a tier that isn't unattended is a permit-carrying task's
+		// alone, which stays clear of the pool's breaker as it did before
+		// the restart.
+		permitJob: rec.OnJob && !d.cfg.unattendedFor(prof, hk.tier),
+		lease:     lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()
 	if first := d.active[hk]; first != nil {
@@ -1433,10 +1525,19 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 	if h.stopRequested {
 		stopAt = stopDeadline(d.src.Config(), d.now())
 	}
+	ended := h.tierEnded
 	d.mu.Unlock()
+	if ended { // marked before the hold began, or a re-adopted task
+		d.endTierHeld(ctx, log, del, h, key, rec)
+		return
+	}
 	for {
 		select {
 		case <-h.stopc:
+			if d.tierEndedOn(h) {
+				d.endTierHeld(ctx, log, del, h, key, rec)
+				return
+			}
 			if stopAt.IsZero() {
 				stopAt = stopDeadline(d.src.Config(), d.now())
 				log.Info("stop requested; the executor has a grace to end the task", "until", stopAt)
@@ -1451,7 +1552,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
-				if !d.stopRequestedOn(h) {
+				if !d.stopRequestedOn(h) && !h.permitJob {
 					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.settle(ctx, log, del, h, key, rec)
@@ -1471,7 +1572,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// against 90s), so a worker that went silent on the stop is
 				// counted here: silent for a renewal and a tick is a worker
 				// lost, and a stop must not hide one.
-				if !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
+				if !h.permitJob && !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
 					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
 				}
 				d.stopHeld(ctx, log, del, h, key, rec)
@@ -1482,7 +1583,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// Its worker renewed to the end, so it was no worker loss: the
 				// probe of this opening closes the breaker as on a finish. A
 				// stopped task never closes it.
-				if !d.stopRequestedOn(h) {
+				if !d.stopRequestedOn(h) && !h.permitJob {
 					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
@@ -1497,8 +1598,11 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// Counted even for a stopped task: a worker lost is a worker
 				// lost, and a stop must not hide one (stopping each poisoned
 				// task would keep the breaker shut). Only closing is denied
-				// a stopped task.
-				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				// a stopped task. A permit Job at a pool's tier is not the
+				// pool's worker, so it isn't counted on the pool's breaker.
+				if !h.permitJob {
+					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				}
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))
 				return
@@ -1543,30 +1647,43 @@ func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Deliv
 }
 
 // publishTerminalRetry publishes a held task's terminal until it lands or
-// ctx ends, and says whether the task may be settled: it landed, or its
-// profile has been gone from the install config for DroppedTerminalGiveUp.
-// A dropped profile's .supervisor grant goes at the next reconnect, so its
-// terminal could be refused for good; it is given up on, logged as an
-// error, and the task settled anyway, rather than hold its slot until a
-// restart. A profile still listed is retried for as long as it takes.
+// ctx ends, and says whether the task may be settled: it landed, its profile
+// has been gone from the install config for DroppedTerminalGiveUp, or, on a
+// latched install, the server has refused the terminal for DroppedTerminalGiveUp
+// (terminalGivenUp). A dropped profile's .supervisor grant goes at the next
+// reconnect, so its terminal could be refused for good; it is given up on,
+// logged as an error, and the task settled anyway, rather than hold its slot
+// until a restart. That check comes first, so a dropped profile keeps its own
+// log line on a latched install too, and not terminalGivenUp's
+// terminal-unpublished. On an unlatched install a profile still listed is
+// retried for as long as it takes, as before the six-token form.
 func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
 	var droppedAt time.Time
+	var refused terminalRefusal
 	for {
 		// Each attempt is bounded on its own: a refused publish is never
 		// acked, and the caller's context may have no deadline at all.
 		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
-		err := d.publishTerminal(actx, h.key(), del.Envelope(), state, reason, detail)
+		err := d.publishTerminal(actx, &refused, h.key(), del.Envelope(), state, reason, detail)
 		cancel()
 		if err == nil {
 			return true
 		}
-		if _, listed := profileOf(d.src.Config(), h.profile); listed {
+		_, listed := profileOf(d.src.Config(), h.profile)
+		switch {
+		case listed:
 			droppedAt = time.Time{}
-		} else if droppedAt.IsZero() {
+		case droppedAt.IsZero():
 			droppedAt = d.now()
-		} else if d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp {
+		case d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp:
 			log.Error("gave up on the terminal of a task whose profile left the install config; settling it without one",
 				"state", state, "reason", reason, "after", d.cfg.DroppedTerminalGiveUp, "err", err)
+			return true
+		}
+		// A dropped profile's refusals are its own bound's, above.
+		if !listed {
+			refused.since = time.Time{}
+		} else if d.terminalGivenUp(log, &refused, err, state, reason) {
 			return true
 		}
 		log.Warn("publish the failure terminal; retrying", "err", err)
@@ -1574,6 +1691,60 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 			return false
 		}
 	}
+}
+
+// terminalRefusal is one terminal's retry state across its attempts: the
+// start of its run of permission refusals, for terminalGivenUp's bound, and
+// the six-token terminal's envelope id (sixTokenTerminalID), drawn on the
+// first attempt and again after any attempt that fails (publishTerminal).
+type terminalRefusal struct {
+	since time.Time
+	id    string
+}
+
+// terminalGivenUp decides, after a failed terminal publish, whether to stop
+// retrying and settle the task without a terminal (#5301). Only a latched
+// install (the dispatch config's six-token profileSupervisorForm) gives up:
+// there the five-token form is no profile task's terminal past the readers'
+// cutoff, so there is nothing to fall back to, and a refusal that outlasts
+// DroppedTerminalGiveUp (a grant that never reached the connection) would
+// otherwise hold the task's slot until a restart. Only a permission refusal
+// counts (errSupervisorPublishRefused: the server refused the six-token
+// publish while the attempt ran): the bound starts at the first and runs
+// while every failed attempt is one. Any other failure (a disconnect, no
+// responders, a timeout with no refusal, a JetStream API error) resets it, so
+// a NATS or TASKS outage of any length is retried and the terminal lands
+// after it. An unlatched install keeps retrying, as it always has. A
+// duplicate ack is never a failure: the six-token terminal's id is random per
+// retry loop (sixTokenTerminalID), so a duplicate is that loop's own send.
+//
+// Giving up is loud: the Error log names ReasonTerminalUnpublished, and the
+// health line counts it (supervisorGiveUps). The requester sees no terminal;
+// the gateway ends a task with no events as never started, and holds one with
+// executor events until the user's stop.
+func (d *Dispatcher) terminalGivenUp(log *slog.Logger, r *terminalRefusal, err error, state lib.TaskState, reason string) bool {
+	if d.src.Config().ProfileSupervisorForm != lib.ProfileSupervisorFormProfile || !errors.Is(err, errSupervisorPublishRefused) {
+		r.since = time.Time{}
+		return false
+	}
+	now := d.now()
+	if r.since.IsZero() {
+		r.since = now
+		return false
+	}
+	if now.Sub(r.since) < d.cfg.DroppedTerminalGiveUp {
+		return false
+	}
+	d.giveUpTerminal(log, state, reason, d.cfg.DroppedTerminalGiveUp, err)
+	return true
+}
+
+// giveUpTerminal records a task settled without its terminal: counted and
+// logged at Error under ReasonTerminalUnpublished.
+func (d *Dispatcher) giveUpTerminal(log *slog.Logger, state lib.TaskState, reason string, after time.Duration, err error) {
+	d.supervisorGiveUps.Add(1)
+	log.Error("gave up on a profile task's terminal on the six-token supervisor subject; settling it without one, and the requester sees no end until a stop",
+		"settle", ReasonTerminalUnpublished, "state", state, "reason", reason, "after", after, "err", err)
 }
 
 // settle ends a task whose outcome is decided (its final renewal came, or
@@ -2043,14 +2214,14 @@ func submitRetention(cfg lib.DispatchConfig) time.Duration {
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
-// config lists is bound. Callers hold d.mu.
+// config derives is bound. Callers hold d.mu.
 func (d *Dispatcher) tierBoundLocked(cfg lib.DispatchConfig, profile, tier string) bool {
 	prof, ok := profileOf(cfg, profile)
 	if !ok {
 		return false
 	}
 	n := 0
-	for _, dur := range prof.Durables {
+	for _, dur := range prof.DerivedDurables() {
 		if dur.Tier != tier {
 			continue
 		}

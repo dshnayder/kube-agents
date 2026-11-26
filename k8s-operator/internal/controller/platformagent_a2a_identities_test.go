@@ -224,9 +224,12 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // connect on every install; seed is applied rather than rendered, so
 // dropping its user would break an object already running on installs today;
 // and console is web's reason again -- a browser holds no ServiceAccount
-// token -- with its one write narrowed to a single subject rather than
-// widened into a second read credential. A seventh name here means someone
-// added a principal without asking whether it could have an identity.
+// token -- with its writes narrowed to two subjects rather than widened
+// into a second read credential; console-mcp is console's reason in a
+// different shape: the MCP pod holds no ServiceAccount token (it never talks
+// to the API server), and it is console less the confirm door. An eighth
+// name here means someone added a principal without asking whether it could
+// have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	var got []string
 	for _, id := range staticIdentities(identityTestAgent()) {
@@ -528,6 +531,48 @@ func TestTheCardStopIsOptInThroughTheOperator(t *testing.T) {
 	}
 }
 
+// The delegation rounds a profile task may use (#6789) render onto the
+// gateway explicitly at 1, the only value supported, whatever the operator
+// carries; any other value on the operator is refused by name, saying rounds
+// above 1 are not supported yet when it is one.
+func TestTheDelegationRoundsRenderAtOneAndAnythingElseIsRefused(t *testing.T) {
+	agent := a2aTestAgent()
+	rounds := func() (corev1.EnvVar, bool) {
+		t.Helper()
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "A2A_DELEGATION_ROUNDS_MAX" {
+				return e, true
+			}
+		}
+		return corev1.EnvVar{}, false
+	}
+	for _, set := range []string{"", "1", " 1 "} {
+		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", set)
+		if e, ok := rounds(); !ok || e.Value != "1" {
+			t.Errorf("operator %q: gateway renders %+v (%v), want A2A_DELEGATION_ROUNDS_MAX=1", set, e, ok)
+		}
+		if err := ValidateA2ADelegationRoundsMax(); err != nil {
+			t.Errorf("operator %q refused: %v", set, err)
+		}
+	}
+	for _, tc := range []struct{ set, want string }{
+		{"2", "rounds above 1 are not supported yet"},
+		{"16", "rounds above 1 are not supported yet"},
+		{"0", "need an integer"},
+		{"-1", "need an integer"},
+		{"junk", "need an integer"},
+	} {
+		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", tc.set)
+		if e, ok := rounds(); !ok || e.Value != "1" {
+			t.Errorf("operator %q: gateway renders %+v (%v), want 1", tc.set, e, ok)
+		}
+		err := ValidateA2ADelegationRoundsMax()
+		if err == nil || !strings.Contains(err.Error(), "A2A_DELEGATION_ROUNDS_MAX") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("operator %q: err %v, want one naming the variable and %q", tc.set, err, tc.want)
+		}
+	}
+}
+
 // The credential A5 retired, refused by name at the render.
 //
 // Three routes could bring it back and two of them would be quiet. A
@@ -604,9 +649,11 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 }
 
 // TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow is the guard renderA2APermission
-// names, and it exists because a deny list has two ways to reach the server as
-// nothing at all -- neither of which fails, logs, or changes the rendered config
-// in a way a reader would notice.
+// names, and it exists because a deny list without an allow beside it doesn't
+// narrow the principal the way its author meant. For a static principal that is
+// silent: nothing fails, logs, or changes the rendered config in a way a reader
+// would notice. For a callout principal it is loud, a refused map, but still
+// not what was meant.
 //
 //  1. STATIC principals. renderA2APermission renders a direction with no allow
 //     entries as `deny = [">"]` and drops the author's deny list on the floor.
@@ -625,14 +672,16 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 //     directions. That path is the $SYS exemption working as intended and is
 //     why the check below is on the identity table rather than on the block.
 //
-//  2. CALLOUT principals. renderA2AAuthMap copies id.publish and id.subscribe
-//     into a2aAuthMapGrants, which has no deny field of any spelling. A deny on
-//     a callout identity is dropped before the JWT is minted, unconditionally,
-//     whether or not an allow sits beside it.
+//  2. CALLOUT principals. Since #5301 renderA2AAuthMap carries a callout
+//     identity's denies into its map grants, and the callout writes them into
+//     the minted JWT. But it refuses an entry whose allow side is empty
+//     whatever it denies (the server reads an empty allow as unrestricted), so
+//     a deny without an allow beside it fails the whole map, which is louder
+//     but still not what the author meant.
 //
 // Neither is live today: the deny lists in the table (gateway, bridge, web,
-// console) sit on static principals with allows in the same direction, which
-// is the case that renders correctly. The point is that nothing stops the next
+// console) sit on principals with allows in the same direction, which is the
+// case that renders correctly. The point is that nothing stops the next
 // one. Every deny in this table is an operator-authored constant --
 // capDenyPublish, capDenySubscribe, and web's and console's literals -- so this
 // test sees all of them, which is what makes a test the right place for the
@@ -666,7 +715,9 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 			"measures nothing")
 	}
 
-	for _, id := range a2aIdentities(agent) {
+	// The gateway's map entry too (gatewayCalloutEntry, #5301): the one
+	// callout principal that carries denies, and only in the map.
+	for _, id := range append(a2aIdentities(agent), gatewayCalloutEntry(agent)) {
 		for _, d := range []struct {
 			kind  string
 			allow []string
@@ -678,10 +729,14 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 			if len(d.deny) == 0 {
 				continue
 			}
-			if id.auth == a2aAuthCallout {
-				t.Errorf("callout principal %q carries a %s deny %v: renderA2AAuthMap copies only the "+
-					"allow lists into a2aAuthMapGrants, so this never reaches the minted JWT and the "+
-					"principal is granted the allow list unsubtracted", id.user, d.kind, d.deny)
+			if id.auth == a2aAuthCallout && id.narrowing != "" {
+				t.Errorf("callout principal %q narrows on %q and carries a %s deny %v: a narrowed entry's grants "+
+					"are derived and may carry none, so the map is refused", id.user, id.narrowing, d.kind, d.deny)
+				continue
+			}
+			if id.auth == a2aAuthCallout && len(d.allow) == 0 {
+				t.Errorf("callout principal %q carries a %s deny %v with no %s allow: the callout refuses "+
+					"an entry with an empty allow side, so this fails the whole map", id.user, d.kind, d.deny, d.kind)
 				continue
 			}
 			if len(d.allow) == 0 {

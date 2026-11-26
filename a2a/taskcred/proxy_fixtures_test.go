@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,11 +26,13 @@ import (
 // verifies the same file, so a change to either verifier that moves a verdict
 // fails one of them.
 //
-// The two verdicts differ only where the proxy is deliberately stricter:
-// a credential with no target (Verify accepts it for this audience; a proxy
-// credential with no target confines nothing), and the encodings the Python
-// verifier refuses (non-canonical base64url, a JSON null, header keys beyond
-// typ and alg).
+// The two verdicts differ only where the proxy is deliberately stricter: the
+// encodings the Python verifier refuses (non-canonical base64url, a JSON
+// null, header keys beyond typ and alg). A credential with no target is
+// refused by both unless it is a report credential (tier unattended and a
+// trigger, #5619): a proxy credential with no target confines nothing, and
+// Verify holds the same rule so the dispatcher never mints a shape the proxy
+// refuses.
 //
 // To regenerate after changing a case or the format:
 //
@@ -81,13 +84,16 @@ type proxyFixture struct {
 }
 
 type proxyFixtureClaims struct {
-	Task    string   `json:"task"`
-	Profile string   `json:"profile"`
-	Tier    string   `json:"tier"`
-	Pod     string   `json:"pod"`
-	PodUID  string   `json:"pod_uid"`
-	Expires int64    `json:"exp"`
-	Target  *Target  `json:"target"`
+	Task    string  `json:"task"`
+	Profile string  `json:"profile"`
+	Tier    string  `json:"tier"`
+	Pod     string  `json:"pod"`
+	PodUID  string  `json:"pod_uid"`
+	Expires int64   `json:"exp"`
+	Target  *Target `json:"target"`
+	// Permits is what the verifier must read out of the permits claim: absent
+	// (null in the file) for a credential that carries none.
+	Permits []Permit `json:"permits"`
 	Trigger *Trigger `json:"trigger,omitempty"`
 }
 
@@ -161,6 +167,19 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "the second of two trusted keys (rotation)", Token: sign(base), Now: fixtureNow, GoOK: true, ProxyOK: true,
 		Trusted: []string{otherPub, pub}, Claims: wantClaims})
 	add(proxyFixture{Name: "expired inside the skew", Token: sign(base), Now: exp + 29, GoOK: true, ProxyOK: true, Claims: wantClaims})
+	permitted := `"cluster":"cluster-a"}`
+	withPermit := `"cluster":"cluster-a"},"permits":["vcs:proposal-create"]`
+	permitClaims := *wantClaims
+	permitClaims.Permits = []Permit{PermitVCSProposalCreate}
+	add(proxyFixture{Name: "a permit", Token: edited(permitted, withPermit), Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &permitClaims})
+	mintedWithPermit, err := Mint(kp, Claims{
+		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
+		Expires: mintNow.Add(10 * time.Minute), Target: &fixtureTarget, Permits: []Permit{PermitVCSProposalCreate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	trig := `,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`
 	withTrigger := func(trigger string) string {
 		return edited(trig, trig+`,"trigger":`+trigger)
@@ -194,15 +213,50 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mintedPermitClaims := mintedClaims
+	mintedPermitClaims.Permits = []Permit{PermitVCSProposalCreate}
+	add(proxyFixture{Name: "minted by taskcred.Mint with a permit", Token: mintedWithPermit, Now: mintNow.Unix(), GoOK: true, ProxyOK: true, Claims: &mintedPermitClaims})
 	mintedTriggerClaims := mintedClaims
 	mintedTriggerClaims.Trigger = &builtin
 	add(proxyFixture{Name: "a trigger minted by taskcred.Mint", Token: mintedTrigger, Now: mintNow.Unix(), GoOK: true, ProxyOK: true, Claims: &mintedTriggerClaims})
 	add(proxyFixture{Name: "a lowercase typ (jwt/v2 upper-cases it)", Token: signWithHeader(t, kp, `{"typ":"jwt","alg":"ed25519-nkey"}`, base),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: wantClaims})
 
-	// Go accepts, the proxy refuses: stricter by design.
+	// A report credential (#5619): no target, which the proxy takes only from
+	// an unattended task a trigger started, and holds to the audit-report routes.
+	report := func(tier, trigger string) string {
+		edits := []string{`"tier":"read"`, `"tier":"` + tier + `"`}
+		if trigger == "" {
+			edits = append(edits, trig, ``)
+		} else {
+			edits = append(edits, trig, `,"trigger":`+trigger)
+		}
+		return edited(edits...)
+	}
+	reportClaims := func(trigger Trigger) *proxyFixtureClaims {
+		c := *wantClaims
+		c.Tier, c.Target, c.Trigger = "unattended", nil, &trigger
+		return &c
+	}
+	add(proxyFixture{Name: "a report credential: unattended, a builtin schedule trigger, no target",
+		Token: report("unattended", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(builtin)})
+	add(proxyFixture{Name: "a report credential: unattended, a collector trigger, no target",
+		Token: report("unattended", `{"name":"stall-watch","origin":"builtin"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(collector)})
+
+	// No target and not a report credential: both refuse.
 	noTarget := edited(`,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`, ``)
-	add(proxyFixture{Name: "no target", Token: noTarget, Now: fixtureNow, GoOK: true})
+	add(refused("no target", noTarget))
+	add(refused("no target, a trigger, at the read tier",
+		report("read", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`)))
+	add(refused("no target, a trigger, at a custom tier",
+		report("nightly", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`)))
+	add(refused("no target, unattended, no trigger", report("unattended", "")))
+
+	// Go accepts, the proxy refuses: stricter by design.
+	add(proxyFixture{Name: "a null target, unattended, a trigger",
+		Token: edited(`"tier":"read"`, `"tier":"unattended"`, trig, `,"target":null,"trigger":{"name":"stall-watch","origin":"builtin"}`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
@@ -242,6 +296,22 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a case-variant trigger key", withTrigger(`{"Name":"schedule/a","origin":"builtin"}`)))
 	add(refused("a duplicate trigger key", withTrigger(`{"name":"schedule/b","name":"schedule/a","origin":"builtin"}`)))
 	add(refused("a NaN", edited(`"version":2`, `"version":NaN`)))
+
+	// Permits: a closed set of strings, in a non-empty list, on this
+	// audience alone.
+	add(refused("an unknown permit", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-merge"]`)))
+	add(refused("a known permit beside an unknown one", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-create","vcs:branch-delete"]`)))
+	add(refused("a case variant of the permit", edited(permitted, `"cluster":"cluster-a"},"permits":["VCS:proposal-create"]`)))
+	add(refused("the permit twice", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-create","vcs:proposal-create"]`)))
+	add(refused("permits on the nats audience", edited(`"aud":"credential-proxy"`, `"aud":"nats"`, permitted, withPermit)))
+	add(refused("permits as a bare string", edited(permitted, `"cluster":"cluster-a"},"permits":"vcs:proposal-create"`)))
+	add(refused("a number in permits", edited(permitted, `"cluster":"cluster-a"},"permits":[1]`)))
+	add(refused("an object in permits", edited(permitted, `"cluster":"cluster-a"},"permits":[{"name":"vcs:proposal-create"}]`)))
+	add(refused("permits as an object", edited(permitted, `"cluster":"cluster-a"},"permits":{"vcs:proposal-create":true}`)))
+	add(refused("an empty permits list", edited(permitted, `"cluster":"cluster-a"},"permits":[]`)))
+	add(refused("a null permits", edited(permitted, `"cluster":"cluster-a"},"permits":null`)))
+	add(refused("a duplicate permits key", edited(permitted, `"cluster":"cluster-a"},"permits":["x"],"permits":["vcs:proposal-create"]`)))
+	add(refused("a case-variant Permits", edited(permitted, `"cluster":"cluster-a"},"Permits":["vcs:proposal-create"]`)))
 
 	// Types.
 	add(refused("version 1", edited(`"version":2`, `"version":1`)))
@@ -380,8 +450,10 @@ func TestCredentialProxyFixtures(t *testing.T) {
 		if err == nil && c.Claims != nil {
 			w := c.Claims
 			if got.Task != w.Task || got.Profile != w.Profile || got.Tier != w.Tier || got.Pod != w.Pod ||
-				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target ||
-				(got.Trigger == nil) != (w.Trigger == nil) || (got.Trigger != nil && *got.Trigger != *w.Trigger) {
+				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires ||
+				(got.Target == nil) != (w.Target == nil) || (got.Target != nil && *got.Target != *w.Target) ||
+				(got.Trigger == nil) != (w.Trigger == nil) || (got.Trigger != nil && *got.Trigger != *w.Trigger) ||
+				!slices.Equal(got.Permits, w.Permits) {
 				t.Errorf("%s: claims = %+v (target %+v), fixture says %+v", c.Name, got, got.Target, w)
 			}
 		}

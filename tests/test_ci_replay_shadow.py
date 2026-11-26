@@ -28,6 +28,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _lift_shell import lift_constant, lift_function  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The smoke build's Docker Hub mirror, as cloudbuild-ci.yaml declares it (#7033).
+_DOCKER_HUB_MIRROR = yaml.safe_load((_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml").read_text())["substitutions"][
+    "_DOCKER_HUB_MIRROR"
+]
 _CI_ENV = _ROOT / "hack" / "ci-env.sh"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CI_EVAL = _ROOT / "hack" / "ci-eval-pr.sh"
@@ -366,6 +370,17 @@ class RecordModeResolveTest(unittest.TestCase):
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("no gcloud on PATH", err)
 
+    def test_a_session_front_door_nightly_never_records(self):
+        """The replay lanes replay the platform front door's recordings; a run
+        through the default session (EVAL_FRONT_DOOR=session, #6539) stays in
+        shadow even as the recorder, and asking it to record is refused."""
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session")
+        self.assertEqual((values["rc"], values["mode"], values["cache"]), ("0", "shadow", ""))
+        self.assertIn("EVAL_FRONT_DOOR=session runs never record", err)
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session", EVAL_REPLAY_RECORD="true")
+        self.assertEqual(values["rc"], "1")
+        self.assertIn("never records into the shared replay cache", err)
+
     def test_a_presubmit_never_records_whoever_it_runs_as(self):
         values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]), ("0", "presubmit", "shadow", ""))
@@ -445,6 +460,27 @@ class ReplayLaneResolveTest(unittest.TestCase):
         self.assertIn("EVAL_REPLAY_LANE=true", err)
 
 
+class EvalRunTagsHelmArgsTest(unittest.TestCase):
+    """eval_run_tags_helm_args: the tag switch rides the proxy, and EVAL_RUN_TAGS=false turns it off alone."""
+
+    def _args(self, **env):
+        script = ("set -euo pipefail\n" + _lifted("eval_run_tags_helm_args", constants=False)
+                  + "eval_run_tags_helm_args\n"
+                  + 'for a in ${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
+        proc = subprocess.run([shutil.which("bash"), "-c", script], env={"PATH": os.environ.get("PATH", ""), **env},
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line.split("=", 1)[1] for line in proc.stdout.splitlines()]
+
+    def test_on_with_the_proxy(self):
+        self.assertEqual(self._args(REPLAY_SHADOW_ACTIVE="true"), ["--set", "platformAgent.deployment.evalRunTags=true"])
+
+    def test_off_without_the_proxy_or_when_turned_off(self):
+        for env in ({}, {"REPLAY_SHADOW_ACTIVE": "false"}, {"REPLAY_SHADOW_ACTIVE": "true", "EVAL_RUN_TAGS": "false"}):
+            with self.subTest(**env):
+                self.assertEqual(self._args(**env), [])
+
+
 class HelmArgsTest(unittest.TestCase):
     def _args(self, **overrides):
         script = ("set -euo pipefail\n" + _lifted(*_RESOLVE, "replay_shadow_helm_args")
@@ -519,15 +555,15 @@ class DeployWiringTest(unittest.TestCase):
                       self.text)
         self.assertIn('REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"', self.text)
 
-    def test_the_install_expands_the_values_and_the_mode_flip_reuses_them(self):
+    def test_the_install_expands_the_values_and_is_the_only_upgrade(self):
         install = self.text[self.text.index('helm upgrade --install "${HELM_RELEASE_NAME}"'):]
         install = install[: install.index("--wait --timeout 15m")]
         self.assertIn('${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}', install)
-        flip = self.text[self.text.index('| helm upgrade "${HELM_RELEASE_NAME}"'):]
-        flip = flip[: flip.index("--wait")]
-        self.assertIn("--reuse-values", flip)
-        # The flip is the only later upgrade, so nothing else can drop the values.
-        self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 2)
+        self.assertIn('${EVAL_RUN_TAGS_HELM_ARGS[@]+"${EVAL_RUN_TAGS_HELM_ARGS[@]}"}', install)
+        self.assertLess(self.text.index('  replay_shadow_helm_args "${AR_REPO}'),
+                        self.text.index("\neval_run_tags_helm_args\n"))
+        # No later upgrade, so nothing can drop the values.
+        self.assertEqual(len(re.findall(r"^\s*[^#\n]*\bhelm upgrade\b", self.text, re.MULTILINE)), 1)
 
 
 class CloudBuildStepTest(unittest.TestCase):
@@ -545,7 +581,8 @@ class CloudBuildStepTest(unittest.TestCase):
         self.calls = pathlib.Path(self.tmp, "calls")
 
     def _run(self, uri):
-        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri)
+        # $_DOCKER_HUB_MIRROR takes its declared default, as Cloud Build fills an unset substitution.
+        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri).replace("$_DOCKER_HUB_MIRROR", _DOCKER_HUB_MIRROR)
         env = {"PATH": f"{self.tmp}:/usr/bin:/bin", "DOCKER_CALLS": str(self.calls)}
         return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
@@ -559,7 +596,8 @@ class CloudBuildStepTest(unittest.TestCase):
         proc = self._run(uri)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [
-            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile .",
+            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile"
+            f" --build-arg PYTHON_IMAGE={_DOCKER_HUB_MIRROR}/library/python .",
             f"push {uri}",
         ])
 
@@ -776,16 +814,15 @@ class ModeCollectorTest(_LifecycleBase):
         return proc
 
     def test_a_trusted_nightly_installed_in_record_mode_collects_and_publishes(self):
-        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", JOB_NAME="ci-kube-agents-eval-nightly",
-                           EVAL_MODE_NEXT="1")
+        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", JOB_NAME="ci-kube-agents-eval-nightly")
         argv, pairs = self._argv_pairs()
         self.assertEqual(pairs["--mode"], "record")
         self.assertEqual(pairs["--publish-bucket"], "kube-agents-replay-cache")
         self.assertEqual(pairs["--verdicts-dir"], str(self.artifacts))
         self.assertEqual(pairs["--cache-subdir"], "replay-cache")
         self.assertEqual(pairs["--final-deadline"], "240")
-        self.assertEqual((pairs["--job-name"], pairs["--eval-mode-next"], pairs["--forge"]),
-                         ("ci-kube-agents-eval-nightly", "1", ""))
+        self.assertEqual((pairs["--job-name"], pairs["--forge"]), ("ci-kube-agents-eval-nightly", ""))
+        self.assertNotIn("--eval-mode-next", pairs, "every install grades the A2A stack; the record's mode is not read from a flag")
         self.assertTrue(os.path.isdir(pairs["--keep-dir"]))
         self.assertNotIn(str(self.artifacts), pairs["--keep-dir"], "kept answers stay out of the public artifacts")
         self.assertIn("wait=255", proc.stdout)
@@ -868,13 +905,15 @@ class ModeCollectorTest(_LifecycleBase):
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
+                'REPLAY_LANE_NEWEST_NIGHT=/n.json\n'
                 'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
         self._fake_collector()
         proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
-                          pairs["--nightly-runs"], pairs["--pr"]), ("replay", "replay-lane", "/k", "/s", "/r.json", ""))
+                          pairs["--nightly-runs"], pairs["--newest-night"], pairs["--pr"]),
+                         ("replay", "replay-lane", "/k", "/s", "/r.json", "/n.json", ""))
 
     def test_the_lane_names_the_commit_it_replays_and_where_it_came_from(self):
         head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -919,6 +958,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         script += lift_function("seed_replay_lane_cache", text, _CI_ENV)
         script += f"REPLAY_CACHE_FETCH_SCRIPT={str(self.fetch)!r}\n"
         script += 'rc=0\nprepare_replay_lane_cache || rc=$?\necho "rc=${rc}"\n'
+        script += 'echo "newest-night=${REPLAY_LANE_NEWEST_NIGHT:-}"\n'
         if seed:
             script += '[ "${rc}" != 0 ] || { seed_replay_lane_cache || rc=$?; echo "seed rc=${rc}"; }\n'
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
@@ -949,14 +989,19 @@ class PrepareLaneCacheTest(_LifecycleBase):
                 self.assertNotIn("seed", [c.split()[0] for c in calls])
 
     def test_it_fetches_then_the_seed_seeds_every_pod(self):
-        proc, calls = self._prepare(seed=True, EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay", EVAL_MODE_NEXT="1",
+        proc, calls = self._prepare(seed=True, EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay",
                                     EVAL_FORGE="gitlab")
         self.assertIn("seed rc=0", proc.stdout, proc.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["fetch", "seed"])
         self.assertIn("--bucket kube-agents-replay-cache", calls[0])
         self.assertIn("--max-age-hours 30", calls[0])
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
-        self.assertIn("--eval-mode-next 1 --forge gitlab", calls[0], "the lane's own mode and forge pick the records")
+        self.assertIn("--forge gitlab", calls[0], "the lane's own forge picks the records")
+        self.assertNotIn("--eval-mode-next", calls[0])
+        # The newest night's builds go where the collector's report reads them (--newest-night).
+        night = re.search(r"^newest-night=(\S+/newest-night\.json)$", proc.stdout, re.M)
+        self.assertIsNotNone(night, proc.stdout)
+        self.assertIn(f"--night-out {night.group(1)} ", calls[0])
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 
@@ -1006,14 +1051,42 @@ class EvalWiringTest(unittest.TestCase):
         arms = body.index('  write_replay_lane_arms "$(date -u +%s)"')
         collector = body.index("  start_replay_shadow_collector")
         self.assertEqual(body[live + 1], "    wait", "the live arm finishes before the seed")
-        self.assertLess(live, seed)
+        # Then every card it filed is archived, so the replayed arm cannot read the
+        # live arm's answers off the board (2122208205344870400).
+        clear = body.index('    fence_live_cards "replay lane live arm" "" "" arm')
+        self.assertLess(live + 1, clear)
+        self.assertLess(clear, seed)
         self.assertLess(seed, arms)
         self.assertLess(arms, collector)
-        # The fan-out calls it right before the main queue, which is then replayed.
+        # The fan-out calls it right before the main queue, which is then replayed,
+        # and right after taking the time the clear archives from.
         replayed = at('launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
         self.assertEqual(self.lines[replayed - 1], "run_replay_lane_live_arm")
+        self.assertEqual(self.lines[replayed - 2], 'EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"')
         self.assertGreater(replayed, end, "defined before the fan-out calls it")
         self.assertEqual(sum(1 for l in self.lines if l.strip() == "seed_replay_lane_cache || exit 1"), 1)
+
+    def _live_arm(self, lane: str) -> list[str]:
+        stubs = textwrap.dedent("""\
+            LIVE_TOTAL=2 UNIT_QUEUE_LIVE="1 0 0" EVAL_TASK_PARALLELISM=4 EVAL_UNIT_LAUNCH_STAGGER_SECONDS=0
+            REPLAY_LANE_SAFETY_NAMES=a
+            launch_units() { (sleep 1; echo "UNIT END") & }
+            fence_live_cards() { echo "CLEAR $*"; }
+            seed_replay_lane_cache() { echo SEED; }
+            write_replay_lane_arms() { echo ARMS; }
+            start_replay_shadow_collector() { echo COLLECTOR; }
+            """)
+        script = ("set -euo pipefail\n" + stubs + f"EVAL_REPLAY_LANE={lane}\n"
+                  + lift_function("run_replay_lane_live_arm", _CI_EVAL.read_text(), _CI_EVAL) + "run_replay_lane_live_arm\n")
+        proc = subprocess.run([shutil.which("bash"), "-c", script], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return [line for line in proc.stdout.splitlines() if not line.startswith(">>>")]
+
+    def test_the_live_arm_cards_are_archived_after_its_units_end_and_before_the_seed(self):
+        self.assertEqual(self._live_arm("true"),
+                         ["UNIT END", 'CLEAR replay lane live arm   arm', "SEED", "ARMS", "COLLECTOR"])
+        self.assertEqual(self._live_arm("false"), [], "nothing changes off the lane")
 
     # The script's decision on whether the run records, run as written: from
     # the JOB_TYPE case to the commit stamp that follows it.

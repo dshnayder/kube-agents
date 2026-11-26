@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -101,22 +102,27 @@ const (
 	// workerRunAsUser is the arbitrary non-root UID session pods run as.
 	workerRunAsUser = 1000
 	// Worker requests: the harness spike's per-session footprint, and what
-	// the session cap's sizing math multiplies. The limits exist because a
+	// the session cap's sizing math multiplies. These are the defaults: the
+	// operator renders A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT} from
+	// spec.harness.tuning.sessionResources (#2371), and they must equal its
+	// DefaultSession* constants (TestSessionResourceDefaultsMatchTheOperators). The limits exist because a
 	// namespace ResourceQuota that requires them refuses a pod without
 	// them at admission, and a session pod refused there is a delegation
 	// that never starts; they are the sandbox's (2 CPU, 2Gi), which is
 	// what a headless harness turn has been observed to fit in. On an
 	// Autopilot cluster without Pod bursting the limit is rewritten to the
 	// request, so the request stays a ceiling a turn can live under.
-	workerCPURequest    = "250m"
-	workerMemoryRequest = "512Mi"
+	workerCPURequest    = "150m"
+	workerMemoryRequest = "320Mi"
 	workerCPULimit      = "2"
 	workerMemoryLimit   = "2Gi"
 	// The scratch emptyDir is the harness's working directory (the worker
 	// adapter's defaultWorkdir), so files the model writes land there, as
 	// do the delegate socket and, with SessionClusterView, HERMES_HOME's
-	// kubeconfig files. No clone can: the image carries no git, and the
-	// agent SDK keeps its transcripts under $HOME, in the writable layer.
+	// kubeconfig files. No clone lands here: the image carries git, for a
+	// profile persona's version-control skill, but a session pod's broker
+	// role reaches no /v1/vcs/ route, so it has nothing to clone from; and
+	// the agent SDK keeps its transcripts under $HOME, in the writable layer.
 	// Sessions measured on dev lanes over seven days (2026-10-22, 30-40
 	// minutes each) left it at 4 KiB. 1Gi is the floor for a workspace an
 	// agent writes into, and Autopilot's default ephemeral-storage request
@@ -191,11 +197,48 @@ const (
 	busTransportLength = 16
 	// natsCAVolume is the session pod's mount of the gateway's CA bundle.
 	natsCAVolume = "nats-ca"
+	// envTaskID is the worker env naming the task a pod is started for.
+	envTaskID = "TASK_ID"
 	// workerContainer is the session pod's one container, the adapter's.
 	workerContainer = "worker"
 	// delegateToolOn is lib.EnvDelegateTool's value for a pod whose adapter
 	// decides the tool per task (delegateToolEnv).
 	delegateToolOn = "on"
+
+	// annoWarm marks a pod the warm pool started (warm_pool.go): no task,
+	// no conversation, waiting for a conversation's first turn to be
+	// addressed to its name. The gateway can't patch it off once claimed, so
+	// a claimed warm pod keeps it, and the claim index in the session-state
+	// bucket says which conversation it now serves (Registry.ClaimWarmPod).
+	annoWarm  = "a2a.kubeagents.dev/warm"
+	warmValue = "true"
+	// workerAdapterPath is the worker image's adapter binary
+	// (a2a/Dockerfile.worker), which the warm pod's readiness probe runs as
+	// `worker-adapter warm-ready`. An image that keeps it elsewhere never
+	// reports ready, so its warm pods are never claimed and every
+	// conversation spawns cold, as without a pool.
+	workerAdapterPath = "/usr/local/bin/worker-adapter"
+	// warmReadinessPeriodSeconds paces the warm pod's readiness probe. It
+	// only decides how soon after start a new warm pod can be claimed; the
+	// probe passes for the pod's whole life once its watcher is live, so a
+	// longer period costs nothing but that.
+	warmReadinessPeriodSeconds = 15
+	// annoWarmShape stamps a warm pod with a digest of the spec it was
+	// created with (warmShape): the worker image, the scope and capability
+	// switch, the resources, the deadlines and the bus transport. A pod whose
+	// stamp is not this gateway's current one was made under an earlier
+	// config, so it is never claimed and the pool replaces it.
+	annoWarmShape = "a2a.kubeagents.dev/warm-shape"
+	// warmShapeName is the placeholder name warmShape builds the spec under,
+	// so the digest is of the config and not of any one pod's name.
+	warmShapeName = "warm-shape"
+	// warmShapeLength is how much of the digest the stamp carries.
+	warmShapeLength = 16
+	// warmReadinessTimeoutMargin is what the probe's timeout adds above the
+	// probe command's own wait for the status endpoint
+	// (lib.SessionWarmReadyWaitSeconds), so the command answers before the
+	// kubelet gives up on it.
+	warmReadinessTimeoutMargin = 5
 
 	// primerVolume, primerMountPath and primerFileName place the primer
 	// annotation in the worker container as a file.
@@ -225,19 +268,22 @@ type spawner interface {
 	// TerminalOrphans lists pods in a terminal phase, with the task identity
 	// their annotations carry (sweep's scan).
 	TerminalOrphans(ctx context.Context) ([]orphanPod, error)
-	// LiveSessions counts session pods not yet in a terminal phase and not
-	// being deleted - the session cap's denominator, over the same pods
-	// SessionPods offers the cap's eviction.
-	LiveSessions(ctx context.Context) (int, error)
 	// Reusable reports whether a pod can take its conversation's next task:
 	// spawned for reuse, running, not being deleted, its worker not exited,
 	// and with room left in its lifetime for a whole task. A pod that is
 	// gone is not reusable and not an error.
 	Reusable(ctx context.Context, podName string) (bool, error)
 	// SessionPods lists the session pods that are live and not being
-	// deleted, with the conversation each belongs to: the cap eviction's
-	// candidates.
+	// deleted, with the conversation each belongs to: the session cap's
+	// count, and its eviction's candidates.
 	SessionPods(ctx context.Context) ([]sessionPod, error)
+	// SpawnWarm creates a warm session pod named name (warm_pool.go): the
+	// session pod Spawn builds, through the same create, with no task and
+	// no conversation on it.
+	SpawnWarm(ctx context.Context, name string) error
+	// WarmPods lists the pods carrying the warm mark, claimed or not, in
+	// any phase until they are deleted.
+	WarmPods(ctx context.Context) ([]warmPod, error)
 	// PodStarted is the pod's status.startTime, when the kubelet took it
 	// (before the image pull), which is where activeDeadlineSeconds counts
 	// from. Zero for a pod not yet started or gone; neither is an error.
@@ -252,6 +298,9 @@ type sessionPod struct {
 	// Reuse is the pod's own reuse annotation: it serves every turn, and so
 	// never exits on its own.
 	Reuse bool
+	// Warm is the pod's warm mark (annoWarm). Its SessionKey is empty on the
+	// pod; the gateway reads the claim index for it (Gateway.sessionPods).
+	Warm bool
 }
 
 type orphanPod struct {
@@ -261,6 +310,22 @@ type orphanPod struct {
 	TaskID        string
 	ContextID     string
 	CorrelationID string
+	// Warm is the pod's warm mark, as on sessionPod.
+	Warm bool
+}
+
+// warmPod is one pod with the warm mark as the pool sees it.
+type warmPod struct {
+	Name    string
+	Created time.Time
+	// Ready is a pod a conversation can be handed: running, not being
+	// deleted, its worker running and past its readiness probe (its task
+	// watcher is live), and on this gateway's bus transport.
+	Ready bool
+	// Gone is a pod in a terminal phase or being deleted.
+	Gone bool
+	// Current is a pod made under this gateway's config (annoWarmShape).
+	Current bool
 }
 
 // mintSessionName gives an incarnation its bus session name,
@@ -351,7 +416,7 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 }
 
 // Spawn creates the session pod: the demo's reference worker shape — no
-// ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests —
+// ambient k8s credentials, scratch on emptyDir, the configured requests —
 // running the headless harness behind the worker adapter (W4's image).
 // Model auth, as shipped (spec-chatops-gateway.md, amended 8/31): the
 // worker talks to the install's own LiteLLM, in-namespace, with no per-pod
@@ -369,6 +434,63 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // on the agent side is two narrower principals, neither of them reachable
 // from a session pod.
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error) {
+	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, s.sessionPodSpec(rec, taskID, primer, originSeq, false), metav1.CreateOptions{})
+	if err != nil {
+		// AlreadyExists included: session names are minted per incarnation,
+		// so a name collision means the mint raced a terminating predecessor
+		// — surface it rather than adopt a pod that is about to vanish.
+		return "", err
+	}
+	return created.Name, nil
+}
+
+// SpawnWarm creates a warm pod: Spawn's pod for a session-routed, reused
+// session named name, through the same create (so the gateway pod admission
+// policy holds it to the same shape), with these differences and no others:
+//   - no task, context, correlation, conversation or primer annotation, and
+//     no TASK_ID or origin sequence: it has no task yet;
+//   - the warm mark (annoWarm), and lib.EnvSessionWarm with the idle bound
+//     (warmRecycleAge) after which its adapter exits unclaimed;
+//   - a readiness probe that passes once its task watcher is live;
+//   - an activeDeadlineSeconds of warmPodLifetime: the recycle age plus the
+//     lifetime a fresh reused pod gets, so a pod claimed at the end of its
+//     warm window still has a fresh pod's whole life ahead of it.
+//
+// The bus identity is the name, exactly as for a fresh spawn: the projected
+// token is bound to this pod, the callout grants this name's subjects, and a
+// task reaches it only with a capability whose delegate is this name.
+func (s *podSpawner) SpawnWarm(ctx context.Context, name string) error {
+	rec := &SessionRecord{BusSession: name, Addressee: name, Profile: sessionProfile, SessionRouted: true}
+	pod := s.sessionPodSpec(rec, "", "", 0, true)
+	pod.Annotations[annoWarmShape] = s.warmShape()
+	_, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	return err
+}
+
+// warmShape is the digest annoWarmShape carries: the warm pod spec this
+// gateway would create now, under a placeholder name.
+func (s *podSpawner) warmShape() string {
+	rec := &SessionRecord{BusSession: warmShapeName, Addressee: warmShapeName, Profile: sessionProfile, SessionRouted: true}
+	spec, err := json.Marshal(s.sessionPodSpec(rec, "", "", 0, true).Spec)
+	if err != nil {
+		// A PodSpec always marshals; an empty stamp matches no pod, so the
+		// failure is a pool that spawns cold rather than one that claims a
+		// pod of unknown shape.
+		return ""
+	}
+	sum := sha256.Sum256(spec)
+	return hex.EncodeToString(sum[:])[:warmShapeLength]
+}
+
+// warmPodLifetime is a warm pod's activeDeadlineSeconds: its unclaimed
+// window plus the life a reused pod spawned fresh at the claim would get.
+func warmPodLifetime(cfg *Config) time.Duration {
+	return warmRecycleAge + podLifetime(cfg, true)
+}
+
+// sessionPodSpec is the session pod Spawn and SpawnWarm create; warm builds
+// the warm shape SpawnWarm describes.
+func (s *podSpawner) sessionPodSpec(rec *SessionRecord, taskID, primer string, originSeq uint64, warm bool) *corev1.Pod {
 	name := rec.BusSession
 	// The gateway Deployment owns its sessions: when it goes — the CR's
 	// deletion, or any other — Kubernetes GC reaps the pods it
@@ -402,7 +524,8 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			ImagePullSecrets: sessionImagePullRefs(s.cfg.ImagePullRefs),
+			RestartPolicy:    corev1.RestartPolicyNever,
 			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
 			// asked as written first: 2 DNS queries, not up to 14 (#5590).
 			DNSConfig: &corev1.PodDNSConfig{
@@ -444,7 +567,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					// which is not a profile. No bus credential rides here any
 					// more: it is the projected token mounted below, which is
 					// the whole of gke-labs#1270.
-					{Name: "TASK_ID", Value: taskID},
+					{Name: envTaskID, Value: taskID},
 					{Name: "PROFILE", Value: rec.Profile},
 					{Name: "NATS_URL", Value: s.cfg.NATSURL},
 					{Name: "A2A_SESSION", Value: rec.BusSession},
@@ -496,18 +619,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 					{Name: "A2A_AUTHORITY_SCOPE", Value: string(s.cfg.AuthorityScope)},
 					{Name: "A2A_CAPABILITY_REQUIRED", Value: strconv.FormatBool(!s.cfg.CapabilityOptional)},
 				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPURequest),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryRequest),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse(workerCPULimit),
-						corev1.ResourceMemory:           resource.MustParse(workerMemoryLimit),
-						corev1.ResourceEphemeralStorage: resource.MustParse(workerEphemeralStorageRequest),
-					},
-				},
+				Resources: s.workerResources(),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "scratch", MountPath: "/scratch"},
 					{Name: "bus-token", MountPath: path.Dir(lib.BusTokenPath), ReadOnly: true},
@@ -589,6 +701,19 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		c := &pod.Spec.Containers[0]
 		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvSessionReuse, Value: reuseValue})
 	}
+	// The harness, and the isolation waiver rendered empty on every session
+	// pod: pod env overrides the image's ENV, so a worker image can't set
+	// the waiver. The harness is added only when the install names one;
+	// unset is the worker's default, Claude Code. The waiver goes when the
+	// worker isolation lands (#6710).
+	{
+		c := &pod.Spec.Containers[0]
+		// Checked again here for a Config built without FromEnv.
+		if h := s.cfg.SessionHarness; h != "" && sessionHarnesses[h] {
+			c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvHarness, Value: h})
+		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: envHarnessUnisolated, Value: ""})
+	}
 	if s.cfg.SessionClusterView {
 		c := &pod.Spec.Containers[0]
 		c.Env = append(c.Env,
@@ -599,6 +724,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		)
 		if s.cfg.CredentialProxyExecURL != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
+		}
+		if s.cfg.UniverseDomain != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: envGoogleCloudUniverseDomain, Value: s.cfg.UniverseDomain})
 		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
@@ -617,6 +745,19 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			if s.cfg.KubeProxyHostContext != "" {
 				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
 			}
+			if s.cfg.KubeProxyMode != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_MODE", Value: s.cfg.KubeProxyMode})
+			}
+			// The kubectl admission's tier (a2a/Dockerfile.worker runs the
+			// admission only when KUBE_PROXY_URL is set), always named: the
+			// wrapper skips the admission for every command only on a tier it
+			// is told, and the admission reads unset as the default tier
+			// anyway. Checked again here for a Config built without FromEnv.
+			tier := kubectlCostTier(s.cfg.KubectlCostTier)
+			if tier == "" {
+				tier = defaultKubectlCostTier
+			}
+			c.Env = append(c.Env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
 		}
 		if s.cfg.KubeProxyCAConfigMap != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
@@ -630,14 +771,51 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			})
 		}
 	}
-	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		// AlreadyExists included: session names are minted per incarnation,
-		// so a name collision means the mint raced a terminating predecessor
-		// — surface it rather than adopt a pod that is about to vanish.
-		return "", err
+	// Every variable the container takes from a Secret is named to the
+	// worker, which withholds it from the processes a turn's tools start.
+	pod.Spec.Containers[0].Env = withToolWithheldList(pod.Spec.Containers[0].Env)
+	if warm {
+		makeWarm(pod, s.cfg)
 	}
-	return created.Name, nil
+	return pod
+}
+
+// makeWarm turns Spawn's pod into the warm shape (SpawnWarm).
+func makeWarm(pod *corev1.Pod, cfg *Config) {
+	for _, k := range []string{annoTask, annoContext, annoCorr, annoConvo, annoPrimer} {
+		delete(pod.Annotations, k)
+	}
+	pod.Annotations[annoWarm] = warmValue
+	pod.Spec.ActiveDeadlineSeconds = ptr.To(int64(warmPodLifetime(cfg) / time.Second))
+	c := &pod.Spec.Containers[0]
+	env := c.Env[:0]
+	for _, e := range c.Env {
+		if e.Name != envTaskID && e.Name != lib.EnvOriginSeq {
+			env = append(env, e)
+		}
+	}
+	c.Env = append(env,
+		corev1.EnvVar{Name: lib.EnvSessionWarm, Value: warmValue},
+		corev1.EnvVar{Name: lib.EnvSessionWarmIdleSeconds, Value: strconv.Itoa(int(warmRecycleAge / time.Second))},
+	)
+	c.ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+			Command: []string{workerAdapterPath, lib.SessionWarmReadyCommand},
+		}},
+		PeriodSeconds:  warmReadinessPeriodSeconds,
+		TimeoutSeconds: lib.SessionWarmReadyWaitSeconds + warmReadinessTimeoutMargin,
+	}
+}
+
+func sessionImagePullRefs(names []string) []corev1.LocalObjectReference {
+	if len(names) == 0 {
+		return nil
+	}
+	refs := make([]corev1.LocalObjectReference, 0, len(names))
+	for _, name := range names {
+		refs = append(refs, corev1.LocalObjectReference{Name: name})
+	}
+	return refs
 }
 
 func (s *podSpawner) Delete(ctx context.Context, podName string) error {
@@ -646,35 +824,6 @@ func (s *podSpawner) Delete(ctx context.Context, podName string) error {
 		return nil
 	}
 	return err
-}
-
-// LiveSessions counts through the k8s API rather than the gateway's own
-// registry: the API is authoritative, survives a gateway restart, and sees
-// orphans the registry has forgotten. Terminal pods are sweep's inventory,
-// not load, so they don't count - matching what a `pods` ResourceQuota
-// counts, which is the layer that backstops this number.
-//
-// A pod being deleted does not count either, though the quota still does
-// until it is gone: its slot is already freeing, and the cap's eviction
-// cannot choose it (SessionPods skips it too), so counting it would evict
-// some other conversation's live pod for a slot nobody needs. The count and
-// the candidates agree, and the overlap while it terminates is the same one
-// a successful eviction already leaves, which the quota headroom absorbs.
-func (s *podSpawner) LiveSessions(ctx context.Context) (int, error) {
-	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
-	})
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
-			continue
-		}
-		n++
-	}
-	return n, nil
 }
 
 // reusePod reports whether a pod spawned for rec serves every turn of its
@@ -789,6 +938,17 @@ func podReusable(p *corev1.Pod, transport string, taskDeadline time.Duration, no
 	return true
 }
 
+// SessionPods reads the k8s API rather than the gateway's own registry: the
+// API is authoritative, survives a gateway restart, and sees orphans the
+// registry has forgotten. Terminal pods are sweep's inventory, not load, so
+// they're not listed, which matches what a `pods` ResourceQuota counts, the
+// layer that backstops the cap.
+//
+// A pod being deleted isn't listed either, though the quota still counts it
+// until it's gone: its slot is already freeing, and the cap's eviction
+// can't choose it, so counting it would evict some other conversation's
+// live pod for a slot nobody needs. The overlap while it terminates is the
+// one a successful eviction already leaves, which the quota headroom absorbs.
 func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
@@ -801,7 +961,8 @@ func (s *podSpawner) SessionPods(ctx context.Context) ([]sessionPod, error) {
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil {
 			continue
 		}
-		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue})
+		out = append(out, sessionPod{PodName: p.Name, SessionKey: p.Annotations[annoConvo], Reuse: p.Annotations[annoReuse] == reuseValue,
+			Warm: p.Annotations[annoWarm] == warmValue})
 	}
 	return out, nil
 }
@@ -825,29 +986,72 @@ func (s *podSpawner) TerminalOrphans(ctx context.Context) ([]orphanPod, error) {
 			TaskID:        p.Annotations[annoTask],
 			ContextID:     p.Annotations[annoContext],
 			CorrelationID: p.Annotations[annoCorr],
+			Warm:          p.Annotations[annoWarm] == warmValue,
 		})
 	}
 	return out, nil
 }
 
+func (s *podSpawner) WarmPods(ctx context.Context) ([]warmPod, error) {
+	pods, err := s.client.CoreV1().Pods(s.cfg.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", labelPartOf, partOfValue, labelRole, sessionRole),
+	})
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	shape := s.warmShape()
+	var out []warmPod
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Annotations[annoWarm] != warmValue {
+			continue
+		}
+		out = append(out, warmPod{
+			Name:    p.Name,
+			Created: p.CreationTimestamp.Time,
+			Ready:   podReusable(p, s.busTransport(), s.cfg.TaskDeadline, now) && podReady(p),
+			Gone:    p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || p.DeletionTimestamp != nil,
+			Current: shape != "" && p.Annotations[annoWarmShape] == shape,
+		})
+	}
+	return out, nil
+}
+
+// podReady reports the pod's Ready condition: for a warm pod, its readiness
+// probe has seen the task watcher live.
+func podReady(p *corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
 // refuseAtSessionCap is the usability half of the session-pod bound, checked
-// before any route mutation that will need a fresh pod. At the cap the pod
-// that has been idle longest makes room (evictIdleSession), and its
-// conversation is told; with no idle pod the turn is refused with a reply
-// naming the numbers - never silently queued, never dropped. replacing marks a turn that retires its previous incarnation in
+// before any route mutation that will need a fresh pod. At the cap the pods
+// idle longest make room (evictIdleSessions): one, or over the cap the idle
+// surplus too, and each conversation is told. With too few idle pods to get
+// under the cap, a chat, console or inject turn waits in line for a slot
+// with a queued notice (session_cap_queue.go); past the line's bounds, or
+// from an A2A door, it is refused with a reply naming the count left - never
+// dropped. replacing marks a turn that retires its previous incarnation in
 // the same breath: the doomed pod is usually still live at count time, so
 // it hands its slot to its successor rather than double-counting - and if
-// it already went terminal or is already being deleted (LiveSessions counts
+// it already went terminal or is already being deleted (SessionPods lists
 // neither), the extra slot is a transient overshoot the quota headroom
 // absorbs.
 //
-// The count-then-create race is real, and wider than one: conversations run
-// on distinct queue workers, so every delegation in flight inside the
-// count-to-create window can pass this check together - the true bound on
-// the overshoot is the namespace ResourceQuota the operator renders above
-// this number, not cap+1 and not a lock here. A lock would only serialize
-// this process, while the quota also holds against a gateway that has
-// stopped honoring its own cap.
+// The count-then-create race: conversations run on distinct queue workers,
+// so every turn in flight inside the count-to-create window used to pass this
+// check together. A burst of 10 on top of 9 live pods left 19 against a cap
+// of 10 (#6033, measured for #2371), well past the quota's few pods of
+// margin. So the check is serialized (capCheck), and a slot granted here counts
+// as live until ensureSessionPod's spawn returns (capHolds), or for at most
+// sessionCapHoldTTL. Only the leader replica takes turns, so one process's
+// check is enough. The namespace ResourceQuota stays the hard bound against a
+// gateway that has stopped honoring its own cap.
 func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, replacing bool) bool {
 	// SessionRouted persists in the KV record; the spawner is a setting. A
 	// W4 rollback leaves session-routed records this check still reaches -
@@ -856,44 +1060,233 @@ func (g *Gateway) refuseAtSessionCap(ctx context.Context, rec *SessionRecord, re
 	if g.spawner == nil {
 		return false
 	}
-	live, err := g.spawner.LiveSessions(ctx)
+	// One check at a time (#6033): concurrent conversations at the cap each
+	// counted the same live pods and all passed, leaving the gateway well
+	// over its cap. The count includes slots granted but not yet created.
+	// The wait for the check honours ctx, so a turn that waited out its
+	// budget is told so rather than failing later, and the chat posts the
+	// check makes (eviction notices, the refusal) go out after it ends, so a
+	// slow chat backend doesn't hold up every other conversation.
+	//
+	// At the cap with nothing to evict, a turn that may park (parksAtCap:
+	// chat, console, inject) waits in line rather than being refused
+	// (session_cap_queue.go): parked, it returns true
+	// as a refusal does, its queued notice posted after the check. A fresh
+	// arrival queues behind a line that is not empty, before any eviction,
+	// so a slot that frees goes to the oldest waiter, whose retry comes
+	// back through here as own. The other refusals are not parked; a
+	// waiter's retry that meets one stays in line until its wait bound.
+	var notices []capNotice
+	var after []func()
+	defer func() {
+		for _, n := range notices {
+			g.post(n.key, n.text)
+		}
+		for _, f := range after {
+			f()
+		}
+	}()
+	parked, parkable := parkableTurn(ctx)
+	if !g.acquireCapCheck(ctx) {
+		// A waiter is answered by capKeepOrGiveUp either way: kept, or
+		// out of the line with its own give-up post.
+		if own, _ := g.capDecision(rec.Key, false); own != nil {
+			g.capKeepOrGiveUp(own, &after)
+			return true
+		}
+		notices = append(notices, capNotice{rec.Key, "⚠️ not started: other conversations were starting session workers and this one waited too long — try again in a moment"})
+		return true
+	}
+	defer g.releaseCapCheck()
+	own, behind := g.capDecision(rec.Key, parkable)
+	// The held slots before the pods: a slot is released only after its
+	// pod exists, so a slot missing from this snapshot means its pod is in
+	// the list read after it. The other order could miss a pod created and
+	// released between the two reads; this one can only count a pod twice
+	// for a moment, which errs on the safe side. One list serves the count,
+	// the replaced pods and the eviction candidates.
+	holds := g.capHoldSnapshot(rec.Key, time.Now())
+	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		// Proceeding blind would make the cap advisory exactly when the API
 		// is misbehaving; say so instead of dropping the turn silently.
 		g.log.Error("session cap: live count failed", "conversation", rec.Key, "err", err)
-		g.post(rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment")
+		if own != nil {
+			g.capKeepOrGiveUp(own, &after)
+			return true
+		}
+		notices = append(notices, capNotice{rec.Key, "⚠️ not started: can't count the running session workers right now — try again in a moment"})
 		return true
 	}
+	live := liveSessionCount(pods, holds)
 	limit := g.cfg.MaxSessions
+	replaces := ""
 	if replacing {
 		limit++
+		replaces = rec.PodName
 	}
-	if live < limit {
+	// A turn replacing its own pod frees one as it takes one, so it need
+	// not wait behind the line.
+	if live < limit && (!behind || replacing) {
+		g.holdCapSlot(rec.Key, replaces)
+		if own != nil {
+			after = append(after, g.capAdmit(own))
+		}
 		return false
 	}
 	// Full, but a pod at the cap may only be holding a conversation nobody
-	// is in right now. Evicting the longest-idle one makes room for one that
-	// is; its conversation is told, and resumes cold with the primer. A
-	// successful eviction is the slot; the count is not read again. A pod
-	// already being deleted is not counted above (LiveSessions), so its
-	// freeing slot never costs another conversation its pod.
-	if g.evictIdleSession(ctx, rec) {
+	// is in right now. Evicting the longest-idle ones makes room for one
+	// that is; each conversation is told, and resumes cold with the primer.
+	// Over the cap (after the cap is lowered, say), the idle surplus goes
+	// too, so the count comes back to the cap rather than staying over it
+	// one-for-one. A pod already being deleted is not listed
+	// (SessionPods), so its freeing slot never costs another conversation
+	// its pod.
+	evicted := 0
+	if !behind {
+		evicted = g.evictIdleSessions(ctx, rec, pods, live-limit+1, func(key, text string) {
+			notices = append(notices, capNotice{key, text})
+		})
+	}
+	if !behind && live-evicted < limit {
+		g.holdCapSlot(rec.Key, replaces)
+		if own != nil {
+			after = append(after, g.capAdmit(own))
+		}
 		return false
 	}
+	live -= evicted
+	switch {
+	case own != nil:
+		// Kept, or out of the line with its own give-up post.
+		g.capKeepOrGiveUp(own, &after)
+		return true
+	case parkable && g.capPark(rec.Key, parked, &after):
+		return true
+	}
+	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
+	notices = append(notices, capNotice{rec.Key, sessionCapRefusal(live, g.cfg.MaxSessions)})
+	return true
+}
+
+// liveSessionCount is the count the cap is checked against: the session pods
+// listed, plus each granted slot whose pod isn't created yet, unless it
+// replaces a pod still listed.
+func liveSessionCount(pods []sessionPod, holds []capHold) int {
+	running := make(map[string]bool, len(pods))
+	for _, p := range pods {
+		running[p.PodName] = true
+	}
+	live := len(pods)
+	for _, h := range holds {
+		if h.replaces == "" || !running[h.replaces] {
+			live++
+		}
+	}
+	return live
+}
+
+// sessionCapRefusal is the cap's refusal, naming live against the cap.
+func sessionCapRefusal(live, limit int) string {
 	workers := fmt.Sprintf("%d session workers are", live)
 	if live == 1 {
 		workers = "1 session worker is"
 	}
-	g.log.Warn("session cap: delegation refused", "conversation", rec.Key, "live", live, "cap", g.cfg.MaxSessions)
-	g.post(rec.Key, fmt.Sprintf(
+	return fmt.Sprintf(
 		"🚦 not started: %s already running (cap %d). Wait for one to finish or `stop` one you started; an operator can raise the cap (A2A_MAX_SESSIONS / spec.harness.tuning.maxSessions).",
-		workers, g.cfg.MaxSessions))
-	return true
+		workers, limit)
+}
+
+// sessionCapHoldTTL is how long a slot refuseAtSessionCap granted counts
+// against the cap before its pod exists. The slot is released as soon as the
+// spawn returns, and again when the conversation's locked turn ends whatever
+// happened in between (releaseCapHold); this bounds only what neither
+// reaches, a panic.
+const sessionCapHoldTTL = 2 * time.Minute
+
+// capNotice is a chat post the cap check makes, sent after the check ends.
+type capNotice struct{ key, text string }
+
+// capHold is a slot granted to a conversation whose pod isn't created yet:
+// when it was granted, and the pod it replaces, if the turn retires one.
+type capHold struct {
+	at       time.Time
+	replaces string
+}
+
+// acquireCapCheck takes the one cap check at a time, or reports false when
+// ctx ends first.
+func (g *Gateway) acquireCapCheck(ctx context.Context) bool {
+	g.initCap()
+	select {
+	case g.capCheck <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (g *Gateway) releaseCapCheck() { <-g.capCheck }
+
+// capHoldSnapshot is the unexpired slots granted to conversations other
+// than key (key's own is replaced by this check), pruning the expired. A
+// replacing turn's slot isn't counted while the pod it replaces is still
+// running: that pod is already in the count, and the slot is its
+// successor's.
+func (g *Gateway) capHoldSnapshot(key string, now time.Time) []capHold {
+	g.capMu.Lock()
+	defer g.capMu.Unlock()
+	var out []capHold
+	for k, h := range g.capHolds {
+		switch {
+		case now.Sub(h.at) > sessionCapHoldTTL:
+			delete(g.capHolds, k)
+		case k != key:
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// holdCapSlot records key's granted slot.
+func (g *Gateway) holdCapSlot(key, replaces string) {
+	g.capMu.Lock()
+	defer g.capMu.Unlock()
+	if g.capHolds == nil {
+		g.capHolds = map[string]capHold{}
+	}
+	g.capHolds[key] = capHold{at: time.Now(), replaces: replaces}
+}
+
+// releaseCapHold ends key's granted slot, if it has one. A slot whose spawn
+// failed is free again, so the session-cap line is nudged.
+func (g *Gateway) releaseCapHold(key string) {
+	g.capMu.Lock()
+	_, held := g.capHolds[key]
+	delete(g.capHolds, key)
+	g.capMu.Unlock()
+	if held {
+		g.kickCapQueue()
+	}
+}
+
+// workerResources is the session pod's requests and limits: CPU and memory
+// as the gateway was configured (Config.SessionResources, #2371), ephemeral
+// storage fixed.
+func (s *podSpawner) workerResources() corev1.ResourceRequirements {
+	r := s.cfg.sessionResources()
+	r.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	r.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(workerEphemeralStorageRequest)
+	return r
 }
 
 // ensureSessionPod spawns (or rehydrates) the session's incarnation for a
 // new task. Only called on session-addressed routes.
 func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, taskID string, originSeq uint64) {
+	// The cap's slot for this turn ends here whichever way it goes: a pod
+	// created is listed by SessionPods (a direct list), one that failed
+	// never will be.
+	defer g.releaseCapHold(rec.Key)
 	if rec.PodName != "" {
 		return
 	}
@@ -901,6 +1294,21 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	// The pod reads the earlier turns, so their people count for a
 	// delegation from it, as the delegating turn's own do.
 	rec.seedSessionAuthors(authors, unknown, since)
+	if pod := rec.warmClaim; pod != "" && pod == rec.BusSession {
+		// A warm pod this turn claimed (claimOrMint) is already running and
+		// takes the task off its own subjects; it only needs recording. The
+		// claim is made only for a conversation with no earlier turn, so
+		// there is no primer for it to have missed.
+		rec.warmClaim = ""
+		if primer != "" {
+			g.log.Warn("a claimed warm pod has no primer, and this turn built one", "session", rec.Key, "pod", pod)
+		}
+		rec.PodName = pod
+		rec.PodReuse = true
+		rec.PodClaimedAt = time.Now()
+		g.log.Info("handed the conversation a warm session pod", "session", rec.Key, "pod", pod, "task", taskID)
+		return
+	}
 	podName, err := g.spawner.Spawn(ctx, rec, taskID, primer, originSeq)
 	if err != nil {
 		g.log.Error("session pod spawn failed", "session", rec.Key, "err", err)
@@ -925,6 +1333,7 @@ func (g *Gateway) ensureSessionPod(ctx context.Context, rec *SessionRecord, task
 	}
 	rec.PodName = podName
 	rec.PodReuse = g.cfg.reusePod(rec)
+	rec.PodClaimedAt = time.Time{}
 	g.log.Info("spawned session pod", "session", rec.Key, "pod", podName, "task", taskID, "reuse", rec.PodReuse)
 }
 
@@ -965,16 +1374,29 @@ func isTaskNotFound(err error) bool {
 func (g *Gateway) sweepOnce(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, sweepPassTimeout)
 	defer cancel()
-	// The untracked pass runs whatever the orphan list does: it lists for
-	// itself, and an API blip there must not hold up the other.
+	// The untracked pass and the warm claim drop run whatever the orphan
+	// list does: each lists for itself, and an API blip there must not hold
+	// up the others.
 	defer g.sweepUntracked(ctx)
+	defer g.sweepWarmClaims(ctx)
 	orphans, err := g.spawner.TerminalOrphans(ctx)
+	if err == nil {
+		orphans, err = g.claimedOrphans(ctx, orphans)
+	}
 	if err != nil {
 		g.log.Error("sweep: pod list failed", "err", err)
 		return
 	}
 	for _, o := range orphans {
-		if o.TaskID == "" || o.Addressee == "" {
+		if o.Warm && o.SessionKey == "" {
+			// An unclaimed warm pod that exited at its idle bound, or died
+			// before anything was sent to it: no task, no conversation.
+			g.log.Info("sweep: deleting an unclaimed warm pod that ended", "pod", o.PodName)
+			_ = g.spawner.Delete(ctx, o.PodName)
+			continue
+		}
+		claimedWarm := o.Warm && o.SessionKey != ""
+		if (o.TaskID == "" && !claimedWarm) || o.Addressee == "" {
 			g.log.Warn("sweep: terminal pod without task annotations; deleting", "pod", o.PodName)
 			_ = g.spawner.Delete(ctx, o.PodName)
 			g.releaseIncarnation(ctx, o)
@@ -1004,6 +1426,11 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 		}
 		_ = g.spawner.Delete(ctx, o.PodName)
 		g.releaseIncarnation(ctx, o)
+		if claimedWarm {
+			if err := g.reg.DropWarmClaim(ctx, o.PodName); err != nil {
+				g.log.Warn("sweep: warm claim not dropped; the pool's pass drops it", "pod", o.PodName, "err", err)
+			}
+		}
 	}
 }
 
@@ -1018,7 +1445,7 @@ func (g *Gateway) sweepOnce(ctx context.Context) {
 // conversation holds the lock, so a pod its record does not name there is
 // untracked rather than one whose spawn is still being written down.
 func (g *Gateway) sweepUntracked(ctx context.Context) {
-	pods, err := g.spawner.SessionPods(ctx)
+	pods, err := g.sessionPods(ctx)
 	if err != nil {
 		g.log.Error("sweep: live pod list failed", "err", err)
 		return
@@ -1060,6 +1487,7 @@ func (g *Gateway) deleteIfUntracked(ctx context.Context, p sessionPod) bool {
 		return false
 	}
 	g.log.Info("deleted an untracked session pod", "conversation", p.SessionKey, "pod", p.PodName)
+	g.kickCapQueue()
 	return true
 }
 
@@ -1077,7 +1505,12 @@ type sweptTask struct {
 // (the gateway holds no patch on pods), and they do not need to be: every
 // earlier turn reached its terminal before the next one was routed here.
 func sweepTasks(o orphanPod, rec *SessionRecord) []sweptTask {
-	tasks := []sweptTask{{ID: o.TaskID, ContextID: o.ContextID, CorrelationID: o.CorrelationID}}
+	var tasks []sweptTask
+	// A claimed warm pod carries no task annotation (claimedOrphans): the
+	// active task below is the one it may owe.
+	if o.TaskID != "" {
+		tasks = append(tasks, sweptTask{ID: o.TaskID, ContextID: o.ContextID, CorrelationID: o.CorrelationID})
+	}
 	if rec == nil || rec.ActiveTask == nil || rec.ActiveTask.TaskID == o.TaskID ||
 		rec.AddresseeFor(rec.ActiveTask.TaskID) != o.Addressee {
 		return tasks
@@ -1241,3 +1674,23 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 	}
 	return "on"
 }
+
+// withToolWithheldList is env with lib.EnvToolWithheld naming every entry
+// sourced from a Secret (secretKeyRef), for the worker to withhold from its
+// tools; env as it was when there is none.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: lib.EnvToolWithheld, Value: strings.Join(names, ",")})
+}
+
+// envHarnessUnisolated is the worker adapter's waiver for running a harness
+// without its isolation; the spawner renders it empty on every session pod.
+const envHarnessUnisolated = "A2A_HARNESS_UNISOLATED"

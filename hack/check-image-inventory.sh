@@ -45,6 +45,17 @@ readonly MINTER_REPO=ci-repo
 # them with the toggle's name.
 readonly LABEL_DEFAULT="a default install"
 readonly LABEL_MIRRORED="a mirrored install"
+# The render a `helm upgrade --reuse-values` from a release before a2aBus
+# produces: that release's values, with no a2aBus key, against this chart.
+# operator-deployment.yaml then renders the bus's four from the pins
+# kube-agents.a2aBusImageDefaults holds, a second copy of a2aBus.images that
+# check 3d holds to the inventory.
+readonly LABEL_REUSED="an install upgraded with --reuse-values from before a2aBus"
+readonly LABEL_REUSED_MIRRORED="a mirrored install upgraded with --reuse-values from before a2aBus"
+readonly REUSED_VALUES=(--set a2aBus=null)
+# What makes a render the mirrored one: both registries at MIRROR, the flags
+# every mirrored render below passes.
+readonly MIRRORED_VALUES=(--set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")
 
 # The env vars whose values are image references, matched on the variable's
 # name. Matching on the shape of the value instead — a quoted string with a
@@ -55,6 +66,10 @@ readonly LABEL_MIRRORED="a mirrored install"
 # CHART_IMAGE_ENV_NAMES, every one of which the pattern below catches.
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
+# The four of those names that are the A2A bus's, which check 3d reads out of
+# the reused-values render: the rest of that render is the default render's,
+# which checks 3a-3c already hold.
+readonly BUS_IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*A2A_[A-Z0-9_]*_IMAGE[[:space:]]*$'
 
 # The *_IMAGE env vars the chart's default render must carry on the operator,
 # one per image the operator renders at reconcile time that appears in no
@@ -195,6 +210,8 @@ check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 check_base_image node a2a/Dockerfile.console NODE_IMAGE NODE_VERSION
 check_base_image golang a2a/Dockerfile.console GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.teams-inbound GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.teams-inbound DISTROLESS_IMAGE DISTROLESS_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime
@@ -264,6 +281,8 @@ check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile fil
 # A persona image has the same two-line shape, with the persona directory as
 # its build context and the payload under /files, where profilepod mounts it.
 check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
+check_literal_from busybox a2a/Dockerfile.persona-tse . /files/
+check_literal_from busybox a2a/Dockerfile.persona-fleet-audit . /files/
 
 # The calls above name their files, so a third plugin copied from the pair
 # (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
@@ -339,6 +358,7 @@ check_go_directive a2a/Dockerfile.dispatcher GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.teams-inbound GOLANG_VERSION a2a/go.mod
 check_go_directive hack/ghes-proxy/Dockerfile GOLANG_VERSION hack/ghes-proxy/go.mod
 check_go_directive a2a/Dockerfile.web-console GOLANG_VERSION a2a/go.mod
 
@@ -433,6 +453,7 @@ check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platf
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
+check_compiled_image_name a2a-teams-inbound k8s-operator/internal/controller/platformagent_teams_inbound.go a2aTeamsInboundImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
 check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
@@ -478,9 +499,10 @@ image_field_refs() {
 # value alone, because an env var's value is not an image by its shape, only by
 # which variable holds it — IMAGE_ENV_NAME_RE is that test. Anything between
 # the name and its value — a `valueFrom:`, the next list entry — drops the
-# pairing.
+# pairing. An optional first argument narrows the names matched
+# (bus_image_env_refs passes BUS_IMAGE_ENV_NAME_RE).
 image_env_refs() {
-  awk -v name_re="$IMAGE_ENV_NAME_RE" -v value_re="$VALUE_FIELD_RE" '
+  awk -v name_re="${1:-$IMAGE_ENV_NAME_RE}" -v value_re="$VALUE_FIELD_RE" '
     $0 ~ name_re { pending = 1; next }
     pending && match($0, value_re) {
       ref = substr($0, RLENGTH + 1)
@@ -505,6 +527,14 @@ image_refs() {
     image_field_refs <<<"$rendered"
     image_env_refs <<<"$rendered"
   } | sort -u
+}
+
+# The references the A2A bus's four env vars carry, from the same stream:
+# check 3d's subject. The reused-values render differs from the default one
+# in those four alone, so checking the whole of it would report a drift
+# anywhere else twice, once under each label.
+bus_image_env_refs() {
+  image_env_refs "$BUS_IMAGE_ENV_NAME_RE" | sort -u
 }
 
 # Split a reference into repository and tag. The digest, if any, goes first;
@@ -631,7 +661,7 @@ check_toggle() {
   shift
   local rendered mirrored_rendered added mirrored_added
   rendered="$(render_chart "$@")" || exit 1
-  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
+  mirrored_rendered="$(render_chart "$@" "${MIRRORED_VALUES[@]}")" || exit 1
   added="$(added_images "$(image_refs <<<"$rendered")" "$default_images")"
   mirrored_added="$(added_images "$(image_refs <<<"$mirrored_rendered")" "$mirrored_images")"
   [ -n "$added" ] || {
@@ -644,7 +674,7 @@ check_toggle() {
 }
 
 default_render="$(render_chart)" || exit 1
-mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
+mirrored_render="$(render_chart "${MIRRORED_VALUES[@]}")" || exit 1
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
 
@@ -685,10 +715,38 @@ check_toggle webConsole --set webConsole.enabled=true
 # The cluster agent's AgentProfile (#3658) adds its persona image; its
 # harness, a2a-worker, is already in the default render.
 check_toggle profiles.cluster --set profiles.cluster.enabled=true
+# The GKE Support Agent's AgentProfile (#3842) adds its persona image the
+# same way.
+check_toggle profiles.tse --set profiles.tse.enabled=true
+# The fleet-audit AgentProfile (#5623) adds its persona image the same way.
+check_toggle profiles.fleetAudit --set profiles.fleetAudit.enabled=true
 # The Hindsight memory store adds its API and Postgres images. hindsight.enabled
 # is a tri-state that follows the memory provider when null; true turns the
 # store on whatever the provider says.
 check_toggle hindsight --set hindsight.enabled=true
+
+# 3d. The reused-values render: no a2aBus key, as a `helm upgrade
+#     --reuse-values` from a release before it renders. The four bus env vars
+#     then come from the template's own copy of the pins
+#     (kube-agents.a2aBusImageDefaults), which nothing above reads: the default
+#     render takes values.yaml's. So the same checks run over the four in this
+#     render, and only the four (bus_image_env_refs): the rest of it is the
+#     default render's, already held above, and a drift there would otherwise
+#     read as two. The four are still on the operator, at the inventory's
+#     pins, and under the mirror by name, so a pin bumped in images.json and
+#     values.yaml but not in the template fails here rather than at pull time
+#     on the one upgrade path that meets it.
+reused_render="$(render_chart "${REUSED_VALUES[@]}")" || exit 1
+mirrored_reused_render="$(render_chart "${REUSED_VALUES[@]}" "${MIRRORED_VALUES[@]}")" || exit 1
+reused_bus_images="$(bus_image_env_refs <<<"$reused_render")"
+[ -n "$reused_bus_images" ] || {
+  echo "ERROR: the reused-values render carried no A2A_*_IMAGE env var that bus_image_env_refs recognises, so check 3d holds nothing to the inventory. Either the chart stopped emitting them or BUS_IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
+  exit 1
+}
+check_chart_image_env_rendered "$LABEL_REUSED" "$reused_render"
+check_inventory_pins "$LABEL_REUSED" "$reused_bus_images"
+check_mirror_prefix "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"
+check_mirror_names "$LABEL_REUSED_MIRRORED" "$(bus_image_env_refs <<<"$mirrored_reused_render")"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

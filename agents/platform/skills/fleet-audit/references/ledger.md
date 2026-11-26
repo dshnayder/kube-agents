@@ -64,6 +64,13 @@ must be written **after** the close. An older command in the thread is reported 
 rather than honoured: comments are never edited away, so a March request would otherwise re-open an
 April close every morning forever. Post a fresh one.
 
+The same rule covers a declared `no-pdb` finding whose PodDisruptionBudget `finish` writes itself.
+A merged or closed pull request that carried the budget stops `finish` writing it again, so the
+finding stays `manual`. A `/remediate <finding-id>` naming it, written after that pull request
+merged or closed, sets it aside: `finish` writes the budget again and opens a new pull request. An older request leaves the
+finding `manual`, and is refused as not a `manifest`. `/remediate all` does not name it, so it does
+not set the pull request aside.
+
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
 When the collector's manifest shows that Config Connector does not apply the object, `finish` writes
@@ -87,17 +94,17 @@ GitHub caps an issue body at 65,536 characters, and a pull request body at the s
 targets 60,000 and will truncate the ledger's findings section to stay under it. Consequences you
 must not work around:
 
-- **Findings are rendered severity-first**, so a count only ever replaces the least-severe end. A
-  critical never gives up its full block to a less severe finding's name. In a band, the cut takes
-  one finding per target in turn: no target gets a second row before every target in the band has
-  one. In the band where full blocks run out, the targets late in the alphabet get a one-line row
-  while names fit; past that, and in the bands below, they may get no line, only the count.
-- **Findings are named while names fit, after the criticals' full blocks.** Findings without room
-  for their full block are each listed on one line (severity, title, location, id, and any fix state
-  with its pull request) under `### Listed without detail`; a 2.7 finding the shared-account shield
-  made manual keeps the shield's note on an indented line under its row. Below the critical band, full blocks give
-  way to names, so as many findings as possible are named; the critical band trades full blocks only
-  for names of more criticals. Past what one line each can hold, the body gives a count.
+- **Findings are rendered severity-first**, so a count only ever replaces the least-severe end. In a
+  band, the cut takes one finding per target in turn: no target gets a second row before every
+  target in the band has one. Where full blocks run out, remaining findings get a one-line row down
+  every severity band while names fit; past that, the least-severe tail gets the count.
+- **Findings are named while names fit, before extra full blocks.** Findings without room for their
+  full block are each listed on one line (severity, title, location, id, and any fix state with its
+  pull request) under `### Listed without detail`; a 2.7 finding the shared-account shield made
+  manual keeps the shield's note on an indented line under its row. Once all full blocks do not fit,
+  full blocks give way to one-line names in every severity band, critical included, keeping at least
+  the first finding in full so as many findings as possible are named. Past what one line each can
+  hold, the body gives the omitted count and per-severity breakdown.
 - **The title's counts stay true.** If the body omits findings it says so explicitly. Never
   hand-trim your document to make it fit — the counts are how a reader learns the real total.
 - **Truncation does not make a run `partial`** — see [Partial coverage](finish.md#partial-coverage), which

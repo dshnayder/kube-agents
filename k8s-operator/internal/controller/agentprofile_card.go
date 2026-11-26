@@ -126,6 +126,8 @@ type a2aAgentCard struct {
 	Parameters  []a2aCardParameter `json:"parameters,omitempty"`
 	// YieldToPinned is lib.AgentCard.YieldToPinned, from spec.yieldToPinned.
 	YieldToPinned bool `json:"yieldToPinned,omitempty"`
+	// Delegates is lib.AgentCard.Delegates, from spec.delegates.
+	Delegates bool `json:"delegates,omitempty"`
 }
 
 // a2aCardClusterRef is lib.ClusterRef.
@@ -148,7 +150,8 @@ func agentCardSubject(profile string) string {
 
 // desiredAgentCard is the card the profile's spec renders.
 func desiredAgentCard(p *agentv1alpha1.AgentProfile) a2aAgentCard {
-	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: liveTiersOf(p), YieldToPinned: p.Spec.YieldToPinned}
+	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: liveTiersOf(p), YieldToPinned: p.Spec.YieldToPinned,
+		Delegates: p.Spec.Delegates}
 	if ref := p.Spec.ClusterRef; ref != nil {
 		card.ClusterRef = &a2aCardClusterRef{ProjectID: ref.ProjectID, Location: ref.Location, Cluster: ref.Cluster}
 	}
@@ -225,10 +228,12 @@ type natsCardPublisher struct {
 	// reader fetches the bus's CA bundle, which the operator trusts the bus
 	// by like every other client: the bus requires TLS.
 	reader client.Reader
+	// recheck holds back re-creating a durable that existed (#6283).
+	recheck *durableRecheck
 }
 
 func newNATSCardPublisher(reader client.Reader) *natsCardPublisher {
-	return &natsCardPublisher{conns: map[string]*nats.Conn{}, reader: reader}
+	return &natsCardPublisher{conns: map[string]*nats.Conn{}, reader: reader, recheck: newDurableRecheck()}
 }
 
 // busTLS is the operator's trust in this agent's bus: the CA bundle the

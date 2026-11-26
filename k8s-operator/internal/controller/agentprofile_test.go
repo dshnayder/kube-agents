@@ -175,6 +175,8 @@ func agentProfileSpecPaths() []string {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
+		p.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessClaudeCode
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -618,11 +620,12 @@ func checkFixture(t *testing.T, path, rendered string) {
 // holds its hand-built envelope to the protocol.
 func TestTheAgentCardFixtureIsWhatTheOperatorRenders(t *testing.T) {
 	at := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	// With declared parameters and yieldToPinned, so the a2a contract test
-	// can hold the routing fields' names to lib.AgentCard's.
+	// With declared parameters, yieldToPinned and delegates, so the a2a
+	// contract test can hold the routing fields' names to lib.AgentCard's.
 	card := desiredAgentCard(ptr.To(testAgentProfile("ns", "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})))
 	body, err := renderDirectoryEnvelope("auditor", &card, at, "000000000000000000000000")
 	if err != nil {
@@ -684,6 +687,9 @@ type fakeDirectory struct {
 	// it fail as a connection opened under an older map would.
 	durables        map[string][]profileDurable
 	durablesRefused bool
+	// durablesRechecking makes it answer as a durable held back for a
+	// re-check does (errDurableAwaitingRecheck).
+	durablesRechecking bool
 }
 
 func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets, namespace) }
@@ -691,6 +697,9 @@ func (f *fakeDirectory) forget(namespace string) { f.forgets = append(f.forgets,
 func (f *fakeDirectory) SyncDurables(_ context.Context, _ *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, _ []string) error {
 	if f.down || f.durablesRefused {
 		return errors.New("permissions violation")
+	}
+	if f.durablesRechecking {
+		return errors.Join(errors.New("durable profile-"+profile+"-read-top"), errDurableAwaitingRecheck)
 	}
 	if f.durables == nil {
 		f.durables = map[string][]profileDurable{}
@@ -1576,10 +1585,17 @@ func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Location: "us-central1", Cluster: "a"}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "namespace"}}
 		p.Spec.YieldToPinned = true
+		p.Spec.Delegates = true
 	})
 	card := desiredAgentCard(&p)
 	if !card.YieldToPinned {
 		t.Error("yieldToPinned didn't reach the card")
+	}
+	if !card.Delegates {
+		t.Error("delegates didn't reach the card")
+	}
+	if desiredAgentCard(ptr.To(testAgentProfile("ns", "plain"))).Delegates {
+		t.Error("a profile without spec.delegates has a card that delegates")
 	}
 	if !slices.Equal(card.Tiers, []string{"read", "unattended"}) {
 		t.Errorf("tiers = %v", card.Tiers)
@@ -1616,6 +1632,97 @@ func TestAFailedDurableSyncDropsTheBusConnection(t *testing.T) {
 	h.reconcile(agent.Namespace, "auditor")
 	if got := h.dir.durables["auditor"]; len(got) != 2 {
 		t.Errorf("after the reconnect the durables = %+v, want read top and child", got)
+	}
+}
+
+// A durable held back for a re-check keeps the bus connection, which
+// answered: only a refused sync drops it (#6283). The pass comes back on the
+// bus retry.
+func TestADurableReCheckKeepsTheBusConnection(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.dir.durablesRechecking = true
+	res := h.reconcile(agent.Namespace, "auditor")
+	if slices.Contains(h.dir.forgets, agent.Namespace) {
+		t.Errorf("a durable re-check dropped the connection: forgets = %v", h.dir.forgets)
+	}
+	if res.RequeueAfter != agentProfileBusRetry {
+		t.Errorf("RequeueAfter %s, want the bus retry %s", res.RequeueAfter, agentProfileBusRetry)
+	}
+}
+
+// status.durableTiers is written by a pass whose durable sync succeeded,
+// and left as it was by one the bus refused, as during a bus migration's
+// write freeze: a refused pass must not erase the record that the durables
+// existed (#6283).
+func TestDurableTiersAreWrittenOnlyBySuccessfulSync(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("after a successful sync durableTiers = %v, want [read]", got)
+	}
+	h.dir.durablesRefused = true
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("after a refused sync durableTiers = %v, want [read] kept", got)
+	}
+}
+
+// A profile reconciled before the upgrade has every compared status field
+// already current, so a status write that skipped on "nothing changed" would
+// never record durableTiers: it is part of the comparison (#6283).
+func TestDurableTiersAreWrittenOnAnOtherwiseUnchangedStatus(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	// As an older operator left it: everything else current, no record.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Status.DurableTiers = nil
+	if err := h.c.Status().Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Errorf("durableTiers = %v after a pass that changed nothing else, want [read]", got)
+	}
+}
+
+// A card withdrawn with the dispatcher on deletes the profile's durables, so
+// it clears durableTiers: a profile that recovers gets its durables at once,
+// not after a re-check of durables the operator deleted itself (#6283).
+func TestAWithdrawnCardClearsDurableTiers(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	h.reconcile(agent.Namespace, "auditor")
+	if got := h.profile(agent.Namespace, "auditor").Status.DurableTiers; !slices.Equal(got, []string{"read"}) {
+		t.Fatalf("precondition: durableTiers = %v", got)
+	}
+	// Refused: an identity naming the session ServiceAccount.
+	live := h.profile(agent.Namespace, "auditor")
+	live.Spec.Identity.ServiceAccountName = a2aSessionServiceAccountName(agent)
+	if err := h.c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+	got := h.profile(agent.Namespace, "auditor")
+	if c := condition(got, agentv1alpha1.AgentProfileConditionCardPublished); c.Reason != reasonAgentProfileIdentityMissing {
+		t.Fatalf("card reason = %q, want %q (the withdraw path)", c.Reason, reasonAgentProfileIdentityMissing)
+	}
+	if len(got.Status.DurableTiers) != 0 {
+		t.Errorf("durableTiers = %v after the withdraw deleted the durables, want none", got.Status.DurableTiers)
 	}
 }
 

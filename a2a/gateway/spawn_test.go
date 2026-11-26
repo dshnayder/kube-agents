@@ -401,7 +401,8 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 		CredentialProxyURL:   "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
 		KubeProxyURL:         "https://agent-kube-proxy.test-ns.svc.cluster.local:8443",
 		KubeProxyCAConfigMap: "agent-kube-proxy-ca-bundle",
-		KubeProxyHostContext: "in-cluster"}
+		KubeProxyHostContext: "in-cluster",
+		KubeProxyMode:        "read-only-dry-run"}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
 	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
@@ -441,6 +442,7 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 		env["KUBE_PROXY_URL"] != cfg.KubeProxyURL ||
 		env["KUBE_PROXY_CA_FILE"] != kubeProxyCAMountPath+"/"+kubeProxyCAFile ||
 		env["KUBE_PROXY_HOST_CONTEXT"] != cfg.KubeProxyHostContext ||
+		env["KUBE_PROXY_MODE"] != cfg.KubeProxyMode ||
 		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}
@@ -496,6 +498,51 @@ func TestClusterViewPassesTheExecTierURLWhenSet(t *testing.T) {
 			}
 			if got != tc.want || set != (tc.want != "") {
 				t.Errorf("CREDENTIAL_PROXY_EXEC_URL = %q (set %v), want %q", got, set, tc.want)
+			}
+		})
+	}
+}
+
+// The kubectl admission's tier reaches the session pod beside KUBE_PROXY_URL,
+// always named there (the gateway's valid tier, else "default"), and only where
+// the wrapper runs the admission (the cluster view with a kube-proxy).
+func TestClusterViewPassesTheKubectlCostTier(t *testing.T) {
+	const proxy = "https://agent-kube-proxy.test-ns.svc.cluster.local:8443"
+	for name, tc := range map[string]struct {
+		view  bool
+		proxy string
+		tier  string
+		want  string
+	}{
+		"view with tier":       {view: true, proxy: proxy, tier: "fleet", want: "fleet"},
+		"view without tier":    {view: true, proxy: proxy, want: "default"},
+		"view with a bad tier": {view: true, proxy: proxy, tier: "Fleet/../x", want: "default"},
+		"view without a proxy": {view: true, tier: "fleet"},
+		"no view":              {proxy: proxy, tier: "fleet"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := k8sfake.NewSimpleClientset()
+			cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+				TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222", SessionClusterView: tc.view,
+				CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
+				KubeProxyURL:       tc.proxy, KubectlCostTier: tc.tier}
+			s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+			rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
+			if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
+				t.Fatal(err)
+			}
+			pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, set := "", false
+			for _, e := range pod.Spec.Containers[0].Env {
+				if e.Name == "KUBEAGENTS_KUBECTL_COST_TIER" {
+					got, set = e.Value, true
+				}
+			}
+			if got != tc.want || set != (tc.want != "") {
+				t.Errorf("KUBEAGENTS_KUBECTL_COST_TIER = %q (set %v), want %q", got, set, tc.want)
 			}
 		})
 	}
@@ -739,5 +786,51 @@ func TestFromEnvReadsTheExecTierURL(t *testing.T) {
 	}
 	if cfg.CredentialProxyExecURL != "" {
 		t.Errorf("CredentialProxyExecURL = %q with the variable unset, want empty", cfg.CredentialProxyExecURL)
+	}
+}
+
+func TestSpawnPropagatesImagePullRefsAndUniverseDomain(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv(envImagePullRefs, " mirror-pull , extra-pull , mirror-pull , ")
+	t.Setenv(envGoogleCloudUniverseDomain, "universe.example.test")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cfg.ImagePullRefs, ",") != "mirror-pull,extra-pull" {
+		t.Fatalf("ImagePullRefs = %v, want [mirror-pull extra-pull]", cfg.ImagePullRefs)
+	}
+	if cfg.UniverseDomain != "universe.example.test" {
+		t.Fatalf("UniverseDomain = %q, want universe.example.test", cfg.UniverseDomain)
+	}
+
+	cs := k8sfake.NewSimpleClientset()
+	cfg.Namespace = "test-ns"
+	cfg.WorkerImage = "img"
+	cfg.SessionServiceAccount = "agent-a2a-session"
+	cfg.TaskDeadline = 15 * time.Minute
+	cfg.SessionClusterView = true
+	cfg.CredentialProxyURL = "http://proxy:8765"
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-pull", Addressee: "chat-otter-pull"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-pull", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pod.Spec.ImagePullSecrets) != 2 || pod.Spec.ImagePullSecrets[0].Name != "mirror-pull" || pod.Spec.ImagePullSecrets[1].Name != "extra-pull" {
+		t.Fatalf("spawned pod ImagePullSecrets = %v, want [mirror-pull extra-pull]", pod.Spec.ImagePullSecrets)
+	}
+	var gotUniverse string
+	for _, ev := range pod.Spec.Containers[0].Env {
+		if ev.Name == envGoogleCloudUniverseDomain {
+			gotUniverse = ev.Value
+		}
+	}
+	if gotUniverse != "universe.example.test" {
+		t.Fatalf("spawned pod %s = %q, want universe.example.test", envGoogleCloudUniverseDomain, gotUniverse)
 	}
 }

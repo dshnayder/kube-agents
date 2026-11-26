@@ -63,6 +63,7 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **GitOps Repository**: Asks where the GitOps repository lives (GitHub, a GitHub Enterprise Server, or GitLab; for Bitbucket, pass `--gitops-forge` instead), or **Nowhere yet** to install without one; a later re-run of `install.sh` connects one. Without a repository the agent runs and the scheduled audits run, but an audit opens no ledger issue or pull request ([Each morning: the scheduled audits](#each-morning-the-scheduled-audits)).
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, selects Vertex AI (no key — Workload Identity), or points the gateway at an OpenAI-compatible server you run (model name, base URL, the egress it needs, and an optional key).
+- **GKE Stockout Investigator**: Prompts on interactive runs to enable automated cluster-autoscaler `noScaleUp` diagnostics, defaulting to Yes when a Google Chat or Slack home channel is configured and No otherwise; non-interactive runs leave it off unless `--enable-stockout-investigator` or `ENABLE_STOCKOUT_INVESTIGATOR=true` is set. Also changeable from the Day-2 Control Panel (`./install.sh --menu`).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Engine Execution**: Generates `terraform/examples/full-install/terraform.tfvars` from the loaded configuration, records that configuration in `install.env` when a first install has none, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
@@ -86,7 +87,7 @@ on freshly created clusters (no Terraform field exists) and the GitHub App priva
 one place; see
 [Shared defaults live in `installer_common.sh`](scripts/installer/README.md#shared-defaults-live-in-installer_commonsh).
 
-Four behaviours worth knowing before the first run:
+Five behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the release version (in release checkouts and bundles) or the checkout's `HEAD` commit SHA (on `main`)**, and must be a SemVer release tag or a full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so the scripts and the container image stay on one revision; pass `--allow-unverified-source` to override that while iterating on the installer itself. Do not install from a `main` checkout when targeting an official release: manifests and CRD schemas on `main` diverge from older releases, and `verify_local_source_ref` blocks mismatched revisions to prevent broken installations.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
@@ -98,10 +99,13 @@ Four behaviours worth knowing before the first run:
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
-  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
-  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
-  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
-  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it;
+  `install.sh` writes none of the explicit `standard_*` or `gvisor_*` inputs, and sets or offers
+  `TF_VAR_sizing_profile=fleet` on a fresh Standard install with 25 or more visible clusters when
+  runtime sizing is `auto` or `fleet` and `TF_VAR_sizing_profile` / `TF_VAR_standard_machine_type`
+  are unset (and accepts an exported `TF_VAR_sizing_profile`). Set other inputs as `TF_VAR_` lines in
+  `install.env`, which Terraform reads where the generated tfvars
+  is silent, and keep them there for every later run: `lifecycle.sh` refuses an apply that would
   resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
   no explicit input decided at the last apply, a profile other than the one that apply recorded),
   the shape a lost line would otherwise plan. Pass
@@ -120,6 +124,25 @@ Four behaviours worth knowing before the first run:
   names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`
   refuses its apply; see
   [the composition's README](terraform/examples/full-install/README.md).
+- **Every run except `--dry-run` changes the project of your active `gcloud` configuration**, a
+  `--generate-only` run too. `install.sh` runs `gcloud config set project` for the target project
+  and does not set it back, so every terminal and process that uses that configuration points at
+  the new project from then on. To keep your default as it is, give the run a configuration of its
+  own, in the terminal that runs the installer:
+
+  ```bash
+  gcloud config configurations create kube-agents-install --no-activate
+  gcloud config set account "$(gcloud config get-value account)" --configuration=kube-agents-install
+  export CLOUDSDK_ACTIVE_CONFIG_NAME=kube-agents-install
+  ```
+
+  Then run the installer from that terminal, in any of its forms. `gcloud` reads
+  `CLOUDSDK_ACTIVE_CONFIG_NAME` only in the processes that have it, so the installer's `gcloud`
+  calls use and change `kube-agents-install`, and other terminals keep their project. The new
+  configuration holds your account and nothing else: pass `--gcp-region` if your default
+  configuration sets a region, and copy any other property that you rely on in the same way as
+  the account. Export the same variable before you run `upgrade.sh`, `uninstall.sh` or your own
+  `gcloud` commands for this install, so that they use the same project.
 
 ### Generate-Only Mode (Recommended for Existing Infrastructure)
 
@@ -140,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it updates only the keys listed in [The install configuration](scripts/installer/README.md#the-install-configuration-installenv)) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).
@@ -504,6 +527,8 @@ Before beginning installation, ensure your environment meets the requirements fo
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
 [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
+The site's [prerequisites](docs/site/src/content/docs/install/prerequisites.md) also cover the
+project's `default` VPC network and a second install for the same GitHub App.
 
 ---
 
@@ -621,8 +646,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **The A2A stack**: every install runs it. The operator renders the NATS bus, the A2A gateway,
-  the auth callout, the capability verifier, the A2A console and the `hermes-bridge` container in
-  front of the agent, whatever the `PlatformAgent`'s deprecated `spec.mode` says
+  the auth callout, the capability verifier, the A2A console, the MCP server, the profile
+  dispatcher and the `hermes-bridge` container in front of the agent, whatever the
+  `PlatformAgent`'s deprecated `spec.mode` says
   ([the upgrade guide](docs/site/src/content/docs/install/upgrade.md#moving-to-the-a2a-stack)
   covers an install made before the stack was unconditional). An install that mirrors its
   third-party images (`--third-party-registry-prefix`) pulls the bus's four images from the
@@ -722,7 +748,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
    - Under **Visibility**, select **Specific people and groups in your domain** and enter your email address (`ALLOWED_USERS`).
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
-   - Neither the first message nor `/sethome` sets it: the A2A gateway posts Google Chat's alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`). The agent sends home posts to each platform that has a home channel, including a Slack channel the gateway learned. With none, every enabled platform's gateway route refuses them and keeps them (up to fifty, for thirty days) for one digest once its channel is set. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
+   - Neither this DM nor `/sethome` sets the home channel: the A2A gateway posts Google Chat's alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), or, with that empty, to the named space where the app is first mentioned top-level. The agent sends home posts to each platform that has a home channel, including one the gateway learned. With none, every enabled platform's gateway route refuses them and keeps them (up to fifty, for thirty days) for one digest once its channel is set. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Who is answered**:
    - The A2A gateway has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
    - Re-display these instructions at any time from the repository root; the script prints the A2A gateway's checklist:
@@ -971,8 +997,8 @@ helm upgrade kube-agents ./charts/kube-agents \
 Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
 
 On an install that came from `install.sh`, set `ENABLE_GVISOR=true` in `install.env` instead. A
-first install writes it as true, but a file without the key reads as false to `upgrade.sh`, and a
-re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
+first install writes it as true; a file without the key is read from the live install (the
+Terraform state, then the node pools), and a re-run with `--enable-gvisor=true` does not record it. The next `upgrade.sh` or
 `install.sh` run regenerates `terraform.tfvars` from `install.env` and writes
 `agent_runtime_class = "gvisor"` from that key, plus the sandbox node pool on Standard, so a value
 set only on the Helm release or only in `terraform.tfvars` is reverted.
@@ -1142,7 +1168,7 @@ AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.ite
   kubectl rollout restart deployment/"${AGENT_NAME}-gateway" statefulset/"${AGENT_NAME}-shell" -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
 ### Step 3: Build & Push the Operator Image
@@ -1184,6 +1210,7 @@ at nothing and the policies silently inert:
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
 kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
+kubectl apply -f config/admission/agentschedule-builtin-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
@@ -1192,7 +1219,7 @@ pods the A2A gateway creates free to run as any ServiceAccount in the
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
 an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
 without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
-and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. With it set, with the dispatcher running (the default; `A2A_PROFILE_DISPATCHER=false` switches it off), the `PlatformAgent`'s `DispatcherJobMode` condition says whether Job mode is on, and why not. Read each file's header for what the
+and are refused at admission (`no-worker`), as are confirmed changes (`change-needs-job`); set it on the operator only once the third policy is applied. With it set, with the dispatcher running (the default; `A2A_PROFILE_DISPATCHER=false` switches it off), the `PlatformAgent`'s `DispatcherJobMode` condition says whether Job mode is on, and why not. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 
@@ -1308,7 +1335,8 @@ absent the operator uses `platform-agent-secrets` / `API_SERVER_KEY` as an optio
 the gateway starts even before that entry exists. This step is for a first install. On an existing
 install keep the CR you have: the webhook admits one per cluster ("only one PlatformAgent is
 allowed per cluster"), so re-applying under a new name is refused, and the upgrade note in Step 2
-derives its names from whichever CR exists.
+derives its names from whichever CR exists. The webhook also admits the CR in the operator's
+namespace only (`kubeagents-system` here), where the operator's write Role is bound.
 
 ```bash
 sed -e 's/^  name: platformagent$/  name: platform-agent/' \
@@ -1394,6 +1422,10 @@ a delivery run the file is renamed `INVENTORY.delivered.md`.
 ```bash
 kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md
 ```
+
+Or ask the agent — in the [no-chat-platform session](#step-6-talk-to-the-agent-with-no-chat-platform), or in chat once a platform is on: `what did onboarding
+find?` reads the same report back through the Platform Agent, `show me the full inventory` reads
+the sweep's complete findings, and `was the first-run report delivered?` says where it went.
 
 To see how far onboarding has got:
 
@@ -1549,12 +1581,12 @@ make uninstall
 
 When a Slack bot connects or is online in your workspace but never replies to messages, DMs, or mentions, verify each of the following:
 
-- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope and Event Subscriptions (`app_mention`, `message.*`) must be enabled.
+- **Socket Mode, Scopes, and Events:** Ensure Socket Mode is enabled in your Slack App console (**Settings → Socket Mode**) and the app-level token (`SLACK_APP_TOKEN`, prefixed with `xapp-`) carries `connections:write`. Bot tokens (`SLACK_BOT_TOKEN`, prefixed with `xoxb-`) must hold every required scope, and the `message.*` Event Subscriptions (`message.im`, `message.channels`, `message.groups`, `message.mpim`) must be enabled. The gateway finds a mention in the message text, so the `app_mention` event is not needed.
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
-  - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
+  - `files:write` is not needed: the gateway's manifest does not have it, and the gateway uploads no file. An app made from the `hermes slack manifest` output has both `app_mention` and `files:write`; they can stay.
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
-  - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
-  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`; the gateway's manifest is on the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page.
+  - On the gateway, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the gateway's manifest carries. An app made from the `hermes slack manifest` output has them too; one generated with `--no-assistant` lacks `assistant:write` and `assistant_thread_started`. Without these scopes and events the answers still arrive, and only the reactions, the answered line, Working… and the prompts go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
+  - For the complete manifest and its event subscriptions, see the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-the-a2a-gateway) page. Its manifest is short enough to paste into Slack's **Create New App → From a manifest** dialog. `./scripts/installer/print_instructions_slack.sh` prints the gateway's checklist and the page's address.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). The A2A gateway answers an unlisted user once with a notice naming their member ID. An empty allowlist admits all members in the workspace. The A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list, unless the list names that member as `T…:U…` (their workspace ID, a colon, their member ID). See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace:** The A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens, Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or Slack is turned off. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
 
@@ -1621,12 +1653,12 @@ On Google Chat the gateway posts a status line for every task ([what a task look
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | tail -n 50
   ```
-  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, restart both readers, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
+  `the bus refused this bridge` means the callout is not admitting the bridge, or the bridge's identity lacks the subject named in the line's `subject` field (see the bus check in the entry above). After 10 minutes with nothing on the task's stream the gateway says so in the conversation, and your next message there starts a new task ([what it posts](docs/site/src/content/docs/concepts/chatops.md#follow-ups-while-a-task-runs)); the gateway's `kubeagents_a2a_gateway_task_terminals_total{source="gateway-never-started"}` counts these. If the `TASKS` stream was deleted and recreated, the operator restarts both readers once it's back, provided it saw the stream missing on three five-minute polls in a row, or re-ran the provision Job itself while it was missing (`A2ABusClientsRestarted` names them). After a quicker fix, restart them yourself, as the [`Ready` condition notes](docs/site/src/content/docs/operator/platformagent-crd.md#status) explain:
   ```bash
   kubectl rollout restart deployment/platform-agent-a2a-gateway deployment/platform-agent-gateway -n kubeagents-system
   ```
 - **The agent says it handed the work off, and then nothing comes.** It filed a board card, and the card's report did not come back. The gateway posts a card's report into the conversation you asked in, on Slack and Google Chat alike. Check each hop:
-  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations and logs `chat.notify home posts not armed: … conversation posts are`. `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
+  1. The gateway's notify route is armed. Its log says `chat.notify route armed` with `"conversations":true`. `chat.notify route not armed` with an `err` means the home channel is set but malformed: on Google Chat `spec.integration.googleChat.homeChannel` must be a space name (`spaces/<id>`), on Slack `spec.integration.slack.homeChannel` a channel id (`C…` or `G…`). Correct or remove it; with none set the route still arms for conversations. It then logs `chat.notify home posts use a learned home channel: …` when the gateway can learn one, and `chat.notify home posts not armed: … conversation posts are` when it cannot (the home channel policy is `manual`). `chat.notify route not armed; retrying` means the bus refused the route's subscription (see the bus check in the entry above).
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
@@ -1641,5 +1673,5 @@ On Google Chat the gateway posts a status line for every task ([what a task look
        sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
      ```
      `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
-- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, deploy the operator with `A2A_CARD_STOP=true` (through the chart's `operator.extraEnv`); it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, set `CARD_STOP_ENABLED=true` in `install.env` (the chart's `operator.cardStop.enabled`), which deploys the operator with `A2A_CARD_STOP=true`; it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
 - **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.

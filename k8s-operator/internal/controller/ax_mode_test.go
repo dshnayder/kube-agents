@@ -167,13 +167,15 @@ func TestAXModeKeepsKubeProxyAndDeletesLegacyGatewayAndShell(t *testing.T) {
 	wantKPEnv := map[string]string{
 		"KUBE_PROXY_TLS_CERT_FILE":           "/run/servicedns-cert/credential-bundle.pem",
 		"KUBE_PROXY_TLS_KEY_FILE":            "/run/servicedns-cert/credential-bundle.pem",
-		"KUBE_PROXY_OIDC_ISSUER_URL":          "https://idp.ate-system.svc",
-		"KUBE_PROXY_OIDC_AUDIENCE":            "https://platform-agent-kube-proxy.kubeagents-system.svc:8443",
-		"KUBE_PROXY_OIDC_CA_FILE":             "/run/servicedns-ca/trust-bundle.pem",
-		"KUBE_PROXY_OIDC_REQUIRED_SUB_PREFIX": "actor/",
-		"KUBE_PROXY_OIDC_PARTITION_CLAIM":    `actor\.ate\.dev.atespace`,
-		"KUBE_PROXY_OIDC_UID_CLAIM":          `actor\.ate\.dev.actorUID`,
-		"KUBE_PROXY_OIDC_ALLOWED_PARTITIONS": "default",
+		"KUBE_PROXY_AUTH_MODE":               "jwt,token-review",
+		"KUBE_PROXY_JWT_ISSUER":              "https://idp.ate-system.svc",
+		"KUBE_PROXY_JWT_AUDIENCES":           "https://platform-agent-kube-proxy.kubeagents-system.svc:8443",
+		"KUBE_PROXY_JWT_CA_FILE":             "/run/servicedns-ca/trust-bundle.pem",
+		"KUBE_PROXY_JWT_REQUIRED_SUB_PREFIX": "actor/",
+		"KUBE_PROXY_JWT_PARTITION_CLAIM":     `actor\.ate\.dev.atespace`,
+		"KUBE_PROXY_JWT_UID_CLAIM":           `actor\.ate\.dev.actorUID`,
+		"KUBE_PROXY_JWT_ALLOWED_PARTITIONS":  "default",
+		"KUBE_PROXY_PARTITION_BY_CALLER":     "partition",
 	}
 	for k, want := range wantKPEnv {
 		if got := kpEnv[k]; got != want {

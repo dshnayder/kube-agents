@@ -198,11 +198,10 @@ Rules:
 
 Resolution turns the declared scope into a set of `(project, cluster, location)` tuples, plus a
 per-project outcome. It runs inside the existing reconcile job under the agent's identity, through
-the credential broker, because the operator deliberately holds no GCP credential. Outside
-`spec.mode: next`, the reconcile is the only process in the install that talks to GCP on a
-schedule.
+the credential broker, because the operator deliberately holds no GCP credential. The reconcile and the scope
+publisher are the two processes in the install that talk to GCP on a schedule.
 
-Under `spec.mode: next` there is a second scheduled caller, the scope publisher. The operator
+The scope publisher is the second scheduled caller. The operator
 starts it as a Job every 15 minutes, and soon after the membership fields of `spec.scope` change,
 while the scope declares a folder, organisation, Shared VPC host or Metrics Scope. It resolves the
 same members through the broker's `scope` role, under a ServiceAccount of its own, and writes them
@@ -378,7 +377,7 @@ carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic pass
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
 
-Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+The A2A gateway also needs the membership, to check a delegated task's
 target cluster before it mints a grant, and it cannot read this volume. The design adds a
 separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
 own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
@@ -394,18 +393,26 @@ listed it and its probe answered `ok`. Explicit projects and the management proj
 A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
 fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
 number-to-ID memo and the members counted against the cap that have no row. A third field the
-gateway and the operator do not read, `clusters` (added 11/11, #5621), keeps what each member's
-probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`, for the
-agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
-covers member projects only, since the management project and explicit projects are never
-probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
+operator does not read, `clusters` (added 11/11, #5621), keeps what each member's probe listed,
+`{"<project>": {"at": <when>, "clusters": [[location, name], ...]}}`. Its readers are the agent's
+helper scripts (`fleet_scope_targets.list_scope_clusters`;
+[`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8) and the A2A gateway's
+`scopeClusters` page for a delegating profile task
+([`spec-a2a-payloads.md`](spec-a2a-payloads.md), "Scope clusters"), which reads unknown when the
+map is absent. The gateway admits targets on the rows alone, never on this map. It also covers
+the management project and the explicit projects the reconcile keeps (not excluded, not over the
+cap): the publisher lists those after every member probe, for the map alone, and they still get
+no row. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
 for a project it could not read. The `projects` rows don't change with it. The map counts toward the 900 KiB budget, but it is
 dropped first: a document whose rows fit is published without it rather than as `too-large`. The operator starts
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
-own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile
-task's target against the document, as described below. The reconcile, its snapshot and today-mode
-installs do not change.
+own copy of `scope.json` declares or an earlier lookup returned. The read-only
+`container clusters list --project` shape also takes the management project, which the operator
+renders on the broker as `CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT` from `spec.harness.projectId`
+and which no `exclude.projects` entry removes, and a project `scope.json` names in `projects` that
+no `exclude.projects` entry matches, by the reconcile's own rule; no other shape takes them. The gateway checks a profile
+task's target against the document, as described below. The reconcile and its snapshot do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
