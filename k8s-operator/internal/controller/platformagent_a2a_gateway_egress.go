@@ -92,6 +92,35 @@ func buildA2AGatewayEgressPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs, d
 	if len(apiPeers) == 0 {
 		apiPeers = formatCIDRPeers([]string{defaultAPIServerClusterIP}, true)
 	}
+	egress := []networkingv1.NetworkPolicyEgressRule{
+		{
+			Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
+			To:    clusterDNSPeers(dnsIPs),
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, map[string]string{
+					labelPartOf:       a2aPartOf,
+					a2aComponentLabel: "nats",
+				}),
+			},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				tcpPort(apiServerHTTPSPort), tcpPort(apiServerAltPort), tcpPort(apiServerProxyPort),
+			},
+			To: apiPeers,
+		},
+		publicHTTPSEgressRule(),
+	}
+	if axModeEnabled() {
+		egress = append(egress, axGatewayEgressRules()...)
+	}
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -102,32 +131,7 @@ func buildA2AGatewayEgressPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs, d
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
-					To:    clusterDNSPeers(dnsIPs),
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, map[string]string{
-							labelPartOf:       a2aPartOf,
-							a2aComponentLabel: "nats",
-						}),
-					},
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-					To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						tcpPort(apiServerHTTPSPort), tcpPort(apiServerAltPort), tcpPort(apiServerProxyPort),
-					},
-					To: apiPeers,
-				},
-				publicHTTPSEgressRule(),
-			},
+			Egress:      egress,
 		},
 	}
 }

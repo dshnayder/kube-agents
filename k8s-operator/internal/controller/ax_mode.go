@@ -89,8 +89,15 @@ const (
 	axPodIdentityCertFile      = axPodIdentityMountPath + "/" + axPodIdentityBundlePath
 	axPodIdentitySignerName    = "podidentity.podcert.ate.dev/identity"
 	axPodIdentityKeyType       = "ECDSAP256"
+	axSystemNamespace          = "ax-system"
+	axServerAppNameLabel       = "ax-server"
 	ateSystemNamespace         = "ate-system"
 	ateEgressAppLabel          = "atenet-egress"
+	ateRouterAppLabel          = "atenet-router"
+	ateIDPAppLabel             = "ate-idp-server"
+	axServerPort               = int32(8080)
+	ateRouterTLSPort           = int32(8443)
+	ateRouterMetricsOrAltPort  = int32(8444)
 	a2aBridgeExecutorAX        = "ax"
 	axDefaultAtespace          = "default"
 	axDefaultAgentGatewayName   = "kube-agents-agent-gw"
@@ -383,6 +390,33 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			{Name: axServiceDNSCAName, MountPath: axServiceDNSCAMountPath, ReadOnly: true},
 			{Name: axServiceDNSCertVolumeName, MountPath: axServiceDNSCertMountPath, ReadOnly: true},
 			{Name: axPodIdentityVolumeName, MountPath: axPodIdentityMountPath, ReadOnly: true},
+		},
+	}
+}
+
+// axGatewayEgressRules allows the A2A gateway pod (which hosts hermes-bridge
+// in AX mode) to dial ax-server, atenet-router, and ate-idp-server across the
+// ax-system and ate-system namespaces.
+func axGatewayEgressRules() []networkingv1.NetworkPolicyEgressRule {
+	return []networkingv1.NetworkPolicyEgressRule{
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(axServerPort)},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(axSystemNamespace, map[string]string{
+					"app.kubernetes.io/name": axServerAppNameLabel,
+				}),
+			},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				tcpPort(apiServerHTTPSPort),
+				tcpPort(ateRouterTLSPort),
+				tcpPort(ateRouterMetricsOrAltPort),
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(ateSystemNamespace, map[string]string{"app": ateRouterAppLabel}),
+				namespacedPodPeer(ateSystemNamespace, map[string]string{"app": ateIDPAppLabel}),
+			},
 		},
 	}
 }

@@ -507,3 +507,39 @@ func TestAXModeReadinessTransitionsReadyAndScansKubeProxyPods(t *testing.T) {
 		t.Fatalf("getDeploymentStatusDetails(kube-proxy ImagePullBackOff) = (%q, %q, %q), want Degraded/ImagePullBackOff", gotPhase, gotReason, gotMsg)
 	}
 }
+
+func TestAXModeGatewayEgressPolicyAllowsAXAndATE(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+	}
+
+	hasNS := func(np *networkingv1.NetworkPolicy, ns, key, val string) bool {
+		for _, rule := range np.Spec.Egress {
+			for _, peer := range rule.To {
+				if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[labelMetadataName] == ns &&
+					peer.PodSelector != nil && peer.PodSelector.MatchLabels[key] == val {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	t.Setenv("AX_ENABLED", "")
+	offNP := buildA2AGatewayEgressPolicy(agent, nil, nil)
+	if hasNS(offNP, "ax-system", "app.kubernetes.io/name", "ax-server") || hasNS(offNP, "ate-system", "app", "atenet-router") {
+		t.Errorf("non-AX gateway egress policy must not include ax-system or ate-system peers")
+	}
+
+	t.Setenv("AX_ENABLED", "true")
+	onNP := buildA2AGatewayEgressPolicy(agent, nil, nil)
+	if !hasNS(onNP, "ax-system", "app.kubernetes.io/name", "ax-server") {
+		t.Errorf("AX gateway egress policy missing ax-system/ax-server peer")
+	}
+	if !hasNS(onNP, "ate-system", "app", "atenet-router") {
+		t.Errorf("AX gateway egress policy missing ate-system/atenet-router peer")
+	}
+	if !hasNS(onNP, "ate-system", "app", "ate-idp-server") {
+		t.Errorf("AX gateway egress policy missing ate-system/ate-idp-server peer")
+	}
+}
