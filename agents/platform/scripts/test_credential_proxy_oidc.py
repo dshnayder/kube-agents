@@ -410,6 +410,55 @@ class OIDCActorAuthenticationTest(unittest.TestCase):
         self.assertEqual(built.oidc_required_sub_prefix, "actor/")
         self.assertEqual(built.oidc_uid_claim, r"actor\.ate\.dev.actorUID")
 
+    def test_oidc_principal_skips_pod_binding_while_sa_enforces_it(self) -> None:
+        auth = self._authenticator()
+        auth.pod_binding = credential_proxy.PodAddressBinding(
+            api_host="127.0.0.1",
+            api_port="6443",
+            ca_file="",
+            token_file="",
+        )
+        oidc_token = _sign_es256(
+            self.ec_key,
+            "ec-1",
+            {
+                "iss": self.server.issuer_url,
+                "sub": "actor/default/platform-agent-sandbox",
+                "aud": "kubeagents-credential-proxy",
+                "exp": int(self.now) + 300,
+                "actor.ate.dev": {"actorUID": "actor-uid-42"},
+            },
+        )
+        oidc_principal = auth.authenticate({"Authorization": f"Bearer {oidc_token}"})
+        self.assertEqual(oidc_principal.auth_source, "oidc")
+
+        def _run_authenticated(principal: credential_proxy.Principal) -> tuple[credential_proxy.Principal | None, list[tuple[Any, Any]]]:
+            responses: list[tuple[Any, Any]] = []
+            handler = object.__new__(credential_proxy.CredentialProxyHandler)
+            handler.authenticator = mock.Mock(pod_binding=auth.pod_binding)
+            handler.authenticator.authenticate.return_value = principal
+            handler.headers = {"Authorization": "Bearer dummy"}
+            handler.path = "/v1/exec"
+            handler.client_address = ("10.0.0.99", 54321)
+            handler.server = mock.Mock()
+            handler._json = lambda status, body: responses.append((status, body))  # type: ignore[method-assign]
+            handler._role_permits = lambda p: True  # type: ignore[method-assign]
+            return handler._authenticated(), responses
+
+        got_oidc, oidc_responses = _run_authenticated(oidc_principal)
+        self.assertEqual(got_oidc, oidc_principal)
+        self.assertEqual(oidc_responses, [])
+
+        unbound_sa = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:platform-agent-shell",
+            uid="ksa-uid",
+            role=credential_proxy.CALLER_ROLE_SHELL,
+        )
+        got_sa, sa_responses = _run_authenticated(unbound_sa)
+        self.assertIsNone(got_sa)
+        self.assertEqual(len(sa_responses), 1)
+        self.assertEqual(sa_responses[0][0], credential_proxy.HTTPStatus.UNAUTHORIZED)
+
     def test_credential_proxy_source_has_no_hardcoded_substrate_strings(self) -> None:
         src = (SCRIPT_DIR / "credential_proxy.py").read_text(encoding="utf-8")
         self.assertNotIn("ate.dev", src)

@@ -6030,6 +6030,9 @@ class Principal:
     role: str = ""
     pod: str = ""
     pod_uid: str = ""
+    # Set to "oidc" only when verified by OidcJwtAuthenticator for external
+    # OIDC callers that carry no Kubernetes pod claims.
+    auth_source: str = ""
     # A profile caller's verified task credential (task_credential.TaskClaims)
     # and its target as a cluster triple; None without one.
     task: Any = None
@@ -6331,7 +6334,7 @@ class _OIDCActorVerifier:
                 raise AuthenticationError("the presented OIDC token is not yet valid")
 
         uid = self._resolve_uid(payload, sub)
-        return Principal(workload=sub, uid=uid, role=CALLER_ROLE_SHELL), float(exp)
+        return Principal(workload=sub, uid=uid, role=CALLER_ROLE_SHELL, auth_source="oidc"), float(exp)
 
     def _resolve_uid(self, payload: Mapping[str, Any], sub: str) -> str:
         if not self._uid_claim_path:
@@ -17791,7 +17794,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # Per request, after the TokenReview, cached or not: the
             # token is good, and now it has to be coming from its own pod.
             binding = getattr(self.authenticator, "pod_binding", None)
-            if binding is not None:
+            if binding is not None and principal.auth_source != "oidc":
                 binding.check(principal, self._peer_address())
             self.principal = principal
         except AuthenticationError as exc:
