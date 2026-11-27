@@ -856,6 +856,68 @@ render_envoy_config() {
   fi
 }
 
+# Render an Envoy config with an additional TLS listener backed by file-based
+# SDS so Kubernetes PodCertificate symlink swaps reload the serving certificate
+# without restarting Envoy.
+render_envoy_tls_config() {
+  local src_path=$1 dst_path=$2 sds_path=$3 raw_port=$4 cert_file=$5 key_file=$6
+  "${PROXY_PYTHON}" - "${src_path}" "${dst_path}" "${sds_path}" "${raw_port}" "${cert_file}" "${key_file}" <<'PY'
+import os
+import sys
+from pathlib import Path
+import yaml
+
+src_path, dst_path, sds_path, raw_port, cert_file, key_file = sys.argv[1:7]
+port = int(raw_port)
+if port < 1 or port > 65535:
+    raise SystemExit(f"start-services: CREDENTIAL_PROXY_TLS_PORT={raw_port} is outside 1-65535")
+doc = yaml.safe_load(Path(src_path).read_text(encoding="utf-8"))
+doc.setdefault("node", {"id": "credential-proxy", "cluster": "credential-proxy"})
+listeners = doc["static_resources"]["listeners"]
+tls_listener = yaml.safe_load(yaml.safe_dump(listeners[0]))
+tls_listener["name"] = "credential_proxy_tls"
+tls_listener["address"]["socket_address"]["port_value"] = port
+watch_dir = os.path.dirname(os.path.abspath(cert_file))
+secret_name = "credential_proxy_tls_cert"
+sds_doc = {
+    "resources": [
+        {
+            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+            "name": secret_name,
+            "tls_certificate": {
+                "certificate_chain": {"filename": cert_file},
+                "private_key": {"filename": key_file},
+            },
+        }
+    ]
+}
+path_config_source = {"path": sds_path}
+if watch_dir:
+    path_config_source["watched_directory"] = {"path": watch_dir}
+tls_listener["filter_chains"][0]["transport_socket"] = {
+    "name": "envoy.transport_sockets.tls",
+    "typed_config": {
+        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+        "common_tls_context": {
+            "tls_params": {"tls_minimum_protocol_version": "TLSv1_2"},
+            "tls_certificate_sds_secret_configs": [
+                {
+                    "name": secret_name,
+                    "sds_config": {
+                        "resource_api_version": "V3",
+                        "path_config_source": path_config_source,
+                    },
+                }
+            ],
+        },
+    },
+}
+listeners.append(tls_listener)
+Path(sds_path).write_text(yaml.safe_dump(sds_doc, sort_keys=False), encoding="utf-8")
+Path(dst_path).write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+PY
+}
+
 start_envoy() {
   # The baked config binds 127.0.0.1, which is the access control for as long as
   # the broker is a sidecar in the agent's Pod. When the operator puts the broker
@@ -877,41 +939,8 @@ start_envoy() {
   fi
   if [[ -n "${CREDENTIAL_PROXY_TLS_PORT:-}" && -n "${CREDENTIAL_PROXY_TLS_CERT_FILE:-}" ]]; then
     local tls_rendered=/tmp/envoy-credential-proxy-tls.yaml
-    "${PROXY_PYTHON}" - "${envoy_config}" "${tls_rendered}" "${CREDENTIAL_PROXY_TLS_PORT}" "${CREDENTIAL_PROXY_TLS_CERT_FILE}" "${CREDENTIAL_PROXY_TLS_KEY_FILE:-${CREDENTIAL_PROXY_TLS_CERT_FILE}}" <<'PY'
-import os
-import sys
-from pathlib import Path
-import yaml
-
-src_path, dst_path, raw_port, cert_file, key_file = sys.argv[1:6]
-port = int(raw_port)
-if port < 1 or port > 65535:
-    raise SystemExit(f"start-services: CREDENTIAL_PROXY_TLS_PORT={raw_port} is outside 1-65535")
-doc = yaml.safe_load(Path(src_path).read_text(encoding="utf-8"))
-listeners = doc["static_resources"]["listeners"]
-tls_listener = yaml.safe_load(yaml.safe_dump(listeners[0]))
-tls_listener["name"] = "credential_proxy_tls"
-tls_listener["address"]["socket_address"]["port_value"] = port
-watch_dir = os.path.dirname(os.path.abspath(cert_file))
-tls_cert = {
-    "certificate_chain": {"filename": cert_file},
-    "private_key": {"filename": key_file},
-}
-if watch_dir:
-    tls_cert["watched_directory"] = {"path": watch_dir}
-tls_listener["filter_chains"][0]["transport_socket"] = {
-    "name": "envoy.transport_sockets.tls",
-    "typed_config": {
-        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
-        "common_tls_context": {
-            "tls_params": {"tls_minimum_protocol_version": "TLSv1_2"},
-            "tls_certificates": [tls_cert],
-        },
-    },
-}
-listeners.append(tls_listener)
-Path(dst_path).write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
-PY
+    local tls_sds=/tmp/envoy-credential-proxy-sds.yaml
+    render_envoy_tls_config "${envoy_config}" "${tls_rendered}" "${tls_sds}" "${CREDENTIAL_PROXY_TLS_PORT}" "${CREDENTIAL_PROXY_TLS_CERT_FILE}" "${CREDENTIAL_PROXY_TLS_KEY_FILE:-${CREDENTIAL_PROXY_TLS_CERT_FILE}}" || exit 1
     envoy_config="${tls_rendered}"
   fi
   /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &

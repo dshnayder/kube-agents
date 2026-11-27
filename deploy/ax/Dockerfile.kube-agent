@@ -49,9 +49,13 @@ COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/defaul
 
 RUN python3 -m compileall -f -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py && \
     rm -f /opt/credential-proxy/bin/gcloud /usr/local/bin/kubectl && \
-    install -d -m 0755 -o agent -g agent /home/agent /home/agent/.hermes /opt/data && \
+    install -d -m 0755 -o agent -g agent /home/agent /home/agent/.hermes /opt/data /opt/data/scratch && \
     cp -a /opt/defaults/* /opt/data/ && \
     chown -R root:root /opt/data/skills /opt/data/governance /opt/data/scripts && \
+    install -d -m 0755 -o root -g root /opt/data/profiles /opt/data/profiles/platform && \
+    ln -sfn /opt/data/skills /opt/data/profiles/platform/skills && \
+    ln -sfn /opt/data/governance /opt/data/profiles/platform/governance && \
+    ln -sfn /opt/data/scripts /opt/data/profiles/platform/scripts && \
     install -d -m 0700 -o agent -g agent /home/agent/.kube /ax && \
     install -d -m 0777 /workspace && \
     printf 'ax-placeholder\n' > /ax/token && \
@@ -267,7 +271,11 @@ USER root
 RUN rm -f /usr/local/bin/kubectl /usr/local/bin/yq /usr/local/bin/helm /usr/local/bin/leeway \
           /opt/credential-proxy/bin/gcloud /opt/credential-proxy/bin/kubectl \
           /usr/bin/kubectl /usr/bin/gcloud && \
-    mkdir -p /etc/sandbox-ssh /root/.ssh /root/.hermes/skills /root/.hermes/logs /root/.hermes/sessions /workspace && \
+    rm -rf /root/.hermes && \
+    mkdir -p /etc/sandbox-ssh /root/.ssh \
+             /root/.hermes-platform/skills /root/.hermes-platform/logs /root/.hermes-platform/sessions \
+             /root/.hermes-cluster/skills /root/.hermes-cluster/logs /root/.hermes-cluster/sessions \
+             /workspace && \
     chmod 0700 /root/.ssh && \
     chmod 0777 /workspace
 
@@ -276,10 +284,16 @@ COPY --from=ssh-keygen-stage --chmod=0600 /ssh/id_ed25519 /etc/sandbox-ssh/id_ed
 
 RUN cat <<'EOF' > /root/.ssh/config && \
     chmod 0600 /root/.ssh/config && \
-    cp -r /opt/cluster-template/SOUL.md /opt/cluster-template/AGENTS.md /opt/cluster-template/CAPABILITIES.md /opt/cluster-template/persona /root/.hermes/ && \
-    cp -r /opt/cluster-template/skills/* /root/.hermes/skills/ && \
-    cp -rn /opt/platform-template/skills/* /root/.hermes/skills/ 2>/dev/null || true && \
-    cat <<'EOF2' > /root/.hermes/config.yaml
+    cp -r /opt/platform-template/SOUL.md /opt/platform-template/AGENTS.md /opt/platform-template/CAPABILITIES.md /root/.hermes-platform/ && \
+    if [ -d /opt/platform-template/governance ]; then cp -r /opt/platform-template/governance /root/.hermes-platform/; fi && \
+    cp -r /opt/platform-template/skills/* /root/.hermes-platform/skills/ && \
+    if [ -d /opt/a2a-template/skills ]; then cp -r /opt/a2a-template/skills/* /root/.hermes-platform/skills/; fi && \
+    if [ -d /opt/defaults/scripts ]; then ln -sfn /opt/defaults/scripts /root/.hermes-platform/scripts; fi && \
+    cp -r /opt/cluster-template/SOUL.md /opt/cluster-template/AGENTS.md /opt/cluster-template/CAPABILITIES.md /opt/cluster-template/persona /root/.hermes-cluster/ && \
+    cp -r /opt/cluster-template/skills/* /root/.hermes-cluster/skills/ && \
+    cat <<'EOF2' > /root/.hermes-platform/config.yaml && \
+    cp /root/.hermes-platform/config.yaml /root/.hermes-cluster/config.yaml && \
+    ln -s /root/.hermes-platform /root/.hermes
 Host 127.0.0.1
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
@@ -334,7 +348,7 @@ EOF2
 
 WORKDIR /workspace
 ENV HOME=/root \
-    HERMES_HOME=/root/.hermes \
+    HERMES_HOME=/root/.hermes-platform \
     HERMES_DOCKER_EXEC_AS_ROOT=1 \
     TERMINAL_ENV=ssh \
     TERMINAL_SSH_HOST=127.0.0.1 \

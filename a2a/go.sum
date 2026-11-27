@@ -230,13 +230,10 @@ github.com/wk8/go-ordered-map/v2 v2.1.8 h1:5h/BUHu93oj4gIdvHHHGsScSTMijfx5PeYkE/
 github.com/wk8/go-ordered-map/v2 v2.1.8/go.mod h1:5nJHM5DyteebpVlHnWMV0rPz6Zp7+xBAnxjb1X5vnTw=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
-<<<<<<< HEAD
-go.ate.dev/substrate v1.0.0 h1:7zFdRCb4e4OHoJUUWugBCQ7m1GLHHb1SxJo05HqEDjw=
-go.ate.dev/substrate v1.0.0/go.mod h1:iBSRX82TClE5CSsD80HoYsxVP81NSpf0zKKTW+2s/+0=
-=======
 github.com/yosida95/uritemplate/v3 v3.0.2 h1:Ed3Oyj9yrmi9087+NczuL5BwkIc4wvTb5zIM+UJPGz4=
 github.com/yosida95/uritemplate/v3 v3.0.2/go.mod h1:ILOh0sOhIJR3+L/8afwt/kE++YT040gmv5BQTMR2HP4=
->>>>>>> upstream/main
+go.ate.dev/substrate v1.0.0 h1:7zFdRCb4e4OHoJUUWugBCQ7m1GLHHb1SxJo05HqEDjw=
+go.ate.dev/substrate v1.0.0/go.mod h1:iBSRX82TClE5CSsD80HoYsxVP81NSpf0zKKTW+2s/+0=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
 go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.70.0 h1:oECp5f+hN7nkwjU/8BxQ/q23bGPb8FIrD839owX222E=

@@ -61,6 +61,8 @@ const (
 
 	axTargetActorHeader       = "ate-target-actor"
 	axSandboxTaskSuffix       = "-sandbox"
+	axPlatformHermesHome      = "/root/.hermes-platform"
+	axClusterHermesHome       = "/root/.hermes-cluster"
 	axAgentSSHProxyBinary     = "/usr/local/bin/ax-sandbox-ssh-proxy"
 	axSandboxDefaultWorkdir   = "/workspace"
 	axSandboxDefaultPATH      = "/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -623,7 +625,40 @@ func (e *axExecutor) RunTurn(ctx context.Context, sessionID, prompt string) (str
 	if err != nil {
 		return "", err
 	}
-	return e.execInActor(ctx, atespace, actor, sessionID, cleanPrompt)
+	return e.execInActor(ctx, atespace, targetTask, actor, sessionID, cleanPrompt)
+}
+
+func axHermesHomeForTask(targetTask string) string {
+	if strings.HasPrefix(targetTask, "cluster-agent-") {
+		return axClusterHermesHome
+	}
+	return axPlatformHermesHome
+}
+
+func (e *axExecutor) gkeEnvVars() []*axv1alpha1.EnvVar {
+	var vars []*axv1alpha1.EnvVar
+	if v := strings.TrimSpace(e.cfg.GKEProjectID); v != "" {
+		vars = append(vars, &axv1alpha1.EnvVar{Name: "GKE_PROJECT_ID", Value: v})
+	}
+	if v := strings.TrimSpace(e.cfg.GKEClusterName); v != "" {
+		vars = append(vars, &axv1alpha1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: v})
+	}
+	if v := strings.TrimSpace(e.cfg.GKELocation); v != "" {
+		vars = append(vars, &axv1alpha1.EnvVar{Name: "GKE_LOCATION", Value: v})
+	}
+	return vars
+}
+
+func (e *axExecutor) applyGKEEnv(dst map[string]string) {
+	if v := strings.TrimSpace(e.cfg.GKEProjectID); v != "" {
+		dst["GKE_PROJECT_ID"] = v
+	}
+	if v := strings.TrimSpace(e.cfg.GKEClusterName); v != "" {
+		dst["GKE_CLUSTER_NAME"] = v
+	}
+	if v := strings.TrimSpace(e.cfg.GKELocation); v != "" {
+		dst["GKE_LOCATION"] = v
+	}
 }
 
 // ExecInPairedSandbox ensures callerTask's 1-to-1 paired sandbox task is active and executes command inside it.
@@ -661,6 +696,7 @@ func (e *axExecutor) ExecInPairedSandbox(
 		"CREDENTIAL_PROXY_TOKEN_FILE": axSandboxTokenFile,
 		"PATH":                        axSandboxDefaultPATH,
 	}
+	e.applyGKEEnv(mergedEnv)
 	for k, v := range callerEnv {
 		mergedEnv[k] = v
 	}
@@ -771,6 +807,11 @@ func (e *axExecutor) buildTaskResources() *axv1alpha1.ResourcesSpec {
 }
 
 func (e *axExecutor) createLazyAgentTask(ctx context.Context, atespace, targetTask string) (*axv1alpha1.Task, error) {
+	env := []*axv1alpha1.EnvVar{{
+		Name:  "SANDBOX_BROKER_URL",
+		Value: e.sandboxBrokerURL(),
+	}}
+	env = append(env, e.gkeEnvVars()...)
 	spec := &axv1alpha1.TaskSpec{
 		Debug: true,
 		Profile: &axv1alpha1.Profile{
@@ -778,10 +819,7 @@ func (e *axExecutor) createLazyAgentTask(ctx context.Context, atespace, targetTa
 			Resources: e.buildTaskResources(),
 		},
 		Commands: []string{axAgentSSHProxyBinary},
-		Env: []*axv1alpha1.EnvVar{{
-			Name:  "SANDBOX_BROKER_URL",
-			Value: e.sandboxBrokerURL(),
-		}},
+		Env:      env,
 	}
 	if gw := strings.TrimSpace(e.cfg.AXAgentGatewayName); gw != "" {
 		spec.Gateway = &axv1alpha1.GatewayRef{Name: gw}
@@ -790,16 +828,18 @@ func (e *axExecutor) createLazyAgentTask(ctx context.Context, atespace, targetTa
 }
 
 func (e *axExecutor) createLazySandboxTask(ctx context.Context, atespace, sandboxTask string) (*axv1alpha1.Task, error) {
+	env := []*axv1alpha1.EnvVar{
+		{Name: "KUBE_PROXY_URL", Value: e.kubeProxyURL()},
+		{Name: "CREDENTIAL_PROXY_URL", Value: e.credentialProxyURL()},
+	}
+	env = append(env, e.gkeEnvVars()...)
 	spec := &axv1alpha1.TaskSpec{
 		Debug: true,
 		Profile: &axv1alpha1.Profile{
 			Image:     strings.TrimSpace(e.cfg.AXSandboxImage),
 			Resources: e.buildTaskResources(),
 		},
-		Env: []*axv1alpha1.EnvVar{
-			{Name: "KUBE_PROXY_URL", Value: e.kubeProxyURL()},
-			{Name: "CREDENTIAL_PROXY_URL", Value: e.credentialProxyURL()},
-		},
+		Env: env,
 	}
 	if gw := strings.TrimSpace(e.cfg.AXSandboxGatewayName); gw != "" {
 		spec.Gateway = &axv1alpha1.GatewayRef{Name: gw}
@@ -910,16 +950,18 @@ type actorProcessSpec struct {
 	Stdin   []byte
 }
 
-func (e *axExecutor) execInActor(ctx context.Context, atespace, actor, sessionID, cleanPrompt string) (string, error) {
+func (e *axExecutor) execInActor(ctx context.Context, atespace, targetTask, actor, sessionID, cleanPrompt string) (string, error) {
+	env := map[string]string{
+		"HERMES_DOCKER_EXEC_AS_ROOT": "1",
+		"HOME":                       "/root",
+		"HERMES_HOME":                axHermesHomeForTask(targetTask),
+		"HERMES_SESSION_ID":          sessionID,
+		"HERMES_SESSION_KEY":         sessionID,
+	}
+	e.applyGKEEnv(env)
 	stdoutBytes, stderrBytes, exitCode, err := e.runProcessInActor(ctx, atespace, actor, actorProcessSpec{
 		Command: []string{"hermes", "chat", "-Q", "--yolo", "-q", cleanPrompt},
-		Env: map[string]string{
-			"HERMES_DOCKER_EXEC_AS_ROOT": "1",
-			"HOME":                       "/root",
-			"HERMES_HOME":                "/root/.hermes",
-			"HERMES_SESSION_ID":          sessionID,
-			"HERMES_SESSION_KEY":         sessionID,
-		},
+		Env:     env,
 	})
 	if err != nil {
 		return "", err

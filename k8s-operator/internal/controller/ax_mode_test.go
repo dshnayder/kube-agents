@@ -38,6 +38,13 @@ import (
 func TestAXModeHelpers(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "demo-proj",
+				ClusterName: "kage-management",
+				Location:    "us-central1",
+			},
+		},
 	}
 
 	if axModeEnabled() {
@@ -274,6 +281,13 @@ func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 	t.Setenv("AX_SANDBOX_IMAGE", "us-central1-docker.pkg.dev/demo/ate-images/ax-kube-sandbox@sha256:2222")
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "demo-proj",
+				ClusterName: "kage-management",
+				Location:    "us-central1",
+			},
+		},
 	}
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -325,6 +339,9 @@ func TestAXModeInjectsBridgeIntoA2AGateway(t *testing.T) {
 		"ATENET_CA_FILE":            "/run/servicedns-ca/trust-bundle.pem",
 		"BRIDGE_ACTIVITY_LISTEN":    "off",
 		"A2A_CAPABILITY_REQUIRED":   a2aCapabilityRequired(),
+		"GKE_PROJECT_ID":            "demo-proj",
+		"GKE_CLUSTER_NAME":          "kage-management",
+		"GKE_LOCATION":              "us-central1",
 	}
 	for k, want := range wantValues {
 		if got := envByName[k].Value; got != want {
@@ -392,6 +409,13 @@ func TestAXModeCredentialProxyOIDCAndNetworkPolicy(t *testing.T) {
 	t.Setenv("AX_ENABLED", "true")
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "demo-proj",
+				ClusterName: "kage-management",
+				Location:    "us-central1",
+			},
+		},
 	}
 
 	dep := buildCredentialProxyDeployment(agent, "policy-hash")
@@ -511,6 +535,13 @@ func TestAXModeReadinessTransitionsReadyAndScansKubeProxyPods(t *testing.T) {
 func TestAXModeGatewayEgressPolicyAllowsAXAndATE(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "demo-proj",
+				ClusterName: "kage-management",
+				Location:    "us-central1",
+			},
+		},
 	}
 
 	hasNS := func(np *networkingv1.NetworkPolicy, ns, key, val string) bool {

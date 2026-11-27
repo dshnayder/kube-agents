@@ -1445,3 +1445,81 @@ func TestAX_StreamReconnectsWithByteOffsets(t *testing.T) {
 		t.Fatalf("stdout offsets = [%d, %d], want [0, >0]", reqs[0].GetStdoutOffset(), reqs[1].GetStdoutOffset())
 	}
 }
+
+func TestAX_SelectsPersonaHermesHomeAndPropagatesGKEEnv(t *testing.T) {
+	axSvc, axAddr, procSvc, routerAddr := startTestAXAndRouter(t, nil)
+	exec, err := newAXExecutor(Config{
+		AXServerAddr:         axAddr,
+		AXAtespace:           DefaultAXAtespace,
+		AXDefaultTask:        DefaultAXTaskName,
+		AXAgentGatewayName:   DefaultAXAgentGatewayName,
+		AXSandboxGatewayName: DefaultAXSandboxGatewayName,
+		AXAgentImage:         "registry.example.com/ax-kube-agent:v1",
+		AXSandboxImage:       "registry.example.com/ax-kube-sandbox:v1",
+		GKEProjectID:         "demo-proj",
+		GKEClusterName:       "kage-management",
+		GKELocation:          "us-central1",
+		AtenetRouterAddr:     routerAddr,
+		AtenetInsecure:       true,
+	})
+	if err != nil {
+		t.Fatalf("newAXExecutor: %v", err)
+	}
+	t.Cleanup(func() { _ = exec.Close() })
+
+	if _, err := exec.RunTurn(testCtx(t), "sess-platform", "check platform"); err != nil {
+		t.Fatalf("RunTurn(platform): %v", err)
+	}
+	if _, err := exec.RunTurn(testCtx(t), "sess-cluster", "@cluster-agent-042 inspect nodes"); err != nil {
+		t.Fatalf("RunTurn(cluster): %v", err)
+	}
+	if _, _, _, err := exec.ExecInPairedSandbox(testCtx(t), DefaultAXAtespace, DefaultAXTaskName, "env", "", nil, nil); err != nil {
+		t.Fatalf("ExecInPairedSandbox: %v", err)
+	}
+
+	procSvc.mu.Lock()
+	calls := slices.Clone(procSvc.calls)
+	procSvc.mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("len(calls) = %d, want 3", len(calls))
+	}
+	if got := calls[0].env["HERMES_HOME"]; got != axPlatformHermesHome {
+		t.Errorf("platform-agent HERMES_HOME = %q, want %q", got, axPlatformHermesHome)
+	}
+	if got := calls[1].env["HERMES_HOME"]; got != axClusterHermesHome {
+		t.Errorf("cluster-agent-042 HERMES_HOME = %q, want %q", got, axClusterHermesHome)
+	}
+	for i, name := range []string{"platform-agent", "cluster-agent-042", "platform-agent-sandbox"} {
+		for k, want := range map[string]string{
+			"GKE_PROJECT_ID":   "demo-proj",
+			"GKE_CLUSTER_NAME": "kage-management",
+			"GKE_LOCATION":     "us-central1",
+		} {
+			if got := calls[i].env[k]; got != want {
+				t.Errorf("%s StartProcess env[%s] = %q, want %q", name, k, got, want)
+			}
+		}
+	}
+
+	axSvc.mu.Lock()
+	created := slices.Clone(axSvc.createdTasks)
+	axSvc.mu.Unlock()
+	if len(created) != 3 {
+		t.Fatalf("len(createdTasks) = %d, want 3", len(created))
+	}
+	for _, task := range created {
+		envMap := map[string]string{}
+		for _, ev := range task.GetSpec().GetEnv() {
+			envMap[ev.GetName()] = ev.GetValue()
+		}
+		for k, want := range map[string]string{
+			"GKE_PROJECT_ID":   "demo-proj",
+			"GKE_CLUSTER_NAME": "kage-management",
+			"GKE_LOCATION":     "us-central1",
+		} {
+			if got := envMap[k]; got != want {
+				t.Errorf("task %s spec.env[%s] = %q, want %q", task.GetMetadata().GetName(), k, got, want)
+			}
+		}
+	}
+}

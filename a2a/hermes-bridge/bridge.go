@@ -281,6 +281,9 @@ type Config struct {
 	AXOIDCHTTPClient      *http.Client
 	PlatformAgentName     string
 	PodNamespace          string
+	GKEProjectID          string
+	GKEClusterName        string
+	GKELocation           string
 	// AtenetRouterAddr, AtenetCertFile, AtenetCAFile, AtenetServerName and
 	// AtenetInsecure configure ExecutorAX process execution over atenet-router.
 	AtenetRouterAddr string

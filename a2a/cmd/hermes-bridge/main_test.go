@@ -469,6 +469,9 @@ func TestConfigFromEnvParsesAXExecutorWithoutAPIServerKey(t *testing.T) {
 	t.Setenv("ATENET_CA_FILE", "/custom/ca.pem")
 	t.Setenv("ATENET_SERVER_NAME", "atenet-router.custom.svc")
 	t.Setenv("ATENET_INSECURE", "true")
+	t.Setenv("GKE_PROJECT_ID", "demo-proj")
+	t.Setenv("GKE_CLUSTER_NAME", "kage-management")
+	t.Setenv("GKE_LOCATION", "us-central1")
 
 	var logs bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logs, nil))
@@ -501,7 +504,10 @@ func TestConfigFromEnvParsesAXExecutorWithoutAPIServerKey(t *testing.T) {
 		cfg.AtenetCertFile != "/custom/cert.pem" ||
 		cfg.AtenetCAFile != "/custom/ca.pem" ||
 		cfg.AtenetServerName != "atenet-router.custom.svc" ||
-		!cfg.AtenetInsecure {
+		!cfg.AtenetInsecure ||
+		cfg.GKEProjectID != "demo-proj" ||
+		cfg.GKEClusterName != "kage-management" ||
+		cfg.GKELocation != "us-central1" {
 		t.Errorf("unexpected AX config parsed from env: %+v", cfg)
 	}
 	if strings.Contains(logs.String(), "no API server key") {

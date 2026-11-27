@@ -337,6 +337,53 @@ func (r *PlatformAgentReconciler) reconcileAXSandboxBroker(ctx context.Context, 
 
 func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	agentImage := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
+	envVars := []corev1.EnvVar{
+		{Name: a2aBridgeNATSURLEnvVar, Value: a2aNATSClientURL(agent)},
+		a2aNATSCAFileEnvVar(),
+		{Name: a2aBridgeNATSUserEnvVar, Value: a2aBridgeUser},
+		{Name: a2aBridgeNATSPasswordEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+			Key:                  a2aBridgePasswordKey,
+		}}},
+		{Name: a2aBridgeConcurrencyEnvVar, Value: axBridgeConcurrencyValue},
+		{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"},
+		{Name: a2aBridgeExecutorEnvVar, Value: a2aBridgeExecutorAX},
+		{Name: axServerAddrEnvVar, Value: axServerAddr()},
+		{Name: atenetRouterAddrEnvVar, Value: atenetRouterAddr()},
+		{Name: "AX_ATESPACE", Value: axDefaultAtespace},
+		{Name: "AX_DEFAULT_TASK", Value: agent.Name},
+		{Name: "PLATFORM_AGENT_NAME", Value: agent.Name},
+		{Name: axAgentGatewayNameEnvVar, Value: axAgentGatewayName()},
+		{Name: axSandboxGatewayNameEnvVar, Value: axSandboxGatewayName()},
+		{Name: axAgentImageEnvVar, Value: resolveAXAgentImage(agentImage)},
+		{Name: axSandboxImageEnvVar, Value: resolveAXSandboxImage(agentImage)},
+		{Name: axTaskCPUEnvVar, Value: axTaskCPU()},
+		{Name: axTaskMemoryEnvVar, Value: axTaskMemory()},
+		{Name: "AX_SANDBOX_BROKER_LISTEN", Value: axSandboxBrokerListenAddr},
+		{Name: "AX_SANDBOX_BROKER_TLS_CERT_FILE", Value: axServiceDNSCertFile},
+		{Name: "AX_SANDBOX_BROKER_TLS_KEY_FILE", Value: axServiceDNSCertFile},
+		{Name: "AX_SANDBOX_BROKER_URL", Value: axSandboxBrokerServiceURL(agent)},
+		{Name: "AX_OIDC_ISSUER_URL", Value: axOIDCIssuerURL},
+		{Name: "AX_OIDC_CA_FILE", Value: axOIDCCAFile},
+		{Name: "ATENET_CERT_FILE", Value: axPodIdentityCertFile},
+		{Name: "ATENET_CA_FILE", Value: axOIDCCAFile},
+		{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"},
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			FieldPath: "metadata.namespace",
+		}}},
+		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+	}
+	if h := agent.Spec.Harness; h != nil {
+		if v := strings.TrimSpace(h.ProjectID); v != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: v})
+		}
+		if v := strings.TrimSpace(h.ClusterName); v != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: v})
+		}
+		if v := strings.TrimSpace(h.Location); v != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: "GKE_LOCATION", Value: v})
+		}
+	}
 	return corev1.Container{
 		Name:            a2aBridgeContainerName,
 		Image:           a2aBridgeImage(agentImage),
@@ -349,42 +396,7 @@ func buildAXGatewayBridgeContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			ContainerPort: axSandboxBrokerPort,
 			Protocol:      corev1.ProtocolTCP,
 		}},
-		Env: []corev1.EnvVar{
-			{Name: a2aBridgeNATSURLEnvVar, Value: a2aNATSClientURL(agent)},
-			a2aNATSCAFileEnvVar(),
-			{Name: a2aBridgeNATSUserEnvVar, Value: a2aBridgeUser},
-			{Name: a2aBridgeNATSPasswordEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
-				Key:                  a2aBridgePasswordKey,
-			}}},
-			{Name: a2aBridgeConcurrencyEnvVar, Value: axBridgeConcurrencyValue},
-			{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"},
-			{Name: a2aBridgeExecutorEnvVar, Value: a2aBridgeExecutorAX},
-			{Name: axServerAddrEnvVar, Value: axServerAddr()},
-			{Name: atenetRouterAddrEnvVar, Value: atenetRouterAddr()},
-			{Name: "AX_ATESPACE", Value: axDefaultAtespace},
-			{Name: "AX_DEFAULT_TASK", Value: agent.Name},
-			{Name: "PLATFORM_AGENT_NAME", Value: agent.Name},
-			{Name: axAgentGatewayNameEnvVar, Value: axAgentGatewayName()},
-			{Name: axSandboxGatewayNameEnvVar, Value: axSandboxGatewayName()},
-			{Name: axAgentImageEnvVar, Value: resolveAXAgentImage(agentImage)},
-			{Name: axSandboxImageEnvVar, Value: resolveAXSandboxImage(agentImage)},
-			{Name: axTaskCPUEnvVar, Value: axTaskCPU()},
-			{Name: axTaskMemoryEnvVar, Value: axTaskMemory()},
-			{Name: "AX_SANDBOX_BROKER_LISTEN", Value: axSandboxBrokerListenAddr},
-			{Name: "AX_SANDBOX_BROKER_TLS_CERT_FILE", Value: axServiceDNSCertFile},
-			{Name: "AX_SANDBOX_BROKER_TLS_KEY_FILE", Value: axServiceDNSCertFile},
-			{Name: "AX_SANDBOX_BROKER_URL", Value: axSandboxBrokerServiceURL(agent)},
-			{Name: "AX_OIDC_ISSUER_URL", Value: axOIDCIssuerURL},
-			{Name: "AX_OIDC_CA_FILE", Value: axOIDCCAFile},
-			{Name: "ATENET_CERT_FILE", Value: axPodIdentityCertFile},
-			{Name: "ATENET_CA_FILE", Value: axOIDCCAFile},
-			{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"},
-			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: "metadata.namespace",
-			}}},
-			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
-		},
+		Env: envVars,
 		VolumeMounts: []corev1.VolumeMount{
 			a2aNATSCABundleMount(),
 			{Name: axServiceDNSCAName, MountPath: axServiceDNSCAMountPath, ReadOnly: true},
