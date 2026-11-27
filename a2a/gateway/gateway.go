@@ -2529,6 +2529,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
 	state.ChildAddressees = chainChildAddressees(rec, taskID)
+	state.ChildCount = chainChildCount(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2628,6 +2629,30 @@ func chainChildAddressees(rec *SessionRecord, taskID string) []string {
 		out = append(out, t.Addressee)
 	}
 	return out
+}
+
+// chainChildCount is how many child tasks the delegation chain rooted at
+// taskID's root minted: every delegation, so two to the same addressee count
+// two where chainChildAddressees names it once. A child minted without an
+// addressee still counts, since it is a delegation whomever it went to. Zero
+// when the chain delegated nothing; nil only when taskID is unknown, so the
+// wire tells "none" from "unknown" as the addressees do. It counts the
+// children the record still holds: a long-lived conversation whose history
+// trim (trimHistory) dropped old child entries under a live root counts
+// fewer, which a fresh bench conversation never reaches.
+func chainChildCount(rec *SessionRecord, taskID string) *int {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == taskRoleChild && t.rootID() == root {
+			n++
+		}
+	}
+	return &n
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.
@@ -3365,7 +3390,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
-	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	// Scheduled goes onto the task's history entry (TaskRef.Scheduled): a
+	// profile task's below a scheduled run, or a wake's continuing one.
 	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
@@ -3423,6 +3449,9 @@ type taskStart struct {
 	// turn only when it arrived with IntentConfirm; a child or a wake
 	// copies its chain's entry, never anything the session wrote.
 	ChangeRequested bool
+	// WakeDelegate goes onto a wake's entry (TaskRef.WakeDelegate). Set
+	// only by startWake, from wakeMayDelegate.
+	WakeDelegate bool
 }
 
 // childKeepsLine reports whether a task keeps its rolling line on a backend
@@ -3534,10 +3563,21 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A turn for the conversation's own session pod carries the agents its
 	// requester may delegate to, which the pod's delegate tool names. Per
 	// turn, so a reused pod sees profiles as they come and go.
-	// A wake runs without the tool, so it carries none.
+	// A wake the gateway didn't let delegate again runs without the tool, so
+	// it carries none; one it did (WakeDelegate, #6861) carries the list a
+	// human turn by its requester would, checked against the same authors.
 	var extra []lib.Part
-	if ts.Route == nil && ts.Role != taskRoleWake && ownSession {
+	if ts.Route == nil && (ts.Role != taskRoleWake || ts.WakeDelegate) && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
+		// A wake carries its child's steer authors (startWake), which the
+		// delegation checks (delegateEntryCheck) but the record's session set
+		// doesn't hold yet, so the list is built for them too.
+		for _, a := range ts.SteerAuthors {
+			if !slices.Contains(authors, a) {
+				authors = append(authors, a)
+			}
+		}
+		unknown = unknown || ts.SteerAuthorsOverflow || len(authors) > sessionAuthorCap
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
 			// (the primer's turns) may not: no list, so the tool falls back
@@ -3673,6 +3713,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Request:      ts.Request,
 		// What a child of this task inherits (handleDelegateRequest).
 		ChangeRequested: ts.ChangeRequested,
+		WakeDelegate:    ts.WakeDelegate,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
@@ -3699,8 +3740,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
-		ref.Scheduled = ts.Scheduled
 	}
+	// The schedule mark goes on whatever carries it: a profile task below a
+	// scheduled run, and a wake continuing such a chain, which has no route
+	// (startWake), so a delegation from it is refused as one below a schedule.
+	ref.Scheduled = ts.Scheduled
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
 		for i := range rec.Tasks {

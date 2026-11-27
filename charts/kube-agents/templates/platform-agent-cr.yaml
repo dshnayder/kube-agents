@@ -723,9 +723,9 @@ spec:
            small one, as the operator admits it. A request set without its limit
            is checked against the ceiling row's limit
            (kube-agents.credentialProxyCeilingRow): the same row, and under auto
-           the fleet row, since the operator renders the latched tier, which the
+           the fleet row, since the operator renders `status.effectiveSizingTier`, which the
            chart cannot read, and a request under the fleet row's limit is one
-           the webhook admits at a latch that has reached it. */}}
+           the webhook admits when the agent reaches it. */}}
     {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
     {{- $proxyCeiling := include "kube-agents.credentialProxyCeilingRow" . | fromJson }}
     {{- $proxyAuto := eq (((.Values.platformAgent.deployment | default dict).sizingProfile) | default "") "auto" }}
@@ -983,6 +983,14 @@ spec:
   {{- end }}
   {{- with .Values.platformAgent.networkPolicy }}
   networkPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.platformAgent.schedules }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules" "path" (list) "field" "schedules") }}
+  {{- if hasKey . "suspendAll" }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules.suspendAll" "path" (list "schedules") "field" "suspendAll") }}
+  {{- end }}
+  schedules:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}

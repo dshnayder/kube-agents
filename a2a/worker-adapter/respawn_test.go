@@ -16,6 +16,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // respawnScope stands the adapter in as the container's init, with the
@@ -94,7 +95,9 @@ func useRespawnScope(t *testing.T) *respawnScope {
 //   - refusal: a clean result, then a write refusal record and a tool
 //     step's result after it;
 //   - writer: a clean result after leaving a process in its own session
-//     (pid in $dir/writer) that the boundary must end;
+//     (pid in $dir/writer) that the boundary must end; on its first run it
+//     waits for $dir/tracked, so the test tracks the pid before the turn
+//     ends and the kill runs;
 //   - double: a clean result, then a second one once its stdin closes, so
 //     the second decides the task while a steer waits for the next process;
 //   - delegate: no result; it waits mid-turn (the test delegates on the
@@ -121,7 +124,7 @@ seconderror) if [ $n = 2 ]; then echo 'ERR boom it failed'; else echo "OK turn $
 linger) echo "OK turn $n"; echo 1 > "$dir/result"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
 refusal) echo "OK turn $n"; sleep 0.3; printf '%%s\n' %q >> "$%s"; echo 'R' ;;
 writer)
-  if [ $n = 1 ]; then /usr/bin/perl -MPOSIX -e 'if (fork) { exit 0 } POSIX::setsid(); open(STDIN,"<","/dev/null"); open(STDOUT,">","/dev/null"); open(STDERR,">","/dev/null"); open(my $f, ">", $ARGV[0]) or die; print $f "$$\n"; close($f); sleep 60' "$dir/writer"; fi
+  if [ $n = 1 ]; then /usr/bin/perl -MPOSIX -e 'if (fork) { exit 0 } POSIX::setsid(); open(STDIN,"<","/dev/null"); open(STDOUT,">","/dev/null"); open(STDERR,">","/dev/null"); open(my $f, ">", $ARGV[0]) or die; print $f "$$\n"; close($f); sleep 60' "$dir/writer"; i=0; while [ ! -e "$dir/tracked" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; fi
   echo "OK turn $n" ;;
 double) echo "OK turn $n"; while read -r more; do :; done; echo "OK again $n" ;;
 delegate) echo 1 > "$dir/mid-turn"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
@@ -255,6 +258,12 @@ func TestALeftoverFromOneProcessIsGoneBeforeTheNext(t *testing.T) {
 	r := respawnRun(t, "writer", 0, func(_ *Config, s *respawnScope) { scope = s }, func(_ *lib.Client, _ *lib.Envelope, _, _, dir string) {
 		pid, _ := strconv.Atoi(waitFileFor(t, filepath.Join(dir, "writer"), 10*time.Second))
 		scope.track(pid)
+		// The turn ends, and the kill runs, only once the pid is tracked:
+		// a kill before that would miss it, and the boundary check after
+		// would see it alive.
+		if err := os.WriteFile(filepath.Join(dir, "tracked"), []byte("1"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	})
 	if r.out.err != nil || r.out.res.State != lib.StateCompleted || r.runs != 2 {
 		t.Fatalf("state=%q err=%v runs=%d", r.out.res.State, r.out.err, r.runs)
@@ -420,7 +429,9 @@ func TestAStopBetweenProcessesRefusesEverySteer(t *testing.T) {
 // arrives during turn one is held, not written to that process; turn one's
 // process ends at its result, and a second process gets an envelope with
 // the steer as its message and turn one's conversation events as its
-// history.
+// history. The turn's MCP servers come from the persona (Config.PersonaMCP)
+// into the turn's own driver; the pod's driver carries none, so a respawn
+// that started from the pod's driver would send none.
 func TestACoreAgentSteerHeldAtTheResultRunsOnAFreshProcess(t *testing.T) {
 	dir := t.TempDir()
 	harness := stub(t, fmt.Sprintf(`
@@ -441,9 +452,8 @@ exit 0
 	session, taskID := "chat-ca-respawn", "task-ca-respawn"
 	origin := submit(t, c, session, taskID, "start")
 	cfg := adapterConfig(url, taskID, session, harness)
-	d := newCoreAgentDriver()
-	d.MCP = []coreagentwire.MCPServer{{Name: "srv", Command: "/bin/true", Tools: []string{"t"}}}
-	cfg.Driver = d
+	cfg.Driver = newCoreAgentDriver()
+	cfg.PersonaMCP = []persona.MCPServer{{Name: "srv", Command: "/bin/true", Tools: []string{"t"}}}
 	useRespawnScope(t)
 	done := runAdapter(context.Background(), cfg)
 	waitFileFor(t, filepath.Join(dir, "turn.1"), 10*time.Second)
@@ -464,6 +474,16 @@ exit 0
 	if late, err := os.ReadFile(filepath.Join(dir, "late.1")); err == nil && len(strings.TrimSpace(string(late))) > 0 {
 		t.Errorf("turn one's process was written to after its envelope: %q", late)
 	}
+	var env1 struct {
+		MCP []coreagentwire.MCPServer `json:"mcp"`
+	}
+	b1, _ := os.ReadFile(filepath.Join(dir, "envelope.1"))
+	if err := json.Unmarshal(b1, &env1); err != nil {
+		t.Fatalf("envelope 1 %q: %v", b1, err)
+	}
+	if len(env1.MCP) != 1 || env1.MCP[0].Name != "srv" {
+		t.Errorf("process 1's envelope carries MCP %+v; want the persona's server", env1.MCP)
+	}
 	var env2 struct {
 		Message string                    `json:"message"`
 		Session string                    `json:"session"`
@@ -478,7 +498,8 @@ exit 0
 		t.Errorf("process 2's message is %q; want the held steer", env2.Message)
 	}
 	// The turn's driver starts the next process, so its per-turn state
-	// (here its MCP servers) is in that envelope too.
+	// (here the persona's MCP servers) is in that envelope too; the pod's
+	// driver has none.
 	if len(env2.MCP) != 1 || env2.MCP[0].Name != "srv" {
 		t.Errorf("process 2's envelope carries MCP %+v; want the turn's server", env2.MCP)
 	}
